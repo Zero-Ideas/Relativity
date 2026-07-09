@@ -21,6 +21,12 @@ VisualOffload.On("SetProjectileDebug", function(enabled)
 	Projectile.SetDebugRays(enabled == true)
 end)
 
+-- Clients can toggle ProjSpawn/ProjSync/ProjHit + ProjMove-rate server console
+-- logging (V key by default) -- see Projectile.SetDebugSync's doc comment.
+VisualOffload.On("SetProjectileSyncDebug", function(enabled)
+	Projectile.SetDebugSync(enabled == true)
+end)
+
 -- Bounds for the player-controllable global time ratio.
 local MIN_RATIO = 0
 local MAX_RATIO = 3

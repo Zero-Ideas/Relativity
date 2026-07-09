@@ -21,6 +21,7 @@ local started = false
 local COOLDOWN = 0
 local lastFire = 0
 local debugRays = false -- matches the server default; toggle with B
+local debugSync = false -- prints ProjSpawn/ProjSync/ProjHit + a ProjMove rate summary server-side; toggle with V
 
 local AIM_RANGE = 5000
 
@@ -87,6 +88,10 @@ function ShooterController.start()
 			VisualOffload.Fire("SetProjectileDebug", debugRays)
 		elseif input.KeyCode == Enum.KeyCode.N then
 			stressTest()
+		elseif input.KeyCode == Enum.KeyCode.V then
+			-- toggle ProjSpawn/ProjSync/ProjHit + ProjMove-rate server console logging
+			debugSync = not debugSync
+			VisualOffload.Fire("SetProjectileSyncDebug", debugSync)
 		end
 	end)
 end

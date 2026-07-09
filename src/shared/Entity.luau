@@ -76,7 +76,7 @@ Entity.HistoryMinDelta = 1 -- studs; skip recording if barely moved since the la
 -- Debug: when true, every entity's hurtbox (HitboxRadius sphere) is streamed to
 -- clients and rendered as a translucent sphere. Flip this constant directly (or
 -- call Entity.SetShowHurtboxes(true) at runtime) -- no keybind needed.
-Entity.ShowHurtboxes = false
+Entity.ShowHurtboxes = true
 
 -- Debug: when true, the FULL position history of every entity streams to clients
 -- as a trail of hurtboxes (see EnableHurtboxHistoryRendering). Independent of
@@ -488,6 +488,7 @@ function Entity:_handleDeath(info: any?)
 	end
 	self._dead = true
 	self.Died:Fire(info)
+	
 	if self.DestroyOnDeath then
 		self:Destroy()
 	end
@@ -632,16 +633,6 @@ function Entity.SetShowHurtboxHistory(enabled: boolean)
 end
 
 if RunService:IsServer() then
-	-- Tracks the flag's state as of the last tick so an on->off transition is
-	-- detected and cleared HERE, regardless of whether the flag was flipped via
-	-- SetShowHurtboxes/SetShowHurtboxHistory or by direct field assignment (which
-	-- this file's own doc comment explicitly endorses as valid usage). Relying
-	-- only on the setters to broadcast the clearing empty snapshot left debug
-	-- spheres permanently orphaned on the client whenever a caller toggled the
-	-- flag directly -- this loop self-heals that regardless of how it's flipped.
-	local wasShowingHurtboxes = false
-	local wasShowingHistory = false
-
 	task.spawn(function()
 		while true do
 			if Entity.ShowHurtboxes then
@@ -657,10 +648,6 @@ if RunService:IsServer() then
 					end
 				end
 				VisualOffload.Fire("HurtboxSnapshot", snapshot)
-				wasShowingHurtboxes = true
-			elseif wasShowingHurtboxes then
-				VisualOffload.Fire("HurtboxSnapshot", {})
-				wasShowingHurtboxes = false
 			end
 
 			if Entity.ShowHurtboxHistory then
@@ -682,10 +669,6 @@ if RunService:IsServer() then
 					end
 				end
 				VisualOffload.Fire("HurtboxHistorySnapshot", snapshot)
-				wasShowingHistory = true
-			elseif wasShowingHistory then
-				VisualOffload.Fire("HurtboxHistorySnapshot", {})
-				wasShowingHistory = false
 			end
 
 			task.wait(0.1) -- real time; this is a debug view, not gameplay
