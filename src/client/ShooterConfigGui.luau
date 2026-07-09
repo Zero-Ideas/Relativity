@@ -15,20 +15,20 @@ local ShooterConfigGui = {}
 -- kind "number" -> TextBox (clamped to min/max), "bool" -> toggle button.
 local FIELDS = {
 	{ key = "Speed", label = "Speed", kind = "number", min = 10, max = math.huge, default = 220 },
-	{ key = "Acceleration", label = "Acceleration", kind = "number", min = -20000, max = math.huge, default = 0 },
-	{ key = "MinSpeed", label = "Min speed", kind = "number", min = 0, max = 1000, default = 0 },
+	{ key = "Acceleration", label = "Acceleration", kind = "number", min = -math.huge, max = math.huge, default = 0 },
+	{ key = "MinSpeed", label = "Min speed", kind = "number", min = 0, max = math.huge, default = 0 },
 	{ key = "MaxSpeed", label = "Max speed", kind = "number", min = 0, max = math.huge, default = 1000 },
 	{ key = "Damage", label = "Damage", kind = "number", min = 0, max = math.huge, default = 20 },
 	{ key = "Lifetime", label = "Lifetime (s)", kind = "number", min = 0.1, max = math.huge, default = 4 },
-	{ key = "Gravity", label = "Gravity", kind = "number", min = 0, max = 500, default = 0 },
+	{ key = "Gravity", label = "Gravity", kind = "number", min = 0, max = math.huge, default = 0 },
 	{ key = "Radius", label = "Radius (sphere)", kind = "number", min = 0, max = math.huge, default = 0 },
 	{ key = "Bounces", label = "Bounces", kind = "number", min = 0, max = math.huge, default = 0 },
 	{ key = "Restitution", label = "Restitution", kind = "number", min = 0, max = math.huge, default = 0.5 },
-	{ key = "Pierces", label = "Pierces", kind = "number", min = 0, max = 10, default = 0 },
-	{ key = "PierceFalloff", label = "Pierce falloff", kind = "number", min = 0, max = 1, default = 0.2 },
+	{ key = "Pierces", label = "Pierces", kind = "number", min = 0, max = math.huge, default = 0 },
+	{ key = "PierceFalloff", label = "Pierce falloff", kind = "number", min = 0, max = math.huge, default = 0.2 },
 	{ key = "Homing", label = "Homing", kind = "bool", default = false },
 	{ key = "Permalock", label = "Permalock", kind = "bool", default = false },
-	{ key = "TurnRate", label = "Turn rate (deg)", kind = "number", min = 0, max = 360, default = 140 },
+	{ key = "TurnRate", label = "Turn rate (deg)", kind = "number", min = 0, max = math.huge, default = 140 },
 	{ key = "AcquireRadius", label = "Acquire radius", kind = "number", min = 0, max = math.huge, default = 60 },
 }
 

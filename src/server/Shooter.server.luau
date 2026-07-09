@@ -82,28 +82,37 @@ VisualOffload.On("FireBullet", function(data, player)
 	end)
 	local rewindSeconds = (ok and typeof(ping) == "number" and ping == ping) and math.clamp(ping / 2, 0, MAX_REWIND) or 0
 
-	-- read + clamp the client's shooter config (all optional)
+	-- read + clamp the client's shooter config (all optional). Only the lower
+	-- bounds are real limits (e.g. a projectile needs Speed > 0); the upper
+	-- bounds are intentionally uncapped (math.huge) so lifetime/bounces/
+	-- pierces/velocity/etc. can be tuned arbitrarily high from the config GUI.
 	local cfg = typeof(data.Config) == "table" and data.Config or {}
-	local speed = num(cfg.Speed, 220, 10, 1000)
-	local bounces = math.floor(num(cfg.Bounces, 0, 0, 10))
-	local pierces = math.floor(num(cfg.Pierces, 0, 0, 10))
+	local speed = num(cfg.Speed, 220, 10, math.huge)
+	local bounces = math.floor(num(cfg.Bounces, 0, 0, math.huge))
+	local pierces = math.floor(num(cfg.Pierces, 0, 0, math.huge))
 
 	local projectileConfig = {
 		Origin = origin + direction * 3, -- spawn ahead of the muzzle so we never hit ourselves
 		Direction = direction,
 		Speed = speed,
-		Acceleration = num(cfg.Acceleration, 0, -2000, 2000),
-		MinSpeed = num(cfg.MinSpeed, 0, 0, 1000),
-		MaxSpeed = num(cfg.MaxSpeed, 1000, 0, 2000),
-		Lifetime = num(cfg.Lifetime, 4, 0.1, 10),
-		Damage = num(cfg.Damage, 20, 0, 1000),
-		Gravity = num(cfg.Gravity, 0, 0, 500),
-		Radius = num(cfg.Radius, 0, 0, 5),
+		Acceleration = num(cfg.Acceleration, 0, -math.huge, math.huge),
+		MinSpeed = num(cfg.MinSpeed, 0, 0, math.huge),
+		MaxSpeed = num(cfg.MaxSpeed, 1000, 0, math.huge),
+		Lifetime = num(cfg.Lifetime, 4, 0.1, math.huge),
+		Damage = num(cfg.Damage, 20, 0, math.huge),
+		Gravity = num(cfg.Gravity, 0, 0, math.huge),
+		Radius = num(cfg.Radius, 0, 0, math.huge),
 		Bounces = bounces,
-		Restitution = num(cfg.Restitution, 0.5, 0, 1),
+		Restitution = num(cfg.Restitution, 0.5, 0, math.huge),
 		MaxPierces = pierces,
-		PierceFalloff = num(cfg.PierceFalloff, 0.2, 0, 1),
+		PierceFalloff = num(cfg.PierceFalloff, 0.2, 0, math.huge),
 		Source = shooter,
+		-- Belt-and-suspenders against self-hits: shooter (the Entity) may
+		-- still be nil for a shot fired in the brief window before
+		-- PlayerManager.server.luau registers this character on CharacterAdded
+		-- -- IgnoreInstances excludes the raw character model from the
+		-- raycast regardless, so a self-hit can't happen even during that race.
+		IgnoreInstances = { character },
 		RewindSeconds = rewindSeconds,
 		Visualize = true, -- server = logic only; clients render
 		VisualRange = 800,
@@ -114,12 +123,12 @@ VisualOffload.On("FireBullet", function(data, player)
 	-- (the shooter's own character is always excluded by Projectile's acquireTarget)
 	if cfg.Homing == true then
 		projectileConfig.Homing = {
-			AcquireRadius = num(cfg.AcquireRadius, 60, 0, 300),
+			AcquireRadius = num(cfg.AcquireRadius, 60, 0, math.huge),
 			TargetTags = { "Enemy", "Player" },
 			Retarget = true,
 			ReacquireRate = 0.3,
 			Permalock = cfg.Permalock == true,
-			TurnRate = math.rad(num(cfg.TurnRate, 140, 0, 360)),
+			TurnRate = math.rad(num(cfg.TurnRate, 140, 0, math.huge)),
 			Delay = 0.05,
 		}
 	end
@@ -174,6 +183,7 @@ VisualOffload.On("StressTestFire", function(data, player)
 			Lifetime = 4,
 			Damage = 0, -- pure load test; never affects real gameplay/entities
 			Source = shooter,
+			IgnoreInstances = { character },
 			Visualize = true,
 			Homing = true,
 			VisualRange = 8000,

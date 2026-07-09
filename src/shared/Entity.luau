@@ -111,6 +111,19 @@ local RESERVED = {
 }
 
 function Entity.new(instance: Instance?, props: { [string]: any }?)
+	-- Idempotent: a second registration of the SAME instance returns the
+	-- existing entity instead of creating a duplicate. Without this, the newer
+	-- entity wins byInstance (Entity.Get resolves to it), but the older one is
+	-- STILL in chunk.Entities, still tagged, still bound to the same Humanoid --
+	-- a "ghost" that Projectile.Source (which points at the new entity) can't
+	-- reference-equal against, so the projectile's self-exclusion in acquireTarget
+	-- / _resolveEntityHit fails and it homes onto / damages its own creator.
+	-- Any re-registration path (CharacterAdded/PlayerAdded timing, respawn,
+	-- double-connect) converges to one live entity instead.
+	if instance ~= nil and byInstance[instance] then
+		return byInstance[instance]
+	end
+
 	nextId += 1
 	local self = setmetatable({
 		Id = nextId,

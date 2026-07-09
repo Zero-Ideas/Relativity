@@ -70,6 +70,10 @@
 	   Lifetime = 5             (dilated seconds; no upper bound is enforced)
 	   Damage = 0
 	   Source = entity          (deals the damage; never hits itself)
+	   IgnoreInstances = {Instance} (raw instances the raycast/spherecast never
+	              hits, e.g. the shooter's character -- independent of Source,
+	              so self-hits stay impossible even if the firing entity hasn't
+	              been registered with the Entity system yet; see buildRayParams)
 	   Filter = (entity)->bool  (which entities count as targets; also applied to homing acquisition)
 	   Gravity = 0              (studs/s² downward, integrated with dilated dt)
 	   Radius = 0               (>0 uses a spherecast)
@@ -314,6 +318,16 @@ local function buildRayParams(projectile)
 	if source and source.Instance then
 		table.insert(ignore, source.Instance)
 	end
+	-- Excluded independently of Source: Source only exists once the firing
+	-- entity is registered with the Entity system (see PlayerManager.server.luau),
+	-- so a shot fired in the window before that registration lands would
+	-- otherwise have nothing excluding the shooter's own character from this
+	-- raycast -- IgnoreInstances closes that gap without depending on timing.
+	if projectile.IgnoreInstances then
+		for _, instance in projectile.IgnoreInstances do
+			table.insert(ignore, instance)
+		end
+	end
 	params.FilterDescendantsInstances = ignore
 	params.IgnoreWater = true
 	return params
@@ -485,6 +499,7 @@ function Projectile.new(config)
 		Damage = config.Damage or 0,
 		DamageMultiplier = 1,
 		Source = config.Source,
+		IgnoreInstances = config.IgnoreInstances,
 		Filter = config.Filter,
 
 		BouncesLeft = bounces,
@@ -512,9 +527,16 @@ function Projectile.new(config)
 		_ignore = {}, -- entities already pierced
 		_bouncedThisTick = false,
 		_bouncedNormal = Vector3.yAxis,
+		-- Lag-compensation working state, repopulated each Step before
+		-- _checkRewoundHit runs (see Step). rewoundPos is memoized per frame
+		-- since RewindSeconds is fixed and os.clock() is stable across one
+		-- frame's substeps; the candidate buffer is reused across substeps to
+		-- avoid per-substep allocation churn under high projectile counts.
+		_rewindTime = 0,
+		_rewindCache = {},
+		_candidateBuf = {},
 		Dead = false,
 	}, Projectile)
-
 	self._rayParams = buildRayParams(self)
 	self._streamedSynced = isSynced(self)
 
@@ -702,9 +724,23 @@ end
 -- whitelist directly from the (loaded) chunk(s) the segment touches -- not a
 -- radius sweep -- so a projectile only ever considers entities actually in a
 -- loaded chunk it's in, per-shooter-desync.
+--
+-- Two memoization/deferral choices preserve the exact "nearest in-range entity
+-- with a clear LOS to `from`" semantics while cutting redundant work:
+--  - The rewind instant (os.clock() - RewindSeconds) is pinned for the whole
+--    Step (see Step's useRewind setup), and each entity's rewound position is
+--    memoized in self._rewindCache. Within a frame RewindSeconds is constant
+--    and os.clock() is stable, so an entity rewinds to the same place on every
+--    substep -- previously this recomputed GetPositionAt per entity per
+--    substep.
+--  - LOS verification is deferred: in-range candidates are collected into a
+--    reusable buffer, sorted ascending by distance-along-segment, then
+--    LOS-checked nearest-first, returning the first whose LOS to `from` is
+--    unobstructed. The survivor is exactly the nearest clear entity the old
+--    hash-order loop would also have produced, but the raycast count is now the
+--    rank of the nearest clear candidate (or N if all blocked) rather than up
+--    to N regardless of order -- deterministically O(rank), not O(N) worst-case.
 function Projectile:_checkRewoundHit(from: Vector3, to: Vector3)
-	local rewindTime = os.clock() - self.RewindSeconds
-
 	local whitelist = {}
 	for _, position in { from, to } do
 		local chunk = ChunkManager.GetChunk(position)
@@ -715,32 +751,52 @@ function Projectile:_checkRewoundHit(from: Vector3, to: Vector3)
 		end
 	end
 
-	local bestEntity, bestPoint, bestDistAlong = nil, nil, math.huge
+	-- Collect in-range candidates (no raycasts yet) into the reusable buffer.
+	local candidates = self._candidateBuf
 	for entity in whitelist do
 		if entity ~= self.Source and not self._ignore[entity] and (not self.Filter or self.Filter(entity)) then
-			local rewoundPos = entity:GetPositionAt(rewindTime)
+			local rewoundPos = self._rewindCache[entity]
+			if not rewoundPos then
+				rewoundPos = entity:GetPositionAt(self._rewindTime)
+				self._rewindCache[entity] = rewoundPos
+			end
 			local closest, distance = closestPointOnSegment(rewoundPos, from, to)
 			if distance <= entity.HitboxRadius + self.Radius then
-				local distAlong = (closest - from).Magnitude
-				if distAlong < bestDistAlong then
-					-- line-of-sight: real geometry must not block the shot before
-					-- it would reach this point, so stale rewound data can never
-					-- be used to hit someone through a wall.
-					local los = workspace:Raycast(from, closest - from, self._rayParams)
-					local blocked = los ~= nil
-						and (los.Position - from).Magnitude < distAlong - 0.5
-						and Entity.Get(los.Instance) ~= entity
-					if not blocked then
-						bestEntity, bestPoint, bestDistAlong = entity, closest, distAlong
-					end
-				end
+				table.insert(candidates, {
+					entity = entity,
+					point = closest,
+					distAlong = (closest - from).Magnitude,
+				})
 			end
 		end
 	end
 
-	if bestEntity then
-		return bestEntity, bestPoint, safeUnit(from - bestPoint, Vector3.yAxis)
+	-- Nearest-first: sort ascending by distance along the segment, then
+	-- LOS-check in order, returning the first unobstructed one. This matches
+	-- the old "bestDistAlong, clear only" survivor exactly.
+	table.sort(candidates, function(a, b)
+		return a.distAlong < b.distAlong
+	end)
+
+	for _, c in candidates do
+		-- line-of-sight: real geometry must not block the shot before it would
+		-- reach this point, so stale rewound data can never be used to hit
+		-- someone through a wall. The hit instance must not belong to the
+		-- candidate itself, so a target's own body can't block hitting it.
+		local los = workspace:Raycast(from, c.point - from, self._rayParams)
+		local blocked = los ~= nil
+			and (los.Position - from).Magnitude < c.distAlong - 0.5
+			and Entity.Get(los.Instance) ~= c.entity
+		if not blocked then
+			-- drain the buffer for this frame so the next substep starts clean
+			-- (Step already clears it, but this keeps the function honest if
+			-- ever called from elsewhere).
+			table.clear(candidates)
+			return c.entity, c.point, safeUnit(from - c.point, Vector3.yAxis)
+		end
 	end
+
+	table.clear(candidates)
 	return nil
 end
 
@@ -831,6 +887,19 @@ function Projectile:Step(globalDt: number): boolean
 	local highRes = chunkHasEntities(self.Position)
 		or chunkHasEntities(self.Position + self.Velocity * dt)
 	local maxStep = highRes and HIGH_RES_STEP or LOW_RES_STEP
+
+	-- Lag-compensation working state for this frame: pin rewindTime and a fresh
+	-- rewound-position cache so every substep rewinds to the SAME instant
+	-- (RewindSeconds is fixed per projectile and os.clock() is stable across
+	-- substeps; previously each substep recomputed both, doing up to N redundant
+	-- GetPositionAt lookups where one would do). The candidate buffer is
+	-- reused, never reallocated -- see _checkRewoundHit.
+	local useRewind = highRes and self.RewindSeconds > 0
+	if useRewind then
+		self._rewindTime = os.clock() - self.RewindSeconds
+		table.clear(self._rewindCache)
+		table.clear(self._candidateBuf)
+	end
 
 	local remaining = dt
 	local guard = 0
