@@ -18,6 +18,7 @@
 	 Entity.GetTagged(tag) -> {entity}
 
 	 entity:GetPosition() / :SetPosition(pos)   (SetPosition for data-only entities)
+	 entity:GetPositionAt(realTime) -> Vector3  (rewound position; see history below)
 	 entity:OnUpdate(fn(dt, entity)) -> connection-like {Disconnect}
 	 entity:SetTimeScale(scale) / :GetEffectiveTimeScale()
 	 entity:AddTag(tag) / :RemoveTag(tag) / :HasTag(tag)
@@ -28,6 +29,14 @@
 	 entity:IsActive() -> boolean            (false when chunk-frozen or destroyed)
 	 entity:GetChunk() -> Chunk?
 	 entity:Destroy()
+
+	 Hurtbox debug visualization: set Entity.ShowHurtboxes = true (or call
+	 Entity.SetShowHurtboxes(true)) to stream every entity's HitboxRadius sphere to
+	 clients; call Entity.EnableHurtboxRendering() once on the client to draw them.
+	 Entity.ShowHurtboxHistory = true (+ Entity.EnableHurtboxHistoryRendering() on
+	 the client) shows the ENTIRE retained history as a trail of hurtboxes, colored
+	 green while a sample is still within HurtboxValidWindow (fresh enough to be
+	 usable for lag compensation) and red once it's older than that.
 
 	 Signals: entity.Damaged(amount, info), entity.Died(info?),
 	          entity.ChunkChanged(newChunk, oldChunk), entity.Destroyed()
@@ -40,14 +49,46 @@
 	   ScaleHumanoid (boolean — scale WalkSpeed/JumpPower with time dilation)
 	   DestroyOnDeath (boolean — auto :Destroy() when Died fires)
 	   Team / anything else -> stored as custom variables
+
+	 Position history (for lag-compensated hit detection, see Projectile.luau):
+	 every entity's real-world position is sampled on a real-time (not dilated)
+	 cadence and kept for Entity.HistoryWindow seconds, so entity:GetPositionAt(t)
+	 can answer "where was this entity at real time t". Sampling is throttled by
+	 Entity.HistorySnapshotInterval and skipped when the entity hasn't moved at
+	 least Entity.HistoryMinDelta studs, so a stationary entity's buffer stays tiny.
 ]]
+
+local RunService = game:GetService("RunService")
 
 local Heartbeat = require(script.Parent.Heartbeat)
 local ChunkManager = require(script.Parent.ChunkManager)
 local Signal = require(script.Parent.Signal)
+local VisualOffload = require(script.Parent.VisualOffload)
 
 local Entity = {}
 Entity.__index = Entity
+
+-- Position-history tuning (real seconds, not dilated) -- see GetPositionAt below.
+Entity.HistoryWindow = 0.5 -- how far back samples are retained
+Entity.HistorySnapshotInterval = 0.02 -- minimum real time between recorded samples
+Entity.HistoryMinDelta = 1 -- studs; skip recording if barely moved since the last sample
+
+-- Debug: when true, every entity's hurtbox (HitboxRadius sphere) is streamed to
+-- clients and rendered as a translucent sphere. Flip this constant directly (or
+-- call Entity.SetShowHurtboxes(true) at runtime) -- no keybind needed.
+Entity.ShowHurtboxes = false
+
+-- Debug: when true, the FULL position history of every entity streams to clients
+-- as a trail of hurtboxes (see EnableHurtboxHistoryRendering). Independent of
+-- ShowHurtboxes above, which only shows the single live hurtbox.
+Entity.ShowHurtboxHistory = false
+
+-- How recent (real seconds) a history sample must be to render green ("valid" --
+-- still fresh enough to matter for lag-compensated hit detection) rather than red
+-- ("stale" -- retained for GetPositionAt's interpolation, but old). Matches this
+-- project's Shooter.server.luau MAX_REWIND by default so the debug view reflects
+-- what's actually usable; tune to taste if that budget changes.
+Entity.HurtboxValidWindow = 0.3
 
 local entities = {} -- flat array for fast iteration
 local entityIndex = {} -- [entity] = array index (O(1) swap-remove)
@@ -77,7 +118,7 @@ function Entity.new(instance: Instance?, props: { [string]: any }?)
 		Humanoid = nil,
 		Health = 100,
 		MaxHealth = 100,
-		HitboxRadius = 2,
+		HitboxRadius = 3,
 		TimeScale = 1,
 		ScaleHumanoid = false,
 		DestroyOnDeath = false,
@@ -99,6 +140,8 @@ function Entity.new(instance: Instance?, props: { [string]: any }?)
 		_baseJumpPower = nil,
 		_lastHumanoidScale = 1,
 		_instanceConnections = {},
+		_history = {}, -- chronological { {Time, Position}, ... }; see GetPositionAt
+		_lastSnapshotTime = -math.huge,
 	}, Entity)
 
 	-- resolve physical root + humanoid
@@ -193,6 +236,68 @@ end
 --------------------------------------------------------------------------------
 -- Position & chunks
 --------------------------------------------------------------------------------
+
+-- Binary search over a chronologically-ordered history array: returns the index
+-- of the last sample with Time <= target, or 0 if every sample is newer.
+local function findBeforeIndex(history: { any }, target: number): number
+	local lo, hi = 1, #history
+	local result = 0
+	while lo <= hi do
+		local mid = (lo + hi) // 2
+		if history[mid].Time <= target then
+			result = mid
+			lo = mid + 1
+		else
+			hi = mid - 1
+		end
+	end
+	return result
+end
+
+-- Records a position sample for lag-compensated rewinding, throttled by
+-- HistorySnapshotInterval and skipped if the entity barely moved since its last
+-- sample. `now` is real time (os.clock()), not dilated Heartbeat time.
+function Entity:_recordPositionSnapshot(now: number)
+	if now - self._lastSnapshotTime < Entity.HistorySnapshotInterval then
+		return
+	end
+	self._lastSnapshotTime = now
+
+	local history = self._history
+	local position = self:GetPosition()
+	local last = history[#history]
+	if last and (position - last.Position).Magnitude < Entity.HistoryMinDelta then
+		return -- hasn't moved enough to justify a new sample
+	end
+
+	table.insert(history, { Time = now, Position = position })
+	while history[1] and history[1].Time < now - Entity.HistoryWindow do
+		table.remove(history, 1)
+	end
+end
+
+-- Where was this entity at real time `time` (an os.clock() value)? Interpolates
+-- between the two recorded samples bracketing `time`, falls back to the live
+-- position for times at/after "now" (or if no history exists), and clamps to
+-- the oldest sample for times older than the retained window.
+function Entity:GetPositionAt(time: number): Vector3
+	local history = self._history
+	local now = os.clock()
+	if #history == 0 or time >= now then
+		return self:GetPosition()
+	end
+
+	local idx = findBeforeIndex(history, time)
+	if idx == 0 then
+		return history[1].Position -- predates all history; clamp to oldest
+	end
+
+	local before = history[idx]
+	local after = history[idx + 1] or { Time = now, Position = self:GetPosition() }
+	local span = after.Time - before.Time
+	local alpha = span > 1e-6 and math.clamp((time - before.Time) / span, 0, 1) or 0
+	return before.Position:Lerp(after.Position, alpha)
+end
 
 function Entity:GetPosition(): Vector3
 	local root = self._root
@@ -478,6 +583,22 @@ Heartbeat.Connect(function(dt)
 	end
 end, { Name = "EntitySystem.Update", Priority = 0 })
 
+-- History loop: real-time (not dilated) position sampling for lag-compensated
+-- hit detection (see Projectile.luau). Runs every real frame -- the callback
+-- ignores `dt` and reads os.clock() directly, since real network latency
+-- doesn't scale with in-game time dilation. Each entity's own throttling
+-- (HistorySnapshotInterval / HistoryMinDelta) keeps the actual recording cost low.
+Heartbeat.Connect(function()
+	local now = os.clock()
+	for i = 1, #entities do
+		local entity = entities[i]
+		local chunk = entity._chunk
+		if chunk == nil or ChunkManager.IsChunkActive(chunk) then
+			entity:_recordPositionSnapshot(now)
+		end
+	end
+end, { Name = "EntitySystem.History", Priority = -60 })
+
 -- Slow loop: re-bucket moved entities into chunks, refresh humanoid dilation.
 Heartbeat.ConnectInterval(0.1, function()
 	for i = 1, #entities do
@@ -491,5 +612,197 @@ Heartbeat.ConnectInterval(0.1, function()
 		entity:_refreshHumanoidScale()
 	end
 end, { Name = "EntitySystem.ChunkTracking", Priority = -50 })
+
+--------------------------------------------------------------------------------
+-- Hurtbox debug visualization
+--------------------------------------------------------------------------------
+
+function Entity.SetShowHurtboxes(enabled: boolean)
+	Entity.ShowHurtboxes = enabled and true or false
+	if RunService:IsServer() and not Entity.ShowHurtboxes then
+		VisualOffload.Fire("HurtboxSnapshot", {}) -- clear any spheres already drawn
+	end
+end
+
+function Entity.SetShowHurtboxHistory(enabled: boolean)
+	Entity.ShowHurtboxHistory = enabled and true or false
+	if RunService:IsServer() and not Entity.ShowHurtboxHistory then
+		VisualOffload.Fire("HurtboxHistorySnapshot", {}) -- clear any trails already drawn
+	end
+end
+
+if RunService:IsServer() then
+	-- Tracks the flag's state as of the last tick so an on->off transition is
+	-- detected and cleared HERE, regardless of whether the flag was flipped via
+	-- SetShowHurtboxes/SetShowHurtboxHistory or by direct field assignment (which
+	-- this file's own doc comment explicitly endorses as valid usage). Relying
+	-- only on the setters to broadcast the clearing empty snapshot left debug
+	-- spheres permanently orphaned on the client whenever a caller toggled the
+	-- flag directly -- this loop self-heals that regardless of how it's flipped.
+	local wasShowingHurtboxes = false
+	local wasShowingHistory = false
+
+	task.spawn(function()
+		while true do
+			if Entity.ShowHurtboxes then
+				local snapshot = {}
+				for i = 1, #entities do
+					local entity = entities[i]
+					if not entity.IsDestroyed then
+						table.insert(snapshot, {
+							Id = entity.Id,
+							Position = entity:GetPosition(),
+							Radius = entity.HitboxRadius,
+						})
+					end
+				end
+				VisualOffload.Fire("HurtboxSnapshot", snapshot)
+				wasShowingHurtboxes = true
+			elseif wasShowingHurtboxes then
+				VisualOffload.Fire("HurtboxSnapshot", {})
+				wasShowingHurtboxes = false
+			end
+
+			if Entity.ShowHurtboxHistory then
+				local now = os.clock()
+				local snapshot = {}
+				for i = 1, #entities do
+					local entity = entities[i]
+					if not entity.IsDestroyed then
+						local samples = {}
+						for _, sample in entity._history do
+							table.insert(samples, {
+								Position = sample.Position,
+								Valid = (now - sample.Time) <= Entity.HurtboxValidWindow,
+							})
+						end
+						-- the live position is always the newest, always-valid sample
+						table.insert(samples, { Position = entity:GetPosition(), Valid = true })
+						table.insert(snapshot, { Id = entity.Id, Radius = entity.HitboxRadius, Samples = samples })
+					end
+				end
+				VisualOffload.Fire("HurtboxHistorySnapshot", snapshot)
+				wasShowingHistory = true
+			elseif wasShowingHistory then
+				VisualOffload.Fire("HurtboxHistorySnapshot", {})
+				wasShowingHistory = false
+			end
+
+			task.wait(0.1) -- real time; this is a debug view, not gameplay
+		end
+	end)
+end
+
+local hurtboxParts: { [number]: BasePart }? = nil -- [entity Id] = debug sphere
+
+local function ensureHurtboxPart(id: number): BasePart
+	local part = hurtboxParts[id]
+	if part then
+		return part
+	end
+	part = Instance.new("Part")
+	part.Name = `Hurtbox_{id}`
+	part.Shape = Enum.PartType.Ball
+	part.Material = Enum.Material.ForceField
+	part.Color = Color3.fromRGB(255, 90, 90)
+	part.Transparency = 0.55
+	part.Anchored = true
+	part.CanCollide = false
+	part.CanQuery = false
+	part.CanTouch = false
+	part.CastShadow = false
+	part.Parent = workspace
+	hurtboxParts[id] = part
+	return part
+end
+
+local hurtboxRenderingEnabled = false
+
+-- Call once on the client to draw every entity's hurtbox whenever
+-- Entity.ShowHurtboxes is true on the server. No-ops on the server.
+function Entity.EnableHurtboxRendering()
+	if hurtboxRenderingEnabled or RunService:IsServer() then
+		return
+	end
+	hurtboxRenderingEnabled = true
+	hurtboxParts = {}
+
+	VisualOffload.On("HurtboxSnapshot", function(snapshot)
+		local seen: { [number]: boolean } = {}
+		for _, info in snapshot do
+			seen[info.Id] = true
+			local part = ensureHurtboxPart(info.Id)
+			part.Size = Vector3.one * (info.Radius * 2)
+			part.Position = info.Position
+		end
+		for id, part in hurtboxParts do
+			if not seen[id] then
+				part:Destroy()
+				hurtboxParts[id] = nil
+			end
+		end
+	end)
+end
+
+-- History-trail rendering: every retained sample per entity, colored green while
+-- still within HurtboxValidWindow, red once older. Overlapping spheres are
+-- expected (denser overlap = the entity lingered there) -- kept more transparent
+-- than the single live hurtbox so the trail doesn't turn into a solid blob.
+local HURTBOX_VALID_COLOR = Color3.fromRGB(90, 230, 120)
+local HURTBOX_INVALID_COLOR = Color3.fromRGB(230, 70, 70)
+
+local historyParts: { [string]: BasePart }? = nil -- ["entityId_index"] = debug sphere
+
+local function ensureHistoryPart(key: string): BasePart
+	local part = historyParts[key]
+	if part then
+		return part
+	end
+	part = Instance.new("Part")
+	part.Name = `HurtboxHistory_{key}`
+	part.Shape = Enum.PartType.Ball
+	part.Material = Enum.Material.ForceField
+	part.Transparency = 0.8
+	part.Anchored = true
+	part.CanCollide = false
+	part.CanQuery = false
+	part.CanTouch = false
+	part.CastShadow = false
+	part.Parent = workspace
+	historyParts[key] = part
+	return part
+end
+
+local hurtboxHistoryRenderingEnabled = false
+
+-- Call once on the client to draw every entity's FULL hurtbox history whenever
+-- Entity.ShowHurtboxHistory is true on the server. No-ops on the server.
+function Entity.EnableHurtboxHistoryRendering()
+	if hurtboxHistoryRenderingEnabled or RunService:IsServer() then
+		return
+	end
+	hurtboxHistoryRenderingEnabled = true
+	historyParts = {}
+
+	VisualOffload.On("HurtboxHistorySnapshot", function(snapshot)
+		local seen: { [string]: boolean } = {}
+		for _, info in snapshot do
+			for index, sample in info.Samples do
+				local key = `{info.Id}_{index}`
+				seen[key] = true
+				local part = ensureHistoryPart(key)
+				part.Size = Vector3.one * (info.Radius * 2)
+				part.Position = sample.Position
+				part.Color = sample.Valid and HURTBOX_VALID_COLOR or HURTBOX_INVALID_COLOR
+			end
+		end
+		for key, part in historyParts do
+			if not seen[key] then
+				part:Destroy()
+				historyParts[key] = nil
+			end
+		end
+	end)
+end
 
 return Entity

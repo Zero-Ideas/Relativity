@@ -18,9 +18,9 @@ local ShooterController = {}
 
 local player = Players.LocalPlayer
 local started = false
-local COOLDOWN = 0.12
+local COOLDOWN = 0
 local lastFire = 0
-local debugRays = true -- matches the server default; toggle with B
+local debugRays = false -- matches the server default; toggle with B
 
 local AIM_RANGE = 5000
 
@@ -53,6 +53,18 @@ local function fire()
 	})
 end
 
+-- Load-testing the projectile system means spawning many projectiles AT ONCE, not
+-- firing many separate player shots -- Shooter.server.luau's FIRE_COOLDOWN (10/sec)
+-- exists to rate-limit real clicking and would silently drop almost all of a tight
+-- client-side firing loop. This sends ONE request asking the server to spawn N
+-- projectiles directly, bypassing that per-click gate entirely (see StressTestFire
+-- in Shooter.server.luau). Press N to fire a stress-test batch.
+local STRESS_TEST_COUNT = 1000
+
+local function stressTest()
+	VisualOffload.Fire("StressTestFire", { Count = STRESS_TEST_COUNT })
+end
+
 function ShooterController.start()
 	if started then
 		return
@@ -73,6 +85,8 @@ function ShooterController.start()
 			-- toggle raycast hit-detection visualization (server owns the flag)
 			debugRays = not debugRays
 			VisualOffload.Fire("SetProjectileDebug", debugRays)
+		elseif input.KeyCode == Enum.KeyCode.N then
+			stressTest()
 		end
 	end)
 end

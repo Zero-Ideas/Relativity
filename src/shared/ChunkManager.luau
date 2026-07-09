@@ -385,15 +385,24 @@ function ChunkManager.EnableReplication()
 				GlobalScale = Heartbeat.GetGlobalTimeScale(),
 			})
 		end)
-		-- mirror global scale changes (polled; Heartbeat stays dependency-free)
+		-- Mirror global scale changes. Polled in REAL time via a plain task loop,
+		-- deliberately NOT a Heartbeat connection: every Heartbeat dt (dilated or
+		-- not) is itself multiplied by the current global scale, so a poll tied to
+		-- Heartbeat would stop advancing the instant the scale it's watching hits
+		-- 0 -- meaning the transition INTO a full freeze could never be detected
+		-- or broadcast to any client that didn't set it locally themselves. Real
+		-- time keeps ticking regardless of dilation, so this always fires.
 		local lastGlobal = Heartbeat.GetGlobalTimeScale()
-		Heartbeat.ConnectInterval(0.2, function()
-			local current = Heartbeat.GetGlobalTimeScale()
-			if current ~= lastGlobal then
-				lastGlobal = current
-				VisualOffload.Fire("GlobalScale", current)
+		task.spawn(function()
+			while true do
+				task.wait(0.2)
+				local current = Heartbeat.GetGlobalTimeScale()
+				if current ~= lastGlobal then
+					lastGlobal = current
+					VisualOffload.Fire("GlobalScale", current)
+				end
 			end
-		end, { Name = "ChunkManager.GlobalScaleReplication", TimeScale = 1 })
+		end)
 	else
 		VisualOffload.On("ChunkScale", function(data)
 			local chunk = chunks[data.Key] or newChunk(data.Key)

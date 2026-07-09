@@ -9,6 +9,7 @@ local Shared = ReplicatedStorage:WaitForChild("Shared")
 
 local ChunkManager = require(Shared.ChunkManager)
 local Projectile = require(Shared.Projectile)
+local Entity = require(Shared.Entity)
 
 -- Client-local systems (sibling ModuleScripts of this LocalScript).
 local MovementController = require(script.MovementController)
@@ -19,6 +20,8 @@ local ShooterController = require(script.ShooterController)
 
 ChunkManager.EnableReplication()
 Projectile.EnableClientRendering()
+Entity.EnableHurtboxRendering() -- draws hurtboxes when Entity.ShowHurtboxes is true
+Entity.EnableHurtboxHistoryRendering() -- draws the history trail when Entity.ShowHurtboxHistory is true
 
 MovementController.start()
 ChunkVisualizer.start()
