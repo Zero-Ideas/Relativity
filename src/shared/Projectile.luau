@@ -18,20 +18,25 @@
 	one ProjMove per frame covering everyone who currently needs it, not one
 	event each) for as long as that's true. There are exactly two such cases,
 	both driven by a single per-tick check (self.HomingTarget ~= nil or
-	self.BouncesLeft > 0), and a rare ProjSync event tells clients when a visual
-	crosses in or out of that state:
+	self.BouncesLeft > 0 or self._hasBounced), and a rare ProjSync event tells
+	clients when a visual crosses in or out of that state:
 	 - Homing while actually locked onto a target: the client only ever sees a
 	   target's position through that target's own replication lag, which
 	   differs per observer, so if it rotated toward that position locally, two
 	   clients watching the same missile chase the same target could compute
 	   two different flight paths.
-	 - Bouncing while bounces remain: reproducing a bounce client-side requires
-	   matching the server's exact raycast resolution/timing AND knowing which
-	   hits are really entities (piercable/filterable, server-only knowledge --
-	   the client has no replicated entity registry to check against), neither
-	   of which the client can do reliably. Guessing wrong doesn't just look
-	   slightly off, it visibly bounces off things that should have been pierced.
-	The moment neither condition holds -- no lock, no bounces left -- streaming
+	 - Bouncing, or having ever bounced: reproducing a bounce client-side
+	   requires matching the server's exact raycast resolution/timing AND
+	   knowing which hits are really entities (piercable/filterable, server-only
+	   knowledge -- the client has no replicated entity registry to check
+	   against), neither of which the client can do reliably. Once a bounce
+	   happens, the projectile stays synced for the rest of its life even after
+	   BouncesLeft hits 0 -- its post-reflection trajectory was never predicted
+	   client-side, and a heavily-restituted bounce can leave it coasting for
+	   seconds before its real terminal hit, so going blind the instant the
+	   last bounce charge is spent would leave that whole remaining flight
+	   free to drift through geometry unnoticed.
+	The moment neither condition holds -- no lock, never bounced -- streaming
 	stops and the client coasts on local physics (gravity/acceleration only, no
 	raycasting), which is driftless because it depends on nothing but universal
 	constants every client agrees on. All client-side simulation is purely
