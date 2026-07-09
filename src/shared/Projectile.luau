@@ -12,37 +12,46 @@
 	cone bursts. Rendering can be offloaded to clients (Visualize = true): the
 	server keeps only the logic. Every projectile gets exactly two replication
 	events over its life -- ProjSpawn (once, with its full trajectory-determining
-	config) and ProjHit (once, on destroy) -- UNLESS it's currently doing
-	something the client can't safely reproduce on its own, in which case the
-	server also streams authoritative Position/Velocity every tick (batched,
-	one ProjMove per frame covering everyone who currently needs it, not one
-	event each) for as long as that's true. There are exactly two such cases,
-	both driven by a single per-tick check (self.HomingTarget ~= nil or
-	self.BouncesLeft > 0 or self._hasBounced), and a rare ProjSync event tells
-	clients when a visual crosses in or out of that state:
-	 - Homing while actually locked onto a target: the client only ever sees a
-	   target's position through that target's own replication lag, which
+	config) and ProjHit (once, on destroy). On top of that there are two
+	independent, orthogonal streaming mechanisms, each covering a different case
+	the client can't safely reproduce on its own:
+	 - Continuous sync while actively homing (self.HomingTarget ~= nil, checked
+	   fresh every tick, never a static classification): the client only ever
+	   sees a target's position through that target's own replication lag, which
 	   differs per observer, so if it rotated toward that position locally, two
-	   clients watching the same missile chase the same target could compute
-	   two different flight paths.
-	 - Bouncing, or having ever bounced: reproducing a bounce client-side
+	   clients watching the same missile chase the same target could compute two
+	   different flight paths. While a lock is held, the server streams
+	   authoritative Position/Velocity every tick (batched, one ProjMove per
+	   frame covering everyone who currently needs it, not one event each), and
+	   a rare ProjSync event tells clients when a visual crosses in or out of
+	   that state. The instant the lock drops -- lost, out of range, or the
+	   target destroyed -- streaming stops immediately; the final synced
+	   ProjMove for that tick carries the exact Velocity the server was using at
+	   the moment the lock was dropped, so the client's subsequent local physics
+	   (gravity/acceleration only) continues in exactly the direction the server
+	   itself would have flown, keeping it aligned with the server's own hit
+	   detection even though nothing streams after that point.
+	 - A one-shot correction on every bounce: reproducing a bounce client-side
 	   requires matching the server's exact raycast resolution/timing AND
 	   knowing which hits are really entities (piercable/filterable, server-only
 	   knowledge -- the client has no replicated entity registry to check
-	   against), neither of which the client can do reliably. Once a bounce
-	   happens, the projectile stays synced for the rest of its life even after
-	   BouncesLeft hits 0 -- its post-reflection trajectory was never predicted
-	   client-side, and a heavily-restituted bounce can leave it coasting for
-	   seconds before its real terminal hit, so going blind the instant the
-	   last bounce charge is spent would leave that whole remaining flight
-	   free to drift through geometry unnoticed.
-	The moment neither condition holds -- no lock, never bounced -- streaming
-	stops and the client coasts on local physics (gravity/acceleration only, no
-	raycasting), which is driftless because it depends on nothing but universal
-	constants every client agrees on. All client-side simulation is purely
-	cosmetic; the server always runs its own independent, authoritative Step,
-	and any visual drift is corrected the instant ProjHit snaps the final
-	position.
+	   against), neither of which the client can do reliably. So rather than
+	   staying synced for the rest of its life, a bouncing projectile is only
+	   ever corrected at the instant it actually bounces: the server sends one
+	   immediate ProjMove entry (Bounced = true) with the exact post-reflection
+	   Position/Velocity, which the client snaps to and treats as its new local
+	   physics baseline. Between bounces (and before the first one, and after
+	   the last one) the client is fully unsynced and coasts on local physics,
+	   just like a non-homing, non-bouncing shot.
+	These two mechanisms are independent and compose freely: a homing projectile
+	that also bounces stays continuously synced while locked (the bounce's
+	position/velocity is folded into that same stream) and, if it loses its lock
+	while bounces remain, drops to the bounce-only one-shot-correction mode
+	instead of going fully local. A bounce correction is always applied
+	unconditionally on receipt, whether or not the visual is currently in
+	continuous-sync mode. All client-side simulation is purely cosmetic; the
+	server always runs its own independent, authoritative Step, and any visual
+	drift is corrected the instant ProjHit snaps the final position.
 
 	API:
 	 Projectile.new(config) -> projectile
@@ -92,7 +101,7 @@
 	 projectile at creation time (the shooter's desync at the moment they fired),
 	 so simultaneous shots from different-ping players independently see hurtboxes
 	 rewound by their own offset. Projectiles not created with a positive
-	 RewindSeconds (anything not fired through Shooter.server.luau) are unaffected.
+	 RewindSeconds (anything not fired through Shooter.server.luau) are unaffected. 
 ]]
 
 local RunService = game:GetService("RunService")
@@ -347,19 +356,19 @@ local function streamTo(projectile, channel: string, payload: any)
 	end
 end
 
--- Whether the client can't safely predict this projectile's motion on its own
--- right now -- see the module doc comment. Checked fresh every tick (Step's
--- end-of-tick transition check, and here for the initial spawn state), never a
--- static per-projectile classification. Note this is NOT just "BouncesLeft >
--- 0": once a projectile has bounced at all, its remaining trajectory is a
--- post-reflection path the client never predicted and may still take a long
--- time to actually resolve (a heavily-restituted bounce can leave it coasting
--- for seconds before its real terminal hit) -- staying synced for the rest of
--- its life, not just while bounces remain, is what keeps that whole remaining
--- flight pinned to the server's real position instead of going fully blind
--- the instant the last bounce is spent.
+-- Whether the client can't safely predict this projectile's CONTINUOUS motion
+-- on its own right now -- see the module doc comment. Checked fresh every
+-- tick (Step's end-of-tick transition check, and here for the initial spawn
+-- state), never a static per-projectile classification. This governs only the
+-- per-tick ProjMove stream; it deliberately excludes bouncing -- a bounce is
+-- corrected with its own one-shot ProjMove entry (Bounced = true) sent the
+-- instant it happens (see _resolveHit), not by holding the projectile synced
+-- for its whole remaining life. A projectile with bounces remaining (or that
+-- has already bounced) but no active homing lock is therefore NOT continuously
+-- synced -- it coasts on local physics between bounces like any other
+-- unsynced shot, and only gets snapped at the moment each bounce occurs.
 local function isSynced(projectile): boolean
-	return projectile.HomingTarget ~= nil or projectile.BouncesLeft > 0 or projectile._hasBounced == true
+	return projectile.HomingTarget ~= nil
 end
 
 local function spawnVisual(projectile)
@@ -375,10 +384,12 @@ local function spawnVisual(projectile)
 		MinSpeed = projectile.MinSpeed,
 		MaxSpeed = projectile.MaxSpeed,
 		Lifetime = projectile.Lifetime,
-		-- Whether it starts out synced (an explicit Homing.Target given at
-		-- construction, or Bounces > 0) -- if so, the client starts in "trust
-		-- the stream" mode immediately; the server's step loop below will
-		-- include it in the very next ProjMove batch.
+		-- Whether it starts out continuously synced -- true only for an
+		-- explicit Homing.Target given at construction (auto-acquire homing
+		-- starts unsynced until it actually locks onto something). Bounces
+		-- never make a projectile start synced -- see isSynced. If true, the
+		-- client starts in "trust the stream" mode immediately; the server's
+		-- step loop below will include it in the very next ProjMove batch.
 		Synced = isSynced(projectile),
 		Model = projectile.Model,
 		Visual = projectile.Visual,
@@ -499,7 +510,6 @@ function Projectile.new(config)
 		RewindSeconds = config.RewindSeconds or 0,
 
 		_ignore = {}, -- entities already pierced
-		_hasBounced = false, -- once true, stays synced for the rest of its life -- see isSynced
 		_bouncedThisTick = false,
 		_bouncedNormal = Vector3.yAxis,
 		Dead = false,
@@ -513,13 +523,13 @@ function Projectile.new(config)
 	return self
 end
 
--- Tells rendering clients only when the sync state actually changed -- not
--- every frame (see isSynced / the module doc comment). True switches the
--- client into "trust the streamed ProjMove" mode; false switches it back to
--- local physics from wherever the last authoritative Position/Velocity left
--- it. Checked once at the end of each Step, after both homing and any bounce
--- resolution have run for that tick, so it correctly reflects both
--- contributing conditions with one flag and one event.
+-- Tells rendering clients only when the homing-sync state actually changed --
+-- not every frame (see isSynced / the module doc comment). True switches the
+-- client into "trust the continuous ProjMove stream" mode; false switches it
+-- back to local physics from wherever the last authoritative Position/
+-- Velocity left it. Bounce corrections are separate (see _resolveHit) and
+-- never touch this flag or fire ProjSync -- they're one-shot regardless of
+-- sync state.
 function Projectile:_checkSyncTransition()
 	local synced = isSynced(self)
 	if synced ~= self._streamedSynced then
@@ -608,8 +618,11 @@ function Projectile:_resolveEntityHit(entity, result): string?
 end
 
 -- Returns "continue" | "destroy" after resolving a physical raycast hit. A
--- bounce marks _bouncedThisTick so the streamed ProjMove for this tick tells
--- rendering clients to snap instead of tween (see EnableClientRendering).
+-- bounce marks _bouncedThisTick and immediately flushes a one-shot ProjMove
+-- correction (Bounced = true) below -- this is now the ONLY streaming a
+-- non-homing bouncing projectile ever gets; it tells rendering clients to
+-- snap instead of tween (see EnableClientRendering) and re-baseline their
+-- local physics from this post-reflection Position/Velocity.
 function Projectile:_resolveHit(result)
 	local instance = result.Instance
 	local entity = instance and Entity.Get(instance)
@@ -634,7 +647,6 @@ function Projectile:_resolveHit(result)
 		-- SNAP to it instead of tweening a straight line from its pre-bounce
 		-- position, which would visibly cut through whatever surface sits
 		-- between the two -- exactly where the bounce happened.
-		self._hasBounced = true
 		self._bouncedThisTick = true
 		self._bouncedNormal = normal
 		-- Flush this bounce's snap-to-position immediately instead of waiting
@@ -645,10 +657,14 @@ function Projectile:_resolveHit(result)
 		-- Step() even returns -- so the outer loop's batching never gets a
 		-- chance to queue this update at all (its "not alive" branch queues
 		-- nothing). Without this, the client would never learn a bounce
-		-- happened here and would keep tweening its stale pre-bounce
+		-- happened here and would keep coasting its stale pre-bounce
 		-- trajectory straight through the surface until ProjHit teleports it
 		-- to the real final position. Sending here guarantees the snap
 		-- always reaches the client before any same-tick Destroy's ProjHit.
+		-- This fires unconditionally on every bounce regardless of homing
+		-- state -- it is the sole sync mechanism for a non-homing bouncer
+		-- (see isSynced): the client is otherwise fully unsynced and coasts
+		-- on local physics between bounces.
 		if self.Visualize then
 			flushMoveBatch({ {
 				VisualRange = self.VisualRange,
@@ -663,9 +679,9 @@ function Projectile:_resolveHit(result)
 			} })
 		end
 		-- Consumed for this tick already -- clear it so the outer loop's
-		-- end-of-frame batch (if this projectile survives the rest of the
-		-- tick) sends a plain tween update instead of re-snapping/
-		-- re-flashing at wherever it ends up after further substeps.
+		-- end-of-frame batch (only reachable while actively homing; see
+		-- isSynced) doesn't re-snap/re-flash a second time at wherever the
+		-- projectile ends up after further substeps this same tick.
 		self._bouncedThisTick = false
 		if self.OnBounce then
 			task.spawn(self.OnBounce, self, result)
@@ -907,13 +923,14 @@ if RunService:IsServer() then
 		local moveBatch = {}
 		for i = #active, 1, -1 do
 			local projectile = active[i]
-			-- Captured BEFORE Step() so a projectile that transitions out of
-			-- sync DURING this exact tick (its last bounce charge just spent,
-			-- or its homing lock just dropped) still gets this tick's
-			-- corrected post-bounce/post-drop Position/Velocity streamed --
-			-- otherwise the client is left holding a stale pre-transition pose
-			-- and resumes local physics from the wrong place (e.g. coasting
-			-- on the old pre-bounce velocity, straight through the floor).
+			-- Captured BEFORE Step() so a projectile whose homing lock drops
+			-- DURING this exact tick still gets this tick's corrected
+			-- post-drop Position/Velocity streamed -- otherwise the client is
+			-- left holding a stale pre-transition pose and resumes local
+			-- physics from the wrong place. Bounce corrections are handled
+			-- separately and immediately inside _resolveHit -- they don't
+			-- depend on isSynced at all, so a non-homing bouncer never
+			-- reaches this batch outside the tick it actually bounces on.
 			local wasSynced = isSynced(projectile)
 			local alive = projectile:Step(globalDt)
 			if not alive then
@@ -922,11 +939,11 @@ if RunService:IsServer() then
 				active[last] = nil
 				projectile:Destroy({ Position = projectile.Position, Normal = Vector3.yAxis })
 			elseif projectile.Visualize and (wasSynced or isSynced(projectile)) then
-				-- Currently (or just-formerly, see above) locked onto a target
-				-- and/or has bounces left (checked fresh every tick, not a
-				-- static classification) -- see the module doc comment for why
-				-- these are the cases that must stay streamed rather than left
-				-- to the client.
+				-- Currently (or just-formerly, see above) locked onto a homing
+				-- target (checked fresh every tick, not a static
+				-- classification) -- see the module doc comment for why this
+				-- is the one case that stays continuously streamed rather
+				-- than left to the client.
 				table.insert(moveBatch, {
 					VisualRange = projectile.VisualRange,
 					Position = projectile.Position,
@@ -1203,30 +1220,38 @@ function Projectile.EnableClientRendering()
 		end
 	end)
 
-	-- Synced visuals only: authoritative pose arrives batched (an array
-	-- covering every currently-synced projectile this frame, not one event
-	-- each) -> tween each toward its latest position. See the module doc
-	-- comment for why this can't be safely predicted client-side.
+	-- Batched authoritative pose updates (an array covering every entry that
+	-- needs one this frame, not one event each). Two kinds of entries arrive
+	-- here, handled differently:
+	--  - Bounced = true: a one-shot bounce correction, sent regardless of
+	--    whether the visual is currently in continuous-sync mode (a
+	--    non-homing bouncer is normally fully unsynced -- see isSynced /
+	--    the module doc comment -- so this is the ONLY update it ever gets
+	--    between spawn and impact). Always applied unconditionally: snap
+	--    instead of tweening, since tweening a straight line from the old
+	--    position would cut through whatever surface sits between them
+	--    (exactly where the bounce occurred), play the ricochet flash, and
+	--    re-baseline position/velocity so local physics (see the per-frame
+	--    loop below) picks up from the correct post-reflection state.
+	--  - Otherwise: a continuous homing-sync update, only meaningful (and
+	--    only sent by the server) while visual.synced is true -- see the
+	--    module doc comment for why homing can't be predicted client-side.
 	VisualOffload.On("ProjMove", function(batch)
 		local now = os.clock()
 		for _, data in batch do
 			local visual = visuals[data.Id]
-			if visual and visual.synced then
+			if visual and data.Bounced then
+				visual.lastUpdate = now
+				visual.position = data.Position
+				visual.velocity = data.Velocity
+				placeVisual(visual.model, data.Position, data.Velocity)
+				playImpact(data.Position, data.Normal, "bounce")
+			elseif visual and visual.synced then
 				local duration = math.clamp(now - visual.lastUpdate, 0.03, 0.2)
 				visual.lastUpdate = now
 				visual.position = data.Position
 				visual.velocity = data.Velocity
-				if data.Bounced then
-					-- A bounce happened on the server between this update and
-					-- the last one -- tweening a straight line from the old
-					-- position to this one would cut through whatever surface
-					-- sits between them (exactly where the bounce occurred), so
-					-- snap instead and play the ricochet flash at the new pose.
-					placeVisual(visual.model, data.Position, data.Velocity)
-					playImpact(data.Position, data.Normal, "bounce")
-				else
-					tweenVisual(visual, data.Position, data.Velocity, duration)
-				end
+				tweenVisual(visual, data.Position, data.Velocity, duration)
 			end
 		end
 	end)
@@ -1250,17 +1275,22 @@ function Projectile.EnableClientRendering()
 	end)
 
 	-- Every projectile visual gets exactly one ProjSpawn and, eventually, one
-	-- ProjHit. For an UNSYNCED visual (the common case: no homing lock, no
-	-- bounces remaining), this loop is the entire simulation in between -- it
-	-- integrates acceleration/gravity/position every frame using the same
-	-- chunk/global dt pipeline the server's Step uses (ChunkManager.ScaleDt).
-	-- No raycasting ever happens here -- a SYNCED visual (actively homing onto
-	-- a target and/or still able to bounce) skips all of that -- its
-	-- Position/Velocity/pose are driven entirely by the streamed ProjMove
-	-- handler above; see the module doc comment for why that case can't be
-	-- safely predicted client-side. All of this is purely cosmetic; the server
-	-- always runs its own independent, authoritative Step, and any drift is
-	-- corrected the instant ProjHit snaps the final position.
+	-- ProjHit. For an UNSYNCED visual (the common case: no active homing lock
+	-- -- this includes a bouncer between bounces, since bouncing no longer
+	-- keeps a visual continuously synced, see isSynced / the module doc
+	-- comment), this loop is the entire simulation in between -- it integrates
+	-- acceleration/gravity/position every frame using the same chunk/global dt
+	-- pipeline the server's Step uses (ChunkManager.ScaleDt). No raycasting
+	-- ever happens here -- a SYNCED visual (actively homing onto a target)
+	-- skips all of that -- its Position/Velocity/pose are driven entirely by
+	-- the streamed ProjMove handler above; see the module doc comment for why
+	-- that case can't be safely predicted client-side. A bouncing visual's
+	-- position/velocity get corrected in-place by the one-shot Bounced
+	-- ProjMove entry each time it bounces (handled above, independent of
+	-- visual.synced), and this loop just keeps integrating forward from
+	-- whatever that correction left behind. All of this is purely cosmetic;
+	-- the server always runs its own independent, authoritative Step, and any
+	-- drift is corrected the instant ProjHit snaps the final position.
 	Heartbeat.Connect(function(globalDt)
 		for id, visual in visuals do
 			local dt = ChunkManager.ScaleDt(globalDt, visual.position)
