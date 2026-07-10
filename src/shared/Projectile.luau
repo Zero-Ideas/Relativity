@@ -60,6 +60,24 @@
 	 Projectile.SetImpactHandler(fn(position, normal, model))  -- client VFX hook
 	 Projectile.SetDebugRays(enabled)            -- default off; see debugRays below
 
+	 Query (server-only -- projectiles only ever live in the server's `active`
+	 list; see the module doc comment above. Every result is the LIVE
+	 projectile object, not a copy, so an ability can read OR write any field
+	 on it directly -- e.g. projectile.Damage = x, or the dedicated
+	 projectile:SetTimeScale(x) below -- and it takes effect on the very next
+	 Step, same tick):
+	 Projectile.GetAll() -> { projectile }
+	 Projectile.GetBySource(source) -> { projectile }       -- e.g. "my own live shots"
+	 Projectile.GetInRadius(position, radius, options?) -> { projectile }
+	    options: { Filter: (projectile) -> boolean }
+	    -- Linear scan, not chunk-indexed like Entity/ChunkManager's spatial
+	    -- queries -- fine at this game's projectile counts (MAX_ACTIVE_
+	    -- PROJECTILES_PER_PLAYER in Shooter.server.luau caps it well below
+	    -- where that would matter); revisit if a future ability calls this
+	    -- every frame at very high projectile counts.
+
+	 projectile:SetTimeScale(scale)   -- clamped >= 0; see TimeScale below
+
 	 config (all optional unless noted):
 	   Origin: Vector3          (required)
 	   Direction: Vector3       (required unless TargetPosition given)
@@ -68,6 +86,9 @@
 	   Acceleration = 0         (studs/s² along current velocity direction; negative decelerates)
 	   MinSpeed = 0, MaxSpeed = math.huge   (clamp for Acceleration)
 	   Lifetime = 5             (dilated seconds; no upper bound is enforced)
+	   TimeScale = 1            (this projectile's OWN dilation, independent of
+	              Source -- see the "Local time" section below; live-mutable
+	              via projectile:SetTimeScale() or the field directly)
 	   Damage = 0
 	   Source = entity          (deals the damage; never hits itself)
 	   IgnoreInstances = {Instance} (raw instances the raycast/spherecast never
@@ -117,15 +138,28 @@
 	 A projectile with no Source, or a Source that never had its TimeScale set,
 	 flies at 1x personal scale (i.e. unaffected).
 
-	 Because the client can't predict a live-changing personal ratio on its own
-	 (it has no replicated view of another player's TimeScale), a projectile
-	 whose Source currently has TimeScale ~= 1 is treated as "synced" exactly
-	 like an actively-homing one -- see isSynced below -- so the server streams
-	 its authoritative Position/Velocity every tick for as long as that holds,
-	 and the client just renders the stream instead of dead-reckoning. The
-	 instant the shooter's ratio returns to 1x, streaming stops and the client
-	 falls back to local physics (which needs no personal-scale correction at
-	 that point, since 1x is the client's implicit default).
+	 Local time: independent of Source.TimeScale, every projectile also carries
+	 its own TimeScale (config.TimeScale, default 1). This is the hook for
+	 abilities that affect projectiles directly rather than through who fired
+	 them -- e.g. an AoE "time bubble" that finds every projectile in a radius
+	 (Projectile.GetInRadius) each tick and sets an extra multiplier on it, or
+	 permanently slows/speeds a specific shot via projectile:SetTimeScale().
+	 Both TimeScale sources are read live every Step and simply multiply
+	 together (world/chunk dilation * Source.TimeScale * projectile.TimeScale),
+	 so an ability's effect composes with the shooter's own personal ratio
+	 rather than overriding it, and always reflects whatever either was most
+	 recently set to -- there's no snapshotting anywhere in this chain.
+
+	 Because the client can't predict a live-changing ratio on its own (an
+	 ability's radius check, or another player's personal TimeScale, aren't
+	 replicated to observers), a projectile whose Source.TimeScale ~= 1 OR
+	 whose own TimeScale ~= 1 is treated as "synced" exactly like an
+	 actively-homing one -- see isSynced below -- so the server streams its
+	 authoritative Position/Velocity every tick for as long as that holds, and
+	 the client just renders the stream instead of dead-reckoning. The instant
+	 both ratios are back to 1x, streaming stops and the client falls back to
+	 local physics (which needs no scale correction at that point, since 1x is
+	 the client's implicit default).
 ]]
 
 local RunService = game:GetService("RunService")
@@ -403,12 +437,15 @@ end
 -- between bounces like any other unsynced shot, and only gets snapped at the
 -- moment each bounce occurs.
 --
--- The Source.TimeScale ~= 1 half of this mirrors homing for the same reason:
--- the client has no replicated view of another player's live personal ratio,
--- so it can't dead-reckon a speed it doesn't know -- see the module doc
--- comment's "Personal time" section.
+-- The TimeScale/Source.TimeScale ~= 1 checks mirror homing for the same
+-- reason: the client has no replicated view of an ability's live radius
+-- effect or another player's live personal ratio, so it can't dead-reckon a
+-- speed it doesn't know -- see the module doc comment's "Local time" section.
 local function isSynced(projectile): boolean
 	if projectile.HomingTarget ~= nil then
+		return true
+	end
+	if projectile.TimeScale ~= 1 then
 		return true
 	end
 	local source = projectile.Source
@@ -526,6 +563,10 @@ function Projectile.new(config)
 
 		Lifetime = config.Lifetime or 5,
 		Age = 0,
+		-- This projectile's OWN dilation, independent of Source -- see the
+		-- module doc comment's "Local time" section. Live-mutable directly or
+		-- via :SetTimeScale(); read live every Step, never snapshotted.
+		TimeScale = math.max(config.TimeScale or 1, 0),
 
 		Damage = config.Damage or 0,
 		DamageMultiplier = 1,
@@ -613,6 +654,50 @@ function Projectile.Burst(config, count: number)
 		table.insert(shots, Projectile.new(pelletConfig))
 	end
 	return shots
+end
+
+-- This projectile's OWN local dilation -- see the module doc comment's
+-- "Local time" section. Read live every Step, so an ability can dial this up
+-- or down over time (or reset it to 1) and the change is immediate. Setting
+-- the .TimeScale field directly works identically; this just adds the same
+-- clamping Entity:SetTimeScale uses.
+function Projectile:SetTimeScale(scale: number)
+	self.TimeScale = math.max(scale, 0)
+end
+
+--------------------------------------------------------------------------------
+-- Query (server-only in practice -- see the module doc comment's API section)
+--------------------------------------------------------------------------------
+
+function Projectile.GetAll()
+	return table.clone(active)
+end
+
+function Projectile.GetBySource(source: any)
+	local result = {}
+	for _, projectile in active do
+		if projectile.Source == source then
+			table.insert(result, projectile)
+		end
+	end
+	return result
+end
+
+export type QueryOptions = {
+	Filter: ((projectile: any) -> boolean)?,
+}
+
+function Projectile.GetInRadius(position: Vector3, radius: number, options: QueryOptions?)
+	local filter = options and options.Filter
+	local result = {}
+	for _, projectile in active do
+		if (projectile.Position - position).Magnitude <= radius then
+			if not filter or filter(projectile) then
+				table.insert(result, projectile)
+			end
+		end
+	end
+	return result
 end
 
 --------------------------------------------------------------------------------
@@ -886,14 +971,15 @@ function Projectile:Step(globalDt: number): boolean
 	self._bouncedThisTick = false
 
 	-- world/chunk dilation at the projectile's own position, times the
-	-- shooter's CURRENT personal ratio -- read live every tick (not
-	-- snapshotted) so dragging the slider mid-flight speeds up or slows down
-	-- bullets already in the air -- see the module doc comment's "Personal
-	-- time" section.
+	-- shooter's CURRENT personal ratio, times this projectile's OWN current
+	-- ratio -- both read live every tick (never snapshotted), so dragging a
+	-- personal-time slider or an ability tweaking this specific projectile's
+	-- TimeScale mid-flight takes effect immediately -- see the module doc
+	-- comment's "Local time" section.
 	local sourceScale = (self.Source and self.Source.TimeScale) or 1
-	local dt = ChunkManager.ScaleDt(globalDt, self.Position) * sourceScale
+	local dt = ChunkManager.ScaleDt(globalDt, self.Position) * sourceScale * self.TimeScale
 	if dt <= 0 then
-		return true -- frozen chunk / paused / shooter frozen: keep it alive, don't move it
+		return true -- frozen chunk / paused / shooter or projectile frozen: keep it alive, don't move it
 	end
 
 	self.Age += dt

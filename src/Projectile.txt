@@ -1,99 +1,4 @@
---!optimize 2
---[[
-	Projectile.luau
-	Server-authoritative, raycast-driven projectiles that live in dilated time.
-	Every projectile steps in the local time of the chunk it currently occupies,
-	so a bullet flying through a 0.2x slow zone crawls, its gravity floats, and
-	its fuse burns slower — all for free.
 
-	Supported behaviours (mix and match): straight shots, ballistic gravity,
-	acceleration/deceleration, bouncing (restitution), homing (explicit target or
-	auto-acquire by tag(s), with optional Permalock), piercing with falloff, and
-	cone bursts. Rendering can be offloaded to clients (Visualize = true): the
-	server keeps only the logic. Every projectile gets exactly two replication
-	events over its life -- ProjSpawn (once, with its full trajectory-determining
-	config) and ProjHit (once, on destroy) -- UNLESS it's currently doing
-	something the client can't safely reproduce on its own, in which case the
-	server also streams authoritative Position/Velocity every tick (batched,
-	one ProjMove per frame covering everyone who currently needs it, not one
-	event each) for as long as that's true. There are exactly two such cases,
-	both driven by a single per-tick check (self.HomingTarget ~= nil or
-	self.BouncesLeft > 0 or self._hasBounced), and a rare ProjSync event tells
-	clients when a visual crosses in or out of that state:
-	 - Homing while actually locked onto a target: the client only ever sees a
-	   target's position through that target's own replication lag, which
-	   differs per observer, so if it rotated toward that position locally, two
-	   clients watching the same missile chase the same target could compute
-	   two different flight paths.
-	 - Bouncing, or having ever bounced: reproducing a bounce client-side
-	   requires matching the server's exact raycast resolution/timing AND
-	   knowing which hits are really entities (piercable/filterable, server-only
-	   knowledge -- the client has no replicated entity registry to check
-	   against), neither of which the client can do reliably. Once a bounce
-	   happens, the projectile stays synced for the rest of its life even after
-	   BouncesLeft hits 0 -- its post-reflection trajectory was never predicted
-	   client-side, and a heavily-restituted bounce can leave it coasting for
-	   seconds before its real terminal hit, so going blind the instant the
-	   last bounce charge is spent would leave that whole remaining flight
-	   free to drift through geometry unnoticed.
-	The moment neither condition holds -- no lock, never bounced -- streaming
-	stops and the client coasts on local physics (gravity/acceleration only, no
-	raycasting), which is driftless because it depends on nothing but universal
-	constants every client agrees on. All client-side simulation is purely
-	cosmetic; the server always runs its own independent, authoritative Step,
-	and any visual drift is corrected the instant ProjHit snaps the final
-	position.
-
-	API:
-	 Projectile.new(config) -> projectile
-	 Projectile.Burst(config, count) -> { projectile }
-	 Projectile.EnableClientRendering()          -- call once on the client
-	 Projectile.SetImpactHandler(fn(position, normal, model))  -- client VFX hook
-	 Projectile.SetDebugRays(enabled)            -- default off; see debugRays below
-
-	 config (all optional unless noted):
-	   Origin: Vector3          (required)
-	   Direction: Vector3       (required unless TargetPosition given)
-	   TargetPosition: Vector3  (aim at a world point instead of a direction)
-	   Speed = 100
-	   Acceleration = 0         (studs/s² along current velocity direction; negative decelerates)
-	   MinSpeed = 0, MaxSpeed = math.huge   (clamp for Acceleration)
-	   Lifetime = 5             (dilated seconds; no upper bound is enforced)
-	   Damage = 0
-	   Source = entity          (deals the damage; never hits itself)
-	   Filter = (entity)->bool  (which entities count as targets; also applied to homing acquisition)
-	   Gravity = 0              (studs/s² downward, integrated with dilated dt)
-	   Radius = 0               (>0 uses a spherecast)
-	   Bounces = 0              (world bounces before it dies; no upper bound is enforced)
-	   Restitution = 0.5        (velocity kept per bounce)
-	   MaxPierces = 0           (enemies passed through)
-	   PierceFalloff = 0        (damage lost per pierce, 0..1)
-	   Homing = { Target?, TargetTag?, TargetTags?, AcquireRadius?, Retarget?,
-	              ReacquireRate?, Permalock?, TurnRate = rad/s, Delay = 0 }
-	              -- TargetTags (plural, list of strings) matches any tag in the
-	              -- list; TargetTag (singular) is still supported for a single tag.
-	              -- Permalock (default off): once locked, a Retarget recheck never
-	              -- drops the target due to range -- only if it's destroyed. Off by
-	              -- default, a dropped-out-of-range lock is genuinely released (not
-	              -- silently kept stale). The projectile's own Source is always
-	              -- excluded from acquisition, and Filter (if set) is respected.
-	   Visualize = false, VisualRange = math.huge
-	   Model = Instance?        (cloned client-side) or Visual = {Shape,Size,Color}
-	   DestroyDelay = 0         (client keeps the visual this long after impact)
-	   OnHit = fn(projectile, result, hitEntity?)
-	   OnBounce = fn(projectile, result)
-	   RewindSeconds = 0        (lag compensation; see below)
-
-	 Lag compensation: when RewindSeconds > 0 (set by Shooter.server.luau from the
-	 firing player's Player:GetNetworkPing() / 2), entity-hit validity while the
-	 projectile is stepping through a chunk that contains entities is decided
-	 against each nearby entity's Entity:GetPositionAt(now - RewindSeconds) instead
-	 of its live position, LOS-checked against real geometry. This is fixed per
-	 projectile at creation time (the shooter's desync at the moment they fired),
-	 so simultaneous shots from different-ping players independently see hurtboxes
-	 rewound by their own offset. Projectiles not created with a positive
-	 RewindSeconds (anything not fired through Shooter.server.luau) are unaffected.
-]]
 
 local RunService = game:GetService("RunService")
 local Players = game:GetService("Players")
@@ -110,21 +15,14 @@ Projectile.__index = Projectile
 local active = {} -- server-side live projectiles
 local nextId = 0
 
--- When on, every movement raycast is streamed to rendering clients so the hit
--- detection can be seen as lines (see ProjRay in the client renderer). Off by
--- default -- this is a per-substep debug stream, expensive at high projectile
--- counts. Toggle from a client via the "SetProjectileDebug" channel.
+
 local debugRays = false
 
 function Projectile.SetDebugRays(enabled: boolean)
 	debugRays = enabled and true or false
 end
 
--- When on, prints every ProjSpawn/ProjSync/ProjHit as they're streamed
--- (individually rare enough to log one line each), plus a once-a-second rate
--- summary for ProjMove (logging every individual batch would be 60/sec and
--- unreadable -- the summary answers "how often is this actually being sent"
--- directly instead). Server-side only; toggle with Projectile.SetDebugSync.
+
 local debugSync = false
 
 function Projectile.SetDebugSync(enabled: boolean)
@@ -135,11 +33,7 @@ end
 -- summary in the server step loop below.
 local _syncMoveStats = { batches = 0, entries = 0 }
 
--- Adaptive raycast resolution. In chunks that contain entities we step finely so
--- fast bullets can't tunnel through a target; in empty chunks we take one long
--- cast per frame (walls still register, but we skip the wasted fine checks). A
--- raycast is NEVER skipped outright -- only its resolution (step size) adapts --
--- so nothing can pass through world geometry unchecked.
+
 local HIGH_RES_STEP = 4 -- studs per raycast near entities
 local LOW_RES_STEP = 64 -- studs per raycast in empty space
 local MAX_SUBSTEPS = 16
@@ -229,12 +123,6 @@ local function targetPosition(target): Vector3?
 	return nil
 end
 
--- Finds the nearest valid homing target: entities matching TargetTag/TargetTags
--- (or ALL entities if neither given), excluding the projectile's own Source and
--- anything its Filter rejects. Uses ChunkManager's spatial index when
--- AcquireRadius is set (the normal case -- every real spawn site sets one), so
--- cost scales with local entity density, not total entity/projectile count; the
--- unbounded case (rare) falls back to a full scan.
 local function acquireTarget(projectile, homing, position: Vector3)
 	local source = projectile.Source
 	local filter = projectile.Filter
@@ -288,15 +176,6 @@ end
 -- Raycasting
 --------------------------------------------------------------------------------
 
--- Built once per projectile and cached on it (Source never changes after
--- construction), reused for every raycast that projectile makes -- Roblox
--- re-evaluates FilterDescendantsInstances against the live scene at cast time, so
--- one instance is safe to reuse across many casts/frames; this only removes the
--- allocation churn of rebuilding it every substep, not a correctness change.
--- NOTE: if a future feature needs to grow the exclude list dynamically (e.g.
--- adding pierced entities instead of the current position-nudge approach),
--- mutating `ignore` in place won't take effect -- FilterDescendantsInstances
--- would need reassigning.
 local function buildRayParams(projectile)
 	local params = RaycastParams.new()
 	params.FilterType = Enum.RaycastFilterType.Exclude
@@ -304,6 +183,12 @@ local function buildRayParams(projectile)
 	local source = projectile.Source
 	if source and source.Instance then
 		table.insert(ignore, source.Instance)
+	end
+
+	if projectile.IgnoreInstances then
+		for _, instance in projectile.IgnoreInstances do
+			table.insert(ignore, instance)
+		end
 	end
 	params.FilterDescendantsInstances = ignore
 	params.IgnoreWater = true
@@ -318,8 +203,7 @@ local function castMovement(projectile, origin: Vector3, displacement: Vector3)
 	return workspace:Raycast(origin, displacement, params)
 end
 
--- Does the chunk containing `position` currently hold any entities? Drives the
--- high/low resolution decision each frame.
+
 local function chunkHasEntities(position: Vector3): boolean
 	local chunk = ChunkManager.GetChunk(position)
 	return chunk ~= nil and chunk.EntityCount > 0
@@ -347,19 +231,12 @@ local function streamTo(projectile, channel: string, payload: any)
 	end
 end
 
--- Whether the client can't safely predict this projectile's motion on its own
--- right now -- see the module doc comment. Checked fresh every tick (Step's
--- end-of-tick transition check, and here for the initial spawn state), never a
--- static per-projectile classification. Note this is NOT just "BouncesLeft >
--- 0": once a projectile has bounced at all, its remaining trajectory is a
--- post-reflection path the client never predicted and may still take a long
--- time to actually resolve (a heavily-restituted bounce can leave it coasting
--- for seconds before its real terminal hit) -- staying synced for the rest of
--- its life, not just while bounces remain, is what keeps that whole remaining
--- flight pinned to the server's real position instead of going fully blind
--- the instant the last bounce is spent.
 local function isSynced(projectile): boolean
-	return projectile.HomingTarget ~= nil or projectile.BouncesLeft > 0 or projectile._hasBounced == true
+	if projectile.HomingTarget ~= nil then
+		return true
+	end
+	local source = projectile.Source
+	return source ~= nil and source.TimeScale ~= 1
 end
 
 local function spawnVisual(projectile)
@@ -375,10 +252,6 @@ local function spawnVisual(projectile)
 		MinSpeed = projectile.MinSpeed,
 		MaxSpeed = projectile.MaxSpeed,
 		Lifetime = projectile.Lifetime,
-		-- Whether it starts out synced (an explicit Homing.Target given at
-		-- construction, or Bounces > 0) -- if so, the client starts in "trust
-		-- the stream" mode immediately; the server's step loop below will
-		-- include it in the very next ProjMove batch.
 		Synced = isSynced(projectile),
 		Model = projectile.Model,
 		Visual = projectile.Visual,
@@ -386,11 +259,7 @@ local function spawnVisual(projectile)
 	})
 end
 
--- Flushes one frame's worth of ProjMove updates for projectiles the client
--- can't currently predict on its own (checked fresh every tick -- see the
--- server step loop below, not a static per-projectile classification) as a
--- single batched event per recipient instead of one event per projectile.
--- Everything else never appears here at all -- see the module doc comment.
+
 local function flushMoveBatch(moveBatch)
 	if #moveBatch == 0 then
 		return
@@ -474,6 +343,7 @@ function Projectile.new(config)
 		Damage = config.Damage or 0,
 		DamageMultiplier = 1,
 		Source = config.Source,
+		IgnoreInstances = config.IgnoreInstances,
 		Filter = config.Filter,
 
 		BouncesLeft = bounces,
@@ -499,12 +369,13 @@ function Projectile.new(config)
 		RewindSeconds = config.RewindSeconds or 0,
 
 		_ignore = {}, -- entities already pierced
-		_hasBounced = false, -- once true, stays synced for the rest of its life -- see isSynced
 		_bouncedThisTick = false,
 		_bouncedNormal = Vector3.yAxis,
+		_rewindTime = 0,
+		_rewindCache = {},
+		_candidateBuf = {},
 		Dead = false,
 	}, Projectile)
-
 	self._rayParams = buildRayParams(self)
 	self._streamedSynced = isSynced(self)
 
@@ -513,13 +384,6 @@ function Projectile.new(config)
 	return self
 end
 
--- Tells rendering clients only when the sync state actually changed -- not
--- every frame (see isSynced / the module doc comment). True switches the
--- client into "trust the streamed ProjMove" mode; false switches it back to
--- local physics from wherever the last authoritative Position/Velocity left
--- it. Checked once at the end of each Step, after both homing and any bounce
--- resolution have run for that tick, so it correctly reflects both
--- contributing conditions with one flag and one event.
 function Projectile:_checkSyncTransition()
 	local synced = isSynced(self)
 	if synced ~= self._streamedSynced then
@@ -531,7 +395,6 @@ function Projectile:_checkSyncTransition()
 	end
 end
 
--- Cone burst: `count` projectiles spread around the base direction.
 function Projectile.Burst(config, count: number)
 	local origin = config.Origin or Vector3.zero
 	local baseDir
@@ -569,22 +432,14 @@ function Projectile:_dealDamage(entity, result)
 	end
 end
 
--- Broadcasts a single movement raycast segment for debug visualization.
--- lowRes marks the coarse casts taken through empty (entity-free) chunks.
 function Projectile:_streamRay(from: Vector3, to: Vector3, lowRes: boolean)
 	streamTo(self, "ProjRay", { From = from, To = to, LowRes = lowRes })
 end
 
--- Handles the case where a raycast (or a lag-compensated rewind check, see
--- _checkRewoundHit) resolved to hitting `entity` at `result`. Returns
--- "continue" if the projectile keeps flying (pierced, or a self/ignored hit),
--- "destroy" if it called Destroy() itself, or nil if the entity should be
--- treated as a fallthrough (filtered out) -- the caller decides what happens
--- next (bounce/world resolution).
+
 function Projectile:_resolveEntityHit(entity, result): string?
 	if entity == self.Source or self._ignore[entity] then
-		-- can't collide with ourselves or an already-pierced target;
-		-- nudge past the surface and keep going
+
 		self.Position = result.Position + safeUnit(self.Velocity, Vector3.zAxis) * (self.Radius + 0.1)
 		return "continue"
 	end
@@ -607,9 +462,7 @@ function Projectile:_resolveEntityHit(entity, result): string?
 	return "destroy"
 end
 
--- Returns "continue" | "destroy" after resolving a physical raycast hit. A
--- bounce marks _bouncedThisTick so the streamed ProjMove for this tick tells
--- rendering clients to snap instead of tween (see EnableClientRendering).
+
 function Projectile:_resolveHit(result)
 	local instance = result.Instance
 	local entity = instance and Entity.Get(instance)
@@ -629,26 +482,10 @@ function Projectile:_resolveHit(result)
 		local reflected = self.Velocity - 2 * self.Velocity:Dot(normal) * normal
 		self.Velocity = reflected * self.Restitution
 		self.Position = result.Position + normal * (self.Radius + 0.05)
-		-- Flags this tick's streamed position as a bounce (see the module doc
-		-- comment / _checkSyncTransition's Step-level reset): the client must
-		-- SNAP to it instead of tweening a straight line from its pre-bounce
-		-- position, which would visibly cut through whatever surface sits
-		-- between the two -- exactly where the bounce happened.
-		self._hasBounced = true
+
 		self._bouncedThisTick = true
 		self._bouncedNormal = normal
-		-- Flush this bounce's snap-to-position immediately instead of waiting
-		-- for the end-of-frame batch in the server step loop. If this is the
-		-- last bounce (BouncesLeft just hit 0) and the reflected path clips
-		-- more geometry later in this SAME tick's substep loop, that next hit
-		-- destroys the projectile and fires ProjHit synchronously -- before
-		-- Step() even returns -- so the outer loop's batching never gets a
-		-- chance to queue this update at all (its "not alive" branch queues
-		-- nothing). Without this, the client would never learn a bounce
-		-- happened here and would keep tweening its stale pre-bounce
-		-- trajectory straight through the surface until ProjHit teleports it
-		-- to the real final position. Sending here guarantees the snap
-		-- always reaches the client before any same-tick Destroy's ProjHit.
+
 		if self.Visualize then
 			flushMoveBatch({ {
 				VisualRange = self.VisualRange,
@@ -662,10 +499,7 @@ function Projectile:_resolveHit(result)
 				},
 			} })
 		end
-		-- Consumed for this tick already -- clear it so the outer loop's
-		-- end-of-frame batch (if this projectile survives the rest of the
-		-- tick) sends a plain tween update instead of re-snapping/
-		-- re-flashing at wherever it ends up after further substeps.
+
 		self._bouncedThisTick = false
 		if self.OnBounce then
 			task.spawn(self.OnBounce, self, result)
@@ -680,15 +514,9 @@ function Projectile:_resolveHit(result)
 	return "destroy"
 end
 
--- Lag-compensated entity check for one movement substep. Only meaningful while
--- passing through a chunk that contains entities (see `highRes` in Step) and
--- only for shots that carry a positive RewindSeconds. Builds its hurtbox
--- whitelist directly from the (loaded) chunk(s) the segment touches -- not a
--- radius sweep -- so a projectile only ever considers entities actually in a
--- loaded chunk it's in, per-shooter-desync.
-function Projectile:_checkRewoundHit(from: Vector3, to: Vector3)
-	local rewindTime = os.clock() - self.RewindSeconds
 
+
+function Projectile:_checkRewoundHit(from: Vector3, to: Vector3)
 	local whitelist = {}
 	for _, position in { from, to } do
 		local chunk = ChunkManager.GetChunk(position)
@@ -699,32 +527,45 @@ function Projectile:_checkRewoundHit(from: Vector3, to: Vector3)
 		end
 	end
 
-	local bestEntity, bestPoint, bestDistAlong = nil, nil, math.huge
+	-- Collect in-range candidates (no raycasts yet) into the reusable buffer.
+	local candidates = self._candidateBuf
 	for entity in whitelist do
 		if entity ~= self.Source and not self._ignore[entity] and (not self.Filter or self.Filter(entity)) then
-			local rewoundPos = entity:GetPositionAt(rewindTime)
+			local rewoundPos = self._rewindCache[entity]
+			if not rewoundPos then
+				rewoundPos = entity:GetPositionAt(self._rewindTime)
+				self._rewindCache[entity] = rewoundPos
+			end
 			local closest, distance = closestPointOnSegment(rewoundPos, from, to)
 			if distance <= entity.HitboxRadius + self.Radius then
-				local distAlong = (closest - from).Magnitude
-				if distAlong < bestDistAlong then
-					-- line-of-sight: real geometry must not block the shot before
-					-- it would reach this point, so stale rewound data can never
-					-- be used to hit someone through a wall.
-					local los = workspace:Raycast(from, closest - from, self._rayParams)
-					local blocked = los ~= nil
-						and (los.Position - from).Magnitude < distAlong - 0.5
-						and Entity.Get(los.Instance) ~= entity
-					if not blocked then
-						bestEntity, bestPoint, bestDistAlong = entity, closest, distAlong
-					end
-				end
+				table.insert(candidates, {
+					entity = entity,
+					point = closest,
+					distAlong = (closest - from).Magnitude,
+				})
 			end
 		end
 	end
 
-	if bestEntity then
-		return bestEntity, bestPoint, safeUnit(from - bestPoint, Vector3.yAxis)
+
+	table.sort(candidates, function(a, b)
+		return a.distAlong < b.distAlong
+	end)
+
+	for _, c in candidates do
+
+		local los = workspace:Raycast(from, c.point - from, self._rayParams)
+		local blocked = los ~= nil
+			and (los.Position - from).Magnitude < c.distAlong - 0.5
+			and Entity.Get(los.Instance) ~= c.entity
+		if not blocked then
+
+			table.clear(candidates)
+			return c.entity, c.point, safeUnit(from - c.point, Vector3.yAxis)
+		end
 	end
+
+	table.clear(candidates)
 	return nil
 end
 
@@ -752,10 +593,7 @@ function Projectile:_updateHoming(dt: number)
 		self.ReacquireTimer -= dt
 		if self.ReacquireTimer <= 0 then
 			self.ReacquireTimer = homing.ReacquireRate or 0.3
-			-- No `or target` fallback: if nothing is in range anymore, the lock
-			-- is genuinely dropped, matching "re-acquire if the target ...
-			-- leaves" above. Homing.Permalock (checked above) is the explicit
-			-- opt-in for "never drop a lock due to range."
+
 			self.HomingTarget = acquireTarget(self, homing, self.Position)
 			target = self.HomingTarget
 		end
@@ -772,19 +610,20 @@ function Projectile:_updateHoming(dt: number)
 	self.Velocity = newDir * speed
 end
 
--- Advances the projectile; returns false when it should be removed.
+
 function Projectile:Step(globalDt: number): boolean
 	if self.Dead then
 		return false
 	end
 
-	-- Reset every tick so a stale true from a previous bounce never leaks into
-	-- a later, non-bouncing tick's streamed payload -- see _resolveHit.
+
 	self._bouncedThisTick = false
 
-	local dt = ChunkManager.ScaleDt(globalDt, self.Position)
+
+	local sourceScale = (self.Source and self.Source.TimeScale) or 1
+	local dt = ChunkManager.ScaleDt(globalDt, self.Position) * sourceScale
 	if dt <= 0 then
-		return true -- frozen chunk / paused: keep it alive, don't move it
+		return true -- frozen chunk / paused / shooter frozen: keep it alive, don't move it
 	end
 
 	self.Age += dt
@@ -808,13 +647,18 @@ function Projectile:Step(globalDt: number): boolean
 		self.Velocity -= Vector3.new(0, self.Gravity * dt, 0)
 	end
 
-	-- Adaptive stepping: fine casts near entities (accurate hit detection),
-	-- one coarse cast per frame in empty chunks (skip the wasted checks). The
-	-- step size is chosen from whether the chunk we're in / moving into holds
-	-- entities. A raycast is never skipped -- only its resolution adapts.
+
 	local highRes = chunkHasEntities(self.Position)
 		or chunkHasEntities(self.Position + self.Velocity * dt)
 	local maxStep = highRes and HIGH_RES_STEP or LOW_RES_STEP
+
+
+	local useRewind = highRes and self.RewindSeconds > 0
+	if useRewind then
+		self._rewindTime = os.clock() - self.RewindSeconds
+		table.clear(self._rewindCache)
+		table.clear(self._candidateBuf)
+	end
 
 	local remaining = dt
 	local guard = 0
@@ -830,8 +674,6 @@ function Projectile:Step(globalDt: number): boolean
 		local displacement = self.Velocity * stepDt
 		local to = from + displacement
 
-		-- Lag-compensated entity check, only while in an entity-containing chunk
-		-- and only for shots carrying a shooter's rewind offset.
 		if highRes and self.RewindSeconds > 0 then
 			local lagEntity, lagPoint, lagNormal = self:_checkRewoundHit(from, to)
 			if lagEntity then
@@ -859,10 +701,7 @@ function Projectile:Step(globalDt: number): boolean
 			local instance = result.Instance
 			local liveEntity = instance and Entity.Get(instance)
 			if liveEntity and highRes and self.RewindSeconds > 0 then
-				-- We're lag-compensating this segment and the rewound check above
-				-- found no valid hit -- from the shooter's ping-adjusted view this
-				-- entity wasn't actually there, so the live-position coincidence
-				-- doesn't count. Nudge past and keep flying.
+
 				self.Position = result.Position + safeUnit(self.Velocity, Vector3.zAxis) * (self.Radius + 0.1)
 				remaining -= stepDt
 			else
@@ -907,13 +746,7 @@ if RunService:IsServer() then
 		local moveBatch = {}
 		for i = #active, 1, -1 do
 			local projectile = active[i]
-			-- Captured BEFORE Step() so a projectile that transitions out of
-			-- sync DURING this exact tick (its last bounce charge just spent,
-			-- or its homing lock just dropped) still gets this tick's
-			-- corrected post-bounce/post-drop Position/Velocity streamed --
-			-- otherwise the client is left holding a stale pre-transition pose
-			-- and resumes local physics from the wrong place (e.g. coasting
-			-- on the old pre-bounce velocity, straight through the floor).
+
 			local wasSynced = isSynced(projectile)
 			local alive = projectile:Step(globalDt)
 			if not alive then
@@ -922,11 +755,7 @@ if RunService:IsServer() then
 				active[last] = nil
 				projectile:Destroy({ Position = projectile.Position, Normal = Vector3.yAxis })
 			elseif projectile.Visualize and (wasSynced or isSynced(projectile)) then
-				-- Currently (or just-formerly, see above) locked onto a target
-				-- and/or has bounces left (checked fresh every tick, not a
-				-- static classification) -- see the module doc comment for why
-				-- these are the cases that must stay streamed rather than left
-				-- to the client.
+
 				table.insert(moveBatch, {
 					VisualRange = projectile.VisualRange,
 					Position = projectile.Position,
@@ -968,6 +797,9 @@ end
 local clientRendering = false
 local visuals = {} -- [id] = { model, position, velocity, gravity, homing/bounce state, ... }
 
+
+local SYNCED_VISUAL_STALE_TIMEOUT = 2
+
 -- Custom impact hook: fn(position, normal, model?, kind). When set, it replaces
 -- the built-in effect below. (model is nil for impacts; kind is
 -- "entity" | "world" | "bounce".)
@@ -1006,8 +838,7 @@ local function defaultImpact(position: Vector3, normal: Vector3, kind: string?)
 	burst.Parent = workspace
 	TweenService:Create(burst, info, { Size = Vector3.one * (big and 3.5 or 1.5), Transparency = 1 }):Play()
 
-	-- flat ring spreading along the surface (Cylinder's length runs along local X,
-	-- so aim X down the normal and keep it thin there)
+
 	local ring = Instance.new("Part")
 	ring.Shape = Enum.PartType.Cylinder
 	ring.Size = Vector3.new(0.12, 0.5, 0.5)
@@ -1115,9 +946,6 @@ local function placeVisual(model: Instance, position: Vector3, velocity: Vector3
 	end
 end
 
--- Removes the flying tracer. Impact VFX is played from the ProjHit handler
--- itself (see EnableClientRendering), so this fires for real hits AND harmless
--- expiry without ever flashing in mid-air.
 local function destroyVisual(id)
 	local visual = visuals[id]
 	if not visual then
@@ -1136,11 +964,6 @@ end
 
 -- Client-side shadow simulation helpers -----------------------------------
 
--- Smoothly moves a SYNCED bullet visual toward the latest authoritative pose
--- via a tween. Duration adapts to how often updates arrive, so motion stays
--- continuous whether the server is stepping fast or coarsely, and it naturally
--- slows when the world's time ratio drops. Unsynced visuals never call this --
--- see the per-frame local-physics loop below.
 local function tweenVisual(visual, position: Vector3, velocity: Vector3, duration: number)
 	local look = position + safeUnit(velocity, Vector3.zAxis)
 	local goal = CFrame.new(position, look)
@@ -1191,42 +1014,33 @@ function Projectile.EnableClientRendering()
 		}
 	end)
 
-	-- Sync state changed (homing lock acquired/dropped, or bounces just ran
-	-- out) -- rare, only on an actual transition, never per-frame. Synced
-	-- switches the visual into "trust the streamed ProjMove" mode; unsynced
-	-- switches it back to local physics from wherever the last authoritative
-	-- Position/Velocity left it.
 	VisualOffload.On("ProjSync", function(data)
 		local visual = visuals[data.Id]
 		if visual then
 			visual.synced = data.Synced == true
+			if visual.synced then
+
+				visual.lastUpdate = os.clock()
+			end
 		end
 	end)
 
-	-- Synced visuals only: authoritative pose arrives batched (an array
-	-- covering every currently-synced projectile this frame, not one event
-	-- each) -> tween each toward its latest position. See the module doc
-	-- comment for why this can't be safely predicted client-side.
 	VisualOffload.On("ProjMove", function(batch)
 		local now = os.clock()
 		for _, data in batch do
 			local visual = visuals[data.Id]
-			if visual and visual.synced then
+			if visual and data.Bounced then
+				visual.lastUpdate = now
+				visual.position = data.Position
+				visual.velocity = data.Velocity
+				placeVisual(visual.model, data.Position, data.Velocity)
+				playImpact(data.Position, data.Normal, "bounce")
+			elseif visual and visual.synced then
 				local duration = math.clamp(now - visual.lastUpdate, 0.03, 0.2)
 				visual.lastUpdate = now
 				visual.position = data.Position
 				visual.velocity = data.Velocity
-				if data.Bounced then
-					-- A bounce happened on the server between this update and
-					-- the last one -- tweening a straight line from the old
-					-- position to this one would cut through whatever surface
-					-- sits between them (exactly where the bounce occurred), so
-					-- snap instead and play the ricochet flash at the new pose.
-					placeVisual(visual.model, data.Position, data.Velocity)
-					playImpact(data.Position, data.Normal, "bounce")
-				else
-					tweenVisual(visual, data.Position, data.Velocity, duration)
-				end
+				tweenVisual(visual, data.Position, data.Velocity, duration)
 			end
 		end
 	end)
@@ -1249,32 +1063,18 @@ function Projectile.EnableClientRendering()
 		drawRay(data.From, data.To, data.LowRes)
 	end)
 
-	-- Every projectile visual gets exactly one ProjSpawn and, eventually, one
-	-- ProjHit. For an UNSYNCED visual (the common case: no homing lock, no
-	-- bounces remaining), this loop is the entire simulation in between -- it
-	-- integrates acceleration/gravity/position every frame using the same
-	-- chunk/global dt pipeline the server's Step uses (ChunkManager.ScaleDt).
-	-- No raycasting ever happens here -- a SYNCED visual (actively homing onto
-	-- a target and/or still able to bounce) skips all of that -- its
-	-- Position/Velocity/pose are driven entirely by the streamed ProjMove
-	-- handler above; see the module doc comment for why that case can't be
-	-- safely predicted client-side. All of this is purely cosmetic; the server
-	-- always runs its own independent, authoritative Step, and any drift is
-	-- corrected the instant ProjHit snaps the final position.
 	Heartbeat.Connect(function(globalDt)
 		for id, visual in visuals do
+			if visual.synced then
+				if os.clock() - visual.lastUpdate > SYNCED_VISUAL_STALE_TIMEOUT then
+					destroyVisual(id)
+				end
+				continue
+			end
+
+
 			local dt = ChunkManager.ScaleDt(globalDt, visual.position)
 			if dt > 0 then
-				if visual.synced then
-					-- Position/velocity/pose come from ProjMove; only the
-					-- left-VisualRange safety net runs here.
-					visual.life -= dt
-					if visual.life <= 0 then
-						destroyVisual(id)
-					end
-					continue
-				end
-
 				if visual.acceleration ~= 0 then
 					local speed = visual.velocity.Magnitude
 					local newSpeed = math.clamp(speed + visual.acceleration * dt, visual.minSpeed, visual.maxSpeed)
@@ -1289,9 +1089,6 @@ function Projectile.EnableClientRendering()
 				visual.life -= dt
 				placeVisual(visual.model, visual.position, visual.velocity)
 				if visual.life <= 0 then
-					-- Safety net: normally ProjHit arrives first and removes this
-					-- entry. This only fires if it never does (e.g. the
-					-- projectile left this client's VisualRange).
 					destroyVisual(id)
 				end
 			end
