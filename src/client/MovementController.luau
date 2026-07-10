@@ -3,10 +3,22 @@
 	MovementController.luau  (client)
 	Makes the local character move in dilated time. Roblox's own character
 	physics run in real time, so on their own WalkSpeed/JumpPower would ignore
-	the global time ratio and chunk time scales. This controller re-derives the
-	character's motion from the same clock every other system uses:
+	chunk time scales and the player's own personal time ratio. This controller
+	re-derives the character's motion from the same clock every other system
+	uses:
 
-	    effScale = Heartbeat.globalScale * chunk scale under the character
+	    effScale = worldScale * chunk scale under the character * personalScale
+
+	worldScale is the true Heartbeat global time scale (a dev/world-level knob,
+	1 unless something explicitly changes it) and personalScale is this
+	player's own ratio, set via SetPersonalTimeScale -- TimeControlGui calls
+	that directly for instant feedback and it's the only thing the slider
+	actually drives. Because only the *local* character is touched here (each
+	client owns/predicts its own, per Roblox's network ownership model),
+	personalScale only ever affects this player's own movement on every
+	client's screen -- other players see it via ordinary Humanoid property
+	replication, but their own movement is driven by their own client's own
+	personalScale, so one player's dial can never affect anyone else's.
 
 	Each frame it:
 	  • scales WalkSpeed by effScale            (walking slows with time)
@@ -18,9 +30,6 @@
 	velocity scaled by effScale and gravity by effScale², jump height is
 	preserved but the whole arc plays out in dilated time. At effScale = 0 the
 	upward force exactly cancels gravity, so the character freezes in place.
-
-	Only the *local* character is driven here — each client owns its own, which
-	is how Roblox network ownership already works.
 ]]
 
 local Players = game:GetService("Players")
@@ -34,6 +43,7 @@ local MovementController = {}
 
 local player = Players.LocalPlayer
 local started = false
+local personalScale = 1
 
 type CharacterState = {
 	humanoid: Humanoid,
@@ -98,7 +108,7 @@ local function step()
 		return
 	end
 
-	local effScale = ChunkManager.GetEffectiveTimeScaleAt(root.Position)
+	local effScale = Heartbeat.GetGlobalTimeScale() * ChunkManager.GetTimeScaleAt(root.Position) * personalScale
 
 	-- Horizontal movement dilation.
 	humanoid.WalkSpeed = current.baseWalkSpeed * effScale
@@ -115,6 +125,16 @@ local function step()
 	local g0 = workspace.Gravity
 	local mass = root.AssemblyMass
 	current.force.Force = Vector3.new(0, mass * g0 * (1 - effScale * effScale), 0)
+end
+
+-- This player's own time ratio (see TimeControlGui.luau), independent of the
+-- shared Heartbeat global scale -- see the module doc comment.
+function MovementController.SetPersonalTimeScale(scale: number)
+	personalScale = math.max(scale, 0)
+end
+
+function MovementController.GetPersonalTimeScale(): number
+	return personalScale
 end
 
 function MovementController.start()

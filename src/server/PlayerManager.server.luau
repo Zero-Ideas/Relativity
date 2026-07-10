@@ -53,6 +53,13 @@ local function registerCharacter(player: Player, character: Model)
 		ScaleHumanoid = true, -- moves in dilated time inside slow chunks
 	})
 	entity:AddTag("Player") -- homing targets this tag
+
+	-- Reapply this player's own personal time ratio (see
+	-- example/init.server.luau's "RequestPersonalTimeScale" handler) -- a
+	-- fresh Entity otherwise starts at 1x, silently resetting it on every
+	-- respawn even though the client's slider still shows the old value.
+	entity:SetTimeScale(player:GetAttribute("PersonalTimeScale") or 1)
+
 	playerEntities[player] = entity
 end
 

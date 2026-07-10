@@ -4,6 +4,12 @@
 	Click to fire. Sends the shot origin (character head) and aim direction (a
 	camera ray through the cursor) to the server, which spawns the actual bullet
 	via the Projectile system. Purely an input forwarder — no authority here.
+
+	start()/stop() are called by ToolControllers/TimeBlaster.luau's
+	Equip/Unequip -- this only listens for input while that tool is actually
+	equipped. The server enforces this independently for FireBullet/
+	StressTestFire (see Shooter.server.luau), so this is about not listening
+	for input at all while the tool is holstered, not about security.
 ]]
 
 local Players = game:GetService("Players")
@@ -17,11 +23,11 @@ local ShooterConfigGui = require(script.Parent.ShooterConfigGui)
 local ShooterController = {}
 
 local player = Players.LocalPlayer
-local started = false
-local COOLDOWN = 0
+local COOLDOWN = 0.1 -- matches Shooter.server.luau's FIRE_COOLDOWN; the server enforces its own copy regardless
 local lastFire = 0
 local debugRays = false -- matches the server default; toggle with B
 local debugSync = false -- prints ProjSpawn/ProjSync/ProjHit + a ProjMove rate summary server-side; toggle with V
+local inputConnection: RBXScriptConnection? = nil
 
 local AIM_RANGE = 5000
 
@@ -67,12 +73,11 @@ local function stressTest()
 end
 
 function ShooterController.start()
-	if started then
+	if inputConnection then
 		return
 	end
-	started = true
 
-	UserInputService.InputBegan:Connect(function(input, processed)
+	inputConnection = UserInputService.InputBegan:Connect(function(input, processed)
 		if processed then
 			return -- click was consumed by the GUI (e.g. the time slider)
 		end
@@ -94,6 +99,13 @@ function ShooterController.start()
 			VisualOffload.Fire("SetProjectileSyncDebug", debugSync)
 		end
 	end)
+end
+
+function ShooterController.stop()
+	if inputConnection then
+		inputConnection:Disconnect()
+		inputConnection = nil
+	end
 end
 
 return ShooterController

@@ -1,7 +1,11 @@
 --[[
 	Client bootstrap: enables projectile visual rendering, receives chunk/global
 	time-scale replication, and starts the client-side dilation systems
-	(movement, chunk overlay, and the global time-ratio panel).
+	(movement, chunk overlay, and the personal time-ratio panel). Also starts
+	ToolManager, which swaps in each equipped tool's controller module (see
+	ToolManager.luau and ToolControllers/) -- e.g. the shooter menu only shows
+	up while the TimeBlaster tool is equipped, driven entirely by
+	ToolControllers/TimeBlaster.luau.
 ]]
 
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
@@ -15,8 +19,7 @@ local Entity = require(Shared.Entity)
 local MovementController = require(script.MovementController)
 local ChunkVisualizer = require(script.ChunkVisualizer)
 local TimeControlGui = require(script.TimeControlGui)
-local ShooterConfigGui = require(script.ShooterConfigGui)
-local ShooterController = require(script.ShooterController)
+local ToolManager = require(script.ToolManager)
 
 ChunkManager.EnableReplication()
 Projectile.EnableClientRendering()
@@ -26,8 +29,7 @@ Entity.EnableHurtboxHistoryRendering() -- draws the history trail when Entity.Sh
 MovementController.start()
 ChunkVisualizer.start()
 TimeControlGui.start()
-ShooterConfigGui.start()
-ShooterController.start()
+ToolManager.start()
 
 -- Optional: custom impact VFX for offloaded projectiles.
 -- Projectile.SetImpactHandler(function(position, normal, model)

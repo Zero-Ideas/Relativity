@@ -5,6 +5,11 @@
 	gravity, bounces, pierces, homing, etc. It just holds a config table; the
 	ShooterController reads getConfig() when firing and sends it to the server,
 	which clamps and applies it. Nothing here is authoritative.
+
+	The panel is built once but stays hidden until setVisible(true) is called --
+	ToolControllers/TimeBlaster.luau calls that from its Equip/Unequip (see
+	ToolManager.luau), so the menu only comes up while the TimeBlaster tool is
+	actually equipped.
 ]]
 
 local Players = game:GetService("Players")
@@ -38,9 +43,18 @@ for _, field in FIELDS do
 end
 
 local started = false
+local screenGui: ScreenGui? = nil
 
 function ShooterConfigGui.getConfig()
 	return table.clone(config)
+end
+
+-- Shown only while the TimeBlaster tool is equipped (see ToolManager.luau /
+-- ToolControllers/TimeBlaster.luau). No-ops if the panel hasn't been built yet.
+function ShooterConfigGui.setVisible(visible: boolean)
+	if screenGui then
+		screenGui.Enabled = visible
+	end
 end
 
 local function makeRow(parent: Instance, field, layoutOrder: number)
@@ -119,7 +133,9 @@ local function build()
 	local screen = Instance.new("ScreenGui")
 	screen.Name = "ShooterConfigGui"
 	screen.ResetOnSpawn = false
+	screen.Enabled = false -- hidden until the TimeBlaster tool is equipped
 	screen.Parent = playerGui
+	screenGui = screen
 
 	local panel = Instance.new("Frame")
 	panel.Name = "Panel"

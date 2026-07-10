@@ -1,15 +1,18 @@
 --!optimize 2
 --[[
 	TimeControlGui.luau  (client)
-	A small on-screen panel to scrub the global time ratio. Dragging the slider
-	(or clicking a preset) does two things:
-	  • applies the ratio locally right away  (Heartbeat.SetGlobalTimeScale) so
-	    the client feels responsive, and
-	  • requests it from the server (VisualOffload "RequestGlobalScale"), which
-	    is authoritative and re-broadcasts the clamped value to everyone.
-
-	The label also reflects incoming server/replicated changes, so if another
-	player scrubs the ratio this panel follows along.
+	A small on-screen panel to scrub YOUR OWN personal time ratio -- it only
+	ever affects this player's own movement and the bullets they fire, live,
+	even ones already in flight (see MovementController.SetPersonalTimeScale
+	and Projectile.luau's Step, which reads Source.TimeScale every tick), never
+	the world or anyone else. Dragging the slider (or clicking a preset) does
+	two things:
+	  • applies the ratio locally right away (MovementController.
+	    SetPersonalTimeScale) so the client feels responsive, and
+	  • requests it from the server (VisualOffload "RequestPersonalTimeScale"),
+	    which is authoritative, clamps it, applies it to this player's Entity,
+	    and replies with the clamped value on "PersonalTimeScale" (to this
+	    player only -- nobody else needs to know it).
 ]]
 
 local Players = game:GetService("Players")
@@ -17,8 +20,8 @@ local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local UserInputService = game:GetService("UserInputService")
 
 local Shared = ReplicatedStorage:WaitForChild("Shared")
-local Heartbeat = require(Shared.Heartbeat)
 local VisualOffload = require(Shared.VisualOffload)
+local MovementController = require(script.Parent.MovementController)
 
 local TimeControlGui = {}
 
@@ -49,7 +52,7 @@ local function render(ratio: number)
 	local alpha = ratioToAlpha(ratio)
 	fill.Size = UDim2.new(alpha, 0, 1, 0)
 	handle.Position = UDim2.new(alpha, 0, 0.5, 0)
-	valueLabel.Text = string.format("Global Time  x%.2f", ratio)
+	valueLabel.Text = string.format("Your Time  x%.2f", ratio)
 end
 
 -- Throttled request to the authoritative server. Coalesces rapid drag updates
@@ -59,20 +62,20 @@ local function requestServer(ratio: number)
 	if now - lastSent >= SEND_INTERVAL then
 		lastSent = now
 		pendingSend = nil
-		VisualOffload.Fire("RequestGlobalScale", ratio)
+		VisualOffload.Fire("RequestPersonalTimeScale", ratio)
 	else
 		pendingSend = ratio
 	end
 end
 
--- Apply locally + tell the server. `fromNetwork` avoids echoing replicated
--- updates back to the server.
+-- Apply locally + tell the server. `fromNetwork` avoids echoing the server's
+-- own reply back at it.
 local function applyRatio(ratio: number, fromNetwork: boolean?)
 	ratio = math.clamp(ratio, MIN_RATIO, MAX_RATIO)
 	currentRatio = ratio
 	render(ratio)
 	if not fromNetwork then
-		Heartbeat.SetGlobalTimeScale(ratio) -- instant local feedback
+		MovementController.SetPersonalTimeScale(ratio) -- instant local feedback
 		requestServer(ratio)
 	end
 end
@@ -230,7 +233,7 @@ function TimeControlGui.start()
 	started = true
 
 	build()
-	applyRatio(Heartbeat.GetGlobalTimeScale(), true)
+	applyRatio(MovementController.GetPersonalTimeScale(), true)
 
 	-- flush any coalesced send shortly after the last drag update
 	task.spawn(function()
@@ -239,14 +242,16 @@ function TimeControlGui.start()
 				local value = pendingSend
 				pendingSend = nil
 				lastSent = os.clock()
-				VisualOffload.Fire("RequestGlobalScale", value)
+				VisualOffload.Fire("RequestPersonalTimeScale", value)
 			end
 			task.wait(SEND_INTERVAL)
 		end
 	end)
 
-	-- follow replicated/server-driven changes when we're not the one dragging
-	VisualOffload.On("GlobalScale", function(scale)
+	-- reconcile against the server's authoritative (possibly clamped) value;
+	-- this only ever targets this player (see example/init.server.luau), never
+	-- broadcast, since it's personal
+	VisualOffload.On("PersonalTimeScale", function(scale)
 		if not dragging and typeof(scale) == "number" then
 			applyRatio(scale, true)
 		end

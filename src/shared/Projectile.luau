@@ -105,7 +105,27 @@
 	 projectile at creation time (the shooter's desync at the moment they fired),
 	 so simultaneous shots from different-ping players independently see hurtboxes
 	 rewound by their own offset. Projectiles not created with a positive
-	 RewindSeconds (anything not fired through Shooter.server.luau) are unaffected. 
+	 RewindSeconds (anything not fired through Shooter.server.luau) are unaffected.
+
+	 Personal time: a projectile's Source may carry its own TimeScale (see
+	 Entity:SetTimeScale) independent of the world/chunk dilation the projectile
+	 flies through -- a player's own personal time ratio (see TimeControlGui.luau /
+	 PlayerManager.server.luau) only affects them and, via this, the bullets they
+	 fire. Source.TimeScale is read LIVE every Step (not snapshotted), so a
+	 shooter dragging their ratio mid-flight speeds up or slows down bullets
+	 already in the air, in real time, exactly like it does their own movement.
+	 A projectile with no Source, or a Source that never had its TimeScale set,
+	 flies at 1x personal scale (i.e. unaffected).
+
+	 Because the client can't predict a live-changing personal ratio on its own
+	 (it has no replicated view of another player's TimeScale), a projectile
+	 whose Source currently has TimeScale ~= 1 is treated as "synced" exactly
+	 like an actively-homing one -- see isSynced below -- so the server streams
+	 its authoritative Position/Velocity every tick for as long as that holds,
+	 and the client just renders the stream instead of dead-reckoning. The
+	 instant the shooter's ratio returns to 1x, streaming stops and the client
+	 falls back to local physics (which needs no personal-scale correction at
+	 that point, since 1x is the client's implicit default).
 ]]
 
 local RunService = game:GetService("RunService")
@@ -378,11 +398,21 @@ end
 -- corrected with its own one-shot ProjMove entry (Bounced = true) sent the
 -- instant it happens (see _resolveHit), not by holding the projectile synced
 -- for its whole remaining life. A projectile with bounces remaining (or that
--- has already bounced) but no active homing lock is therefore NOT continuously
--- synced -- it coasts on local physics between bounces like any other
--- unsynced shot, and only gets snapped at the moment each bounce occurs.
+-- has already bounced) but no active homing lock and a Source at 1x personal
+-- time is therefore NOT continuously synced -- it coasts on local physics
+-- between bounces like any other unsynced shot, and only gets snapped at the
+-- moment each bounce occurs.
+--
+-- The Source.TimeScale ~= 1 half of this mirrors homing for the same reason:
+-- the client has no replicated view of another player's live personal ratio,
+-- so it can't dead-reckon a speed it doesn't know -- see the module doc
+-- comment's "Personal time" section.
 local function isSynced(projectile): boolean
-	return projectile.HomingTarget ~= nil
+	if projectile.HomingTarget ~= nil then
+		return true
+	end
+	local source = projectile.Source
+	return source ~= nil and source.TimeScale ~= 1
 end
 
 local function spawnVisual(projectile)
@@ -398,10 +428,11 @@ local function spawnVisual(projectile)
 		MinSpeed = projectile.MinSpeed,
 		MaxSpeed = projectile.MaxSpeed,
 		Lifetime = projectile.Lifetime,
-		-- Whether it starts out continuously synced -- true only for an
-		-- explicit Homing.Target given at construction (auto-acquire homing
-		-- starts unsynced until it actually locks onto something). Bounces
-		-- never make a projectile start synced -- see isSynced. If true, the
+		-- Whether it starts out continuously synced -- true for an explicit
+		-- Homing.Target given at construction, or a Source already at a
+		-- non-1x personal time ratio when fired (see isSynced / the module
+		-- doc comment's "Personal time" section; auto-acquire homing starts
+		-- unsynced until it actually locks onto something). If true, the
 		-- client starts in "trust the stream" mode immediately; the server's
 		-- step loop below will include it in the very next ProjMove batch.
 		Synced = isSynced(projectile),
@@ -854,9 +885,15 @@ function Projectile:Step(globalDt: number): boolean
 	-- a later, non-bouncing tick's streamed payload -- see _resolveHit.
 	self._bouncedThisTick = false
 
-	local dt = ChunkManager.ScaleDt(globalDt, self.Position)
+	-- world/chunk dilation at the projectile's own position, times the
+	-- shooter's CURRENT personal ratio -- read live every tick (not
+	-- snapshotted) so dragging the slider mid-flight speeds up or slows down
+	-- bullets already in the air -- see the module doc comment's "Personal
+	-- time" section.
+	local sourceScale = (self.Source and self.Source.TimeScale) or 1
+	local dt = ChunkManager.ScaleDt(globalDt, self.Position) * sourceScale
 	if dt <= 0 then
-		return true -- frozen chunk / paused: keep it alive, don't move it
+		return true -- frozen chunk / paused / shooter frozen: keep it alive, don't move it
 	end
 
 	self.Age += dt
@@ -1053,6 +1090,12 @@ end
 
 local clientRendering = false
 local visuals = {} -- [id] = { model, position, velocity, gravity, homing/bounce state, ... }
+
+-- Real (undilated) seconds of no ProjMove update before a SYNCED visual is
+-- assumed to have left VisualRange and gets cleaned up -- see the render
+-- loop below. Generous on purpose: ProjMove batches normally arrive every
+-- server tick, so anything this stale really has stopped, not just lagged.
+local SYNCED_VISUAL_STALE_TIMEOUT = 2
 
 -- Custom impact hook: fn(position, normal, model?, kind). When set, it replaces
 -- the built-in effect below. (model is nil for impacts; kind is
@@ -1286,6 +1329,14 @@ function Projectile.EnableClientRendering()
 		local visual = visuals[data.Id]
 		if visual then
 			visual.synced = data.Synced == true
+			if visual.synced then
+				-- reset the staleness clock right at the transition -- see the
+				-- synced branch of the render loop below -- so a lastUpdate
+				-- left over from before this transition (however old) can't
+				-- immediately read as stale before the first real ProjMove
+				-- arrives.
+				visual.lastUpdate = os.clock()
+			end
 		end
 	end)
 
@@ -1362,18 +1413,34 @@ function Projectile.EnableClientRendering()
 	-- drift is corrected the instant ProjHit snaps the final position.
 	Heartbeat.Connect(function(globalDt)
 		for id, visual in visuals do
+			if visual.synced then
+				-- Position/velocity/pose come from ProjMove; the only thing
+				-- that runs here is a left-VisualRange safety net. This is
+				-- deliberately wall-clock (os.clock()), NOT a dilated-dt
+				-- countdown: a synced visual can belong to a shooter at ANY
+				-- personal time ratio, including exactly 0 (a legitimate
+				-- indefinite freeze the player chose), so there's no dilated
+				-- "Lifetime elapsed" schedule the client could reconstruct on
+				-- its own without knowing that live ratio (which isn't
+				-- replicated to observers -- see the module doc comment's
+				-- "Personal time" section). Instead: the server includes every
+				-- synced projectile in its ProjMove batch every tick
+				-- regardless of dt (see the server step loop below), so as
+				-- long as this client is in VisualRange, lastUpdate keeps
+				-- getting refreshed; once it stops (genuinely left range, or
+				-- the projectile is gone), a real-time timeout cleans it up.
+				if os.clock() - visual.lastUpdate > SYNCED_VISUAL_STALE_TIMEOUT then
+					destroyVisual(id)
+				end
+				continue
+			end
+
+			-- No personal-scale factor needed here: whenever the Source's
+			-- ratio isn't 1x, the projectile is synced (see isSynced / the
+			-- module doc comment's "Personal time" section) and hits the
+			-- branch above instead -- position comes from the ProjMove stream.
 			local dt = ChunkManager.ScaleDt(globalDt, visual.position)
 			if dt > 0 then
-				if visual.synced then
-					-- Position/velocity/pose come from ProjMove; only the
-					-- left-VisualRange safety net runs here.
-					visual.life -= dt
-					if visual.life <= 0 then
-						destroyVisual(id)
-					end
-					continue
-				end
-
 				if visual.acceleration ~= 0 then
 					local speed = visual.velocity.Magnitude
 					local newSpeed = math.clamp(speed + visual.acceleration * dt, visual.minSpeed, visual.maxSpeed)

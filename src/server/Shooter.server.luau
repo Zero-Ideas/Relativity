@@ -6,7 +6,20 @@
 	rendered client-side by Projectile.EnableClientRendering().
 
 	Because Projectile steps on the dilated Heartbeat, these bullets slow down with
-	the global time ratio and inside slow chunks for free.
+	the global time ratio and inside slow chunks for free -- and, per-shooter, live
+	with that player's own personal time ratio (Projectile.luau reads Source.
+	TimeScale every tick, so a shooter dragging their ratio mid-flight speeds up
+	or slows down bullets already in the air).
+
+	Anti-exploit, defense in depth (VisualOffload's remote is reachable directly by
+	any client, bypassing ShooterController's own throttling entirely):
+	 - FIRE_COOLDOWN is a hard per-player rate limit enforced here regardless of
+	   how fast (or how directly) the remote is fired.
+	 - MAX_ACTIVE_PROJECTILES_PER_PLAYER caps how many of a player's bullets can be
+	   alive at once, so even max-rate firing with a huge Lifetime can't build an
+	   unbounded swarm.
+	 - A shot is only accepted while the firing player's character has the
+	   TimeBlaster tool (see ShooterTool.luau) equipped.
 
 	Lag compensation: each shot carries RewindSeconds, half the firing player's
 	current network ping, clamped to MAX_REWIND. Projectile.luau uses this to check
@@ -17,23 +30,30 @@
 	Also handles "StressTestFire": a dev/benchmarking request that spawns many
 	projectiles in one go, bypassing FIRE_COOLDOWN (which throttles per-click
 	requests, not a single "spawn N" request) -- see the client's N keybind in
-	ShooterController.luau. Use Heartbeat.GetStats().AvgFrameTime to read the
-	actual per-frame cost while a batch is in flight.
+	ShooterController.luau. Restricted to Studio (see the RunService:IsStudio()
+	guard below) since spawning thousands of projectiles per request is itself an
+	exploit vector if left reachable in a live game. Use
+	Heartbeat.GetStats().AvgFrameTime to read the actual per-frame cost while a
+	batch is in flight.
 ]]
 
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local RunService = game:GetService("RunService")
 local Shared = ReplicatedStorage:WaitForChild("Shared")
 
 local Heartbeat = require(Shared.Heartbeat)
 local Entity = require(Shared.Entity)
 local Projectile = require(Shared.Projectile)
 local VisualOffload = require(Shared.VisualOffload)
+local ShooterToolInfo = require(Shared.ShooterTool)
 
 local MAX_ORIGIN_DISTANCE = 24 -- reject/clamp origins claimed too far from the shooter
-local FIRE_COOLDOWN = 0 -- server-side rate limit (seconds, real time)
+local FIRE_COOLDOWN = 0.1 -- server-side rate limit (seconds, real time) -- 10/sec hard cap, independent of client input
+local MAX_ACTIVE_PROJECTILES_PER_PLAYER = 150 -- concurrently-alive cap per player
 local MAX_REWIND = 0.4 -- seconds; stays safely under Entity.HistoryWindow (0.5s)
 
 local lastFire: { [Player]: number } = {}
+local activeProjectileCount: { [Player]: number } = {}
 
 -- Clamp a client-supplied number into a trusted range (anti-cheat + sanity).
 local function num(value: any, default: number, min: number, max: number): number
@@ -55,18 +75,32 @@ VisualOffload.On("FireBullet", function(data, player)
 	end
 	direction = direction.Unit
 
-	-- rate limit
-	local now = os.clock()
-	if lastFire[player] and now - lastFire[player] < FIRE_COOLDOWN then
-		return
-	end
-	lastFire[player] = now
-
 	local character = player.Character
 	local root = character and (character.PrimaryPart or character:FindFirstChild("HumanoidRootPart"))
 	if not root then
 		return
 	end
+
+	-- must have the TimeBlaster tool equipped -- closes the gap where an
+	-- exploiter fires this remote directly without ever equipping anything
+	local tool = character:FindFirstChild(ShooterToolInfo.Name)
+	if not tool or not tool:IsA("Tool") then
+		return
+	end
+
+	-- rate limit: a hard per-player cap independent of client input, since the
+	-- remote is reachable directly (see the module doc comment above)
+	local now = os.clock()
+	if lastFire[player] and now - lastFire[player] < FIRE_COOLDOWN then
+		return
+	end
+
+	-- concurrent-projectile cap: stops max-rate firing + a huge Lifetime from
+	-- building an unbounded swarm
+	if (activeProjectileCount[player] or 0) >= MAX_ACTIVE_PROJECTILES_PER_PLAYER then
+		return
+	end
+	lastFire[player] = now
 
 	-- basic anti-cheat: don't trust a claimed origin far from the character
 	if (origin - root.Position).Magnitude > MAX_ORIGIN_DISTANCE then
@@ -133,6 +167,15 @@ VisualOffload.On("FireBullet", function(data, player)
 		}
 	end
 
+	-- counted against MAX_ACTIVE_PROJECTILES_PER_PLAYER above; OnHit fires
+	-- exactly once per projectile on every destroy path (entity hit, world hit,
+	-- or lifetime expiry -- see Projectile.luau's Step/Destroy), so this always
+	-- balances the increment below.
+	activeProjectileCount[player] = (activeProjectileCount[player] or 0) + 1
+	projectileConfig.OnHit = function()
+		activeProjectileCount[player] = math.max((activeProjectileCount[player] or 1) - 1, 0)
+	end
+
 	Projectile.new(projectileConfig)
 end)
 
@@ -141,7 +184,10 @@ end)
 -- single request asking for N spawns, not N separate clicks). Damage is forced to
 -- 0 so a stress test never kills the Dummy or otherwise interferes with real
 -- gameplay mid-benchmark. Has its own, longer cooldown so repeated presses don't
--- compound into an ever-growing pile.
+-- compound into an ever-growing pile. Restricted to Studio (see the IsStudio
+-- guard below): spawning up to MAX_STRESS_COUNT projectiles per request is
+-- itself an "ungodly amounts of projectiles" vector if any client could reach
+-- it in a live game, so this never runs outside of testing.
 local MAX_STRESS_COUNT = 5000
 local STRESS_COOLDOWN = 2
 local lastStressTest: { [Player]: number } = {}
@@ -154,7 +200,7 @@ local function randomDirection(): Vector3
 end
 
 VisualOffload.On("StressTestFire", function(data, player)
-	if not player then
+	if not player or not RunService:IsStudio() then
 		return
 	end
 
@@ -219,6 +265,7 @@ end)
 game:GetService("Players").PlayerRemoving:Connect(function(player)
 	lastFire[player] = nil
 	lastStressTest[player] = nil
+	activeProjectileCount[player] = nil
 end)
 
 print("[Relativity] shooter online")
