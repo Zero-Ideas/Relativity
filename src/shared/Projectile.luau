@@ -1303,19 +1303,36 @@ local function buildVisualModel(data): Instance
 		else
 			part.Size = Vector3.one * 0.4
 			part.Color = Color3.fromRGB(255, 220, 120)
-		end
+		ends
 		part.Material = Enum.Material.Neon
 		model = part
 	end
+	if model:IsA("Model") then
+		for _, part in { model, table.unpack(model:GetDescendants()) } do
 
-	for _, part in { model, table.unpack(model:GetDescendants()) } do
-		if part:IsA("BasePart") then
-			part.Anchored = true
-			part.CanCollide = false
-			part.CanQuery = false
-			part.CanTouch = false
-			part.CastShadow = false
+			if part:IsA("BasePart") then
+				if part == model.PrimaryPart then
+					part.Anchored = true
+					part.CanCollide = false
+					part.CanQuery = false
+					part.CanTouch = false
+					part.CastShadow = false
+				else
+					part.Anchored = false
+					part.CanCollide = false
+					part.CanQuery = false
+					part.CanTouch = false
+					part.CastShadow = false
+				end
+
+			end
 		end
+	else
+		model.Anchored = true
+		model.CanCollide = false
+		model.CanQuery = false
+		model.CanTouch = false
+		model.CastShadow = false
 	end
 	model.Parent = workspace
 	RunService.RenderStepped:Wait()
