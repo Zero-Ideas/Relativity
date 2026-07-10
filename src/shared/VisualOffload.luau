@@ -82,6 +82,7 @@ local function ensureListening()
 end
 
 function VisualOffload.Fire(channel: string, payload: any?)
+	
 	local r = getRemote()
 	if RunService:IsServer() then
 		r:FireAllClients(channel, payload)

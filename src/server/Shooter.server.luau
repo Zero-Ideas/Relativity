@@ -67,7 +67,7 @@ VisualOffload.On("FireBullet", function(data, player)
 	if not player or typeof(data) ~= "table" then
 		return
 	end
-
+	
 	local origin = data.Origin
 	local direction = data.Direction
 	if typeof(origin) ~= "Vector3" or typeof(direction) ~= "Vector3" or direction.Magnitude < 1e-3 then
@@ -151,8 +151,12 @@ VisualOffload.On("FireBullet", function(data, player)
 		Visualize = true, -- server = logic only; clients render
 		VisualRange = 800,
 		Visual = { Shape = "Ball", Size = Vector3.one * 0.4, Color = Color3.fromRGB(120, 220, 255) },
+		Model = cfg.Model or nil,
 	}
-
+	
+	--if cfg.Model then	
+	--	projectileConfig.Model = cfg.Model,
+	--end
 	-- homing: auto-lock the nearest Enemy- or Player-tagged entity within range
 	-- (the shooter's own character is always excluded by Projectile's acquireTarget)
 	if cfg.Homing == true then
@@ -175,6 +179,7 @@ VisualOffload.On("FireBullet", function(data, player)
 	projectileConfig.OnHit = function()
 		activeProjectileCount[player] = math.max((activeProjectileCount[player] or 1) - 1, 0)
 	end
+	
 
 	Projectile.new(projectileConfig)
 end)

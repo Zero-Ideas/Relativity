@@ -53,10 +53,13 @@ local function fire()
 	-- 2) aim the muzzle AT that point, so the bullet converges where you clicked
 	--    (fixes the camera/muzzle parallax that made shots drift off-target).
 	local origin = head.Position
+	local configuration = ShooterConfigGui.getConfig()
+	configuration.Model = game.ReplicatedStorage.Effects.Model
+	--print(configuration)
 	VisualOffload.Fire("FireBullet", {
 		Origin = origin,
-		Direction = (targetPoint - origin).Unit,
-		Config = ShooterConfigGui.getConfig(),
+		Direction = (targetPoint - origin).Unit,	
+		Config = configuration,
 	})
 end
 

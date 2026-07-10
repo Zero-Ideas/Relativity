@@ -1286,6 +1286,7 @@ end
 
 local function buildVisualModel(data): Instance
 	local model
+
 	if data.Model then
 		model = data.Model:Clone()
 	else
@@ -1317,6 +1318,7 @@ local function buildVisualModel(data): Instance
 		end
 	end
 	model.Parent = workspace
+	RunService.RenderStepped:Wait()
 	return model
 end
 
