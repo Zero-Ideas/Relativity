@@ -94,6 +94,7 @@ end
 function VisualOffload.FireClient(player: Player, channel: string, payload: any?)
 	assert(RunService:IsServer(), "VisualOffload.FireClient is server-only")
 	getRemote():FireClient(player, channel, payload)
+	print("Fired",payload)
 end
 
 function VisualOffload.On(channel: string, handler: (any, any?) -> ())

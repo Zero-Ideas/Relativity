@@ -29,6 +29,7 @@ local FIELDS = {
 	{ key = "Radius", label = "Radius (sphere)", kind = "number", min = 0, max = math.huge, default = 0 },
 	{ key = "Bounces", label = "Bounces", kind = "number", min = 0, max = math.huge, default = 0 },
 	{ key = "Restitution", label = "Restitution", kind = "number", min = 0, max = math.huge, default = 0.5 },
+	{ key = "Penetration", label = "Penetration (studs)", kind = "number", min = 0, max = math.huge, default = 0 },
 	{ key = "Pierces", label = "Pierces", kind = "number", min = 0, max = math.huge, default = 0 },
 	{ key = "PierceFalloff", label = "Pierce falloff", kind = "number", min = 0, max = math.huge, default = 0.2 },
 	{ key = "Homing", label = "Homing", kind = "bool", default = false },

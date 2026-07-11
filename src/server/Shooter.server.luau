@@ -2,8 +2,10 @@
 	Shooter (server authority)
 	Receives fire requests from clients (VisualOffload "FireBullet") and spawns a
 	bullet through the Projectile system. The server owns the projectile — clients
-	only send where they clicked. No model: the bullet is a plain Visual ball spec,
-	rendered client-side by Projectile.EnableClientRendering().
+	only send where they clicked and non-authoritative tuning (speed, damage,
+	etc.); the bullet's Model/Visual is decided server-side (see
+	PROJECTILE_MODELS below), rendered client-side by
+	Projectile.EnableClientRendering().
 
 	Because Projectile steps on the dilated Heartbeat, these bullets slow down with
 	the global time ratio and inside slow chunks for free -- and, per-shooter, live
@@ -20,6 +22,10 @@
 	   unbounded swarm.
 	 - A shot is only accepted while the firing player's character has the
 	   TimeBlaster tool (see ShooterTool.luau) equipped.
+	 - The bullet's Model is looked up server-side from the equipped tool's
+	   name (PROJECTILE_MODELS below), never taken from client config -- a
+	   client-supplied Instance reference could point at anything replicated
+	   to them and get cloned onto every observer via ProjSpawn.
 
 	Lag compensation: each shot carries RewindSeconds, half the firing player's
 	current network ping, clamped to MAX_REWIND. Projectile.luau uses this to check
@@ -46,6 +52,20 @@ local Entity = require(Shared.Entity)
 local Projectile = require(Shared.Projectile)
 local VisualOffload = require(Shared.VisualOffload)
 local ShooterToolInfo = require(Shared.ShooterTool)
+
+-- Server-owned mapping of equipped-tool name -> the Model clients render for
+-- that tool's bullets. NEVER trust a client-sent Model reference (a remote
+-- can carry an Instance argument, and a client could point it at literally
+-- anything replicated to them -- another player's rig, a chunk of terrain, a
+-- LocalScript buried somewhere else in the game -- which the server would
+-- then clone and broadcast onto every observer via ProjSpawn). The tool a
+-- shot came from is already validated below (character:FindFirstChild(
+-- ShooterToolInfo.Name)), so keying off tool.Name here is safe. A tool with
+-- no entry (or a missing asset) just falls back to the default Visual ball.
+local Effects = ReplicatedStorage:FindFirstChild("Effects")
+local PROJECTILE_MODELS: { [string]: Instance } = {
+	[ShooterToolInfo.Name] = Effects and Effects:FindFirstChild("Model"),
+}
 
 local MAX_ORIGIN_DISTANCE = 24 -- reject/clamp origins claimed too far from the shooter
 local FIRE_COOLDOWN = 0.1 -- server-side rate limit (seconds, real time) -- 10/sec hard cap, independent of client input
@@ -138,6 +158,7 @@ VisualOffload.On("FireBullet", function(data, player)
 		Radius = num(cfg.Radius, 0, 0, math.huge),
 		Bounces = bounces,
 		Restitution = num(cfg.Restitution, 0.5, 0, math.huge),
+		Penetration = num(cfg.Penetration, 0, 0, math.huge),
 		MaxPierces = pierces,
 		PierceFalloff = num(cfg.PierceFalloff, 0.2, 0, math.huge),
 		Source = shooter,
@@ -151,12 +172,12 @@ VisualOffload.On("FireBullet", function(data, player)
 		Visualize = true, -- server = logic only; clients render
 		VisualRange = 800,
 		Visual = { Shape = "Ball", Size = Vector3.one * 0.4, Color = Color3.fromRGB(120, 220, 255) },
-		Model = cfg.Model or nil,
+		-- Chosen server-side from the validated equipped tool, never from cfg
+		-- (see PROJECTILE_MODELS above) -- a client-supplied Model reference
+		-- would be an easy exploit vector.
+		Model = PROJECTILE_MODELS[tool.Name],
 	}
-	
-	--if cfg.Model then	
-	--	projectileConfig.Model = cfg.Model,
-	--end
+
 	-- homing: auto-lock the nearest Enemy- or Player-tagged entity within range
 	-- (the shooter's own character is always excluded by Projectile's acquireTarget)
 	if cfg.Homing == true then
@@ -171,17 +192,42 @@ VisualOffload.On("FireBullet", function(data, player)
 		}
 	end
 
-	-- counted against MAX_ACTIVE_PROJECTILES_PER_PLAYER above; OnHit fires
-	-- exactly once per projectile on every destroy path (entity hit, world hit,
-	-- or lifetime expiry -- see Projectile.luau's Step/Destroy), so this always
-	-- balances the increment below.
+	-- counted against MAX_ACTIVE_PROJECTILES_PER_PLAYER above; OnDestroy fires
+	-- exactly once per projectile on every removal path (entity hit, world
+	-- hit, dilated lifetime expiry, or the real-time MaxRealLifetime safety
+	-- cap -- see Projectile.luau's Step/Destroy), so this always balances the
+	-- increment below. OnHit is NOT exactly-once (piercing/bouncing/
+	-- penetrating fire it without removing the projectile), which is exactly
+	-- why this uses OnDestroy instead. The real-time cap matters here
+	-- specifically: a shooter who freezes their own personal time with shots
+	-- in flight would otherwise have those shots sit in activeProjectileCount
+	-- forever, silently eating into their MAX_ACTIVE_PROJECTILES_PER_PLAYER
+	-- budget.
 	activeProjectileCount[player] = (activeProjectileCount[player] or 0) + 1
-	projectileConfig.OnHit = function()
+	local proj = Projectile.new(projectileConfig)
+	proj.OnDestroy:Connect(function()
 		activeProjectileCount[player] = math.max((activeProjectileCount[player] or 1) - 1, 0)
-	end
-	
+	end)
 
-	Projectile.new(projectileConfig)
+	-- The module deals no damage itself anymore (see Projectile.luau's
+	-- "Events" doc section) -- this replicates the exact damage behavior that
+	-- used to live in Projectile:_dealDamage, just from the caller side now.
+	-- DamageMultiplier already reflects PierceFalloff, applied live per pierce.
+	proj.OnHit:Connect(function(hit)
+		if not hit.Entity then
+			return
+		end
+		local damage = proj.Damage * proj.DamageMultiplier
+		if damage <= 0 then
+			return
+		end
+		local info = { Type = "Projectile", Source = shooter, Position = hit.CFrame.Position }
+		if shooter and shooter.DealDamage then
+			shooter:DealDamage(hit.Entity, damage, info)
+		else
+			hit.Entity:TakeDamage(damage, info)
+		end
+	end)
 end)
 
 -- Dev/benchmarking only: spawns Count projectiles immediately in one request,

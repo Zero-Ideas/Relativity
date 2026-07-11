@@ -54,8 +54,11 @@ local function fire()
 	--    (fixes the camera/muzzle parallax that made shots drift off-target).
 	local origin = head.Position
 	local configuration = ShooterConfigGui.getConfig()
-	configuration.Model = game.ReplicatedStorage.Effects.Model
-	--print(configuration)
+	-- Sent for dev convenience only -- the server IGNORES this and picks the
+	-- Model from the equipped tool's name instead (see PROJECTILE_MODELS in
+	-- Shooter.server.luau). A client-supplied Instance reference would
+	-- otherwise be trivially exploitable, so don't rely on this field.
+	configuration.Model = game.ReplicatedStorage.Effects.Bullet2
 	VisualOffload.Fire("FireBullet", {
 		Origin = origin,
 		Direction = (targetPoint - origin).Unit,	
