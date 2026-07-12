@@ -51,6 +51,10 @@ local function registerCharacter(player: Player, character: Model)
 
 	local entity = Entity.new(character, {
 		ScaleHumanoid = true, -- moves in dilated time inside slow chunks
+		BodyOffset = Vector3.new(0, -1, 0),
+		HitboxRadius = 2.5,
+		HeadRadius = 1.2
+
 	})
 	entity:AddTag("Player") -- homing targets this tag
 

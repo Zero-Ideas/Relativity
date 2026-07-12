@@ -112,8 +112,14 @@
 	                         stop. Does NOT fire for natural Lifetime/
 	                         MaxRealLifetime expiry (nothing was actually hit).
 	                         Listener receives one table:
-	                           { CFrame: CFrame, Part: BasePart, Entity: Entity? }
-	                         Entity is nil for a pure world/wall contact. The
+	                           { CFrame: CFrame, Part: BasePart, Entity: Entity?,
+	                             Hurtbox: ("Head" | "Body")? }
+	                         Entity is nil for a pure world/wall contact.
+	                         Hurtbox is which of the entity's two hurtboxes
+	                         (see Entity.luau's "Head + Body hurtboxes"
+	                         section) was struck -- nil alongside a nil
+	                         Entity. Shooter.server.luau applies the target's
+	                         HeadshotMultiplier when this is "Head". The
 	                         module deals no damage itself anymore -- read
 	                         projectile.Damage * projectile.DamageMultiplier
 	                         (the latter already reflects PierceFalloff) and
@@ -837,16 +843,21 @@ end
 -- Per-projectile step
 --------------------------------------------------------------------------------
 
--- Builds the { CFrame, Part, Entity? } table passed to every projectile.OnHit
--- listener -- see the module doc comment's "Events" section. `result` is a
--- RaycastResult (or an equivalent plain table shape for a bounce/penetration
--- point); entity is nil for a pure world/wall contact.
-local function buildHitInfo(result, entity)
+-- Builds the { CFrame, Part, Entity?, Hurtbox? } table passed to every
+-- projectile.OnHit listener -- see the module doc comment's "Events"
+-- section. `result` is a RaycastResult (or an equivalent plain table shape
+-- for a bounce/penetration point); entity is nil for a pure world/wall
+-- contact. hurtboxName is "Head" | "Body" | nil -- see _resolveHit /
+-- _checkRewoundHit, which resolve it analytically against
+-- entity:GetHeadPosition()/GetBodyPosition() (see Entity.luau's "Head +
+-- Body hurtboxes" section).
+local function buildHitInfo(result, entity, hurtboxName: string?)
 	local normal = result.Normal and safeUnit(result.Normal, Vector3.zAxis) or Vector3.zAxis
 	return {
 		CFrame = CFrame.lookAt(result.Position, result.Position + normal),
 		Part = result.Instance,
 		Entity = entity,
+		Hurtbox = hurtboxName,
 	}
 end
 
@@ -862,7 +873,7 @@ end
 -- "destroy" if it called Destroy() itself, or nil if the entity should be
 -- treated as a fallthrough (filtered out) -- the caller decides what happens
 -- next (bounce/world resolution).
-function Projectile:_resolveEntityHit(entity, result): string?
+function Projectile:_resolveEntityHit(entity, result, hurtboxName: string?): string?
 	if entity == self.Source or self._ignore[entity] then
 		-- can't collide with ourselves or an already-pierced target;
 		-- nudge past the surface and keep going
@@ -873,7 +884,7 @@ function Projectile:_resolveEntityHit(entity, result): string?
 		return nil -- fallthrough: filtered out, treat like world geometry
 	end
 
-	self.OnHit:Fire(buildHitInfo(result, entity))
+	self.OnHit:Fire(buildHitInfo(result, entity, hurtboxName))
 	if self.PiercesLeft > 0 then
 		self.PiercesLeft -= 1
 		self.DamageMultiplier *= (1 - self.PierceFalloff)
@@ -896,7 +907,19 @@ function Projectile:_resolveHit(result)
 	local entity = instance and Entity.Get(instance)
 
 	if entity then
-		local verdict = self:_resolveEntityHit(entity, result)
+		-- Head/Body classification is purely analytic here (no synthetic
+		-- hurtbox Parts, no CanQuery/CollisionGroup tricks -- see the module
+		-- doc comment's "Head + Body hurtboxes" section): the raycast hits
+		-- whatever real rig geometry is physically in the way, exactly as
+		-- before this feature existed; we just check whether that hit POINT
+		-- happens to fall within HeadRadius of the entity's Head center.
+		local hurtboxName = "Body"
+		local headPosition = entity:GetHeadPosition()
+		if headPosition and (result.Position - headPosition).Magnitude <= entity.HeadRadius then
+			hurtboxName = "Head"
+		end
+
+		local verdict = self:_resolveEntityHit(entity, result, hurtboxName)
 		if verdict then
 			return verdict
 		end
@@ -1058,21 +1081,45 @@ function Projectile:_checkRewoundHit(from: Vector3, to: Vector3)
 	end
 
 	-- Collect in-range candidates (no raycasts yet) into the reusable buffer.
+	-- Each entity is tested against BOTH its rewound Head and Body spheres
+	-- (see the module doc comment's "Head + Body hurtboxes" section) --
+	-- Head is checked first and wins outright if in range (the two spheres
+	-- are independent, not required to nest -- see Entity.luau).
 	local candidates = self._candidateBuf
 	for entity in whitelist do
 		if entity ~= self.Source and not self._ignore[entity] and (not self.Filter or self.Filter(entity)) then
-			local rewoundPos = self._rewindCache[entity]
-			if not rewoundPos then
-				rewoundPos = entity:GetPositionAt(self._rewindTime)
-				self._rewindCache[entity] = rewoundPos
+			local cache = self._rewindCache[entity]
+			if not cache then
+				cache = {
+					Body = entity:GetBodyPositionAt(self._rewindTime),
+					Head = entity:GetHeadPositionAt(self._rewindTime),
+				}
+				self._rewindCache[entity] = cache
 			end
-			local closest, distance = closestPointOnSegment(rewoundPos, from, to)
-			if distance <= entity.HitboxRadius + self.Radius then
-				table.insert(candidates, {
-					entity = entity,
-					point = closest,
-					distAlong = (closest - from).Magnitude,
-				})
+
+			local matchedHead = false
+			if cache.Head then
+				local closest, distance = closestPointOnSegment(cache.Head, from, to)
+				if distance <= entity.HeadRadius + self.Radius then
+					table.insert(candidates, {
+						entity = entity,
+						point = closest,
+						distAlong = (closest - from).Magnitude,
+						hurtbox = "Head",
+					})
+					matchedHead = true
+				end
+			end
+			if not matchedHead then
+				local closest, distance = closestPointOnSegment(cache.Body, from, to)
+				if distance <= entity.HitboxRadius + self.Radius then
+					table.insert(candidates, {
+						entity = entity,
+						point = closest,
+						distAlong = (closest - from).Magnitude,
+						hurtbox = "Body",
+					})
+				end
 			end
 		end
 	end
@@ -1098,7 +1145,7 @@ function Projectile:_checkRewoundHit(from: Vector3, to: Vector3)
 			-- (Step already clears it, but this keeps the function honest if
 			-- ever called from elsewhere).
 			table.clear(candidates)
-			return c.entity, c.point, safeUnit(from - c.point, Vector3.yAxis)
+			return c.entity, c.point, safeUnit(from - c.point, Vector3.yAxis), c.hurtbox
 		end
 	end
 
@@ -1253,12 +1300,12 @@ function Projectile:Step(globalDt: number): boolean
 		-- Lag-compensated entity check, only while in an entity-containing chunk
 		-- and only for shots carrying a shooter's rewind offset.
 		if highRes and self.RewindSeconds > 0 then
-			local lagEntity, lagPoint, lagNormal = self:_checkRewoundHit(from, to)
+			local lagEntity, lagPoint, lagNormal, lagHurtbox = self:_checkRewoundHit(from, to)
 			if lagEntity then
 				if debugRays then
 					self:_streamRay(from, lagPoint, false)
 				end
-				local verdict = self:_resolveEntityHit(lagEntity, { Position = lagPoint, Normal = lagNormal })
+				local verdict = self:_resolveEntityHit(lagEntity, { Position = lagPoint, Normal = lagNormal }, lagHurtbox)
 				if verdict == "destroy" then
 					return false
 				end

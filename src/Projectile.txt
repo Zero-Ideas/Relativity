@@ -4,7 +4,12 @@
 	Server-authoritative, raycast-driven projectiles that live in dilated time.
 	Every projectile steps in the local time of the chunk it currently occupies,
 	so a bullet flying through a 0.2x slow zone crawls, its gravity floats, and
-	its fuse burns slower — all for free.
+	its fuse burns slower — all for free. Because of that, a dilated Lifetime
+	alone can't bound a projectile's real-world lifespan -- something frozen at
+	0x (its own TimeScale, its Source's personal ratio, or its chunk) would
+	never expire on its own. MaxRealLifetime is a separate, real-time
+	(wall-clock) hard cap that always applies regardless of dilation -- see
+	DEFAULT_MAX_REAL_LIFETIME / Projectile.SetDefaultMaxRealLifetime below.
 
 	Supported behaviours (mix and match): straight shots, ballistic gravity,
 	acceleration/deceleration, bouncing (restitution), homing (explicit target or
@@ -12,7 +17,7 @@
 	cone bursts. Rendering can be offloaded to clients (Visualize = true): the
 	server keeps only the logic. Every projectile gets exactly two replication
 	events over its life -- ProjSpawn (once, with its full trajectory-determining
-	config) and ProjHit (once, on destroy). On top of that there are two
+	config) and ProjHit (once, on destroy). On top of that there are three
 	independent, orthogonal streaming mechanisms, each covering a different case
 	the client can't safely reproduce on its own:
 	 - Continuous sync while actively homing (self.HomingTarget ~= nil, checked
@@ -43,15 +48,32 @@
 	   physics baseline. Between bounces (and before the first one, and after
 	   the last one) the client is fully unsynced and coasts on local physics,
 	   just like a non-homing, non-bouncing shot.
-	These two mechanisms are independent and compose freely: a homing projectile
-	that also bounces stays continuously synced while locked (the bounce's
-	position/velocity is folded into that same stream) and, if it loses its lock
-	while bounces remain, drops to the bounce-only one-shot-correction mode
-	instead of going fully local. A bounce correction is always applied
-	unconditionally on receipt, whether or not the visual is currently in
-	continuous-sync mode. All client-side simulation is purely cosmetic; the
-	server always runs its own independent, authoritative Step, and any visual
-	drift is corrected the instant ProjHit snaps the final position.
+	 - A one-shot ProjTimeScale message every time a projectile's personal/local
+	   dilation actually CHANGES (Source.TimeScale * projectile.TimeScale --
+	   see "Local time" below), not a continuous stream: the client can't
+	   predict a ratio it's never been told, but once it knows the current
+	   number it can fold it straight into the same local ChunkManager.ScaleDt
+	   dead-reckoning every unsynced visual already does (see the render loop),
+	   exactly like it already does for chunk/world dilation (which similarly
+	   replicates as sparse chunk-scale updates, not a per-projectile stream).
+	   This used to be handled by forcing the projectile fully "synced" (see
+	   isSynced) for as long as either ratio held at non-1x, which meant a
+	   60/sec authoritative Position/Velocity stream PER slowed/sped-up
+	   projectile for its entire flight -- needlessly expensive, since the only
+	   thing the client was actually missing was the number itself, which
+	   almost never changes mid-flight.
+	These three mechanisms are independent and compose freely: a homing
+	projectile that also bounces stays continuously synced while locked (the
+	bounce's position/velocity is folded into that same stream) and, if it
+	loses its lock while bounces remain, drops to the bounce-only
+	one-shot-correction mode instead of going fully local. A bounce correction
+	is always applied unconditionally on receipt, whether or not the visual is
+	currently in continuous-sync mode; likewise a ProjTimeScale update always
+	applies unconditionally (a homing-synced visual just caches it for later,
+	in case its lock later drops). All client-side simulation is purely
+	cosmetic; the server always runs its own independent, authoritative Step,
+	and any visual drift is corrected the instant ProjHit snaps the final
+	position.
 
 	API:
 	 Projectile.new(config) -> projectile
@@ -59,6 +81,7 @@
 	 Projectile.EnableClientRendering()          -- call once on the client
 	 Projectile.SetImpactHandler(fn(position, normal, model))  -- client VFX hook
 	 Projectile.SetDebugRays(enabled)            -- default off; see debugRays below
+	 Projectile.SetDefaultMaxRealLifetime(seconds) -- default 60; see MaxRealLifetime below
 
 	 Query (server-only -- projectiles only ever live in the server's `active`
 	 list; see the module doc comment above. Every result is the LIVE
@@ -78,6 +101,40 @@
 
 	 projectile:SetTimeScale(scale)   -- clamped >= 0; see TimeScale below
 
+	 Events (Signal.luau -- see that module for the full API; :Connect(fn) ->
+	 Connection with :Disconnect()). There is no config.OnHit anymore: connect
+	 on the returned projectile instead, e.g.
+	   local proj = Projectile.new(config)
+	   proj.OnHit:Connect(function(hit) ... end)
+	 projectile.OnHit    -- fires on EVERY contact worth reporting: an entity
+	                         hit (piercing or final), a world bounce, a
+	                         successful wall-penetration, or a final world
+	                         stop. Does NOT fire for natural Lifetime/
+	                         MaxRealLifetime expiry (nothing was actually hit).
+	                         Listener receives one table:
+	                           { CFrame: CFrame, Part: BasePart, Entity: Entity? }
+	                         Entity is nil for a pure world/wall contact. The
+	                         module deals no damage itself anymore -- read
+	                         projectile.Damage * projectile.DamageMultiplier
+	                         (the latter already reflects PierceFalloff) and
+	                         apply it yourself, e.g. via hit.Entity:TakeDamage
+	                         or projectile.Source:DealDamage. This is what
+	                         makes per-projectile custom effects possible
+	                         (status effects, chain lightning, whatever) without
+	                         touching this module.
+	 projectile.OnDestroy -- fires exactly ONCE, whenever the projectile is
+	                         actually removed (entity kill shot, world stop,
+	                         bounces/penetration exhausted, or natural
+	                         expiry). Listener receives
+	                           { Position: Vector3, Normal: Vector3, Kind: string? }
+	                         Kind is "entity" | "world" | nil (nil covers both
+	                         a fizzled/expired shot and a bare Destroy() call).
+	                         Use this for exactly-once bookkeeping (e.g.
+	                         Shooter.server.luau's activeProjectileCount
+	                         decrement) -- OnHit is NOT exactly-once, since
+	                         piercing/bouncing/penetrating fire it without
+	                         destroying the projectile.
+
 	 config (all optional unless noted):
 	   Origin: Vector3          (required)
 	   Direction: Vector3       (required unless TargetPosition given)
@@ -86,11 +143,20 @@
 	   Acceleration = 0         (studs/s² along current velocity direction; negative decelerates)
 	   MinSpeed = 0, MaxSpeed = math.huge   (clamp for Acceleration)
 	   Lifetime = 5             (dilated seconds; no upper bound is enforced)
+	   MaxRealLifetime = 60     (real, undilated seconds -- a hard safety cap
+	              independent of Lifetime/TimeScale/chunk dilation; see
+	              DEFAULT_MAX_REAL_LIFETIME below. Fires even if this
+	              projectile's effective time is completely frozen, since
+	              Age itself would otherwise never advance)
 	   TimeScale = 1            (this projectile's OWN dilation, independent of
 	              Source -- see the "Local time" section below; live-mutable
 	              via projectile:SetTimeScale() or the field directly)
-	   Damage = 0
-	   Source = entity          (deals the damage; never hits itself)
+	   Damage = 0               (data only -- the module never deals damage
+	              itself anymore; read Damage * DamageMultiplier in your own
+	              projectile.OnHit listener and apply it yourself. Kept +
+	              still adjusted by PierceFalloff purely as a convenience so
+	              callers don't have to reimplement pierce falloff bookkeeping)
+	   Source = entity          (excluded from ever being hit; see IgnoreInstances)
 	   IgnoreInstances = {Instance} (raw instances the raycast/spherecast never
 	              hits, e.g. the shooter's character -- independent of Source,
 	              so self-hits stay impossible even if the firing entity hasn't
@@ -100,8 +166,14 @@
 	   Radius = 0               (>0 uses a spherecast)
 	   Bounces = 0              (world bounces before it dies; no upper bound is enforced)
 	   Restitution = 0.5        (velocity kept per bounce)
+	   Penetration = 0          (studs of wall material this projectile can punch
+	              through; see _attemptPenetration below. Tried BEFORE bouncing
+	              on a world hit; a wall thicker than the remaining Penetration
+	              blocks it, falling through to Bounces/destroy as normal.
+	              Persistent, depleting state -- punching through several thin
+	              walls in a row keeps consuming the same budget)
 	   MaxPierces = 0           (enemies passed through)
-	   PierceFalloff = 0        (damage lost per pierce, 0..1)
+	   PierceFalloff = 0        (damage lost per pierce, 0..1 -- see Damage above)
 	   Homing = { Target?, TargetTag?, TargetTags?, AcquireRadius?, Retarget?,
 	              ReacquireRate?, Permalock?, TurnRate = rad/s, Delay = 0 }
 	              -- TargetTags (plural, list of strings) matches any tag in the
@@ -114,8 +186,7 @@
 	   Visualize = false, VisualRange = math.huge
 	   Model = Instance?        (cloned client-side) or Visual = {Shape,Size,Color}
 	   DestroyDelay = 0         (client keeps the visual this long after impact)
-	   OnHit = fn(projectile, result, hitEntity?)
-	   OnBounce = fn(projectile, result)
+	   OnBounce = fn(projectile, result)   -- still config-driven, unlike OnHit (see Events above)
 	   RewindSeconds = 0        (lag compensation; see below)
 
 	 Lag compensation: when RewindSeconds > 0 (set by Shooter.server.luau from the
@@ -150,16 +221,19 @@
 	 rather than overriding it, and always reflects whatever either was most
 	 recently set to -- there's no snapshotting anywhere in this chain.
 
-	 Because the client can't predict a live-changing ratio on its own (an
+	 The client can't predict a live-changing ratio it was never told about (an
 	 ability's radius check, or another player's personal TimeScale, aren't
-	 replicated to observers), a projectile whose Source.TimeScale ~= 1 OR
-	 whose own TimeScale ~= 1 is treated as "synced" exactly like an
-	 actively-homing one -- see isSynced below -- so the server streams its
-	 authoritative Position/Velocity every tick for as long as that holds, and
-	 the client just renders the stream instead of dead-reckoning. The instant
-	 both ratios are back to 1x, streaming stops and the client falls back to
-	 local physics (which needs no scale correction at that point, since 1x is
-	 the client's implicit default).
+	 otherwise replicated to observers) -- but it doesn't need continuous
+	 position streaming to use one once it knows it. Every Step, the server
+	 diffs the combined Source.TimeScale * projectile.TimeScale against the
+	 last value it streamed for that projectile and, only on an actual change,
+	 sends a single small ProjTimeScale { Id, TimeScale } message (see
+	 spawnVisual for the initial value and Step for the on-change check). The
+	 client stores that number per visual and multiplies it straight into its
+	 existing local ChunkManager.ScaleDt dead-reckoning (see the render loop),
+	 the same way it already accounts for chunk/world dilation. This is
+	 unrelated to isSynced/homing, which is still the one case that genuinely
+	 needs a continuous authoritative stream (see above).
 ]]
 
 local RunService = game:GetService("RunService")
@@ -170,6 +244,7 @@ local Heartbeat = require(script.Parent.Heartbeat)
 local ChunkManager = require(script.Parent.ChunkManager)
 local Entity = require(script.Parent.Entity)
 local VisualOffload = require(script.Parent.VisualOffload)
+local Signal = require(script.Parent.Signal)
 
 local Projectile = {}
 Projectile.__index = Projectile
@@ -210,6 +285,20 @@ local _syncMoveStats = { batches = 0, entries = 0 }
 local HIGH_RES_STEP = 4 -- studs per raycast near entities
 local LOW_RES_STEP = 64 -- studs per raycast in empty space
 local MAX_SUBSTEPS = 16
+
+-- Hard real-time (wall-clock, undilated) cap on how long any projectile can
+-- stay alive, regardless of its own dilated Lifetime/Age. A projectile whose
+-- effective time is frozen (its Source's personal ratio, its own TimeScale,
+-- or the chunk it's sitting in all read as 0 -- see Step) never advances Age,
+-- so the normal Lifetime expiry alone would let it live in `active` forever.
+-- Checked every Step via os.clock(), independent of dt. Per-shot override via
+-- config.MaxRealLifetime; change the default for every future shot with
+-- Projectile.SetDefaultMaxRealLifetime.
+local DEFAULT_MAX_REAL_LIFETIME = 60 -- real seconds
+
+function Projectile.SetDefaultMaxRealLifetime(seconds: number)
+	DEFAULT_MAX_REAL_LIFETIME = math.max(seconds, 0)
+end
 
 --------------------------------------------------------------------------------
 -- Geometry helpers
@@ -432,24 +521,25 @@ end
 -- corrected with its own one-shot ProjMove entry (Bounced = true) sent the
 -- instant it happens (see _resolveHit), not by holding the projectile synced
 -- for its whole remaining life. A projectile with bounces remaining (or that
--- has already bounced) but no active homing lock and a Source at 1x personal
--- time is therefore NOT continuously synced -- it coasts on local physics
--- between bounces like any other unsynced shot, and only gets snapped at the
--- moment each bounce occurs.
---
--- The TimeScale/Source.TimeScale ~= 1 checks mirror homing for the same
--- reason: the client has no replicated view of an ability's live radius
--- effect or another player's live personal ratio, so it can't dead-reckon a
--- speed it doesn't know -- see the module doc comment's "Local time" section.
+-- has already bounced) but no active homing lock is therefore NOT
+-- continuously synced -- it coasts on local physics between bounces like any
+-- other unsynced shot, and only gets snapped at the moment each bounce
+-- occurs. It also deliberately excludes Source.TimeScale/projectile.TimeScale
+-- -- those no longer force a continuous stream (see ProjTimeScale / the
+-- module doc comment's "Local time" section): the client just needs to KNOW
+-- the current ratio, not be streamed a live position because of it.
 local function isSynced(projectile): boolean
-	if projectile.HomingTarget ~= nil then
-		return true
-	end
-	if projectile.TimeScale ~= 1 then
-		return true
-	end
+	return projectile.HomingTarget ~= nil
+end
+
+-- world/chunk dilation is applied separately (ChunkManager.ScaleDt, replicated
+-- to clients on its own); this is just the shooter's personal ratio times
+-- this specific projectile's own local ratio -- see the module doc comment's
+-- "Local time" section. Read live, never snapshotted.
+local function combinedTimeScale(projectile): number
 	local source = projectile.Source
-	return source ~= nil and source.TimeScale ~= 1
+	local sourceScale = (source and source.TimeScale) or 1
+	return sourceScale * projectile.TimeScale
 end
 
 local function spawnVisual(projectile)
@@ -465,14 +555,24 @@ local function spawnVisual(projectile)
 		MinSpeed = projectile.MinSpeed,
 		MaxSpeed = projectile.MaxSpeed,
 		Lifetime = projectile.Lifetime,
-		-- Whether it starts out continuously synced -- true for an explicit
-		-- Homing.Target given at construction, or a Source already at a
-		-- non-1x personal time ratio when fired (see isSynced / the module
-		-- doc comment's "Personal time" section; auto-acquire homing starts
-		-- unsynced until it actually locks onto something). If true, the
-		-- client starts in "trust the stream" mode immediately; the server's
-		-- step loop below will include it in the very next ProjMove batch.
+		-- Whether it starts out continuously synced -- true only for an
+		-- explicit Homing.Target given at construction (auto-acquire homing
+		-- starts unsynced until it actually locks onto something). If true,
+		-- the client starts in "trust the stream" mode immediately; the
+		-- server's step loop below will include it in the very next ProjMove
+		-- batch.
 		Synced = isSynced(projectile),
+		-- Initial combined Source.TimeScale * projectile.TimeScale, so the
+		-- client's local dead-reckoning is correct from frame one even if
+		-- this shot was fired while the shooter's ratio was already off 1x --
+		-- see ProjTimeScale / the module doc comment's "Local time" section.
+		TimeScale = projectile._lastStreamedTimeScale,
+		-- Real (undilated) safety cap -- see MaxRealLifetime / the module doc
+		-- comment. Lets the client independently self-destroy the visual as a
+		-- backstop even if it never receives this projectile's ProjHit (e.g.
+		-- it drifted outside VisualRange), rather than being able to leak a
+		-- frozen visual forever -- see the render loop below.
+		MaxRealLifetime = projectile.MaxRealLifetime,
 		Model = projectile.Model,
 		Visual = projectile.Visual,
 		DestroyDelay = projectile.DestroyDelay,
@@ -563,6 +663,11 @@ function Projectile.new(config)
 
 		Lifetime = config.Lifetime or 5,
 		Age = 0,
+		-- Hard real-time (wall-clock) safety cap -- see
+		-- DEFAULT_MAX_REAL_LIFETIME above. _spawnRealTime is os.clock() at
+		-- construction, checked every Step regardless of dt/freeze state.
+		MaxRealLifetime = math.max(config.MaxRealLifetime or DEFAULT_MAX_REAL_LIFETIME, 0),
+		_spawnRealTime = os.clock(),
 		-- This projectile's OWN dilation, independent of Source -- see the
 		-- module doc comment's "Local time" section. Live-mutable directly or
 		-- via :SetTimeScale(); read live every Step, never snapshotted.
@@ -576,6 +681,10 @@ function Projectile.new(config)
 
 		BouncesLeft = bounces,
 		Restitution = config.Restitution or 0.5,
+		-- Depleting budget of wall material this projectile can still punch
+		-- through -- see _attemptPenetration / the module doc comment's
+		-- config section. Tried before bouncing on a world hit.
+		Penetration = math.max(config.Penetration or 0, 0),
 
 		PiercesLeft = config.MaxPierces or 0,
 		PierceFalloff = config.PierceFalloff or 0,
@@ -591,7 +700,10 @@ function Projectile.new(config)
 		Visual = config.Visual,
 		DestroyDelay = config.DestroyDelay or 0,
 
-		OnHit = config.OnHit,
+		-- See "Events" in the module doc comment's API section. Fresh Signal
+		-- per projectile -- connect on the returned instance, not via config.
+		OnHit = Signal.new(),
+		OnDestroy = Signal.new(),
 		OnBounce = config.OnBounce,
 
 		RewindSeconds = config.RewindSeconds or 0,
@@ -611,6 +723,10 @@ function Projectile.new(config)
 	}, Projectile)
 	self._rayParams = buildRayParams(self)
 	self._streamedSynced = isSynced(self)
+	-- Baseline for the ProjTimeScale on-change check in Step -- see
+	-- combinedTimeScale / the module doc comment's "Local time" section.
+	-- Computed before spawnVisual so ProjSpawn's TimeScale field matches.
+	self._lastStreamedTimeScale = combinedTimeScale(self)
 
 	table.insert(active, self)
 	spawnVisual(self)
@@ -632,6 +748,23 @@ function Projectile:_checkSyncTransition()
 			print(`[Relativity][sync] ProjSync Id={self.Id} Synced={synced} (BouncesLeft={self.BouncesLeft} Homing={self.HomingTarget ~= nil})`)
 		end
 		streamTo(self, "ProjSync", { Id = self.Id, Synced = synced })
+	end
+end
+
+-- Tells rendering clients only when the combined Source.TimeScale *
+-- projectile.TimeScale actually CHANGES -- not every frame. This is what
+-- replaced continuously streaming Position/Velocity for the whole flight of
+-- any personal/local-time-affected projectile (see the module doc comment's
+-- "Local time" section): the client just needs the number, which in the
+-- common case (nobody touched it after firing) never changes again after
+-- ProjSpawn, so this fires zero extra times per shot instead of 60/sec.
+function Projectile:_checkTimeScaleChange(combinedScale: number)
+	if combinedScale ~= self._lastStreamedTimeScale then
+		self._lastStreamedTimeScale = combinedScale
+		if debugSync then
+			print(`[Relativity][sync] ProjTimeScale Id={self.Id} TimeScale={combinedScale}`)
+		end
+		streamTo(self, "ProjTimeScale", { Id = self.Id, TimeScale = combinedScale })
 	end
 end
 
@@ -704,17 +837,17 @@ end
 -- Per-projectile step
 --------------------------------------------------------------------------------
 
-function Projectile:_dealDamage(entity, result)
-	local damage = self.Damage * self.DamageMultiplier
-	if damage <= 0 then
-		return
-	end
-	local info = { Type = "Projectile", Source = self.Source, Position = result.Position }
-	if self.Source and self.Source.DealDamage then
-		self.Source:DealDamage(entity, damage, info)
-	else
-		entity:TakeDamage(damage, info)
-	end
+-- Builds the { CFrame, Part, Entity? } table passed to every projectile.OnHit
+-- listener -- see the module doc comment's "Events" section. `result` is a
+-- RaycastResult (or an equivalent plain table shape for a bounce/penetration
+-- point); entity is nil for a pure world/wall contact.
+local function buildHitInfo(result, entity)
+	local normal = result.Normal and safeUnit(result.Normal, Vector3.zAxis) or Vector3.zAxis
+	return {
+		CFrame = CFrame.lookAt(result.Position, result.Position + normal),
+		Part = result.Instance,
+		Entity = entity,
+	}
 end
 
 -- Broadcasts a single movement raycast segment for debug visualization.
@@ -740,10 +873,7 @@ function Projectile:_resolveEntityHit(entity, result): string?
 		return nil -- fallthrough: filtered out, treat like world geometry
 	end
 
-	self:_dealDamage(entity, result)
-	if self.OnHit then
-		task.spawn(self.OnHit, self, result, entity)
-	end
+	self.OnHit:Fire(buildHitInfo(result, entity))
 	if self.PiercesLeft > 0 then
 		self.PiercesLeft -= 1
 		self.DamageMultiplier *= (1 - self.PierceFalloff)
@@ -771,6 +901,21 @@ function Projectile:_resolveHit(result)
 			return verdict
 		end
 		-- fallthrough (filtered out): treat like world geometry below
+	end
+
+	-- world geometry (or a filtered-out entity): try to punch straight through
+	-- before considering a bounce -- see _attemptPenetration / the module doc
+	-- comment's config section.
+	if self.Penetration > 0 then
+		local exitPosition = self:_attemptPenetration(result)
+		if exitPosition then
+			self.OnHit:Fire(buildHitInfo(result, entity))
+			self.Position = exitPosition
+			return "continue"
+		end
+		-- Blocked (wall thicker than remaining Penetration): fall through to
+		-- the normal bounce/destroy resolution below, same as if Penetration
+		-- had been 0 all along.
 	end
 
 	-- world geometry (or a filtered-out entity): bounce if we can
@@ -824,14 +969,59 @@ function Projectile:_resolveHit(result)
 		if self.OnBounce then
 			task.spawn(self.OnBounce, self, result)
 		end
+		self.OnHit:Fire(buildHitInfo(result, entity))
 		return "continue"
 	end
 
-	if self.OnHit then
-		task.spawn(self.OnHit, self, result, entity)
-	end
+	self.OnHit:Fire(buildHitInfo(result, entity))
 	self:Destroy(result, "world")
 	return "destroy"
+end
+
+-- Attempts to punch this projectile through the wall it just hit. Probes a
+-- point Penetration studs further along the ray past the entry point, then
+-- raycasts BACKWARD from that probe to the entry point, whitelisted to ONLY
+-- the part that was just hit:
+--  - Hit (not nil): the probe already crossed back into the SAME part from
+--    outside it, meaning the wall's far/exit surface is somewhere between the
+--    probe and the entry point -- i.e. the wall is thinner than the current
+--    Penetration budget. The distance from the entry point to that exit
+--    surface is the wall's actual thickness; that amount (not the probe
+--    distance) is subtracted from Penetration, since a thin wall should
+--    barely dent the budget and a thick one should nearly exhaust it.
+--  - Nil: the probe point is still INSIDE the wall's solid (Roblox raycasts
+--    never register a hit against a part the ray starts inside of), meaning
+--    the wall is thicker than the entire Penetration budget -- can't punch
+--    through at all.
+-- Returns the position just past the exit surface on success, or nil if
+-- blocked (caller falls through to bounce/destroy as normal).
+function Projectile:_attemptPenetration(result): Vector3?
+	local instance = result.Instance
+	if not instance then
+		return nil
+	end
+
+	local direction = safeUnit(self.Velocity, Vector3.zAxis)
+	local probeOrigin = result.Position + direction * self.Penetration
+
+	local probeParams = RaycastParams.new()
+	probeParams.FilterType = Enum.RaycastFilterType.Include
+	probeParams.FilterDescendantsInstances = { instance }
+
+	local probeResult = workspace:Raycast(probeOrigin, result.Position - probeOrigin, probeParams)
+	if not probeResult then
+		return nil
+	end
+
+	local thickness = (probeResult.Position - result.Position).Magnitude
+	self.Penetration -= thickness
+	if self.Penetration < 0 then
+		-- Ran out of power exactly on this wall -- treat as blocked, same as
+		-- the nil case above.
+		return nil
+	end
+
+	return probeResult.Position + direction * (self.Radius + 0.1)
 end
 
 -- Lag-compensated entity check for one movement substep. Only meaningful while
@@ -960,10 +1150,30 @@ function Projectile:_updateHoming(dt: number)
 	self.Velocity = newDir * speed
 end
 
+-- Shared "died of natural causes, nothing was actually hit" path -- dilated
+-- Lifetime expiry and the real-time MaxRealLifetime cap below both fizzle out
+-- the same way. Deliberately does NOT fire OnHit (there was no contact to
+-- report -- see the module doc comment's "Events" section); OnDestroy still
+-- fires exactly once, from Destroy(), which the outer server step loop calls
+-- once Step() returns false here, same as any other removal.
+function Projectile:_expire(): boolean
+	return false
+end
+
 -- Advances the projectile; returns false when it should be removed.
 function Projectile:Step(globalDt: number): boolean
 	if self.Dead then
 		return false
+	end
+
+	-- Hard real-time cap, checked unconditionally every tick via os.clock()
+	-- BEFORE anything dt-dependent -- this is the one expiry check that MUST
+	-- run even while the projectile is completely frozen (combinedScale/chunk
+	-- dt at 0 below), since Age itself never advances in that state and the
+	-- dilated Lifetime check further down would otherwise never fire. See
+	-- MaxRealLifetime / DEFAULT_MAX_REAL_LIFETIME above.
+	if os.clock() - self._spawnRealTime >= self.MaxRealLifetime then
+		return self:_expire()
 	end
 
 	-- Reset every tick so a stale true from a previous bounce never leaks into
@@ -976,19 +1186,21 @@ function Projectile:Step(globalDt: number): boolean
 	-- personal-time slider or an ability tweaking this specific projectile's
 	-- TimeScale mid-flight takes effect immediately -- see the module doc
 	-- comment's "Local time" section.
-	local sourceScale = (self.Source and self.Source.TimeScale) or 1
-	local dt = ChunkManager.ScaleDt(globalDt, self.Position) * sourceScale * self.TimeScale
+	local combinedScale = combinedTimeScale(self)
+	-- Checked BEFORE the dt<=0 early return below, so a ratio change that
+	-- freezes the projectile entirely (combinedScale hits 0) still reaches
+	-- the client -- otherwise a frozen shot would silently keep whatever
+	-- stale TimeScale it last streamed. See ProjTimeScale / the module doc
+	-- comment's "Local time" section.
+	self:_checkTimeScaleChange(combinedScale)
+	local dt = ChunkManager.ScaleDt(globalDt, self.Position) * combinedScale
 	if dt <= 0 then
 		return true -- frozen chunk / paused / shooter or projectile frozen: keep it alive, don't move it
 	end
 
 	self.Age += dt
 	if self.Age >= self.Lifetime then
-		local result = { Position = self.Position, Normal = Vector3.yAxis, Instance = nil }
-		if self.OnHit then
-			task.spawn(self.OnHit, self, result, nil)
-		end
-		return false
+		return self:_expire()
 	end
 
 	self:_updateHoming(dt)
@@ -1078,7 +1290,7 @@ function Projectile:Step(globalDt: number): boolean
 				if verdict == "destroy" then
 					return false
 				end
-				-- pierce/bounce/ignore already advanced self.Position past the surface
+				-- pierce/bounce/penetrate/ignore already advanced self.Position past the surface
 				remaining -= stepDt
 			end
 		end
@@ -1099,11 +1311,20 @@ function Projectile:Destroy(result, kind: string?)
 	end
 	streamTo(self, "ProjHit", { Id = self.Id, Position = hitResult.Position, Normal = hitResult.Normal, Kind = kind })
 
+	-- Exactly-once -- see the module doc comment's "Events" section. Fired
+	-- here (not in _resolveEntityHit/_resolveHit/_expire) so EVERY removal
+	-- path funnels through the same single call, including natural Lifetime/
+	-- MaxRealLifetime expiry (which calls Destroy() from the outer server
+	-- step loop, not from here).
+	self.OnDestroy:Fire({ Position = hitResult.Position, Normal = hitResult.Normal, Kind = kind })
+
 	-- Defensive: drop heavy references so a projectile object that somehow
 	-- outlives removal from `active` (e.g. a future caller retaining the
 	-- returned handle) doesn't keep entities/closures alive through it.
 	table.clear(self._ignore)
 	self.HomingTarget = nil
+	self.OnHit:Destroy()
+	self.OnDestroy:Destroy()
 end
 
 --------------------------------------------------------------------------------
@@ -1303,7 +1524,7 @@ local function buildVisualModel(data): Instance
 		else
 			part.Size = Vector3.one * 0.4
 			part.Color = Color3.fromRGB(255, 220, 120)
-		ends
+		end
 		part.Material = Enum.Material.Neon
 		model = part
 	end
@@ -1311,13 +1532,13 @@ local function buildVisualModel(data): Instance
 		for _, part in { model, table.unpack(model:GetDescendants()) } do
 
 			if part:IsA("BasePart") then
-				if part == model.PrimaryPart then
-					part.Anchored = true
-				else
-					part.Anchored = false
-
-				end
-				--part.Anchored = part == model.PrimaryPart <-- clever? might try later but this works 4 now
+				--if part == model.PrimaryPart then
+				--	part.Anchored = true
+				--else
+				--	part.Anchored = false
+--
+				--end
+				part.Anchored = part == model.PrimaryPart --<-- clever? might try later but this works 4 now
 				part.CanCollide = false
 				part.CanQuery = false
 				part.CanTouch = false
@@ -1419,7 +1640,29 @@ function Projectile.EnableClientRendering()
 			life = data.Lifetime or 5,
 
 			synced = data.Synced == true,
+			-- Combined Source.TimeScale * projectile.TimeScale at spawn time;
+			-- updated live via ProjTimeScale below, folded into the unsynced
+			-- render loop's local dead-reckoning -- see the module doc
+			-- comment's "Local time" section.
+			timeScale = data.TimeScale or 1,
+			-- Real (undilated) safety-net cap -- see MaxRealLifetime / the
+			-- render loop below. spawnRealTime is THIS client's own os.clock()
+			-- at spawn, not the server's -- fine, since this only needs to be
+			-- a generous backstop, not an exact match to the server's own cap.
+			spawnRealTime = os.clock(),
+			maxRealLifetime = data.MaxRealLifetime or DEFAULT_MAX_REAL_LIFETIME,
 		}
+	end)
+
+	-- Fires only when the combined personal/local TimeScale actually changes
+	-- (see Projectile:_checkTimeScaleChange) -- not a per-frame stream. The
+	-- client just needed to know the number; from here it predicts locally
+	-- exactly like it already does for chunk/world dilation.
+	VisualOffload.On("ProjTimeScale", function(data)
+		local visual = visuals[data.Id]
+		if visual then
+			visual.timeScale = data.TimeScale
+		end
 	end)
 
 	-- Sync state changed (homing lock acquired/dropped, or bounces just ran
@@ -1515,6 +1758,20 @@ function Projectile.EnableClientRendering()
 	-- drift is corrected the instant ProjHit snaps the final position.
 	Heartbeat.Connect(function(globalDt)
 		for id, visual in visuals do
+			-- Real (undilated) backstop, checked unconditionally before the
+			-- synced/unsynced split below -- mirrors the server's own
+			-- MaxRealLifetime check (see Step). Primarily this is redundant
+			-- with ProjHit already destroying the visual the instant the
+			-- server actually expires it; this exists purely as a client-only
+			-- fallback in case that message is ever missed (e.g. the visual
+			-- drifted outside VisualRange), so a visual can never linger
+			-- forever regardless of dt/freeze state -- same reasoning as the
+			-- server-side fix this mirrors.
+			if os.clock() - visual.spawnRealTime >= visual.maxRealLifetime then
+				destroyVisual(id)
+				continue
+			end
+
 			if visual.synced then
 				-- Position/velocity/pose come from ProjMove; the only thing
 				-- that runs here is a left-VisualRange safety net. This is
@@ -1537,11 +1794,12 @@ function Projectile.EnableClientRendering()
 				continue
 			end
 
-			-- No personal-scale factor needed here: whenever the Source's
-			-- ratio isn't 1x, the projectile is synced (see isSynced / the
-			-- module doc comment's "Personal time" section) and hits the
-			-- branch above instead -- position comes from the ProjMove stream.
-			local dt = ChunkManager.ScaleDt(globalDt, visual.position)
+			-- visual.timeScale is the combined Source.TimeScale *
+			-- projectile.TimeScale, kept current via the (rare, on-change
+			-- only) ProjTimeScale handler above -- see the module doc
+			-- comment's "Local time" section. This mirrors the server's own
+			-- Step exactly: ChunkManager.ScaleDt(globalDt, pos) * combinedScale.
+			local dt = ChunkManager.ScaleDt(globalDt, visual.position) * visual.timeScale
 			if dt > 0 then
 				if visual.acceleration ~= 0 then
 					local speed = visual.velocity.Magnitude

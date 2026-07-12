@@ -44,11 +44,34 @@
 	 Config props (all optional, passed in `props`; everything else in props is
 	 copied onto the entity as custom data):
 	   Health / MaxHealth (numbers)
-	   HitboxRadius (number, default 2 — padding used by spatial queries)
+	   HitboxRadius (number, default 2 — Body/Torso hurtbox radius)
+	   HeadRadius (number, default Entity.HeadRadius — Head hurtbox radius)
+	   HeadshotMultiplier (number, default Entity.HeadshotMultiplier)
+	   HeadOffset / BodyOffset (Vector3, default zero — manual nudge on top of
+	              the auto-calibrated Head position / the root position, for
+	              rigs where the automatic placement isn't quite right)
 	   TimeScale (number, default 1)
 	   ScaleHumanoid (boolean — scale WalkSpeed/JumpPower with time dilation)
 	   DestroyOnDeath (boolean — auto :Destroy() when Died fires)
 	   Team / anything else -> stored as custom variables
+
+	 Head + Body hurtboxes: purely data, no extra Instances -- every humanoid
+	 entity has an independent Head sphere (radius HeadRadius) and Body sphere
+	 (radius HitboxRadius), see entity:GetHeadPosition() / :GetBodyPosition()
+	 (live) and :GetHeadPositionAt(t) / :GetBodyPositionAt(t) (rewound). The
+	 two spheres are NOT required to nest or overlap -- HeadRadius,
+	 HitboxRadius, HeadOffset and BodyOffset are independent knobs, each
+	 applied as configured with no cross-clamping (an earlier version
+	 auto-clamped HeadRadius to force geometric nesting; that was removed --
+	 it existed only to support a since-abandoned physical-raycast design and
+	 was silently zeroing HeadRadius out for any BodyOffset/HitboxRadius
+	 combination it didn't like). Projectile.luau's lag-compensated rewind
+	 check tests both spheres directly against these positions (Head first);
+	 its live raycast path classifies a hit as "Head" by checking whether the
+	 hit point falls within HeadRadius of GetHeadPosition() (real rig
+	 geometry is untouched -- no CanQuery/CollisionGroup tricks, since
+	 CollisionGroup-based hiding was tried and reverted after it broke
+	 player-vs-floor collision).
 
 	 Position history (for lag-compensated hit detection, see Projectile.luau):
 	 every entity's real-world position is sampled on a real-time (not dilated)
@@ -89,6 +112,14 @@ Entity.ShowHurtboxHistory = false
 -- project's Shooter.server.luau MAX_REWIND by default so the debug view reflects
 -- what's actually usable; tune to taste if that budget changes.
 Entity.HurtboxValidWindow = 0.3
+
+-- Head hurtbox defaults (see the module doc comment's "Hurtbox debug
+-- visualization" section and GetHeadPosition/GetBodyPosition below). Copied
+-- onto each entity at construction (like HitboxRadius already is), so a
+-- prop override (props.HeadRadius / props.HeadshotMultiplier) still works
+-- per-entity without touching these globals.
+Entity.HeadRadius = 1.5 -- studs; independent of HitboxRadius, no nesting requirement
+Entity.HeadshotMultiplier = 2 -- damage multiplier applied by Shooter.server.luau on a Head hit
 
 local entities = {} -- flat array for fast iteration
 local entityIndex = {} -- [entity] = array index (O(1) swap-remove)
@@ -131,7 +162,11 @@ function Entity.new(instance: Instance?, props: { [string]: any }?)
 		Humanoid = nil,
 		Health = 100,
 		MaxHealth = 100,
-		HitboxRadius = 3,
+		HitboxRadius = 2,
+		HeadRadius = Entity.HeadRadius,
+		HeadshotMultiplier = Entity.HeadshotMultiplier,
+		HeadOffset = Vector3.zero, -- manual nudge on top of the auto-calibrated head offset
+		BodyOffset = Vector3.new(0, -1, 0), -- manual nudge on top of the root position
 		TimeScale = 1,
 		ScaleHumanoid = false,
 		DestroyOnDeath = false,
@@ -144,6 +179,7 @@ function Entity.new(instance: Instance?, props: { [string]: any }?)
 
 		_position = Vector3.zero, -- used when there is no instance
 		_root = nil :: BasePart?,
+		_headOffset = nil :: Vector3?, -- auto-calibrated Head-relative-to-root offset; nil if no Head part
 		_chunk = nil,
 		_updateFns = {},
 		_damageModifiers = {},
@@ -172,6 +208,21 @@ function Entity.new(instance: Instance?, props: { [string]: any }?)
 				self.MaxHealth = humanoid.MaxHealth
 				self._baseWalkSpeed = humanoid.WalkSpeed
 				self._baseJumpPower = humanoid.UseJumpPower and humanoid.JumpPower or humanoid.JumpHeight
+				self._root = humanoid.RootPart
+
+				-- Auto-calibrated Head offset, measured once at spawn (see
+				-- entity:GetHeadPosition() / HeadOffset). Self-calibrates to
+				-- whatever rig/scale this instance actually has instead of a
+				-- hardcoded magic number. Bounded WaitForChild, not a plain
+				-- FindFirstChild -- a live player's accessories/appearance can
+				-- still be streaming in when CharacterAdded fires (the same
+				-- class of race humanoid.RootPart above already guards
+				-- against for the root), so Head may not exist on the very
+				-- first frame yet.
+				local head = instance:FindFirstChild("Head") or instance:WaitForChild("Head", 2)
+				if head and head:IsA("BasePart") and self._root then
+					self._headOffset = head.Position - self._root.Position
+				end
 
 				table.insert(
 					self._instanceConnections,
@@ -312,6 +363,25 @@ function Entity:GetPositionAt(time: number): Vector3
 	return before.Position:Lerp(after.Position, alpha)
 end
 
+-- Rewound Body hurtbox center at real time `time` -- GetPositionAt() plus
+-- the manual BodyOffset nudge, matching GetBodyPosition()'s live equivalent.
+function Entity:GetBodyPositionAt(time: number): Vector3
+	return self:GetPositionAt(time) + self.BodyOffset
+end
+
+-- Rewound Head hurtbox center at real time `time`, or nil if this entity has
+-- no Head hurtbox. Only the tracked root position is actually rewound; the
+-- auto-calibrated/manual offsets are applied on top of that (rotation isn't
+-- tracked, matching the rest of this system) -- same approximation as the
+-- live GetHeadPosition().
+function Entity:GetHeadPositionAt(time: number): Vector3?
+	local headOffset = self._headOffset
+	if not headOffset then
+		return nil
+	end
+	return self:GetPositionAt(time) + headOffset + self.HeadOffset
+end
+
 function Entity:GetPosition(): Vector3
 	local root = self._root
 	if root and root.Parent then
@@ -330,6 +400,26 @@ function Entity:SetPosition(position: Vector3)
 	else
 		self._position = position
 	end
+end
+
+-- Center of the Body/Torso hurtbox -- GetPosition() plus the manual nudge
+-- (BodyOffset). This is what the Body hurtbox sphere (live + debug) and
+-- Projectile.luau's rewind check use; unrelated systems (homing, AOE,
+-- ChunkManager) keep using plain GetPosition().
+function Entity:GetBodyPosition(): Vector3
+	return self:GetPosition() + self.BodyOffset
+end
+
+-- Center of the Head hurtbox, or nil if this entity has no Head part (a
+-- non-humanoid entity, or a humanoid rig with no Head child at construction
+-- time). GetPosition() plus the auto-calibrated offset plus the manual
+-- nudge (HeadOffset).
+function Entity:GetHeadPosition(): Vector3?
+	local headOffset = self._headOffset
+	if not headOffset then
+		return nil
+	end
+	return self:GetPosition() + headOffset + self.HeadOffset
 end
 
 function Entity:GetChunk()
@@ -655,8 +745,10 @@ if RunService:IsServer() then
 					if not entity.IsDestroyed then
 						table.insert(snapshot, {
 							Id = entity.Id,
-							Position = entity:GetPosition(),
+							Position = entity:GetBodyPosition(),
 							Radius = entity.HitboxRadius,
+							HeadPosition = entity:GetHeadPosition(),
+							HeadRadius = entity.HeadRadius,
 						})
 					end
 				end
@@ -689,18 +781,21 @@ if RunService:IsServer() then
 	end)
 end
 
-local hurtboxParts: { [number]: BasePart }? = nil -- [entity Id] = debug sphere
+local HURTBOX_BODY_COLOR = Color3.fromRGB(255, 90, 90)
+local HURTBOX_HEAD_COLOR = Color3.fromRGB(255, 170, 60)
 
-local function ensureHurtboxPart(id: number): BasePart
-	local part = hurtboxParts[id]
+local hurtboxParts: { [string]: BasePart }? = nil -- ["{id}_Body" | "{id}_Head"] = debug sphere
+
+local function ensureHurtboxPart(key: string, color: Color3): BasePart
+	local part = hurtboxParts[key]
 	if part then
 		return part
 	end
 	part = Instance.new("Part")
-	part.Name = `Hurtbox_{id}`
+	part.Name = `Hurtbox_{key}`
 	part.Shape = Enum.PartType.Ball
 	part.Material = Enum.Material.ForceField
-	part.Color = Color3.fromRGB(255, 90, 90)
+	part.Color = color
 	part.Transparency = 0.55
 	part.Anchored = true
 	part.CanCollide = false
@@ -708,14 +803,15 @@ local function ensureHurtboxPart(id: number): BasePart
 	part.CanTouch = false
 	part.CastShadow = false
 	part.Parent = workspace
-	hurtboxParts[id] = part
+	hurtboxParts[key] = part
 	return part
 end
 
 local hurtboxRenderingEnabled = false
 
--- Call once on the client to draw every entity's hurtbox whenever
--- Entity.ShowHurtboxes is true on the server. No-ops on the server.
+-- Call once on the client to draw every entity's Body (+ Head, if present)
+-- hurtbox whenever Entity.ShowHurtboxes is true on the server. No-ops on the
+-- server.
 function Entity.EnableHurtboxRendering()
 	if hurtboxRenderingEnabled or RunService:IsServer() then
 		return
@@ -724,17 +820,26 @@ function Entity.EnableHurtboxRendering()
 	hurtboxParts = {}
 
 	VisualOffload.On("HurtboxSnapshot", function(snapshot)
-		local seen: { [number]: boolean } = {}
+		local seen: { [string]: boolean } = {}
 		for _, info in snapshot do
-			seen[info.Id] = true
-			local part = ensureHurtboxPart(info.Id)
-			part.Size = Vector3.one * (info.Radius * 2)
-			part.Position = info.Position
+			local bodyKey = `{info.Id}_Body`
+			seen[bodyKey] = true
+			local body = ensureHurtboxPart(bodyKey, HURTBOX_BODY_COLOR)
+			body.Size = Vector3.one * (info.Radius * 2)
+			body.Position = info.Position
+
+			if info.HeadPosition then
+				local headKey = `{info.Id}_Head`
+				seen[headKey] = true
+				local head = ensureHurtboxPart(headKey, HURTBOX_HEAD_COLOR)
+				head.Size = Vector3.one * (info.HeadRadius * 2)
+				head.Position = info.HeadPosition
+			end
 		end
-		for id, part in hurtboxParts do
-			if not seen[id] then
+		for key, part in hurtboxParts do
+			if not seen[key] then
 				part:Destroy()
-				hurtboxParts[id] = nil
+				hurtboxParts[key] = nil
 			end
 		end
 	end)

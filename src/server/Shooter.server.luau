@@ -213,15 +213,20 @@ VisualOffload.On("FireBullet", function(data, player)
 	-- "Events" doc section) -- this replicates the exact damage behavior that
 	-- used to live in Projectile:_dealDamage, just from the caller side now.
 	-- DamageMultiplier already reflects PierceFalloff, applied live per pierce.
+	-- hit.Hurtbox ("Head" | "Body" | nil, see Entity.luau's "Head + Body
+	-- hurtboxes" section) applies the target's own HeadshotMultiplier on top.
 	proj.OnHit:Connect(function(hit)
 		if not hit.Entity then
 			return
 		end
 		local damage = proj.Damage * proj.DamageMultiplier
+		if hit.Hurtbox == "Head" then
+			damage *= hit.Entity.HeadshotMultiplier
+		end
 		if damage <= 0 then
 			return
 		end
-		local info = { Type = "Projectile", Source = shooter, Position = hit.CFrame.Position }
+		local info = { Type = "Projectile", Source = shooter, Position = hit.CFrame.Position, Hurtbox = hit.Hurtbox }
 		if shooter and shooter.DealDamage then
 			shooter:DealDamage(hit.Entity, damage, info)
 		else
