@@ -93,13 +93,13 @@ Entity.__index = Entity
 
 -- Position-history tuning (real seconds, not dilated) -- see GetPositionAt below.
 Entity.HistoryWindow = 0.5 -- how far back samples are retained
-Entity.HistorySnapshotInterval = 0.02 -- minimum real time between recorded samples
-Entity.HistoryMinDelta = 1 -- studs; skip recording if barely moved since the last sample
+Entity.HistorySnapshotInterval = 0.01 -- minimum real time between recorded samples
+Entity.HistoryMinDelta = 0.5 -- studs; skip recording if barely moved since the last sample
 
 -- Debug: when true, every entity's hurtbox (HitboxRadius sphere) is streamed to
 -- clients and rendered as a translucent sphere. Flip this constant directly (or
 -- call Entity.SetShowHurtboxes(true) at runtime) -- no keybind needed.
-Entity.ShowHurtboxes = true
+Entity.ShowHurtboxes = false
 
 -- Debug: when true, the FULL position history of every entity streams to clients
 -- as a trail of hurtboxes (see EnableHurtboxHistoryRendering). Independent of

@@ -49,7 +49,7 @@ local Shared = ReplicatedStorage:WaitForChild("Shared")
 
 local Heartbeat = require(Shared.Heartbeat)
 local Entity = require(Shared.Entity)
-local Projectile = require(Shared.Projectile)
+local Projectile = require(script.Parent.Projectile)
 local VisualOffload = require(Shared.VisualOffload)
 local ShooterToolInfo = require(Shared.ShooterTool)
 

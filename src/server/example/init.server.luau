@@ -20,7 +20,7 @@ local Shared = ReplicatedStorage:WaitForChild("Shared")
 local ChunkManager = require(Shared.ChunkManager)
 local Entity = require(Shared.Entity)
 local VisualOffload = require(Shared.VisualOffload)
-local Projectile = require(Shared.Projectile)
+local Projectile = require(script.Parent.Projectile)
 
 ChunkManager.EnableReplication()
 
