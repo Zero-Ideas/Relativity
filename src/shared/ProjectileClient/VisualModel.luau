@@ -73,6 +73,40 @@ function VisualModel.Place(model: Instance, position: Vector3, velocity: Vector3
 	end
 end
 
+-- Instantly hides a bullet visual without destroying it: every BasePart goes
+-- fully transparent and every Trail/ParticleEmitter/Beam (and Light) is
+-- disabled. Returns how many seconds of grace the caller should wait before
+-- actually :Destroy()ing the model: the longest lifetime among the effects
+-- that were still enabled -- disabling a Trail/ParticleEmitter only stops NEW
+-- emission, while everything already emitted keeps fading out naturally over
+-- its Lifetime, so destroying any earlier would cut those remnants off
+-- mid-air (the "unnatural deletion" this exists to prevent). Beams/Lights
+-- have no lingering emission (disabling hides them instantly) and contribute
+-- no grace. Returns 0 for an effectless model -- safe to destroy immediately.
+function VisualModel.FadeOut(model: Instance): number
+	local grace = 0
+	for _, inst in { model, table.unpack(model:GetDescendants()) } do
+		if inst:IsA("BasePart") then
+			inst.Transparency = 1
+		elseif inst:IsA("ParticleEmitter") then
+			if inst.Enabled then
+				grace = math.max(grace, inst.Lifetime.Max)
+			end
+			inst.Enabled = false
+		elseif inst:IsA("Trail") then
+			if inst.Enabled then
+				grace = math.max(grace, inst.Lifetime)
+			end
+			inst.Enabled = false
+		elseif inst:IsA("Beam") then
+			inst.Enabled = false
+		elseif inst:IsA("Light") then
+			inst.Enabled = false
+		end
+	end
+	return grace
+end
+
 -- Smoothly moves a SYNCED bullet visual toward the latest authoritative pose
 -- via a tween. Duration adapts to how often updates arrive, so motion stays
 -- continuous whether the server is stepping fast or coarsely, and it naturally

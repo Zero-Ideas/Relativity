@@ -60,14 +60,24 @@ local visuals = {} -- [id] = { model, position, velocity, gravity, homing/bounce
 
 -- Removes the flying tracer. Impact VFX is played from the ProjHit handler
 -- itself (see EnableClientRendering), so this fires for real hits AND harmless
--- expiry without ever flashing in mid-air.
+-- expiry without ever flashing in mid-air. The bullet DISAPPEARS instantly
+-- (VisualModel.FadeOut hides every part and disables every
+-- trail/particle/beam), but the actual :Destroy() waits out the longest
+-- lifetime among the effects that were emitting -- already-spawned trail
+-- segments and particles keep fading naturally during that grace window
+-- instead of being cut off mid-air (or the spawn-configured DestroyDelay,
+-- whichever is longer).
 local function destroyVisual(id)
 	local visual = visuals[id]
 	if not visual then
 		return
 	end
 	visuals[id] = nil
-	local delay = visual.destroyDelay or 0
+	if visual.tween then
+		visual.tween:Cancel()
+		visual.tween = nil
+	end
+	local delay = math.max(visual.destroyDelay or 0, VisualModel.FadeOut(visual.model))
 	if delay > 0 then
 		task.delay(delay, function()
 			visual.model:Destroy()

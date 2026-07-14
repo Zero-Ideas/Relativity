@@ -54,18 +54,20 @@ local VisualOffload = require(Shared.VisualOffload)
 local ShooterToolInfo = require(Shared.ShooterTool)
 
 -- Server-owned mapping of equipped-tool name -> the Model clients render for
--- that tool's bullets. NEVER trust a client-sent Model reference (a remote
--- can carry an Instance argument, and a client could point it at literally
--- anything replicated to them -- another player's rig, a chunk of terrain, a
--- LocalScript buried somewhere else in the game -- which the server would
--- then clone and broadcast onto every observer via ProjSpawn). The tool a
--- shot came from is already validated below (character:FindFirstChild(
--- ShooterToolInfo.Name)), so keying off tool.Name here is safe. A tool with
--- no entry (or a missing asset) just falls back to the default Visual ball.
+-- that tool's bullets, built from ShooterTool.Weapons (the shared registry of
+-- every tool name allowed to fire at all). NEVER trust a client-sent Model
+-- reference (a remote can carry an Instance argument, and a client could
+-- point it at literally anything replicated to them -- another player's rig,
+-- a chunk of terrain, a LocalScript buried somewhere else in the game --
+-- which the server would then clone and broadcast onto every observer via
+-- ProjSpawn). The tool a shot came from is already validated below against
+-- the same registry, so keying off tool.Name here is safe. A tool with no
+-- entry (or a missing asset) just falls back to the default Visual ball.
 local Effects = ReplicatedStorage:FindFirstChild("Effects")
-local PROJECTILE_MODELS: { [string]: Instance } = {
-	[ShooterToolInfo.Name] = Effects and Effects:FindFirstChild("Model"),
-}
+local PROJECTILE_MODELS: { [string]: Instance } = {}
+for toolName, assetName in ShooterToolInfo.Weapons do
+	PROJECTILE_MODELS[toolName] = Effects and Effects:FindFirstChild(assetName)
+end
 
 local MAX_ORIGIN_DISTANCE = 24 -- reject/clamp origins claimed too far from the shooter
 local FIRE_COOLDOWN = 0.1 -- server-side rate limit (seconds, real time) -- 10/sec hard cap, independent of client input
@@ -101,10 +103,18 @@ VisualOffload.On("FireBullet", function(data, player)
 		return
 	end
 
-	-- must have the TimeBlaster tool equipped -- closes the gap where an
-	-- exploiter fires this remote directly without ever equipping anything
-	local tool = character:FindFirstChild(ShooterToolInfo.Name)
-	if not tool or not tool:IsA("Tool") then
+	-- must have one of the registered shooting tools equipped -- closes the
+	-- gap where an exploiter fires this remote directly without ever
+	-- equipping anything.
+	local tool: Tool? = nil
+	for toolName in ShooterToolInfo.Weapons do
+		local candidate = character:FindFirstChild(toolName)
+		if candidate and candidate:IsA("Tool") then
+			tool = candidate
+			break
+		end
+	end
+	if not tool then
 		return
 	end
 

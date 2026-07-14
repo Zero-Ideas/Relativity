@@ -7,9 +7,9 @@
 	which clamps and applies it. Nothing here is authoritative.
 
 	The panel is built once but stays hidden until setVisible(true) is called --
-	ToolControllers/TimeBlaster.luau calls that from its Equip/Unequip (see
-	ToolManager.luau), so the menu only comes up while the TimeBlaster tool is
-	actually equipped.
+	any shooting weapon's ToolControllers/<Name>.luau (TimeBlaster.luau,
+	Railgun.luau) calls that from its Equip/Unequip (see ToolManager.luau), so
+	the menu only comes up while one of those tools is actually equipped.
 ]]
 
 local Players = game:GetService("Players")

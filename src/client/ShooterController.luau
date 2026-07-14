@@ -5,11 +5,13 @@
 	camera ray through the cursor) to the server, which spawns the actual bullet
 	via the Projectile system. Purely an input forwarder — no authority here.
 
-	start()/stop() are called by ToolControllers/TimeBlaster.luau's
-	Equip/Unequip -- this only listens for input while that tool is actually
-	equipped. The server enforces this independently for FireBullet/
-	StressTestFire (see Shooter.server.luau), so this is about not listening
-	for input at all while the tool is holstered, not about security.
+	start()/stop() are called by any shooting weapon's ToolControllers/
+	<Name>.luau Equip/Unequip (TimeBlaster.luau, Railgun.luau) -- this only
+	listens for input while one of those tools is actually equipped. The
+	server enforces this independently for FireBullet/StressTestFire (see
+	Shooter.server.luau, which validates against Shared.ShooterTool.Weapons),
+	so this is about not listening for input at all while no shooting tool is
+	equipped, not about security.
 ]]
 
 local Players = game:GetService("Players")
@@ -54,11 +56,10 @@ local function fire()
 	--    (fixes the camera/muzzle parallax that made shots drift off-target).
 	local origin = head.Position
 	local configuration = ShooterConfigGui.getConfig()
-	-- Sent for dev convenience only -- the server IGNORES this and picks the
-	-- Model from the equipped tool's name instead (see PROJECTILE_MODELS in
-	-- Shooter.server.luau). A client-supplied Instance reference would
-	-- otherwise be trivially exploitable, so don't rely on this field.
-	configuration.Model = game.ReplicatedStorage.Effects.Bullet2
+	-- The server picks the Model from the equipped tool's name (see
+	-- PROJECTILE_MODELS / ShooterTool.Weapons in Shooter.server.luau /
+	-- ShooterTool.luau) -- a client-supplied Instance reference would
+	-- otherwise be trivially exploitable, so this never sends one.
 	VisualOffload.Fire("FireBullet", {
 		Origin = origin,
 		Direction = (targetPoint - origin).Unit,	
