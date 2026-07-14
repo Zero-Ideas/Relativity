@@ -1,18 +1,25 @@
 --!optimize 2
 --[[
 	ShooterConfigGui (client)
-	A side panel to tune the bullets the ShooterController fires: speed, damage,
-	gravity, bounces, pierces, homing, etc. It just holds a config table; the
-	ShooterController reads getConfig() when firing and sends it to the server,
-	which clamps and applies it. Nothing here is authoritative.
+	A Studio-only debug side panel to tune the bullets ShooterController
+	fires: speed, damage, gravity, bounces, pierces, homing, etc. It just
+	holds a config table; ShooterController reads getConfig() when firing
+	and sends it to the server ONLY while RunService:IsStudio() is true (see
+	Shooter.server.luau's applyStudioDebugOverrides) -- a live client's
+	config is never read at all. Every weapon's REAL stats live server-side
+	in its own Weapons/<Name>.luau module (see src/server/Weapons/); this
+	panel is purely a live-iteration convenience layered on top of that
+	while testing in Studio, not a source of truth.
 
-	The panel is built once but stays hidden until setVisible(true) is called --
-	any shooting weapon's ToolControllers/<Name>.luau (TimeBlaster.luau,
-	Railgun.luau) calls that from its Equip/Unequip (see ToolManager.luau), so
-	the menu only comes up while one of those tools is actually equipped.
+	The panel is built once but stays hidden until setVisible(true) is called
+	-- any shooting weapon's ToolControllers/<Name>.luau (via the shared
+	_ShootingWeapon.luau) calls that from its Equip/Unequip (see
+	ToolManager.luau), so the menu only comes up while one of those tools is
+	actually equipped.
 ]]
 
 local Players = game:GetService("Players")
+local RunService = game:GetService("RunService")
 
 local ShooterConfigGui = {}
 
@@ -50,8 +57,9 @@ function ShooterConfigGui.getConfig()
 	return table.clone(config)
 end
 
--- Shown only while the TimeBlaster tool is equipped (see ToolManager.luau /
--- ToolControllers/TimeBlaster.luau). No-ops if the panel hasn't been built yet.
+-- Shown only while a shooting weapon tool is equipped (see ToolManager.luau
+-- / ToolControllers/_ShootingWeapon.luau). No-ops if the panel hasn't been
+-- built yet.
 function ShooterConfigGui.setVisible(visible: boolean)
 	if screenGui then
 		screenGui.Enabled = visible
@@ -134,7 +142,7 @@ local function build()
 	local screen = Instance.new("ScreenGui")
 	screen.Name = "ShooterConfigGui"
 	screen.ResetOnSpawn = false
-	screen.Enabled = false -- hidden until the TimeBlaster tool is equipped
+	screen.Enabled = false -- hidden until a shooting weapon tool is equipped
 	screen.Parent = playerGui
 	screenGui = screen
 
@@ -159,7 +167,7 @@ local function build()
 	title.TextSize = 15
 	title.TextXAlignment = Enum.TextXAlignment.Left
 	title.TextColor3 = Color3.fromRGB(235, 240, 255)
-	title.Text = "Shooter Settings"
+	title.Text = "Shooter Settings (Studio only)"
 	title.Parent = panel
 
 	local list = Instance.new("ScrollingFrame")
@@ -181,8 +189,11 @@ local function build()
 	end
 end
 
+-- Never builds outside Studio: the server ignores a live client's Config
+-- entirely (see Shooter.server.luau), so showing this panel to real players
+-- in a published game would just be confusing clutter with zero effect.
 function ShooterConfigGui.start()
-	if started then
+	if started or not RunService:IsStudio() then
 		return
 	end
 	started = true

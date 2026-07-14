@@ -8,7 +8,7 @@
 	that controller's Equip(tool, character); when it's unequipped (or a
 	death/respawn cuts it off without a clean Unequipped), it calls
 	Unequip(tool, character). This is the ONLY thing that knows tools exist --
-	individual controllers (ShooterConfigGui, ShooterController, etc.) know
+	individual controllers (ShooterController, Viewmodel, etc.) know
 	nothing about equip state; they're just started/stopped by their
 	controller module. A tool with no matching module is ignored entirely --
 	this only drives custom per-tool client behavior, not equipping itself,

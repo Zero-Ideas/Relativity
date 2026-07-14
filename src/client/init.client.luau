@@ -3,9 +3,9 @@
 	time-scale replication, and starts the client-side dilation systems
 	(movement, chunk overlay, and the personal time-ratio panel). Also starts
 	ToolManager, which swaps in each equipped tool's controller module (see
-	ToolManager.luau and ToolControllers/) -- e.g. the shooter menu only shows
-	up while the TimeBlaster tool is equipped, driven entirely by
-	ToolControllers/TimeBlaster.luau.
+	ToolManager.luau and ToolControllers/) -- e.g. firing input only listens
+	while a registered weapon (TimeBlaster, Railgun, ...) is equipped, driven
+	entirely by that tool's ToolControllers/<Name>.luau.
 ]]
 
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
@@ -20,6 +20,9 @@ local MovementController = require(script.MovementController)
 local ChunkVisualizer = require(script.ChunkVisualizer)
 local TimeControlGui = require(script.TimeControlGui)
 local ToolManager = require(script.ToolManager)
+-- Self-registers its "AmmoSync" listener at require time (no .start()) --
+-- see AmmoState.luau; a future HUD just requires it and reads/subscribes.
+local _AmmoState = require(script.AmmoState)
 
 ChunkManager.EnableReplication()
 ProjectileClient.EnableClientRendering()
