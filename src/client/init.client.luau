@@ -20,9 +20,12 @@ local MovementController = require(script.MovementController)
 local ChunkVisualizer = require(script.ChunkVisualizer)
 local TimeControlGui = require(script.TimeControlGui)
 local ToolManager = require(script.ToolManager)
--- Self-registers its "AmmoSync" listener at require time (no .start()) --
--- see AmmoState.luau; a future HUD just requires it and reads/subscribes.
+-- These two self-register their VisualOffload listeners at require time
+-- (no .start()) -- see AmmoState.luau (ammo cache for a future HUD) and
+-- WeaponEffects.luau (server-broadcast one-shot weapon VFX like the
+-- muzzle blast).
 local _AmmoState = require(script.AmmoState)
+local _WeaponEffects = require(script.WeaponEffects)
 
 ChunkManager.EnableReplication()
 ProjectileClient.EnableClientRendering()

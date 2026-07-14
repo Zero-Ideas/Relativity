@@ -63,7 +63,8 @@
 	   absence just means the left arm is left alone (one-handed weapon).
 	 - Sight + SightEnd -- optional pair; enables aim-down-sights. While
 	   aiming (right mouse button held, or Viewmodel.SetAiming(true) from
-	   code), the weapon blends from the hip hold to a pose where Sight
+	   code), the weapon eases (a real TweenService tween, see ADS_IN_TIME/
+	   ADS_OUT_TIME/ADS_EASING_STYLE) from the hip hold to a pose where Sight
 	   sits DEAD-CENTER on screen, ADS_SIGHT_DISTANCE studs in front of
 	   the camera, with the Sight -> SightEnd line aligned to the look
 	   direction. Only the POSITIONS of the two attachments matter (put
@@ -91,6 +92,7 @@
 local RunService = game:GetService("RunService")
 local UserInputService = game:GetService("UserInputService")
 local Workspace = game:GetService("Workspace")
+local TweenService = game:GetService("TweenService")
 
 local ArmRig = require(script.ArmRig)
 local Sway = require(script.Sway)
@@ -147,8 +149,14 @@ local GRIP_OFFSET_ATTRIBUTE = "ViewmodelGripOffset"
 -- ADS ("aim down sights") tuning -- see the Sight bullet in the module doc
 -- comment for the full behavior/contract.
 local ADS_SIGHT_DISTANCE = 1.2 -- studs from the camera to the Sight while fully aimed
-local ADS_BLEND_SPEED = 12 -- 1/s; how snappily the hip <-> ADS blend moves
 local ADS_SWAY_FACTOR = 0.75 -- fraction of sway/bob suppressed at full ADS (steadier aim)
+-- Hip <-> ADS blend is a real TweenService tween (see the AdsValue/AdsTween
+-- fields below) so it eases in/out with a proper curve instead of an
+-- asymptotic per-frame chase -- a fresh tween is only started when `aiming`
+-- actually FLIPS (see the Stepped loop), not recreated every frame.
+local ADS_IN_TIME = 0.18 -- seconds, hip -> aimed
+local ADS_OUT_TIME = 0.12 -- seconds, aimed -> hip (snappier so you can react faster)
+local ADS_EASING_STYLE = Enum.EasingStyle.Quad
 
 -- Camera-to-focus distance at/below which we treat the camera as first
 -- person. Roblox's own first-person camera pins the camera essentially onto
@@ -170,7 +178,14 @@ type ActiveEntry = {
 	Handle: BasePart,
 	Posed: boolean,
 	SightRel: CFrame?, -- handle-local ADS sight frame, built at equip (nil = weapon can't ADS)
-	AdsAlpha: number, -- smooth hip (0) <-> fully-aimed (1) blend, chases `aiming` every frame
+	-- Smooth hip (0) <-> fully-aimed (1) blend, driven by TweenService: read
+	-- AdsValue.Value each frame; AdsTarget is the last target a tween was
+	-- STARTED toward (so the Stepped loop only creates a new tween on an
+	-- actual flip, not every frame); AdsTween is that in-flight tween, kept
+	-- so a rapid re-toggle can smoothly retarget instead of stacking tweens.
+	AdsValue: NumberValue,
+	AdsTarget: number,
+	AdsTween: Tween?,
 	-- Original C0 per RightGrip Weld INSTANCE -- Roblox destroys/recreates
 	-- the weld across equips, so keying by instance means we can never
 	-- "restore" a stale C0 onto a fresh weld we never modified.
@@ -187,10 +202,10 @@ local active: { [Tool]: ActiveEntry } = {}
 -- Recursion guard for the LocalTransparencyModifier forcing below.
 local forcingTransparency = false
 
--- Whether the player is currently TRYING to aim (the smooth per-tool blend
--- factor lives on each entry as AdsAlpha). Driven by the right mouse button
--- below; other input schemes (touch buttons, gamepad triggers) can call
--- Viewmodel.SetAiming instead.
+-- Whether the player is currently TRYING to aim (the smooth per-tool tweened
+-- blend lives on each entry as AdsValue -- see the ActiveEntry type). Driven
+-- by the right mouse button below; other input schemes (touch buttons,
+-- gamepad triggers) can call Viewmodel.SetAiming instead.
 local aiming = false
 
 function Viewmodel.SetAiming(isAiming: boolean)
@@ -334,7 +349,11 @@ function Viewmodel.Equip(tool: Tool, character: Model)
 		Handle = handle,
 		Posed = false,
 		SightRel = sightRel,
-		AdsAlpha = 0,
+		-- Never parented -- TweenService tweens a plain Instance's property
+		-- fine without one; this is purely an internal number holder.
+		AdsValue = Instance.new("NumberValue"),
+		AdsTarget = 0,
+		AdsTween = nil,
 		OriginalWeldC0 = {},
 	} :: ActiveEntry
 	entry.Right = {
@@ -379,10 +398,27 @@ function Viewmodel.Equip(tool: Tool, character: Model)
 		end
 		entry.Posed = true
 
-		-- Smooth hip <-> ADS blend (only weapons with a Sight ever aim).
+		-- Smooth hip <-> ADS blend (only weapons with a Sight ever aim). A
+		-- new tween is only started when the target actually flips -- eases
+		-- from wherever AdsValue currently sits (mid-tween or settled) to
+		-- the new target, so rapid re-toggling retargets smoothly instead of
+		-- snapping or stacking tweens.
 		local adsTarget = if aiming and entry.SightRel then 1 else 0
-		entry.AdsAlpha += (adsTarget - entry.AdsAlpha) * math.min(dt * ADS_BLEND_SPEED, 1)
-		local ads = entry.AdsAlpha
+		if entry.AdsTarget ~= adsTarget then
+			entry.AdsTarget = adsTarget
+			if entry.AdsTween then
+				entry.AdsTween:Cancel()
+			end
+			local duration = if adsTarget > 0.5 then ADS_IN_TIME else ADS_OUT_TIME
+			local tween = TweenService:Create(
+				entry.AdsValue,
+				TweenInfo.new(duration, ADS_EASING_STYLE, Enum.EasingDirection.Out),
+				{ Value = adsTarget }
+			)
+			entry.AdsTween = tween
+			tween:Play()
+		end
+		local ads = entry.AdsValue.Value
 
 		local swayCFrame = entry.Sway:Update(dt, humanoid)
 		if ads > 1e-3 then
@@ -478,6 +514,10 @@ function Viewmodel.Unequip(tool: Tool, _character: Model)
 	if entry.Left then
 		entry.Left.TransparencyConnection:Disconnect()
 	end
+	if entry.AdsTween then
+		entry.AdsTween:Cancel()
+	end
+	entry.AdsValue:Destroy()
 end
 
 return Viewmodel

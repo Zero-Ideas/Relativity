@@ -42,11 +42,18 @@ export type WeaponDef = {
 	-- Optional. Called once per ACCEPTED shot (fire-rate/ammo checks already
 	-- passed), before the projectile spawns -- purely cosmetic (muzzle
 	-- flash, fire sound, recoil kick, etc.), never gameplay. Runs
-	-- SERVER-SIDE and is passed the equipped Tool instance, but one-shot
-	-- replicating calls made from here (ParticleEmitter:Emit(),
-	-- Sound:Play(), etc.) replicate to every client that can see the Tool
-	-- automatically -- no VisualOffload/remote needed for this.
-	OnFire: ((tool: Tool) -> ())?,
+	-- SERVER-SIDE and is passed the equipped Tool instance plus the exact
+	-- Origin/Direction the projectile itself is about to spawn with (see
+	-- resolveMuzzleOrigin in Shooter.server.luau), so a muzzle effect can
+	-- place itself directly on the bullet's actual path instead of relying
+	-- on the Tool's own (possibly stale/third-person) transform. CAUTION on
+	-- what actually shows from server code: property changes and new
+	-- instances replicate (so Sound:Play() works -- Playing is a property),
+	-- but METHOD calls like ParticleEmitter:Emit() do NOT -- particle
+	-- bursts must be broadcast to clients instead; fire a VisualOffload
+	-- channel handled in src/client/WeaponEffects.luau (see Railgun.luau's
+	-- "MuzzleBlast" for the pattern).
+	OnFire: ((tool: Tool, origin: Vector3, direction: Vector3) -> ())?,
 
 	-- Optional. FULLY REPLACES default damage-dealing for this weapon's
 	-- hits when present -- the dispatcher does not auto-apply damage if

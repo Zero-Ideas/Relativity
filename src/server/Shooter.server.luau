@@ -299,9 +299,11 @@ VisualOffload.On("FireBullet", function(data, player)
 
 	-- Shot is fully accepted at this point -- fire the weapon's cosmetic
 	-- hook (muzzle flash, fire sound, etc.) now, before the projectile
-	-- itself spawns. See the OnFire doc comment in Weapons/init.luau.
+	-- itself spawns, passing the same origin/direction the projectile will
+	-- actually use so the effect always lands on the real bullet path. See
+	-- the OnFire doc comment in Weapons/init.luau.
 	if weapon.OnFire then
-		weapon.OnFire(tool)
+		weapon.OnFire(tool, origin, direction)
 	end
 
 	local shooter = Entity.Get(character) -- may be nil if the character isn't registered

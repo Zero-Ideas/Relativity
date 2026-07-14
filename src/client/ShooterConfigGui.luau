@@ -11,6 +11,16 @@
 	panel is purely a live-iteration convenience layered on top of that
 	while testing in Studio, not a source of truth.
 
+	getConfig() ONLY returns fields you've actually edited (see `touched`
+	below), never the full field set with its baked-in defaults -- every
+	field here defaults to a plausible-looking number (e.g. Speed = 220),
+	and if those were always sent/applied regardless of whether you touched
+	them, firing ANY weapon in Studio would silently clobber that weapon's
+	real Stats with this panel's unrelated defaults (this happened: Railgun
+	fired at this panel's default Speed instead of its own). Untouched
+	fields fall through entirely, so a weapon you've never opened this panel
+	for behaves exactly as its own module declares.
+
 	The panel is built once but stays hidden until setVisible(true) is called
 	-- any shooting weapon's ToolControllers/<Name>.luau (via the shared
 	_ShootingWeapon.luau) calls that from its Equip/Unequip (see
@@ -50,11 +60,19 @@ for _, field in FIELDS do
 	config[field.key] = field.default
 end
 
+-- Which fields the dev has actually edited in THIS session -- see the
+-- module doc comment. Set true only from a field's own edit handler below.
+local touched: { [string]: boolean } = {}
+
 local started = false
 local screenGui: ScreenGui? = nil
 
 function ShooterConfigGui.getConfig()
-	return table.clone(config)
+	local result = {}
+	for key in touched do
+		result[key] = config[key]
+	end
+	return result
 end
 
 -- Shown only while a shooting weapon tool is equipped (see ToolManager.luau
@@ -106,6 +124,7 @@ local function makeRow(parent: Instance, field, layoutOrder: number)
 			if n then
 				n = math.clamp(n, field.min, field.max)
 				config[field.key] = n
+				touched[field.key] = true
 			end
 			box.Text = tostring(config[field.key])
 		end)
@@ -131,6 +150,7 @@ local function makeRow(parent: Instance, field, layoutOrder: number)
 		render()
 		toggle.Activated:Connect(function()
 			config[field.key] = not config[field.key]
+			touched[field.key] = true
 			render()
 		end)
 	end
