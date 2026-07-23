@@ -7,7 +7,6 @@
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local Shared = ReplicatedStorage:WaitForChild("Shared")
 local Heartbeat = require(Shared.Heartbeat)
-
 -- Runs every frame. dt is already scaled by the global time scale.
 local frameConnection = Heartbeat.Connect(function(dt, connection)
 	-- physics-ish work here
