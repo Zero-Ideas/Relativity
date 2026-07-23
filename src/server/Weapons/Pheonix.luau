@@ -40,18 +40,18 @@ local function emitMuzzleBlast(tool: Tool, origin: Vector3, direction: Vector3)
 end
 
 return {
-	Model = "RailgunRod", -- ReplicatedStorage.Effects.RailgunRod
+	Model = "Rocket", -- ReplicatedStorage.Effects.RailgunRod
 
 	Stats = {
-		Speed = 1250,
+		Speed = 250,
 		Acceleration = 0,
 		MinSpeed = 0,
 		MaxSpeed = 10000,
 		Damage = 750,
 		Lifetime = 3,
-		Gravity = 0,
+		Gravity = 25,
 		Radius = 0.2,
-		Bounces = 0,
+		Bounces = 3,
 		Restitution = 0,
 		Penetration = 0,
 		MaxPierces = 3,
@@ -61,8 +61,8 @@ return {
 	FireRate = 2, -- shots/sec
 
 	Magazine = {
-		Size = 6,
-		Reserve = 24,
+		Size = math.huge,
+		Reserve = math.huge,
 		ReloadTime = 2.2, -- seconds
 	},
 

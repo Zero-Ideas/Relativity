@@ -10,6 +10,11 @@ local TweenService = game:GetService("TweenService")
 
 local VisualModel = {}
 
+-- Defaults for ActivateParticlesOnCreate (see VisualModel.ActivateParticles)
+-- when a ParticleEmitter doesn't carry its own EmitCount/EmitDelay attribute.
+local DEFAULT_EMIT_COUNT = 5
+local DEFAULT_EMIT_DELAY = 0
+
 local function safeUnit(v: Vector3, fallback: Vector3): Vector3
 	local magnitude = v.Magnitude
 	if magnitude < 1e-5 then
@@ -74,30 +79,46 @@ function VisualModel.Place(model: Instance, position: Vector3, velocity: Vector3
 end
 
 -- Instantly hides a bullet visual without destroying it: every BasePart goes
--- fully transparent and every Trail/ParticleEmitter/Beam (and Light) is
--- disabled. Returns how many seconds of grace the caller should wait before
--- actually :Destroy()ing the model: the longest lifetime among the effects
--- that were still enabled -- disabling a Trail/ParticleEmitter only stops NEW
--- emission, while everything already emitted keeps fading out naturally over
--- its Lifetime, so destroying any earlier would cut those remnants off
--- mid-air (the "unnatural deletion" this exists to prevent). Beams/Lights
--- have no lingering emission (disabling hides them instantly) and contribute
--- no grace. Returns 0 for an effectless model -- safe to destroy immediately.
-function VisualModel.FadeOut(model: Instance): number
+-- fully transparent, and every Trail/ParticleEmitter/Beam (and Light) is
+-- either faded or deleted outright depending on waitForParticles/
+-- waitForTrails (see the Projectile config's WaitForParticles/WaitForTrails --
+-- both default true). Returns how many seconds of grace the caller should
+-- wait before actually :Destroy()ing the model:
+--  - waitForParticles/waitForTrails true (default): disabling a
+--    Trail/ParticleEmitter only stops NEW emission, while everything already
+--    emitted keeps fading out naturally over its Lifetime, so destroying any
+--    earlier would cut those remnants off mid-air (the "unnatural deletion"
+--    this exists to prevent) -- contributes that Lifetime to the grace period.
+--  - waitForParticles/waitForTrails false: the instance is :Destroy()d
+--    immediately instead of just disabled -- no lingering remnants, no grace
+--    contribution from it.
+-- Beams/Lights have no lingering emission (disabling hides them instantly)
+-- and never contribute grace. Returns 0 (safe to destroy immediately) when
+-- nothing in the model still needs to wait -- e.g. both flags false, or one
+-- flag false and the model has none of the other kind.
+function VisualModel.FadeOut(model: Instance, waitForParticles: boolean, waitForTrails: boolean): number
 	local grace = 0
 	for _, inst in { model, table.unpack(model:GetDescendants()) } do
 		if inst:IsA("BasePart") then
 			inst.Transparency = 1
 		elseif inst:IsA("ParticleEmitter") then
-			if inst.Enabled then
-				grace = math.max(grace, inst.Lifetime.Max)
+			if waitForParticles then
+				if inst.Enabled then
+					grace = math.max(grace, inst.Lifetime.Max)
+				end
+				inst.Enabled = false
+			else
+				inst:Destroy()
 			end
-			inst.Enabled = false
 		elseif inst:IsA("Trail") then
-			if inst.Enabled then
-				grace = math.max(grace, inst.Lifetime)
+			if waitForTrails then
+				if inst.Enabled then
+					grace = math.max(grace, inst.Lifetime)
+				end
+				inst.Enabled = false
+			else
+				inst:Destroy()
 			end
-			inst.Enabled = false
 		elseif inst:IsA("Beam") then
 			inst.Enabled = false
 		elseif inst:IsA("Light") then
@@ -105,6 +126,35 @@ function VisualModel.FadeOut(model: Instance): number
 		end
 	end
 	return grace
+end
+
+-- ActivateParticlesOnCreate support: fires every ParticleEmitter under
+-- `model` exactly once via :Emit(), per its own EmitCount/EmitDelay
+-- attributes (defaulting to 5 / 0s when either is missing). EmitDelay is
+-- seconds from THIS call until that emitter actually emits -- 0 emits
+-- inline, synchronously. Call once, right after VisualModel.Build.
+function VisualModel.ActivateParticles(model: Instance)
+	for _, inst in { model, table.unpack(model:GetDescendants()) } do
+		if inst:IsA("ParticleEmitter") then
+			local emitCount = inst:GetAttribute("EmitCount")
+			if typeof(emitCount) ~= "number" then
+				emitCount = DEFAULT_EMIT_COUNT
+			end
+			local emitDelay = inst:GetAttribute("EmitDelay")
+			if typeof(emitDelay) ~= "number" then
+				emitDelay = DEFAULT_EMIT_DELAY
+			end
+			if emitDelay > 0 then
+				task.delay(emitDelay, function()
+					if inst.Parent then
+						inst:Emit(emitCount)
+					end
+				end)
+			else
+				inst:Emit(emitCount)
+			end
+		end
+	end
 end
 
 -- Smoothly moves a SYNCED bullet visual toward the latest authoritative pose

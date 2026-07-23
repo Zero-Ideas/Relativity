@@ -107,6 +107,12 @@ function Replication.spawnVisual(projectile)
 		Model = projectile.Model,
 		Visual = projectile.Visual,
 		DestroyDelay = projectile.DestroyDelay,
+		-- Client-side effect-cleanup/activation options -- see
+		-- VisualModel.FadeOut / VisualModel.ActivateParticles and the module
+		-- doc comment's config section.
+		WaitForParticles = projectile.WaitForParticles,
+		WaitForTrails = projectile.WaitForTrails,
+		ActivateParticlesOnCreate = projectile.ActivateParticlesOnCreate,
 	})
 end
 

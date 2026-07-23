@@ -1,0 +1,934 @@
+--!optimize 2
+--[[
+	Viewmodel (client, purely cosmetic)
+	FIRST-PERSON-ONLY procedural viewmodel: while a weapon Tool is equipped
+	AND the camera is in first person, the weapon is placed relative to the
+	CAMERA every frame (with procedural sway/bob/breathing -- see
+	Sway.luau), and the local player's own arms telescope out to hold it at
+	its named grip Attachments (see ArmRig.luau). No keyframed
+	AnimationTracks anywhere in this system -- everything is computed live,
+	every frame. Outside first person nothing is touched at all: the
+	character holds the tool with Roblox's stock grip/animations, and
+	leaving first person restores everything.
+
+	WHY THE CAMERA DRIVES THE WEAPON (and not the other way around): the
+	Tool is welded to the Right Arm by Roblox's auto-created "RightGrip"
+	Weld, so an earlier version that aimed the arms at the tool's live
+	attachment positions was chasing its own output -- posing the arm moved
+	the tool, which moved the target, which re-posed the arm, diverging
+	into visible spazzing. Here the kinematic chain is solved from a single
+	root, once per frame, with no read-back:
+	    camera -> grip frame (sway * WEAPON_CAMERA_OFFSET, an upright
+	              camera-aligned "virtual hand")
+	           -> desired Handle CFrame (grip frame * Tool.Grip:Inverse() --
+	              see WEAPON ORIENTATION below)
+	           -> desired grip points (attachment offsets captured at equip)
+	           -> arm poses (ArmRig.PoseArm, returns the PREDICTED arm CFrame)
+	           -> RightGrip weld C0 solved so the Handle lands exactly on
+	              the desired CFrame.
+	This is also what animates the weapon itself: sway/bob/breathing move
+	the gun, and the arms follow it.
+
+	This directly poses the REAL arm parts, not a separate fake viewmodel
+	clone rig: Roblox never replicates a client's own cosmetic property
+	writes (CFrame/Size/Motor6D.Transform/Weld.C0) back to the server or to
+	other clients, so this is visible ONLY to the local player. Other
+	players keep seeing this character's normal third-person body. This
+	intentionally supersedes an old Studio-only "EasyFirstPerson" script
+	(never in source control) that took the fake-clone-rig approach --
+	remove that script from StarterCharacterScripts in Studio so the two
+	don't fight over the arms in first person.
+
+	WEAPON ORIENTATION -- Tool.Grip is respected, not overwritten: Roblox's
+	own hold places the Handle as gripFrame * Grip:Inverse(), where the grip
+	frame is an upright frame aligned with the character's look direction
+	(that's exactly what Grip means -- how the handle sits in the hand --
+	and it's what Studio grip-editor plugins edit). The camera frame uses
+	the same convention (-Z forward, +Y up), so composing our camera-derived
+	grip frame with the SAME Grip:Inverse() reproduces the designer's
+	intended weapon orientation in first person. Grip is read live every
+	frame, so tweaking it (via the Grip properties or a grip editor plugin)
+	updates the viewmodel immediately, even mid-Play. For a viewmodel-ONLY
+	adjustment on top (rotate/nudge the weapon in the hand without touching
+	the third-person Grip), set a CFrame attribute named
+	"ViewmodelGripOffset" on the Tool -- it's applied in grip-frame space,
+	so e.g. CFrame.Angles(0, math.rad(10), 0) yaws the weapon in the hand.
+
+	Weapon setup contract: the Tool must have a "Handle" BasePart, and marks
+	where each hand grips with named Attachment instances (searched for
+	recursively under the Tool):
+	 - RightGripAttachment -- required for ANY weapon, one- or two-handed;
+	   the right hand is always the primary grip.
+	 - LeftGripAttachment -- optional; only two-handed weapons need it. Its
+	   absence just means the left arm is left alone (one-handed weapon).
+	 - Sight + SightEnd -- optional pair; enables aim-down-sights. While
+	   aiming (right mouse button held, or Viewmodel.SetAiming(true) from
+	   code), the weapon eases (a real TweenService tween, see ADS_IN_TIME/
+	   ADS_OUT_TIME/ADS_EASING_STYLE) from the hip hold to a pose where Sight
+	   sits DEAD-CENTER on screen, ADS_SIGHT_DISTANCE studs in front of
+	   the camera, with the Sight -> SightEnd line aligned to the look
+	   direction. Only the POSITIONS of the two attachments matter (put
+	   Sight at the rear of the sight picture, SightEnd farther forward
+	   along the exact line the player should look down) -- their
+	   ORIENTATIONS are deliberately ignored, so a mis-rotated attachment
+	   can't skew the aimed grip; aimed roll comes from the weapon's own
+	   Grip up. A weapon with a Sight but no SightEnd falls back to aiming
+	   along the Sight's own LookVector (orientation and all -- the old
+	   contract). Weapons with neither attachment simply never ADS.
+	Attachment offsets are captured relative to the Handle ONCE at equip --
+	per-frame code deliberately never reads att.WorldCFrame (that's the
+	feedback loop described above).
+
+	API:
+	 Viewmodel.Equip(tool: Tool, character: Model)   -- call from a
+	   ToolControllers/<Name>.luau's Equip(tool, character). No-op if the
+	   tool has no Handle or no RightGripAttachment.
+	 Viewmodel.Unequip(tool: Tool, character: Model) -- call from Unequip;
+	   restores the rig/weld exactly as Equip found them. Safe to call even
+	   if the character/parts were since destroyed, or if Equip never
+	   actually activated for this tool -- both are silent no-ops.
+]]
+
+local RunService = game:GetService("RunService")
+local UserInputService = game:GetService("UserInputService")
+local Workspace = game:GetService("Workspace")
+local TweenService = game:GetService("TweenService")
+
+local ArmRig = require(script.ArmRig)
+local Sway = require(script.Sway)
+
+type ArmSide = ArmRig.ArmSide
+type ArmCache = ArmRig.ArmCache
+
+local Viewmodel = {}
+
+Viewmodel.RIGHT_GRIP_NAME = "RightGripAttachment"
+Viewmodel.LEFT_GRIP_NAME = "LeftGripAttachment"
+Viewmodel.SIGHT_NAME = "Sight"
+Viewmodel.SIGHT_END_NAME = "SightEnd"
+
+-- Camera-local virtual SHOULDER anchor positions, one per arm, read EVERY
+-- frame: where each arm's two-bone elbow solve hangs from, relative to the
+-- (swayed) camera -- +X right, -Y down, +Z behind the view plane. Placed at
+-- forearm/elbow height BELOW the eye line so the rendered forearm visibly
+-- rises from low on the screen (and follows the camera's pitch); anchoring
+-- at the character's real shoulder socket made the arms appear to originate
+-- up at shoulder height instead of at the IK-solved elbow. See
+-- ArmRig.PoseArm's anchorPos.
+Viewmodel.RightShoulderOffset = Vector3.new(0.9, -1.5, 0.2)
+Viewmodel.LeftShoulderOffset = Vector3.new(-0.9, -1.5, 0.2)
+
+-- Dynamic arm offsets, one per arm, read EVERY frame -- reassign these at
+-- runtime (from anywhere) to repose the arms live, e.g. for lowered or
+-- sprint poses. Each is a CFrame: the POSITION shifts the virtual shoulder
+-- anchor (camera-local, on top of the ShoulderOffset above), the ROTATION
+-- swings the whole posed forearm around the grip point -- the hand stays
+-- planted on the weapon. See ArmRig.PoseArm.
+Viewmodel.RightElbowOffset = ArmRig.DEFAULT_ELBOW_OFFSET :: CFrame
+Viewmodel.LeftElbowOffset = ArmRig.DEFAULT_ELBOW_OFFSET :: CFrame
+
+-- Camera-local IK pole vectors, one per arm, read EVERY frame: which way
+-- each virtual elbow bends when the arm isn't straight -- down and OUTWARD
+-- (right elbow to the right, left to the left), like real elbows on a
+-- shouldered weapon. See ArmRig.PoseArm's poleDir.
+Viewmodel.RightElbowPole = Vector3.new(1, -0.8, 0.4)
+Viewmodel.LeftElbowPole = Vector3.new(-1, -0.8, 0.4)
+
+-- Where the GRIP FRAME (the "virtual hand" the weapon is held by -- the
+-- Handle itself then sits at grip * Tool.Grip:Inverse(), see the module doc
+-- comment) sits relative to the (swayed) camera: right of center, below eye
+-- line, pushed forward -- the classic FPS hold. TUNE ME by feel in Studio;
+-- this is the global knob for the hold pose across ALL weapons -- per-weapon
+-- adjustments belong in Tool.Grip or the ViewmodelGripOffset attribute.
+local WEAPON_CAMERA_OFFSET = CFrame.new(1.1, -1.1, -2.2)
+
+-- Optional per-Tool CFrame attribute: extra viewmodel-only offset composed
+-- into the grip frame (does not affect third-person holding at all).
+local GRIP_OFFSET_ATTRIBUTE = "ViewmodelGripOffset"
+
+-- ADS ("aim down sights") tuning -- see the Sight bullet in the module doc
+-- comment for the full behavior/contract.
+local ADS_SIGHT_DISTANCE = 1.2 -- studs from the camera to the Sight while fully aimed
+local ADS_SWAY_FACTOR = 0.75 -- fraction of sway/bob suppressed at full ADS (steadier aim)
+-- Hip <-> ADS blend is a real TweenService tween (see the AdsValue/AdsTween
+-- fields below) so it eases in/out with a proper curve instead of an
+-- asymptotic per-frame chase -- a fresh tween is only started when `aiming`
+-- actually FLIPS (see the Stepped loop), not recreated every frame.
+local ADS_IN_TIME = 0.18 -- seconds, hip -> aimed
+local ADS_OUT_TIME = 0.12 -- seconds, aimed -> hip (snappier so you can react faster)
+local ADS_EASING_STYLE = Enum.EasingStyle.Quad
+
+-- Camera-to-focus distance at/below which we treat the camera as first
+-- person. Roblox's own first-person camera pins the camera essentially onto
+-- the focus (distance ~0); ordinary third-person zoom is well above 1.
+local FIRST_PERSON_MAX_DISTANCE = 1
+
+type PosedHand = {
+	AttRel: CFrame, -- grip attachment's offset from the Handle, captured at equip
+	Arm: ArmSide,
+	Cache: ArmCache,
+	TransparencyConnection: RBXScriptConnection,
+}
+
+type ActiveEntry = {
+	Connection: RBXScriptConnection,
+	Right: PosedHand,
+	Left: PosedHand?,
+	Sway: Sway.Sway,
+	Handle: BasePart,
+	Posed: boolean,
+	SightRel: CFrame?, -- handle-local ADS sight frame, built at equip (nil = weapon can't ADS)
+	-- Smooth hip (0) <-> fully-aimed (1) blend, driven by TweenService: read
+	-- AdsValue.Value each frame; AdsTarget is the last target a tween was
+	-- STARTED toward (so the Stepped loop only creates a new tween on an
+	-- actual flip, not every frame); AdsTween is that in-flight tween, kept
+	-- so a rapid re-toggle can smoothly retarget instead of stacking tweens.
+	AdsValue: NumberValue,
+	AdsTarget: number,
+	AdsTween: Tween?,
+	-- Original C0 per RightGrip Weld INSTANCE -- Roblox destroys/recreates
+	-- the weld across equips, so keying by instance means we can never
+	-- "restore" a stale C0 onto a fresh weld we never modified.
+	OriginalWeldC0: { [Weld]: CFrame },
+}
+
+-- Keyed by Tool instance rather than a single slot -- Roblox only ever lets
+-- one Tool be equipped at a time in practice, but keying this way means a
+-- rapid unequip-then-equip-a-different-tool before the first Tool's
+-- Unequipped fully lands can never cross-restore the wrong cache onto the
+-- wrong tool.
+local active: { [Tool]: ActiveEntry } = {}
+
+-- Recursion guard for the LocalTransparencyModifier forcing below.
+local forcingTransparency = false
+
+-- Whether the player is currently TRYING to aim (the smooth per-tool tweened
+-- blend lives on each entry as AdsValue -- see the ActiveEntry type). Driven
+-- by the right mouse button below; other input schemes (touch buttons,
+-- gamepad triggers) can call Viewmodel.SetAiming instead.
+local aiming = false
+
+function Viewmodel.SetAiming(isAiming: boolean)
+	aiming = isAiming
+end
+
+UserInputService.InputBegan:Connect(function(input, gameProcessed)
+	if gameProcessed then
+		return
+	end
+	if input.UserInputType == Enum.UserInputType.MouseButton2 then
+		aiming = true
+	end
+end)
+
+UserInputService.InputEnded:Connect(function(input)
+	-- Deliberately no gameProcessed check: releasing the button must ALWAYS
+	-- unaim, even if the release landed over UI.
+	if input.UserInputType == Enum.UserInputType.MouseButton2 then
+		aiming = false
+	end
+end)
+
+local function findGripAttachment(tool: Tool, name: string): Attachment?
+	local found = tool:FindFirstChild(name, true)
+	if found and found:IsA("Attachment") then
+		return found
+	end
+	return nil
+end
+
+-- In first person the engine sets LocalTransparencyModifier = 1 on limbs
+-- every frame to hide them; the whole point of a viewmodel is visible arms,
+-- so while posed we pin it back to 0 the instant the engine touches it.
+local function watchTransparency(entry: ActiveEntry, part: BasePart): RBXScriptConnection
+	return part:GetPropertyChangedSignal("LocalTransparencyModifier"):Connect(function()
+		if forcingTransparency or not entry.Posed then
+			return
+		end
+		forcingTransparency = true
+		part.LocalTransparencyModifier = 0
+		forcingTransparency = false
+	end)
+end
+
+local function findGripWeld(entry: ActiveEntry): Weld?
+	-- Roblox parents the auto-created tool weld under the Right Arm, named
+	-- "RightGrip". Re-found every frame rather than cached: the engine
+	-- destroys and recreates it across (un)equips.
+	local weld = entry.Right.Arm.Arm:FindFirstChild("RightGrip")
+	if weld and weld:IsA("Weld") then
+		return weld
+	end
+	return nil
+end
+
+-- Puts everything back to stock (arms, joint, tool weld). Idempotent; called
+-- both when leaving first person (tool stays equipped, Roblox's normal
+-- third-person hold takes over) and from Unequip.
+local function unpose(entry: ActiveEntry)
+	if not entry.Posed then
+		return
+	end
+	entry.Posed = false
+	ArmRig.Restore(entry.Right.Arm, entry.Right.Cache)
+	if entry.Left then
+		ArmRig.Restore(entry.Left.Arm, entry.Left.Cache)
+	end
+	local weld = findGripWeld(entry)
+	if weld then
+		local originalC0 = entry.OriginalWeldC0[weld]
+		if originalC0 then
+			weld.C0 = originalC0
+		end
+	end
+	-- LocalTransparencyModifier is left alone: the engine rewrites it every
+	-- frame from camera distance, so it self-corrects the moment we stop
+	-- pinning it (the watch connections gate on entry.Posed).
+end
+
+function Viewmodel.Equip(tool: Tool, character: Model)
+	if active[tool] then
+		return -- already active (defensive; ToolManager shouldn't double-fire)
+	end
+
+	local handle = tool:FindFirstChild("Handle")
+	if not (handle and handle:IsA("BasePart")) then
+		return -- no Handle, nothing to place relative to the camera
+	end
+	local rightGrip = findGripAttachment(tool, Viewmodel.RIGHT_GRIP_NAME)
+	if not rightGrip then
+		-- No grip marked at all -- nothing for this system to do; leave the
+		-- Tool to Roblox's default Grip/weld behavior untouched.
+		return
+	end
+	local rightArm = ArmRig.Find(character, "Right")
+	if not rightArm then
+		return -- not an R6 rig, or missing parts; nothing safe to do
+	end
+
+	local humanoid = character:FindFirstChildOfClass("Humanoid")
+
+	-- Capture grip offsets relative to the Handle ONCE -- see the module
+	-- doc comment on why per-frame WorldCFrame reads are forbidden.
+	local handleInverse = handle.CFrame:Inverse()
+
+	-- ADS sight frame, handle-local (see the Sight/SightEnd contract in the
+	-- module doc comment): position from Sight, aim axis from the
+	-- Sight -> SightEnd line -- attachment ORIENTATION is deliberately
+	-- ignored when SightEnd exists, so a mis-rotated Sight can't skew the
+	-- aimed grip. Roll comes from the weapon's own Grip up (the handle-local
+	-- direction that points up in the hip grip frame -- see WEAPON
+	-- ORIENTATION), so aiming never rolls the weapon relative to its hip
+	-- hold. A lone Sight (no SightEnd) keeps the old full-CFrame contract.
+	local sightRel: CFrame? = nil
+	local sight = findGripAttachment(tool, Viewmodel.SIGHT_NAME)
+	if sight then
+		local sightCF = handleInverse * sight.WorldCFrame
+		sightRel = sightCF
+		local sightEnd = findGripAttachment(tool, Viewmodel.SIGHT_END_NAME)
+		if sightEnd then
+			local aimAxis = (handleInverse * sightEnd.WorldCFrame).Position - sightCF.Position
+			if aimAxis.Magnitude > 1e-3 then
+				local axis = aimAxis.Unit
+				local upHint = tool.Grip.UpVector
+				if math.abs(upHint:Dot(axis)) > 0.99 then
+					upHint = sightCF.UpVector -- aim axis runs along the weapon's up; any stable hint works
+				end
+				if math.abs(upHint:Dot(axis)) > 0.99 then
+					upHint = if math.abs(axis.Y) < 0.9 then Vector3.yAxis else Vector3.xAxis
+				end
+				sightRel = CFrame.lookAt(sightCF.Position, sightCF.Position + aimAxis, upHint)
+			end
+		end
+	end
+
+	local entry = {
+		Right = nil :: any,
+		Left = nil :: PosedHand?,
+		Sway = Sway.new(),
+		Handle = handle,
+		Posed = false,
+		SightRel = sightRel,
+		-- Never parented -- TweenService tweens a plain Instance's property
+		-- fine without one; this is purely an internal number holder.
+		AdsValue = Instance.new("NumberValue"),
+		AdsTarget = 0,
+		AdsTween = nil,
+		OriginalWeldC0 = {},
+	} :: ActiveEntry
+	entry.Right = {
+		AttRel = handleInverse * rightGrip.WorldCFrame,
+		Arm = rightArm,
+		Cache = ArmRig.Capture(rightArm),
+		TransparencyConnection = watchTransparency(entry, rightArm.Arm),
+	}
+
+	local leftGrip = findGripAttachment(tool, Viewmodel.LEFT_GRIP_NAME)
+	if leftGrip then
+		local leftArm = ArmRig.Find(character, "Left")
+		if leftArm then
+			entry.Left = {
+				AttRel = handleInverse * leftGrip.WorldCFrame,
+				Arm = leftArm,
+				Cache = ArmRig.Capture(leftArm),
+				TransparencyConnection = watchTransparency(entry, leftArm.Arm),
+			}
+		end
+	end
+
+	-- Stepped, NOT RenderStepped: the animation system writes every
+	-- Motor6D.Transform right before Stepped fires, so this is the one spot
+	-- where our Transform override deterministically lands last (see
+	-- ArmRig.luau). NOTE Stepped's dt is the SECOND argument.
+	entry.Connection = RunService.Stepped:Connect(function(_runningTime: number, dt: number)
+		if not (handle.Parent and rightArm.Torso.Parent) then
+			-- The tool/character was destroyed out from under us -- clean up
+			-- via Unequip's own restore path rather than erroring every frame.
+			Viewmodel.Unequip(tool, character)
+			return
+		end
+
+		local camera = Workspace.CurrentCamera
+		local isFirstPerson = camera ~= nil
+			and (camera.CFrame.Position - camera.Focus.Position).Magnitude <= FIRST_PERSON_MAX_DISTANCE
+
+		if not isFirstPerson then
+			unpose(entry) -- no-op if already unposed
+			return
+		end
+		entry.Posed = true
+
+		-- Smooth hip <-> ADS blend (only weapons with a Sight ever aim). A
+		-- new tween is only started when the target actually flips -- eases
+		-- from wherever AdsValue currently sits (mid-tween or settled) to
+		-- the new target, so rapid re-toggling retargets smoothly instead of
+		-- snapping or stacking tweens.
+		local adsTarget = if aiming and entry.SightRel then 1 else 0
+		if entry.AdsTarget ~= adsTarget then
+			entry.AdsTarget = adsTarget
+			if entry.AdsTween then
+				entry.AdsTween:Cancel()
+			end
+			local duration = if adsTarget > 0.5 then ADS_IN_TIME else ADS_OUT_TIME
+			local tween = TweenService:Create(
+				entry.AdsValue,
+				TweenInfo.new(duration, ADS_EASING_STYLE, Enum.EasingDirection.Out),
+				{ Value = adsTarget }
+			)
+			entry.AdsTween = tween
+			tween:Play()
+		end
+		local ads = entry.AdsValue.Value
+
+		local swayCFrame = entry.Sway:Update(dt, humanoid)
+		if ads > 1e-3 then
+			-- Steady the weapon while aiming (fade most of the sway/bob out).
+			swayCFrame = CFrame.identity:Lerp(swayCFrame, 1 - ADS_SWAY_FACTOR * ads)
+		end
+
+		-- Root of the whole chain: the camera-relative grip frame, then the
+		-- Handle placed in it exactly the way Tool.Grip says it sits in a
+		-- hand (see WEAPON ORIENTATION in the module doc comment). Grip is
+		-- read live so grip edits show up immediately.
+		local swayedCamera = camera.CFrame * swayCFrame
+		local gripFrame = swayedCamera * WEAPON_CAMERA_OFFSET
+		local extraOffset = tool:GetAttribute(GRIP_OFFSET_ATTRIBUTE)
+		if typeof(extraOffset) == "CFrame" then
+			gripFrame = gripFrame * extraOffset
+		end
+		local desiredHandle = gripFrame * tool.Grip:Inverse()
+
+		local sightRel = entry.SightRel
+		if sightRel and ads > 1e-3 then
+			-- ADS pose: solve the Handle CFrame that puts the sight frame
+			-- (built at equip from Sight/SightEnd -- see the module doc
+			-- comment) dead-center, ADS_SIGHT_DISTANCE in front of the
+			-- (swayed) camera and rotation-aligned with it, then blend the
+			-- hip pose toward it. The arms + weld all follow desiredHandle,
+			-- so the hands ride the weapon up to the eye automatically.
+			local adsHandle = swayedCamera * CFrame.new(0, 0, -ADS_SIGHT_DISTANCE) * sightRel:Inverse()
+			desiredHandle = desiredHandle:Lerp(adsHandle, ads)
+		end
+
+		-- Pole vectors are defined camera-locally (so elbows keep bending
+		-- down-and-out relative to the view) and resolved to world here.
+		-- The camera CFrame is also passed so each arm over-stretches its
+		-- near (cut) end behind the view plane -- never visible on screen.
+		-- Each arm's virtual shoulder anchor hangs from the (swayed) camera
+		-- at forearm height (ShoulderOffset + the dynamic ElbowOffset's
+		-- position shift) -- see the field comments above / ArmRig.PoseArm.
+		local predictedRightArm = ArmRig.PoseArm(
+			entry.Right.Arm,
+			entry.Right.Cache,
+			desiredHandle * entry.Right.AttRel,
+			Viewmodel.RightElbowOffset,
+			camera.CFrame:VectorToWorldSpace(Viewmodel.RightElbowPole),
+			camera.CFrame,
+			swayedCamera:PointToWorldSpace(Viewmodel.RightShoulderOffset + Viewmodel.RightElbowOffset.Position)
+		)
+		local left = entry.Left
+		if left then
+			ArmRig.PoseArm(
+				left.Arm,
+				left.Cache,
+				desiredHandle * left.AttRel,
+				Viewmodel.LeftElbowOffset,
+				camera.CFrame:VectorToWorldSpace(Viewmodel.LeftElbowPole),
+				camera.CFrame,
+				swayedCamera:PointToWorldSpace(Viewmodel.LeftShoulderOffset + Viewmodel.LeftElbowOffset.Position)
+			)
+		end
+
+		-- Actually move the tool: solve the engine's own RightGrip weld
+		-- (Handle = Arm.CFrame * C0 * C1:Inverse()) so the Handle lands
+		-- exactly on desiredHandle, using the arm CFrame we JUST solved
+		-- (reading Arm.CFrame back would be a frame stale).
+		local weld = findGripWeld(entry)
+		if weld then
+			if entry.OriginalWeldC0[weld] == nil then
+				entry.OriginalWeldC0[weld] = weld.C0
+			end
+			weld.C0 = predictedRightArm:Inverse() * desiredHandle * weld.C1
+		end
+
+		-- Keep the posed arms visible (the watch connections catch the
+		-- engine's own writes; this catches the very first posed frame).
+		entry.Right.Arm.Arm.LocalTransparencyModifier = 0
+		if left then
+			left.Arm.Arm.LocalTransparencyModifier = 0
+		end
+	end)
+
+	active[tool] = entry
+end
+
+function Viewmodel.Unequip(tool: Tool, _character: Model)
+	local entry = active[tool]
+	if not entry then
+		return
+	end
+	active[tool] = nil
+	entry.Connection:Disconnect()
+	unpose(entry)
+	entry.Right.TransparencyConnection:Disconnect()
+	if entry.Left then
+		entry.Left.TransparencyConnection:Disconnect()
+	end
+	if entry.AdsTween then
+		entry.AdsTween:Cancel()
+	end
+	entry.AdsValue:Destroy()
+end
+
+return Viewmodel
+
+
+--!optimize 2
+--[[
+	Viewmodel/ArmRig.luau
+	R6-specific single-segment arm stretch. Confirmed via live inspection
+	that this project's player characters are R6 (Torso -[Shoulder
+	Motor6D]-> "Right Arm"/"Left Arm" -- ONE block part, no elbow/wrist and
+	no separate Hand part at all). Stretches that single Arm part
+	("telescoping" -- there's no elbow to bend anyway) from a fixed
+	body-relative pivot to reach an arbitrary target grip CFrame.
+
+	HOW THE JOINT IS DRIVEN -- Motor6D.Transform, never C0/C1:
+	A Motor6D places its child as
+	    Part1.CFrame = Part0.CFrame * C0 * Transform * C1:Inverse()
+	and the `Transform` term is REWRITTEN BY THE ANIMATION SYSTEM every
+	frame, right before RunService.Stepped fires. An earlier version of
+	this file wrote Shoulder.C0 per frame instead -- the running idle/walk
+	AnimationTracks kept stacking their own Transform on top of our moved
+	C0, so the two systems fought each other and the arms visibly spazzed
+	out. (Measured live: with animations running, Torso*C0*C1:Inverse()
+	differs from the real Arm CFrame by ~1 stud -- that difference IS the
+	animation's Transform.) The fix: leave C0/C1 alone entirely and write
+	`Transform` itself from a Stepped callback, which runs AFTER the
+	animator's write each frame, so our value simply wins while posed --
+	no fighting, and Restore just zeroes Transform and the animator
+	seamlessly takes back over next frame.
+
+	Because we solve the full formula for Transform (given the world-space
+	Arm CFrame we want), C1 cancels out exactly -- so unlike the old C0
+	approach, C1's perpendicular seating offset needs no special quadratic
+	handling. The only geometry that matters:
+	 - The virtual shoulder anchor the two-bone elbow solve hangs from:
+	   normally a caller-supplied CAMERA-hung point (PoseArm's anchorPos --
+	   see Viewmodel.RightShoulderOffset), falling back to the rig's real
+	   shoulder socket (Torso.CFrame * C0).Position -- see FOREARM below.
+	 - The grip point sits GRIP_INSET studs in from the arm's far tip
+	   along the bone axis (the "half a stud inside the hand" rule -- R6
+	   has no separate Hand part, so the inset applies to the Arm itself).
+	 - The socket sits DistFromTop studs down from the arm's near tip
+	   (measured from the rig's own C1 axial offset at Capture time), so
+	   the stretched arm still visually "hangs from" the shoulder.
+	So the base stretched length is simply
+	    L = |gripPos - elbowPos| + DistFromTop + GRIP_INSET
+	(then possibly extended further to hide the near tip off-screen -- see
+	PoseArm's hideNearTipFrom) and the arm's center sits (L/2 - GRIP_INSET)
+	back from the grip along the bone direction. Any length works: the grip
+	end always lands exactly on target, extra length only pushes the unseen
+	near end further back.
+
+	THE ARM IS TREATED AS A FOREARM, WITH A TWO-BONE IK ELBOW: a whole
+	2-stud arm pivoting rigidly at a fixed point reads as a stiff,
+	straight-armed point -- and glitches badly looking down, when the grip
+	drops far below the fixed pivot and the brick swings near-vertical. So
+	PoseArm runs the standard two-segment viewmodel solve instead: a
+	virtual BICEP (VIRTUAL_BICEP_LENGTH, never rendered) from the virtual
+	shoulder anchor to an elbow, a virtual FOREARM (VIRTUAL_FOREARM_LENGTH)
+	from that elbow to the grip, elbow position solved by law of cosines and
+	bent toward a caller-supplied pole vector -- and then renders ONLY the
+	forearm segment with the single R6 brick. The bicep's whole job is
+	deciding where the elbow is, so the forearm's angle changes naturally
+	as the grip moves (looking down bends the elbow instead of producing a
+	vertical full-arm point). When the grip is out of reach the forearm
+	segment stretches to cover the difference, keeping the solve valid at
+	any distance. The driven joint is still the Shoulder Motor6D (R6 has
+	no elbow joint) -- the "elbow" exists only in the math. On top of the
+	IK, PoseArm's elbowOffset parameter (dynamic, per-frame) shifts the
+	virtual shoulder anchor (position) and/or swings the posed forearm
+	around the planted hand (rotation).
+
+	BONE AXIS: the arm's long dimension is local Y (Size = (1, 2, 1),
+	confirmed live) and hangs DOWN (local -Y) from the shoulder at rest,
+	so the pose aims local -Y from the socket toward the grip.
+]]
+
+local GRIP_INSET = 0.5 -- studs inward from the arm's far tip -- see module doc comment
+local RESIZE_AXIS = Vector3.yAxis -- the arm's long (bone) dimension, for Size
+
+-- Two-bone IK segment lengths (studs): the virtual bicep (shoulder ->
+-- elbow, never rendered) and the virtual forearm (elbow -> grip; the
+-- rendered brick's nominal reach -- it stretches beyond this when the grip
+-- is farther than both segments combined). Their sum is the arm's
+-- comfortable reach. TUNE ME by feel: longer bicep = the elbow swings
+-- wider as you look around; longer forearm = straighter-looking hold.
+local VIRTUAL_BICEP_LENGTH = 1.25
+local VIRTUAL_FOREARM_LENGTH = 1.75
+
+-- Default arm offset (see PoseArm's elbowOffset parameter). Identity: the
+-- two-bone solve already produces the natural dropped-elbow forearm look
+-- on its own, so this is purely an artistic override -- reassign
+-- Viewmodel.RightElbowOffset / .LeftElbowOffset (read every frame) to
+-- shift the virtual shoulder anchor (position) or swing the posed forearm
+-- around the planted hand (rotation).
+local DEFAULT_ELBOW_OFFSET = CFrame.identity
+
+-- How far behind the hide camera's view plane the arm's near tip must sit
+-- (see PoseArm's hideNearTipFrom) -- generous enough that the 1-stud-wide
+-- tip face can't clip through the near plane at the screen edges.
+local HIDE_NEAR_TIP_MARGIN = 0.5
+
+-- Never stretch past this, even to hide the near tip -- an arm nearly
+-- perpendicular to the view direction would otherwise ask for an absurd
+-- (toward-infinite) length.
+local MAX_ARM_LENGTH = 20
+
+-- Solved lengths are rounded UP to this step. The grip end lands exactly on
+-- target for ANY length (only the hidden near tip moves), so quantizing
+-- costs nothing visually -- and it stops the per-frame sway/bob length
+-- wobble from forcing a Size write (a physics-geometry rebuild) every
+-- single frame.
+local LENGTH_QUANTUM = 0.1
+
+local ArmRig = {}
+
+ArmRig.DEFAULT_ELBOW_OFFSET = DEFAULT_ELBOW_OFFSET
+
+-- Builds a rotation-only CFrame whose LOCAL +Y axis points along world
+-- direction `yDir`, using `upHint` to resolve roll around that axis (must
+-- not be near-parallel to yDir -- callers should pick a fallback hint when
+-- it is, see PoseArm).
+local function cframeWithLocalYAlong(yDir: Vector3, upHint: Vector3): CFrame
+	yDir = yDir.Unit
+	local xDir = upHint:Cross(yDir)
+	if xDir.Magnitude < 1e-4 then
+		xDir = (math.abs(yDir.Y) < 0.9 and Vector3.yAxis or Vector3.xAxis):Cross(yDir)
+	end
+	xDir = xDir.Unit
+	local zDir = xDir:Cross(yDir).Unit
+	return CFrame.fromMatrix(Vector3.zero, xDir, yDir, zDir)
+end
+
+export type ArmSide = {
+	Shoulder: Motor6D, -- Part0 = Torso, Part1 = Arm
+	Torso: BasePart,
+	Arm: BasePart,
+}
+
+export type ArmCache = {
+	ShoulderC0: CFrame, -- read-only reference (never rewritten by this module)
+	ShoulderC1: CFrame, -- read-only reference (never rewritten by this module)
+	ArmSize: Vector3,
+	ArmLength: number,
+	-- Axial distance from the arm's near (shoulder-end) tip to the
+	-- shoulder attachment point, measured from the rig's own C1 at
+	-- Capture time (= 0.5 on a standard R6 rig). Kept fixed as the arm
+	-- stretches, so the shoulder end stays visually seated in the torso.
+	DistFromTop: number,
+	Massless: boolean,
+}
+
+-- Finds the named parts/joint for one arm ("Right" or "Left") on a
+-- character, or nil if any piece is missing (e.g. not an R6 rig).
+function ArmRig.Find(character: Model, side: "Right" | "Left"): ArmSide?
+	local torso = character:FindFirstChild("Torso") :: BasePart?
+	local arm = character:FindFirstChild(side .. " Arm") :: BasePart?
+	if not (torso and arm) then
+		return nil
+	end
+	-- R6 parents the joint under Torso (the parent side), unlike R15's
+	-- convention of parenting under the child limb -- check both so this
+	-- doesn't silently break if that ever changes.
+	local shoulder = (torso:FindFirstChild(side .. " Shoulder") or arm:FindFirstChild(side .. " Shoulder")) :: Motor6D?
+	if not shoulder then
+		return nil
+	end
+	return { Shoulder = shoulder, Torso = torso, Arm = arm }
+end
+
+-- Snapshots everything PoseArm is about to touch, so Restore can put it back
+-- exactly. Call once per Equip, before the first PoseArm call.
+function ArmRig.Capture(arm: ArmSide): ArmCache
+	local armLength = math.max(arm.Arm.Size:Dot(RESIZE_AXIS), 1e-3)
+	return {
+		ShoulderC0 = arm.Shoulder.C0,
+		ShoulderC1 = arm.Shoulder.C1,
+		ArmSize = arm.Arm.Size,
+		ArmLength = armLength,
+		DistFromTop = armLength / 2 - arm.Shoulder.C1.Position.Y,
+		Massless = arm.Arm.Massless,
+	}
+end
+
+-- Undoes Capture -- call once when unposing (leaving first person) or on
+-- Unequip. Zeroing Transform hands the joint straight back to the
+-- animation system, which rewrites it next frame anyway. Safe to call on a
+-- since-destroyed character's parts (property writes on a destroyed
+-- Instance just no-op), so callers don't need a validity check.
+function ArmRig.Restore(arm: ArmSide, cache: ArmCache)
+	arm.Arm.Size = cache.ArmSize
+	arm.Arm.Massless = cache.Massless
+	arm.Shoulder.Transform = CFrame.identity
+end
+
+-- The actual "telescoping" stretch + aim. Call every frame from a
+-- RunService.Stepped callback (NOT RenderStepped -- the write must land
+-- after the animation system's per-frame Transform write, see the module
+-- doc comment) while posed. Positions/orients the Arm part so the INSET
+-- grip point ends up exactly at targetGripCFrame's position, stretching
+-- from the fixed elbow pivot (forearm treatment -- see module doc comment).
+--
+-- Returns the world-space Arm CFrame it solved for -- callers that need to
+-- place other things relative to the arm this same frame (the tool weld,
+-- see Viewmodel/init.luau) must use this predicted value, NOT read
+-- arm.Arm.CFrame back (which is one frame stale -- the engine applies the
+-- Transform we just wrote after Stepped returns).
+-- elbowOffset (optional, defaults to DEFAULT_ELBOW_OFFSET): fully dynamic --
+-- pass a different value any frame. Its POSITION shifts the virtual SHOULDER
+-- anchor the two-bone solve hangs from; its ROTATION is applied about the
+-- GRIP POINT, so the hand stays planted on the weapon while the elbow end
+-- swings -- an artistic override on top of the IK.
+--
+-- poleDir (optional, world-space): the IK pole vector -- which way the
+-- virtual elbow bends when the arm isn't straight. Defaults to torso-down;
+-- callers should pass a down-and-outward hint per arm (see
+-- Viewmodel.RightElbowPole / .LeftElbowPole).
+--
+-- hideNearTipFrom (optional, pass the camera's CFrame): when given, the arm
+-- is stretched extra far back so its near (cut) tip always sits behind that
+-- view plane -- off-screen no matter how the pivot/angles work out.
+--
+-- anchorPos (optional, world-space): where the virtual shoulder hangs. The
+-- viewmodel passes a CAMERA-hung point at forearm height (see
+-- Viewmodel.RightShoulderOffset) so the rendered forearm visibly rises from
+-- LOW on the screen and follows the camera's pitch -- anchoring at the rig's
+-- real shoulder socket made the arms appear to originate up at shoulder/body
+-- height instead of at the solved elbow. When nil, falls back to that real
+-- socket. NOTE: when anchorPos is given, the caller is expected to have
+-- already baked elbowOffset.Position into it (camera-locally -- see
+-- Viewmodel/init.luau); only the fallback path applies it here (torso-local).
+function ArmRig.PoseArm(
+	arm: ArmSide,
+	cache: ArmCache,
+	targetGripCFrame: CFrame,
+	elbowOffset: CFrame?,
+	poleDir: Vector3?,
+	hideNearTipFrom: CFrame?,
+	anchorPos: Vector3?
+): CFrame
+	local offset = elbowOffset or DEFAULT_ELBOW_OFFSET
+
+	-- 1. The virtual shoulder anchor: the caller's camera-hung point, or the
+	-- rig's real shoulder socket (from the ORIGINAL, never-touched C0) plus
+	-- the caller's torso-local shift.
+	local shoulderPos = if anchorPos
+		then anchorPos
+		else (arm.Torso.CFrame * cache.ShoulderC0).Position
+			+ arm.Torso.CFrame:VectorToWorldSpace(offset.Position)
+	local gripPos = targetGripCFrame.Position
+	local toGrip = gripPos - shoulderPos
+	local dist = toGrip.Magnitude
+	if dist < 1e-3 then
+		return arm.Arm.CFrame -- grip on top of the shoulder; nothing sane to solve
+	end
+	local reachDir = toGrip / dist
+
+	-- 2. Two-bone IK for the virtual elbow (law of cosines, the standard
+	-- two-segment viewmodel solve -- see module doc comment): the elbow
+	-- sits `a` along the shoulder->grip axis and `h` off it, bent toward
+	-- the pole. When the grip is out of reach the virtual forearm STRETCHES
+	-- (to dist - bicep), which collapses h to 0 -- a straight arm -- rather
+	-- than the solve failing.
+	local bicep = VIRTUAL_BICEP_LENGTH
+	local forearm = math.max(VIRTUAL_FOREARM_LENGTH, dist - bicep)
+	local a = math.clamp((bicep * bicep - forearm * forearm + dist * dist) / (2 * dist), -bicep, bicep)
+	local h = math.sqrt(math.max(bicep * bicep - a * a, 0))
+	local elbowPos = shoulderPos + reachDir * a
+	if h > 1e-4 then
+		local pole = poleDir or -arm.Torso.CFrame.UpVector
+		local bend = pole - reachDir * pole:Dot(reachDir) -- pole, perpendicular to the reach axis
+		if bend.Magnitude > 1e-3 then
+			elbowPos += bend.Unit * h
+		end
+	end
+
+	-- 3. The rendered brick is the FOREARM only, elbow -> grip (the bicep
+	-- is never drawn; its whole job was deciding where the elbow is).
+	local toGripFromElbow = gripPos - elbowPos
+	local forearmDist = toGripFromElbow.Magnitude
+	if forearmDist < 1e-3 then
+		return arm.Arm.CFrame -- grip on top of the elbow; degenerate
+	end
+	local aimDir = toGripFromElbow / forearmDist
+
+	-- 4. Aim: point the bone axis from the elbow at the grip (position wins
+	-- over the target's own rotation -- a floating gun reads as far more
+	-- broken than a slightly-off wrist roll; the target's UpVector only
+	-- resolves roll). Then apply the elbow offset's rotation ON TOP, about
+	-- the grip point.
+	local upHint = targetGripCFrame.UpVector
+	if math.abs(upHint:Dot(aimDir)) > 0.99 then
+		upHint = Vector3.yAxis
+	end
+	-- Bone axis is local -Y, so local +Y must point opposite the aim.
+	local rotation = cframeWithLocalYAlong(-aimDir, upHint) * offset.Rotation
+	local boneDir = -rotation.YVector -- where local -Y ACTUALLY points after the offset
+
+	-- 5. Length: elbow-to-grip distance plus the fixed seatings at both
+	-- ends (see module doc comment), then extended as needed to bury the
+	-- near tip behind the hide view plane, capped, and rounded up to
+	-- LENGTH_QUANTUM (the grip end is exact for any length -- only the
+	-- hidden near end moves).
+	local newLength = forearmDist + cache.DistFromTop + GRIP_INSET
+	if hideNearTipFrom then
+		local look = hideNearTipFrom.LookVector
+		local along = boneDir:Dot(look)
+		if along > 1e-2 then
+			-- Near tip sits (L - GRIP_INSET) back from the grip along
+			-- -boneDir; solve its depth along `look` <= -MARGIN for L.
+			local gripDepth = (gripPos - hideNearTipFrom.Position):Dot(look)
+			local hideLength = GRIP_INSET + (gripDepth + HIDE_NEAR_TIP_MARGIN) / along
+			newLength = math.max(newLength, hideLength)
+		end
+	end
+	newLength = math.clamp(newLength, 1e-3, MAX_ARM_LENGTH)
+	newLength = math.ceil(newLength / LENGTH_QUANTUM) * LENGTH_QUANTUM
+
+	-- 6. Resize -- only when it actually changed (Size writes are much more
+	-- expensive than CFrame-ish writes: they rebuild physics geometry;
+	-- that's what LENGTH_QUANTUM is for) -- and keep the stretched arm from
+	-- changing the character's physics mass.
+	local keep = Vector3.one - RESIZE_AXIS
+	local newSize = cache.ArmSize * keep + RESIZE_AXIS * newLength
+	if (arm.Arm.Size - newSize).Magnitude > 1e-3 then
+		arm.Arm.Size = newSize
+	end
+	arm.Arm.Massless = true
+
+	-- 7. Place: grip point exactly on target, the rest of the arm running
+	-- back along the final (offset-rotated) bone direction.
+	local armCFrame = CFrame.new(gripPos - boneDir * (newLength / 2 - GRIP_INSET)) * rotation
+
+	-- 8. Solve the Motor6D placement formula
+	-- (Arm = Torso * C0 * Transform * C1:Inverse()) for Transform. C1
+	-- cancels exactly, so no perpendicular-offset special-casing needed.
+	arm.Shoulder.Transform = cache.ShoulderC0:Inverse() * arm.Torso.CFrame:Inverse() * armCFrame * cache.ShoulderC1
+
+	return armCFrame
+end
+
+return ArmRig
+
+--!optimize 2
+--[[
+	Viewmodel/Sway.luau
+	Procedural (non-keyframed) motion layered on top of the attachment-solved
+	base grip pose: mouse-look sway, walk-cycle bob, and idle breathing. Pure
+	offset generator -- returns a CFrame meant to be composed onto the solved
+	target hand CFrame (targetHandCFrame * offset), never touches the rig
+	directly, so it has no idea ArmRig/Motor6Ds even exist.
+
+	Deliberately driven by REAL (undilated) dt, not this game's dilated
+	Heartbeat clock -- this is camera-relative rendering polish, not gameplay
+	simulation, and should feel the same regardless of the world/personal
+	time ratio (unlike e.g. walk speed, which this game deliberately DOES
+	dilate -- see MovementController.luau).
+]]
+
+local UserInputService = game:GetService("UserInputService")
+
+local Sway = {}
+Sway.__index = Sway
+
+-- Tuning -- studs/radians. Untested against the actual game feel; retune
+-- once this is visible in Studio.
+local MOUSE_SWAY_STRENGTH = 0.006 -- radians of tilt per pixel of mouse delta
+local MOUSE_SWAY_SMOOTHING = 8 -- higher = snappier follow, lower = floatier lag
+local BOB_WALK_FREQUENCY = 8 -- bob cycles per second at full walk speed
+local BOB_WALK_AMPLITUDE = 0.03 -- studs
+local BOB_FADE_IN_SPEED = 16 -- studs/s of movement to reach full bob amplitude
+local BREATH_FREQUENCY = 0.35 -- cycles per second
+local BREATH_AMPLITUDE = 0.015 -- studs
+
+function Sway.new()
+	return setmetatable({
+		_smoothedSway = Vector2.zero, -- current smoothed mouse-sway tilt
+		_bobPhase = 0,
+	}, Sway)
+end
+
+export type Sway = typeof(Sway.new())
+
+-- dt: real (undilated) seconds since last call. Returns a CFrame to compose
+-- onto the base grip pose (basePose * sway:Update(...)).
+function Sway:Update(dt: number, humanoid: Humanoid?): CFrame
+	-- Mouse-look sway: tilt opposite the recent mouse delta, smoothed so it
+	-- springs back to center instead of snapping frame-to-frame.
+	local delta = UserInputService:GetMouseDelta()
+	local targetSway = Vector2.new(-delta.Y, -delta.X) * MOUSE_SWAY_STRENGTH
+	local alpha = math.clamp(MOUSE_SWAY_SMOOTHING * dt, 0, 1)
+	self._smoothedSway = self._smoothedSway:Lerp(targetSway, alpha)
+
+	-- Walk bob: advance a phase accumulator at a rate proportional to actual
+	-- move speed (not just "are we moving"), and fade amplitude in/out with
+	-- speed too so starting/stopping isn't a hard cut.
+	local speed = 0
+	if humanoid then
+		speed = humanoid.MoveDirection.Magnitude * humanoid.WalkSpeed
+	end
+	self._bobPhase += dt * BOB_WALK_FREQUENCY
+	local bobStrength = math.clamp(speed / BOB_FADE_IN_SPEED, 0, 1)
+	local bobY = math.sin(self._bobPhase * math.pi * 2) * BOB_WALK_AMPLITUDE * bobStrength
+	local bobX = math.cos(self._bobPhase * math.pi) * BOB_WALK_AMPLITUDE * 0.5 * bobStrength
+
+	-- Idle breathing: always-on, tiny, so the viewmodel never looks
+	-- perfectly frozen even standing still.
+	local breath = math.sin(os.clock() * BREATH_FREQUENCY * math.pi * 2) * BREATH_AMPLITUDE
+
+	return CFrame.Angles(self._smoothedSway.X, self._smoothedSway.Y, 0) * CFrame.new(bobX, bobY + breath, 0)
+end
+
+return Sway

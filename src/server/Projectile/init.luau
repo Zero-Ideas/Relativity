@@ -197,6 +197,22 @@
 	   Visualize = false, VisualRange = math.huge
 	   Model = Instance?        (cloned client-side) or Visual = {Shape,Size,Color}
 	   DestroyDelay = 0         (client keeps the visual this long after impact)
+	   WaitForParticles = true (client-side; while true, a ParticleEmitter
+	              under the visual is only disabled on destroy -- already-
+	              emitted particles keep fading out over their own Lifetime,
+	              and the model's actual :Destroy() waits out the longest one.
+	              false deletes every ParticleEmitter immediately instead,
+	              contributing no wait -- see VisualModel.FadeOut)
+	   WaitForTrails = true    (same as WaitForParticles, but for Trail
+	              instances. If both this and WaitForParticles are false, or
+	              one is false and the model has none of the other kind, the
+	              visual is destroyed instantly with no grace period)
+	   ActivateParticlesOnCreate = false (client-side; when true, every
+	              ParticleEmitter under the visual fires once via :Emit()
+	              right after spawn, per its own EmitCount/EmitDelay
+	              attributes -- defaults to 5 / 0s when either is unset;
+	              EmitDelay is seconds from spawn until that emitter actually
+	              emits -- see VisualModel.ActivateParticles)
 	   OnBounce = fn(projectile, result)   -- still config-driven, unlike OnHit (see Events above)
 	   RewindSeconds = 0        (lag compensation; see below)
 
@@ -382,6 +398,12 @@ function Projectile.new(config)
 		Model = config.Model,
 		Visual = config.Visual,
 		DestroyDelay = config.DestroyDelay or 0,
+		-- Client-side effect-cleanup/activation options -- see the module doc
+		-- comment's config section and VisualModel.FadeOut /
+		-- VisualModel.ActivateParticles for the actual behaviour.
+		WaitForParticles = config.WaitForParticles ~= false,
+		WaitForTrails = config.WaitForTrails ~= false,
+		ActivateParticlesOnCreate = config.ActivateParticlesOnCreate == true,
 
 		-- See "Events" in the module doc comment's API section. Fresh Signal
 		-- per projectile -- connect on the returned instance, not via config.

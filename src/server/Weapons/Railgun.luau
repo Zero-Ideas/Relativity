@@ -113,8 +113,8 @@ return {
 	FireRate = 2, -- shots/sec
 
 	Magazine = {
-		Size = 6,
-		Reserve = 24,
+		Size = math.huge,
+		Reserve = math.huge,
 		ReloadTime = 2.2, -- seconds
 	},
 

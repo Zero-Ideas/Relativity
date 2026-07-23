@@ -77,7 +77,8 @@ local function destroyVisual(id)
 		visual.tween:Cancel()
 		visual.tween = nil
 	end
-	local delay = math.max(visual.destroyDelay or 0, VisualModel.FadeOut(visual.model))
+	local delay =
+		math.max(visual.destroyDelay or 0, VisualModel.FadeOut(visual.model, visual.waitForParticles, visual.waitForTrails))
 	if delay > 0 then
 		task.delay(delay, function()
 			visual.model:Destroy()
@@ -96,9 +97,15 @@ function ProjectileClient.EnableClientRendering()
 	VisualOffload.On("ProjSpawn", function(data)
 		local model = VisualModel.Build(data)
 		VisualModel.Place(model, data.Position, data.Velocity)
+		if data.ActivateParticlesOnCreate then
+			VisualModel.ActivateParticles(model)
+		end
 		visuals[data.Id] = {
 			model = model,
 			destroyDelay = data.DestroyDelay or 0,
+			-- See VisualModel.FadeOut -- both default true.
+			waitForParticles = data.WaitForParticles ~= false,
+			waitForTrails = data.WaitForTrails ~= false,
 			lastUpdate = os.clock(),
 			tween = nil,
 

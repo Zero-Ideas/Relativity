@@ -74,6 +74,12 @@
 local GRIP_INSET = 0.5 -- studs inward from the arm's far tip -- see module doc comment
 local RESIZE_AXIS = Vector3.yAxis -- the arm's long (bone) dimension, for Size
 
+-- Cross-section thickness (studs) the posed arm is forced to in first
+-- person, overriding the rig's native (1, _, 1) girth -- purely cosmetic,
+-- doesn't affect the IK/length solve above. Applied on both non-bone axes
+-- (X and Z) in the resize step below.
+local ARM_THICKNESS = 0.75
+
 -- Two-bone IK segment lengths (studs): the virtual bicep (shoulder ->
 -- elbow, never rendered) and the virtual forearm (elbow -> grip; the
 -- rendered brick's nominal reach -- it stretches beyond this when the grip
@@ -317,7 +323,7 @@ function ArmRig.PoseArm(
 	-- that's what LENGTH_QUANTUM is for) -- and keep the stretched arm from
 	-- changing the character's physics mass.
 	local keep = Vector3.one - RESIZE_AXIS
-	local newSize = cache.ArmSize * keep + RESIZE_AXIS * newLength
+	local newSize = Vector3.new(ARM_THICKNESS, 0, ARM_THICKNESS) * keep + RESIZE_AXIS * newLength
 	if (arm.Arm.Size - newSize).Magnitude > 1e-3 then
 		arm.Arm.Size = newSize
 	end
