@@ -21,6 +21,10 @@
 	 ChunkManager.GetTimeScaleAt(worldPos) -> number
 	 ChunkManager.SetTimeScaleAt(worldPos, scale)
 	 ChunkManager.SetTimeScaleInRadius(worldPos, radius, scale)
+	 ChunkManager.GetChunkKeysInRadius(worldPos, radius) -> { Vector3 }
+	 ChunkManager.SetTimeScaleForKey(key, scale, persistent?)
+	 ChunkManager.AddTimeScaleZone(id, position, radius, scale)
+	 ChunkManager.RemoveTimeScaleZone(id)
 	 ChunkManager.SetLoadedAt(worldPos, loaded)
 	 ChunkManager.IsActiveAt(worldPos) -> boolean
 	 ChunkManager.GetEntitiesInChunk(worldPos) -> {Entity}
@@ -47,6 +51,9 @@ ChunkManager.UseY = false -- 2D (XZ) chunking by default
 local chunks: { [Vector3]: any } = {} -- keyed by chunk-coordinate Vector3
 local chunkCount = 0
 local autoLoadConnection = nil
+local timeZones = {} -- ordered oldest -> newest; newest containing zone wins
+local timeZonesById = {}
+local replicationEnabled = false
 
 --------------------------------------------------------------------------------
 -- Chunk lookup
@@ -108,8 +115,101 @@ end
 
 -- Chunk-local time scale at a position (1 when no chunk exists there).
 function ChunkManager.GetTimeScaleAt(worldPos: Vector3): number
+	for i = #timeZones, 1, -1 do
+		local zone = timeZones[i]
+		local offset = worldPos - zone.Position
+		if offset:Dot(offset) <= zone.Radius * zone.Radius then
+			return zone.Scale
+		end
+	end
 	local chunk = chunks[toChunkKey(worldPos)]
 	return chunk and chunk.TimeScale or 1
+end
+
+function ChunkManager.GetTimeScaleZones()
+	return table.clone(timeZones)
+end
+
+local function replicateZone(channel: string, payload)
+	if not replicationEnabled or not RunService:IsServer() then
+		return
+	end
+	local VisualOffload = require(script.Parent.VisualOffload)
+	VisualOffload.Fire(channel, payload)
+end
+
+function ChunkManager.AddTimeScaleZone(id: any, position: Vector3, radius: number, scale: number)
+	local existing = timeZonesById[id]
+	if existing then
+		local index = table.find(timeZones, existing)
+		if index then
+			table.remove(timeZones, index)
+		end
+	end
+	local zone = {
+		Id = id,
+		Position = position,
+		Radius = math.max(radius, 0),
+		Scale = math.max(scale, 0),
+	}
+	timeZonesById[id] = zone
+	table.insert(timeZones, zone)
+	replicateZone("TimeZoneUpsert", zone)
+	return zone
+end
+
+function ChunkManager.RemoveTimeScaleZone(id: any)
+	local zone = timeZonesById[id]
+	if not zone then
+		return
+	end
+	timeZonesById[id] = nil
+	local index = table.find(timeZones, zone)
+	if index then
+		table.remove(timeZones, index)
+	end
+	replicateZone("TimeZoneRemove", { Id = id })
+end
+
+-- Earliest entry/exit of a radial zone that changes the effective scale along
+-- this straight segment. Projectile curvature limits keep the chord error
+-- bounded before this function is consulted.
+function ChunkManager.GetRadialTimeScaleBoundaryDt(position: Vector3, velocity: Vector3, maxDt: number): number
+	local speedSq = velocity:Dot(velocity)
+	if speedSq < 1e-8 or #timeZones == 0 then
+		return math.huge
+	end
+
+	local speed = math.sqrt(speedSq)
+	local direction = velocity / speed
+	local initialScale = ChunkManager.GetTimeScaleAt(position + direction * 1e-3)
+	local candidates = {}
+	for _, zone in timeZones do
+		local offset = position - zone.Position
+		local b = 2 * offset:Dot(velocity)
+		local c = offset:Dot(offset) - zone.Radius * zone.Radius
+		local discriminant = b * b - 4 * speedSq * c
+		if discriminant >= 0 then
+			local root = math.sqrt(discriminant)
+			local denominator = 2 * speedSq
+			local first = (-b - root) / denominator
+			local second = (-b + root) / denominator
+			if first > 1e-6 and first < maxDt then
+				table.insert(candidates, first)
+			end
+			if second > 1e-6 and second < maxDt then
+				table.insert(candidates, second)
+			end
+		end
+	end
+	table.sort(candidates)
+	local sampleDt = 1e-3 / speed
+	for _, candidate in candidates do
+		if ChunkManager.GetTimeScaleAt(position + velocity * (candidate + sampleDt)) ~= initialScale then
+			return candidate
+		end
+	end
+	return math.huge
 end
 
 -- Full effective scale at a position: global * chunk.
@@ -126,31 +226,58 @@ function ChunkManager.ScaleDt(dt: number, worldPos: Vector3): number
 end
 
 function ChunkManager.SetTimeScaleAt(worldPos: Vector3, scale: number)
-	local chunk = ChunkManager.GetOrCreateChunk(worldPos)
-	chunk.TimeScale = math.max(scale, 0)
-	chunk.Persistent = true
-	ChunkManager._replicateScale(chunk)
-	maybeCollect(chunk)
+	return ChunkManager.SetTimeScaleForKey(toChunkKey(worldPos), scale, true)
 end
 
-function ChunkManager.SetTimeScaleInRadius(worldPos: Vector3, radius: number, scale: number)
+-- Key-based variant used by temporary zone systems that must restore both the
+-- previous scale and persistence state without leaking empty default chunks.
+function ChunkManager.SetTimeScaleForKey(key: Vector3, scale: number, persistent: boolean?)
+	local chunk = chunks[key] or newChunk(key)
+	chunk.TimeScale = math.max(scale, 0)
+	if persistent ~= nil then
+		chunk.Persistent = persistent
+	end
+	ChunkManager._replicateScale(chunk)
+	maybeCollect(chunk)
+	return chunk
+end
+
+-- Chunk keys whose axis-aligned cells intersect a circular (2D mode) or
+-- spherical (3D mode) radius. Public so debug/test visuals can show the exact
+-- same discretized zone that simulation uses.
+function ChunkManager.GetChunkKeysInRadius(worldPos: Vector3, radius: number): { Vector3 }
 	local size = ChunkManager.ChunkSize
+	radius = math.max(radius, 0)
 	local minY, maxY = 0, 0
 	if ChunkManager.UseY then
 		minY = math.floor((worldPos.Y - radius) / size)
 		maxY = math.floor((worldPos.Y + radius) / size)
 	end
+	local radiusSq = radius * radius
+	local keys = {}
 	for x = math.floor((worldPos.X - radius) / size), math.floor((worldPos.X + radius) / size) do
 		for z = math.floor((worldPos.Z - radius) / size), math.floor((worldPos.Z + radius) / size) do
 			for y = minY, maxY do
-				local key = Vector3.new(x, y, z)
-				local chunk = chunks[key] or newChunk(key)
-				chunk.TimeScale = math.max(scale, 0)
-				chunk.Persistent = true
-				ChunkManager._replicateScale(chunk)
-				maybeCollect(chunk)
+				local minPoint = Vector3.new(x * size, if ChunkManager.UseY then y * size else worldPos.Y, z * size)
+				local maxPoint = minPoint + Vector3.new(size, if ChunkManager.UseY then size else 0, size)
+				local closest = Vector3.new(
+					math.clamp(worldPos.X, minPoint.X, maxPoint.X),
+					if ChunkManager.UseY then math.clamp(worldPos.Y, minPoint.Y, maxPoint.Y) else worldPos.Y,
+					math.clamp(worldPos.Z, minPoint.Z, maxPoint.Z)
+				)
+				local offset = closest - worldPos
+				if offset:Dot(offset) <= radiusSq then
+					table.insert(keys, Vector3.new(x, y, z))
+				end
 			end
 		end
+	end
+	return keys
+end
+
+function ChunkManager.SetTimeScaleInRadius(worldPos: Vector3, radius: number, scale: number)
+	for _, key in ChunkManager.GetChunkKeysInRadius(worldPos, radius) do
+		ChunkManager.SetTimeScaleForKey(key, scale, true)
 	end
 end
 
@@ -354,8 +481,6 @@ end
 -- client-side visual simulation (see Projectile) dilates identically.
 --------------------------------------------------------------------------------
 
-local replicationEnabled = false
-
 function ChunkManager._replicateScale(chunk)
 	if not replicationEnabled or not RunService:IsServer() then
 		return
@@ -382,6 +507,7 @@ function ChunkManager.EnableReplication()
 			end
 			VisualOffload.FireClient(player, "ChunkSnapshot", {
 				Chunks = snapshot,
+				Zones = timeZones,
 				GlobalScale = Heartbeat.GetGlobalTimeScale(),
 			})
 		end)
@@ -416,7 +542,16 @@ function ChunkManager.EnableReplication()
 				chunk.TimeScale = entry.Scale
 				chunk.Persistent = true
 			end
+			for _, zone in data.Zones or {} do
+				ChunkManager.AddTimeScaleZone(zone.Id, zone.Position, zone.Radius, zone.Scale)
+			end
 			Heartbeat.SetGlobalTimeScale(data.GlobalScale)
+		end)
+		VisualOffload.On("TimeZoneUpsert", function(zone)
+			ChunkManager.AddTimeScaleZone(zone.Id, zone.Position, zone.Radius, zone.Scale)
+		end)
+		VisualOffload.On("TimeZoneRemove", function(data)
+			ChunkManager.RemoveTimeScaleZone(data.Id)
 		end)
 		VisualOffload.On("GlobalScale", function(scale)
 			Heartbeat.SetGlobalTimeScale(scale)

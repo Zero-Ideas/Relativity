@@ -14,6 +14,7 @@ local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local Shared = ReplicatedStorage:WaitForChild("Shared")
 local VisualOffload = require(Shared.VisualOffload)
 local StatusEffectSys = require(Shared.StatusEffectSys)
+local Ragdoll = require(script.Parent.Parent.Ragdoll)
 local WeaponsShared = require(script.Parent.Shared)
 
 -- How far along the shot's own path (origin + direction * this) the muzzle
@@ -68,25 +69,25 @@ local function onRailgunHit(ctx: WeaponsShared.FireContext, hit: WeaponsShared.H
 
 	-- Fling AFTER the stun above: Stun's OnApply ragdolls synchronously (see
 	-- StatusEffects.server.luau), so by this point the target's Motor6Ds are
-	-- already disabled and its root part is its own free physics body --
-	-- exactly what makes a velocity kick here read as a hard launch instead
-	-- of just nudging a rigid, animation-locked rig.
+	-- disabled. SetRootVelocity converts this world-time launch into the
+	-- ragdoll's current local time before native physics takes over.
 	local humanoid = entity.Humanoid
 	local rootPart = humanoid and humanoid.RootPart
 	if rootPart then
 		local direction = ctx.Projectile.Velocity
 		if direction.Magnitude > 1e-3 then
-			rootPart.AssemblyLinearVelocity = direction.Unit * FLING_FORCE + Vector3.new(0, FLING_FORCE * FLING_UP_RATIO, 0)
+			local linearVelocity = direction.Unit * FLING_FORCE + Vector3.new(0, FLING_FORCE * FLING_UP_RATIO, 0)
 			-- Random tumble so every fling reads as a chaotic ragdoll hit
 			-- instead of a perfectly clean launch -- the connected limbs
 			-- (via the Stun ragdoll's BallSocketConstraints) get dragged
 			-- along with the spinning root part over subsequent physics
 			-- steps, same as the linear kick above.
-			rootPart.AssemblyAngularVelocity = Vector3.new(
+			local angularVelocity = Vector3.new(
 				(math.random() * 2 - 1) * FLING_SPIN_FORCE,
 				(math.random() * 2 - 1) * FLING_SPIN_FORCE,
 				(math.random() * 2 - 1) * FLING_SPIN_FORCE
 			)
+			Ragdoll.SetRootVelocity(entity.Instance, linearVelocity, angularVelocity)
 		end
 	end
 end

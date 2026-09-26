@@ -84,6 +84,7 @@ function Replication.spawnVisual(projectile)
 		Velocity = projectile.Velocity,
 		Gravity = projectile.Gravity,
 		Acceleration = projectile.Acceleration,
+		AccelerationDirection = projectile.AccelerationDirection,
 		MinSpeed = projectile.MinSpeed,
 		MaxSpeed = projectile.MaxSpeed,
 		Lifetime = projectile.Lifetime,

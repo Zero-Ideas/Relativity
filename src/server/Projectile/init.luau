@@ -151,8 +151,11 @@
 	   Direction: Vector3       (required unless TargetPosition given)
 	   TargetPosition: Vector3  (aim at a world point instead of a direction)
 	   Speed = 100
-	   Acceleration = 0         (studs/s² along current velocity direction; negative decelerates)
-	   MinSpeed = 0, MaxSpeed = math.huge   (clamp for Acceleration)
+	   Acceleration = 0         (number: studs/s² along AccelerationDirection,
+	              or current velocity when no direction is supplied; negative
+	              decelerates. Vector3: arbitrary world-space acceleration)
+	   AccelerationDirection = nil (optional direction for numeric Acceleration)
+	   MinSpeed = 0, MaxSpeed = math.huge   (clamp after acceleration + gravity)
 	   Lifetime = 5             (dilated seconds; no upper bound is enforced)
 	   MaxRealLifetime = 60     (real, undilated seconds -- a hard safety cap
 	              independent of Lifetime/TimeScale/chunk dilation; see
@@ -173,7 +176,8 @@
 	              so self-hits stay impossible even if the firing entity hasn't
 	              been registered with the Entity system yet; see Raycast.buildRayParams)
 	   Filter = (entity)->bool  (which entities count as targets; also applied to homing acquisition)
-	   Gravity = 0              (studs/s² downward, integrated with dilated dt)
+	   Gravity = 0              (number: studs/s² downward; Vector3: custom
+	              world-space gravity. Integrated as acceleration with dilated dt)
 	   Radius = 0               (>0 uses a spherecast)
 	   Bounces = 0              (world bounces before it dies; no upper bound is enforced)
 	   Restitution = 0.5        (velocity kept per bounce)
@@ -270,6 +274,7 @@ local Shared = ReplicatedStorage:WaitForChild("Shared")
 local Heartbeat = require(Shared.Heartbeat)
 local ChunkManager = require(Shared.ChunkManager)
 local Entity = require(Shared.Entity)
+local ProjectileMotion = require(Shared.ProjectileMotion)
 local Signal = require(Shared.Signal)
 
 local Math = require(script.Math)
@@ -316,6 +321,9 @@ end
 local HIGH_RES_STEP = 4 -- studs per raycast near entities
 local LOW_RES_STEP = 64 -- studs per raycast in empty space
 local MAX_SUBSTEPS = 16
+local CURVE_ERROR = 0.35 -- maximum studs between a curved path and its cast chord
+local MAX_HOMING_TURN_STEP = math.rad(5)
+local MIN_STEP_DT = 1e-5
 
 -- Hard real-time (wall-clock, undilated) cap on how long any projectile can
 -- stay alive, regardless of its own dilated Lifetime/Age. A projectile whose
@@ -355,6 +363,7 @@ function Projectile.new(config)
 		Velocity = direction * speed,
 		Speed = speed,
 		Acceleration = config.Acceleration or 0,
+		AccelerationDirection = config.AccelerationDirection,
 		MinSpeed = config.MinSpeed or 0,
 		MaxSpeed = config.MaxSpeed or math.huge,
 		Gravity = config.Gravity or 0,
@@ -424,6 +433,7 @@ function Projectile.new(config)
 		_rewindTime = 0,
 		_rewindCache = {},
 		_candidateBuf = {},
+		_simulationDebt = 0, -- unprocessed personal/global dt carried across frames
 		Dead = false,
 	}, Projectile)
 	self._rayParams = Raycast.buildRayParams(self)
@@ -573,12 +583,10 @@ function Projectile:Step(globalDt: number): boolean
 	-- a later, non-bouncing tick's streamed payload -- see Raycast._resolveHit.
 	self._bouncedThisTick = false
 
-	-- world/chunk dilation at the projectile's own position, times the
-	-- shooter's CURRENT personal ratio, times this projectile's OWN current
-	-- ratio -- both read live every tick (never snapshotted), so dragging a
-	-- personal-time slider or an ability tweaking this specific projectile's
-	-- TimeScale mid-flight takes effect immediately -- see the module doc
-	-- comment's "Local time" section.
+	-- Personal/global time is consumed below one spatial segment at a time.
+	-- Chunk scale is deliberately NOT folded in here: each segment samples the
+	-- chunk it is entering, so crossing a slow/frozen boundary takes effect at
+	-- the boundary instead of one whole frame late.
 	local combinedScale = Replication.combinedTimeScale(self)
 	-- Checked BEFORE the dt<=0 early return below, so a ratio change that
 	-- freezes the projectile entirely (combinedScale hits 0) still reaches
@@ -586,35 +594,9 @@ function Projectile:Step(globalDt: number): boolean
 	-- stale TimeScale it last streamed. See ProjTimeScale / the module doc
 	-- comment's "Local time" section.
 	self:_checkTimeScaleChange(combinedScale)
-	local dt = ChunkManager.ScaleDt(globalDt, self.Position) * combinedScale
-	if dt <= 0 then
+	if globalDt <= 0 or combinedScale <= 0 then
 		return true -- frozen chunk / paused / shooter or projectile frozen: keep it alive, don't move it
 	end
-
-	self.Age += dt
-	if self.Age >= self.Lifetime then
-		return self:_expire()
-	end
-
-	self:_updateHoming(dt)
-
-	if self.Acceleration ~= 0 then
-		local speed = self.Velocity.Magnitude
-		local newSpeed = math.clamp(speed + self.Acceleration * dt, self.MinSpeed, self.MaxSpeed)
-		self.Velocity = Math.safeUnit(self.Velocity, Vector3.zAxis) * newSpeed
-	end
-
-	if self.Gravity > 0 then
-		self.Velocity -= Vector3.new(0, self.Gravity * dt, 0)
-	end
-
-	-- Adaptive stepping: fine casts near entities (accurate hit detection),
-	-- one coarse cast per frame in empty chunks (skip the wasted checks). The
-	-- step size is chosen from whether the chunk we're in / moving into holds
-	-- entities. A raycast is never skipped -- only its resolution adapts.
-	local highRes = Raycast.chunkHasEntities(self.Position)
-		or Raycast.chunkHasEntities(self.Position + self.Velocity * dt)
-	local maxStep = highRes and HIGH_RES_STEP or LOW_RES_STEP
 
 	-- Lag-compensation working state for this frame: pin rewindTime and a fresh
 	-- rewound-position cache so every substep rewinds to the SAME instant
@@ -622,25 +604,100 @@ function Projectile:Step(globalDt: number): boolean
 	-- substeps; previously each substep recomputed both, doing up to N redundant
 	-- GetPositionAt lookups where one would do). The candidate buffer is
 	-- reused, never reallocated -- see RewindHit._checkRewoundHit.
-	local useRewind = highRes and self.RewindSeconds > 0
-	if useRewind then
+	if self.RewindSeconds > 0 then
 		self._rewindTime = os.clock() - self.RewindSeconds
 		table.clear(self._rewindCache)
 		table.clear(self._candidateBuf)
 	end
 
-	local remaining = dt
+	local remaining = globalDt * combinedScale + self._simulationDebt
+	self._simulationDebt = 0
 	local guard = 0
-	while remaining > 1e-4 and guard < MAX_SUBSTEPS do
+	while remaining > MIN_STEP_DT and guard < MAX_SUBSTEPS do
 		guard += 1
-		local speed = self.Velocity.Magnitude
-		local stepDt = remaining
-		if speed * stepDt > maxStep then
-			stepDt = maxStep / math.max(speed, 1e-3)
+
+		local accelerationVector = ProjectileMotion.GetAcceleration(
+			self.Velocity,
+			self.Acceleration,
+			self.AccelerationDirection,
+			self.Gravity
+		)
+		local direction = Math.safeUnit(
+			self.Velocity,
+			Math.safeUnit(accelerationVector, Vector3.zAxis)
+		)
+		local samplePosition = self.Position + direction * ProjectileMotion.PositionEpsilon
+		local chunkScale = ChunkManager.GetTimeScaleAt(samplePosition)
+		if chunkScale <= 0 then
+			-- Real time spent in a frozen chunk is consumed without building a
+			-- catch-up burst for when the chunk is unfrozen.
+			remaining = 0
+			break
 		end
 
+		local availableDt = remaining * chunkScale
+		local lifetimeRemaining = self.Lifetime - self.Age
+		if lifetimeRemaining <= MIN_STEP_DT then
+			return self:_expire()
+		end
+
+		local predictedVelocity = self.Velocity + accelerationVector * availableDt
+		local estimatedMovementVelocity = (self.Velocity + predictedVelocity) * 0.5
+		local speed = estimatedMovementVelocity.Magnitude
+		local highRes = Raycast.chunkHasEntities(samplePosition)
+		local maxDistance = ProjectileMotion.GetAdaptiveMaxDistance(speed, highRes)
+		-- Preserve the old conservative floors near entities while allowing the
+		-- adaptive policy to grow with speed.
+		maxDistance = math.max(maxDistance, if highRes then HIGH_RES_STEP else LOW_RES_STEP)
+
+		local stepDt = math.min(availableDt, lifetimeRemaining)
+		if speed > 1e-5 then
+			stepDt = math.min(stepDt, maxDistance / speed)
+			local chunkBoundaryDt = ProjectileMotion.GetTimeScaleBoundaryDt(
+				self.Position,
+				estimatedMovementVelocity,
+				ChunkManager.ChunkSize,
+				ChunkManager.UseY,
+				chunkScale,
+				stepDt,
+				ChunkManager.GetTimeScaleAt
+			)
+			local radialBoundaryDt = ChunkManager.GetRadialTimeScaleBoundaryDt(
+				self.Position,
+				estimatedMovementVelocity,
+				stepDt
+			)
+			stepDt = math.min(stepDt, chunkBoundaryDt, radialBoundaryDt)
+		end
+		stepDt = math.min(stepDt, ProjectileMotion.GetCurvatureStepDt(self.Velocity, accelerationVector, CURVE_ERROR))
+		if self.HomingTarget and self.Homing then
+			local turnRate = self.Homing.TurnRate or math.rad(120)
+			if turnRate > 0 then
+				stepDt = math.min(stepDt, MAX_HOMING_TURN_STEP / turnRate)
+			end
+		end
+		if stepDt <= MIN_STEP_DT then
+			-- Numerical boundary precision should never delete frame time.
+			self._simulationDebt = remaining
+			break
+		end
+
+		self:_updateHoming(stepDt)
+		local movementVelocity
+		self.Velocity, movementVelocity = ProjectileMotion.Integrate(
+			self.Velocity,
+			self.Acceleration,
+			self.AccelerationDirection,
+			self.Gravity,
+			self.MinSpeed,
+			self.MaxSpeed,
+			stepDt
+		)
+		self.Age += stepDt
+		remaining = math.max(remaining - stepDt / chunkScale, 0)
+
 		local from = self.Position
-		local displacement = self.Velocity * stepDt
+		local displacement = movementVelocity * stepDt
 		local to = from + displacement
 
 		-- Lag-compensated entity check, only while in an entity-containing chunk
@@ -655,7 +712,6 @@ function Projectile:Step(globalDt: number): boolean
 				if verdict == "destroy" then
 					return false
 				end
-				remaining -= stepDt
 				continue
 			end
 		end
@@ -667,7 +723,6 @@ function Projectile:Step(globalDt: number): boolean
 
 		if not result then
 			self.Position = to
-			remaining -= stepDt
 		else
 			local instance = result.Instance
 			local liveEntity = instance and Entity.Get(instance)
@@ -676,17 +731,31 @@ function Projectile:Step(globalDt: number): boolean
 				-- found no valid hit -- from the shooter's ping-adjusted view this
 				-- entity wasn't actually there, so the live-position coincidence
 				-- doesn't count. Nudge past and keep flying.
-				self.Position = result.Position + Math.safeUnit(self.Velocity, Vector3.zAxis) * (self.Radius + 0.1)
-				remaining -= stepDt
+				self.Position = result.Position + Math.safeUnit(movementVelocity, Vector3.zAxis) * (self.Radius + 0.1)
 			else
+				local velocityBeforeHit = self.Velocity
 				local verdict = self:_resolveHit(result)
 				if verdict == "destroy" then
 					return false
 				end
+				if self.Velocity ~= velocityBeforeHit then
+					-- Continue this frame along the reflected velocity instead of
+					-- the pre-bounce average used for the incoming trajectory.
+					movementVelocity = self.Velocity
+				end
 				-- pierce/bounce/penetrate/ignore already advanced self.Position past the surface
-				remaining -= stepDt
 			end
 		end
+
+		if self.Age >= self.Lifetime - MIN_STEP_DT then
+			return self:_expire()
+		end
+	end
+
+	if remaining > MIN_STEP_DT and self._simulationDebt == 0 then
+		-- Preserve work beyond this frame's safety budget instead of shortening
+		-- the projectile's range/lifetime by silently discarding it.
+		self._simulationDebt = remaining
 	end
 
 	self:_checkSyncTransition()

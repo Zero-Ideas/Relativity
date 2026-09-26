@@ -444,9 +444,7 @@ function Entity:SetTimeScale(scale: number)
 end
 
 function Entity:GetEffectiveTimeScale(): number
-	local chunk = self._chunk
-	local chunkScale = chunk and chunk.TimeScale or 1
-	return Heartbeat.GetGlobalTimeScale() * chunkScale * self.TimeScale
+	return Heartbeat.GetGlobalTimeScale() * ChunkManager.GetTimeScaleAt(self:GetPosition()) * self.TimeScale
 end
 
 function Entity:_refreshHumanoidScale()
@@ -673,9 +671,9 @@ Heartbeat.Connect(function(dt)
 		local entity = entities[i]
 		local fns = entity._updateFns
 		if #fns > 0 then
-			local chunk = entity._chunk
-			if chunk == nil or ChunkManager.IsChunkActive(chunk) then
-				local scale = (chunk and chunk.TimeScale or 1) * entity.TimeScale
+				local chunk = entity._chunk
+				if chunk == nil or ChunkManager.IsChunkActive(chunk) then
+					local scale = ChunkManager.GetTimeScaleAt(entity:GetPosition()) * entity.TimeScale
 				if scale > 0 then
 					local entityDt = dt * scale
 					for j = 1, #fns do

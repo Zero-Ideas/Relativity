@@ -34,7 +34,14 @@ local function registerDummy(model: Model)
 	entity:AddTag("Enemy") -- homing targets this tag
 
 	entity.Died:Connect(function()
-		task.delay(RESPAWN_DELAY, function()
+		local elapsed = 0
+		local delayConnection
+		delayConnection = entity:OnUpdate(function(dt)
+			elapsed += dt
+			if elapsed < RESPAWN_DELAY then
+				return
+			end
+			delayConnection:Disconnect()
 			if model.Parent then
 				model:Destroy() -- clear the corpse
 			end

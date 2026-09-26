@@ -24,6 +24,7 @@ local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local Shared = ReplicatedStorage:WaitForChild("Shared")
 local Heartbeat = require(Shared.Heartbeat)
 local ChunkManager = require(Shared.ChunkManager)
+local ProjectileMotion = require(Shared.ProjectileMotion)
 local VisualOffload = require(Shared.VisualOffload)
 
 local VisualModel = require(script.VisualModel)
@@ -31,14 +32,6 @@ local Impact = require(script.Impact)
 local DebugRays = require(script.DebugRays)
 
 local ProjectileClient = {}
-
-local function safeUnit(v: Vector3, fallback: Vector3): Vector3
-	local magnitude = v.Magnitude
-	if magnitude < 1e-5 then
-		return fallback
-	end
-	return v / magnitude
-end
 
 function ProjectileClient.SetImpactHandler(fn)
 	Impact.SetHandler(fn)
@@ -54,9 +47,105 @@ local DEFAULT_MAX_REAL_LIFETIME = 60
 -- loop below. Generous on purpose: ProjMove batches normally arrive every
 -- server tick, so anything this stale really has stopped, not just lagged.
 local SYNCED_VISUAL_STALE_TIMEOUT = 2
+local MAX_PREDICTION_SUBSTEPS = 16
+local PREDICTION_CURVE_ERROR = 0.35
+local MIN_STEP_DT = 1e-5
 
 local clientRendering = false
 local visuals = {} -- [id] = { model, position, velocity, gravity, homing/bounce state, ... }
+
+local function simulateVisual(visual, baseDt: number): (boolean, boolean)
+	if baseDt <= 0 then
+		return true, false
+	end
+
+	local remaining = baseDt + (visual.simulationDebt or 0)
+	visual.simulationDebt = 0
+	local moved = false
+	local guard = 0
+	while remaining > MIN_STEP_DT and guard < MAX_PREDICTION_SUBSTEPS do
+		guard += 1
+		local accelerationVector = ProjectileMotion.GetAcceleration(
+			visual.velocity,
+			visual.acceleration,
+			visual.accelerationDirection,
+			visual.gravity
+		)
+		local direction = visual.velocity
+		if direction.Magnitude < 1e-5 then
+			direction = accelerationVector.Magnitude >= 1e-5 and accelerationVector or Vector3.zAxis
+		end
+		direction = direction.Unit
+
+		local samplePosition = visual.position + direction * ProjectileMotion.PositionEpsilon
+		local chunkScale = ChunkManager.GetTimeScaleAt(samplePosition)
+		if chunkScale <= 0 then
+			remaining = 0
+			break
+		end
+
+		local availableDt = remaining * chunkScale
+		if visual.life <= MIN_STEP_DT then
+			return false, moved
+		end
+
+		local predictedVelocity = visual.velocity + accelerationVector * availableDt
+		local estimatedMovementVelocity = (visual.velocity + predictedVelocity) * 0.5
+		local speed = estimatedMovementVelocity.Magnitude
+		local stepDt = math.min(availableDt, visual.life)
+		if speed > 1e-5 then
+			local maxDistance = ProjectileMotion.GetAdaptiveMaxDistance(speed, true)
+			stepDt = math.min(stepDt, maxDistance / speed)
+			local chunkBoundaryDt = ProjectileMotion.GetTimeScaleBoundaryDt(
+				visual.position,
+				estimatedMovementVelocity,
+				ChunkManager.ChunkSize,
+				ChunkManager.UseY,
+				chunkScale,
+				stepDt,
+				ChunkManager.GetTimeScaleAt
+			)
+			local radialBoundaryDt = ChunkManager.GetRadialTimeScaleBoundaryDt(
+				visual.position,
+				estimatedMovementVelocity,
+				stepDt
+			)
+			stepDt = math.min(stepDt, chunkBoundaryDt, radialBoundaryDt)
+		end
+		stepDt = math.min(
+			stepDt,
+			ProjectileMotion.GetCurvatureStepDt(visual.velocity, accelerationVector, PREDICTION_CURVE_ERROR)
+		)
+		if stepDt <= MIN_STEP_DT then
+			visual.simulationDebt = remaining
+			break
+		end
+
+		local movementVelocity
+		visual.velocity, movementVelocity = ProjectileMotion.Integrate(
+			visual.velocity,
+			visual.acceleration,
+			visual.accelerationDirection,
+			visual.gravity,
+			visual.minSpeed,
+			visual.maxSpeed,
+			stepDt
+		)
+		visual.position += movementVelocity * stepDt
+		visual.life -= stepDt
+		remaining = math.max(remaining - stepDt / chunkScale, 0)
+		moved = true
+
+		if visual.life <= MIN_STEP_DT then
+			return false, moved
+		end
+	end
+
+	if remaining > MIN_STEP_DT and visual.simulationDebt == 0 then
+		visual.simulationDebt = remaining
+	end
+	return true, moved
+end
 
 -- Removes the flying tracer. Impact VFX is played from the ProjHit handler
 -- itself (see EnableClientRendering), so this fires for real hits AND harmless
@@ -73,10 +162,6 @@ local function destroyVisual(id)
 		return
 	end
 	visuals[id] = nil
-	if visual.tween then
-		visual.tween:Cancel()
-		visual.tween = nil
-	end
 	local delay =
 		math.max(visual.destroyDelay or 0, VisualModel.FadeOut(visual.model, visual.waitForParticles, visual.waitForTrails))
 	if delay > 0 then
@@ -95,27 +180,27 @@ function ProjectileClient.EnableClientRendering()
 	clientRendering = true
 
 	VisualOffload.On("ProjSpawn", function(data)
-		local model = VisualModel.Build(data)
-		VisualModel.Place(model, data.Position, data.Velocity)
-		if data.ActivateParticlesOnCreate then
-			VisualModel.ActivateParticles(model)
-		end
-		visuals[data.Id] = {
+		local model, rig = VisualModel.Build(data)
+		local now = os.clock()
+		local visual = {
 			model = model,
+			rig = rig,
 			destroyDelay = data.DestroyDelay or 0,
 			-- See VisualModel.FadeOut -- both default true.
 			waitForParticles = data.WaitForParticles ~= false,
 			waitForTrails = data.WaitForTrails ~= false,
-			lastUpdate = os.clock(),
-			tween = nil,
+			lastUpdate = now,
+			lastRenderStep = now,
 
 			position = data.Position,
 			velocity = data.Velocity,
 			gravity = data.Gravity or 0,
 			acceleration = data.Acceleration or 0,
+			accelerationDirection = data.AccelerationDirection,
 			minSpeed = data.MinSpeed or 0,
 			maxSpeed = data.MaxSpeed or math.huge,
 			life = data.Lifetime or 5,
+			simulationDebt = 0,
 
 			synced = data.Synced == true,
 			-- Combined Source.TimeScale * projectile.TimeScale at spawn time;
@@ -127,9 +212,14 @@ function ProjectileClient.EnableClientRendering()
 			-- render loop below. spawnRealTime is THIS client's own os.clock()
 			-- at spawn, not the server's -- fine, since this only needs to be
 			-- a generous backstop, not an exact match to the server's own cap.
-			spawnRealTime = os.clock(),
+			spawnRealTime = now,
 			maxRealLifetime = data.MaxRealLifetime or DEFAULT_MAX_REAL_LIFETIME,
 		}
+		VisualModel.Place(visual, data.Position, data.Velocity)
+		if data.ActivateParticlesOnCreate then
+			VisualModel.ActivateParticles(model)
+		end
+		visuals[data.Id] = visual
 	end)
 
 	-- Fires only when the combined personal/local TimeScale actually changes
@@ -153,6 +243,7 @@ function ProjectileClient.EnableClientRendering()
 		if visual then
 			visual.synced = data.Synced == true
 			if visual.synced then
+				visual.simulationDebt = 0
 				-- reset the staleness clock right at the transition -- see the
 				-- synced branch of the render loop below -- so a lastUpdate
 				-- left over from before this transition (however old) can't
@@ -187,14 +278,15 @@ function ProjectileClient.EnableClientRendering()
 				visual.lastUpdate = now
 				visual.position = data.Position
 				visual.velocity = data.Velocity
-				VisualModel.Place(visual.model, data.Position, data.Velocity)
+				visual.simulationDebt = 0
+				VisualModel.Place(visual, data.Position, data.Velocity)
 				Impact.Play(data.Position, data.Normal, "bounce")
 			elseif visual and visual.synced then
 				local duration = math.clamp(now - visual.lastUpdate, 0.03, 0.2)
 				visual.lastUpdate = now
 				visual.position = data.Position
 				visual.velocity = data.Velocity
-				VisualModel.Tween(visual, data.Position, data.Velocity, duration)
+				VisualModel.SetTarget(visual, data.Position, data.Velocity, duration)
 			end
 		end
 	end)
@@ -205,7 +297,7 @@ function ProjectileClient.EnableClientRendering()
 			-- Snap to the server's exact position before destroying, so any
 			-- imperceptible mid-flight drift from local simulation never shows
 			-- at the one moment it would be visible.
-			VisualModel.Place(visual.model, data.Position, visual.velocity)
+			VisualModel.Place(visual, data.Position, visual.velocity)
 			if data.Kind then
 				Impact.Play(data.Position, data.Normal, data.Kind)
 			end
@@ -235,7 +327,10 @@ function ProjectileClient.EnableClientRendering()
 	-- the server always runs its own independent, authoritative Step, and any
 	-- drift is corrected the instant ProjHit snaps the final position.
 	Heartbeat.Connect(function(globalDt)
+		local now = os.clock()
 		for id, visual in visuals do
+			local realDt = math.max(now - visual.lastRenderStep, 0)
+			visual.lastRenderStep = now
 			-- Real (undilated) backstop, checked unconditionally before the
 			-- synced/unsynced split below -- mirrors the server's own
 			-- MaxRealLifetime check (see Step). Primarily this is redundant
@@ -245,12 +340,13 @@ function ProjectileClient.EnableClientRendering()
 			-- drifted outside VisualRange), so a visual can never linger
 			-- forever regardless of dt/freeze state -- same reasoning as the
 			-- server-side fix this mirrors.
-			if os.clock() - visual.spawnRealTime >= visual.maxRealLifetime then
+			if now - visual.spawnRealTime >= visual.maxRealLifetime then
 				destroyVisual(id)
 				continue
 			end
 
 			if visual.synced then
+				VisualModel.Step(visual, realDt)
 				-- Position/velocity/pose come from ProjMove; the only thing
 				-- that runs here is a left-VisualRange safety net. This is
 				-- deliberately wall-clock (os.clock()), NOT a dilated-dt
@@ -266,7 +362,7 @@ function ProjectileClient.EnableClientRendering()
 				-- this client is in VisualRange, lastUpdate keeps getting
 				-- refreshed; once it stops (genuinely left range, or the
 				-- projectile is gone), a real-time timeout cleans it up.
-				if os.clock() - visual.lastUpdate > SYNCED_VISUAL_STALE_TIMEOUT then
+				if now - visual.lastUpdate > SYNCED_VISUAL_STALE_TIMEOUT then
 					destroyVisual(id)
 				end
 				continue
@@ -275,29 +371,17 @@ function ProjectileClient.EnableClientRendering()
 			-- visual.timeScale is the combined Source.TimeScale *
 			-- projectile.TimeScale, kept current via the (rare, on-change
 			-- only) ProjTimeScale handler above -- see the module doc
-			-- comment's "Local time" section. This mirrors the server's own
-			-- Step exactly: ChunkManager.ScaleDt(globalDt, pos) * combinedScale.
-			local dt = ChunkManager.ScaleDt(globalDt, visual.position) * visual.timeScale
-			if dt > 0 then
-				if visual.acceleration ~= 0 then
-					local speed = visual.velocity.Magnitude
-					local newSpeed = math.clamp(speed + visual.acceleration * dt, visual.minSpeed, visual.maxSpeed)
-					visual.velocity = safeUnit(visual.velocity, Vector3.zAxis) * newSpeed
-				end
-				if visual.gravity > 0 then
-					visual.velocity -= Vector3.new(0, visual.gravity * dt, 0)
-				end
-
-				visual.position += visual.velocity * dt
-
-				visual.life -= dt
-				VisualModel.Place(visual.model, visual.position, visual.velocity)
-				if visual.life <= 0 then
-					-- Safety net: normally ProjHit arrives first and removes this
-					-- entry. This only fires if it never does (e.g. the
-					-- projectile left this client's VisualRange).
-					destroyVisual(id)
-				end
+			-- comment's "Local time" section. simulateVisual consumes that
+			-- time across chunk boundaries using each entered chunk's own scale.
+			local alive, moved = simulateVisual(visual, globalDt * visual.timeScale)
+			if moved then
+				VisualModel.Place(visual, visual.position, visual.velocity)
+			end
+			if not alive then
+				-- Safety net: normally ProjHit arrives first and removes this
+				-- entry. This only fires if it never does (e.g. the
+				-- projectile left this client's VisualRange).
+				destroyVisual(id)
 			end
 		end
 	end, { Name = "ProjectileSystem.ClientSimulate", Priority = 5 })

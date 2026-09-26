@@ -5,6 +5,9 @@ local Players = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local RunService = game:GetService("RunService")
 
+local Shared = ReplicatedStorage:WaitForChild("Shared")
+local ChunkManager = require(Shared.ChunkManager)
+
 --- Module ---
 local RagdollModule = {}
 
@@ -14,7 +17,147 @@ local RAGDOLL_INSTANCE_NAMES = {
 	["RagdollAttachment"] = true,
 	["RagdollConstraint"] = true,
 	["ColliderPart"] = true, -- Keep this for cleanup in case old ragdolls had them
+	["RagdollTimeAttachment"] = true,
+	["RagdollTimeGravity"] = true,
 }
+
+local SCALE_EPSILON = 1e-4
+local trackedRagdolls = {}
+
+local function getRoot(character: Model): BasePart?
+	local humanoid = character:FindFirstChildOfClass("Humanoid")
+	local root = humanoid and humanoid.RootPart or character.PrimaryPart
+	return if root and root:IsA("BasePart") then root else nil
+end
+
+local function getScale(character: Model): number
+	local root = getRoot(character)
+	if not root then
+		return 1
+	end
+	return ChunkManager.GetEffectiveTimeScaleAt(root.Position)
+end
+
+local function getParts(character: Model): { BasePart }
+	local parts = {}
+	for _, descendant in character:GetDescendants() do
+		if descendant:IsA("BasePart") and not descendant.Anchored then
+			table.insert(parts, descendant)
+		end
+	end
+	return parts
+end
+
+local function getGravityForce(part: BasePart): VectorForce
+	local existing = part:FindFirstChild("RagdollTimeGravity")
+	if existing and existing:IsA("VectorForce") then
+		return existing
+	end
+
+	local attachment = Instance.new("Attachment")
+	attachment.Name = "RagdollTimeAttachment"
+	attachment.Parent = part
+
+	local force = Instance.new("VectorForce")
+	force.Name = "RagdollTimeGravity"
+	force.Attachment0 = attachment
+	force.ApplyAtCenterOfMass = true
+	force.RelativeTo = Enum.ActuatorRelativeTo.World
+	force.Parent = part
+	return force
+end
+
+local function removeTracking(character: Model)
+	local state = trackedRagdolls[character]
+	if not state then
+		return
+	end
+	trackedRagdolls[character] = nil
+	if state.AncestryConnection then
+		state.AncestryConnection:Disconnect()
+	end
+end
+
+local function beginTracking(character: Model)
+	if trackedRagdolls[character] then
+		return
+	end
+
+	local scale = getScale(character)
+	local state = {
+		Scale = scale,
+		Parts = getParts(character),
+		FrozenVelocity = {},
+	}
+	trackedRagdolls[character] = state
+
+	-- Existing motion becomes dilated as soon as the body ragdolls. New pushes
+	-- should use SetRootVelocity below so they are expressed in world-time units.
+	for _, part in state.Parts do
+		part.AssemblyLinearVelocity *= scale
+		part.AssemblyAngularVelocity *= scale
+		local force = getGravityForce(part)
+		force.Force = Vector3.new(0, part.AssemblyMass * workspace.Gravity * (1 - scale * scale), 0)
+	end
+
+	state.AncestryConnection = character.AncestryChanged:Connect(function(_, parent)
+		if parent == nil then
+			removeTracking(character)
+		end
+	end)
+end
+
+-- Native rigid-body physics always advances in real time. Keep ragdoll velocity
+-- proportional to local time and cancel the portion of engine gravity that
+-- should not occur. Gravity uses scale^2 because both velocity and elapsed time
+-- are dilated: x(realTime) = x(worldTime * scale).
+RunService.Heartbeat:Connect(function()
+	for character, state in trackedRagdolls do
+		if not character.Parent then
+			removeTracking(character)
+			continue
+		end
+
+		local scale = getScale(character)
+		local previousScale = state.Scale
+		if math.abs(scale - previousScale) > SCALE_EPSILON then
+			for _, part in state.Parts do
+				if not part.Parent then
+					continue
+				end
+				if previousScale > SCALE_EPSILON then
+					local canonicalLinear = part.AssemblyLinearVelocity / previousScale
+					local canonicalAngular = part.AssemblyAngularVelocity / previousScale
+					state.FrozenVelocity[part] = {
+						Linear = canonicalLinear,
+						Angular = canonicalAngular,
+					}
+					part.AssemblyLinearVelocity = canonicalLinear * scale
+					part.AssemblyAngularVelocity = canonicalAngular * scale
+				else
+					local frozen = state.FrozenVelocity[part]
+					if frozen then
+						part.AssemblyLinearVelocity = frozen.Linear * scale
+						part.AssemblyAngularVelocity = frozen.Angular * scale
+					end
+				end
+			end
+			state.Scale = scale
+		end
+
+		for _, part in state.Parts do
+			if not part.Parent then
+				continue
+			end
+			local force = getGravityForce(part)
+			force.Force = Vector3.new(0, part.AssemblyMass * workspace.Gravity * (1 - scale * scale), 0)
+			if scale <= SCALE_EPSILON then
+				part.AssemblyLinearVelocity = Vector3.zero
+				part.AssemblyAngularVelocity = Vector3.zero
+			end
+		end
+	end
+end)
 
 --- Helper Functions ---
 
@@ -143,7 +286,7 @@ local function applyPush(character: Model, magnitude: number)
 	local rootPart = character:FindFirstChild("HumanoidRootPart")
 	if rootPart and rootPart:IsA("BasePart") then
 		-- Apply impulse in the opposite direction of the character's forward vector
-		rootPart:ApplyImpulse(rootPart.CFrame.LookVector * -magnitude)
+		rootPart:ApplyImpulse(rootPart.CFrame.LookVector * -magnitude * getScale(character))
 	end
 end
 
@@ -175,6 +318,7 @@ function RagdollModule.SetRagdoll(character: Model, value: boolean, applyPushOnR
 
 	if value then -- Ragdoll the character
 		replaceJoints(character, humanoid)
+		beginTracking(character)
 		
 		--> Check to see if the module is being called from client/server
 		if RunService:IsClient() then
@@ -182,7 +326,10 @@ function RagdollModule.SetRagdoll(character: Model, value: boolean, applyPushOnR
 			humanoid:SetStateEnabled(Enum.HumanoidStateType.GettingUp, false)
 			
 		elseif RunService:IsServer() then
-			character.PrimaryPart:SetNetworkOwner(nil)
+			local root = getRoot(character)
+			if root then
+				root:SetNetworkOwner(nil)
+			end
 			
 			humanoid:ChangeState(Enum.HumanoidStateType.Ragdoll)
 			humanoid:SetStateEnabled(Enum.HumanoidStateType.GettingUp, false)
@@ -193,6 +340,7 @@ function RagdollModule.SetRagdoll(character: Model, value: boolean, applyPushOnR
 			applyPush(character, pushMagnitude)
 		end
 	else -- Unragdoll the character
+		removeTracking(character)
 		resetJoints(character, humanoid)
 		
 		if RunService:IsClient() then
@@ -205,10 +353,31 @@ function RagdollModule.SetRagdoll(character: Model, value: boolean, applyPushOnR
 			
 			-- Fix network ownership for players
 			local player: Player? = Players:GetPlayerFromCharacter(character)
-			if player then
-				character.PrimaryPart:SetNetworkOwner(player)
+			local root = getRoot(character)
+			if player and root then
+				root:SetNetworkOwner(player)
 			end
 		end
+	end
+end
+
+-- Sets a launch velocity in undilated world-time units. Writing the assembly
+-- properties directly would bypass the ragdoll controller until a zone change.
+function RagdollModule.SetRootVelocity(character: Model, linearVelocity: Vector3, angularVelocity: Vector3?)
+	local root = getRoot(character)
+	if not root then
+		return
+	end
+	local state = trackedRagdolls[character]
+	local scale = if state then state.Scale else getScale(character)
+	local angular = angularVelocity or root.AssemblyAngularVelocity
+	root.AssemblyLinearVelocity = linearVelocity * scale
+	root.AssemblyAngularVelocity = angular * scale
+	if state then
+		state.FrozenVelocity[root] = {
+			Linear = linearVelocity,
+			Angular = angular,
+		}
 	end
 end
 
