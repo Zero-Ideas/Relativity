@@ -54,6 +54,21 @@ export type BuildConfig = {
 	wallColor: Color3?,
 	seed: number?, -- only used to pick which doorCell each room opens at
 	openEdges: { { number } }?, -- {ax,ay,bx,by} cell-pair edges to always leave open (see RoomFinder.resolvePockets)
+
+	-- roof: a single ceiling slab cover sitting on top of the walls
+	ceilingThickness: number?, -- studs
+	ceilingColor: Color3?,
+
+	-- ceiling lights: placed on a uniform cell grid wherever there's floor below.
+	-- Keep lightRange comfortably above (lightSpacing * cellSize) / 2 -- that's
+	-- the point exactly between two adjacent lights, and a Range that only just
+	-- reaches it will be dim there even without a literal dark gap.
+	lightSpacing: number?, -- cells between lights, both axes
+	lightRange: number?, -- studs
+	lightBrightness: number?,
+	lightColor: Color3?,
+	lightFixtureSize: number?, -- studs, the visible fixture housing
+	lightShadows: boolean?, -- shadow-casting lights are far more expensive; off by default
 }
 
 local DEFAULTS = {
@@ -66,6 +81,16 @@ local DEFAULTS = {
 	hallCarpetColor = Color3.fromRGB(120, 30, 35),
 	roomFloorColor = Color3.fromRGB(195, 178, 150),
 	wallColor = Color3.fromRGB(230, 225, 215),
+
+	ceilingThickness = 1,
+	ceilingColor = Color3.fromRGB(235, 232, 224),
+
+	lightSpacing = 5,
+	lightRange = 32,
+	lightBrightness = 2.5,
+	lightColor = Color3.fromRGB(255, 244, 214),
+	lightFixtureSize = 2,
+	lightShadows = false,
 }
 
 local function withDefaults(config: BuildConfig?)
@@ -366,6 +391,105 @@ local function buildFloorRects(cfg, rects, color: Color3, material: Enum.Materia
 end
 
 --------------------------------------------------------------------------------
+-- Roof: one ceiling slab cover over every floor cell (room or hallway alike --
+-- unlike floors, the roof doesn't need a per-compartment material split), sat
+-- on top of the walls. Same greedy rectangle cover as the floors.
+--------------------------------------------------------------------------------
+
+local function buildCeiling(grid, cellRoom, cfg, folder)
+	local rects = greedyRectangleCover(grid.width, grid.height, function(x, y)
+		return cellRoom[grid:index(x, y)] ~= 0 or grid:get(x, y) == Grid.HALL
+	end)
+	local ceilingY = cfg.origin.Y + cfg.wallHeight
+	for _, r in rects do
+		local x, y, w, h = r[1], r[2], r[3], r[4]
+		local minCorner = CellSpace.cellMin(cfg.origin, cfg.cellSize, x, y)
+		local maxCorner = CellSpace.cellMin(cfg.origin, cfg.cellSize, x + w, y + h)
+		local size = Vector3.new(maxCorner.X - minCorner.X, cfg.ceilingThickness, maxCorner.Z - minCorner.Z)
+		local pos = Vector3.new(
+			(minCorner.X + maxCorner.X) / 2,
+			ceilingY + cfg.ceilingThickness / 2,
+			(minCorner.Z + maxCorner.Z) / 2
+		)
+		makePart(size, pos, cfg.ceilingColor, Enum.Material.SmoothPlastic, `Ceiling_{x}_{y}`, folder)
+	end
+end
+
+--------------------------------------------------------------------------------
+-- Ceiling lights: placed per-room and per hallway-rect (the same greedy-cover
+-- pieces the hallway floor already uses) instead of a uniform grid over the
+-- whole map. A uniform grid doesn't know where room/hallway boundaries are, so
+-- it can land a light right against a wall or miss a small room's center
+-- entirely. Per-piece placement guarantees a light is centered in anything too
+-- small to need more than one, and evenly spread (still centered within its
+-- own even share of the space) once a piece is big enough for several.
+--
+-- Roofing the map blocks the outdoor sun from reaching indoor space, so these
+-- need real range/brightness to actually light rooms -- not just decorative
+-- fixtures.
+--
+-- Room lights are placed against each room's ORIGINAL packed rectangle
+-- (room.w/room.h), not any pocket RoomFinder.resolvePockets merged into it --
+-- a merged extension relies on spillover from the main room's lights (or a
+-- hallway light nearby) rather than getting a dedicated fixture of its own.
+--------------------------------------------------------------------------------
+
+-- Evenly spaced, centered offsets along one axis of length `size` (in cells):
+-- 1 offset dead-center if `size` doesn't clear `spacing`, otherwise as many as
+-- fit at roughly `spacing` apart, each centered within its own even share.
+local function axisLightOffsets(size: number, spacing: number): { number }
+	local n = math.max(1, math.floor(size / spacing + 0.5))
+	local offsets = table.create(n)
+	for i = 1, n do
+		offsets[i] = (i - 0.5) * size / n
+	end
+	return offsets
+end
+
+local function placeLight(cfg, worldX: number, worldZ: number, ceilingY: number, name: string, folder)
+	local fixture = Instance.new("Part")
+	fixture.Name = name
+	fixture.Anchored = true
+	fixture.CanCollide = false
+	fixture.CanQuery = false
+	fixture.CastShadow = false
+	fixture.Material = Enum.Material.Neon
+	fixture.Color = cfg.lightColor
+	fixture.Size = Vector3.new(cfg.lightFixtureSize, 0.4, cfg.lightFixtureSize)
+	fixture.Position = Vector3.new(worldX, ceilingY - 0.2, worldZ)
+	fixture.Parent = folder
+
+	local light = Instance.new("PointLight")
+	light.Color = cfg.lightColor
+	light.Range = cfg.lightRange
+	light.Brightness = cfg.lightBrightness
+	light.Shadows = cfg.lightShadows
+	light.Parent = fixture
+end
+
+-- Places a centered/evenly-spread light grid over one axis-aligned cell
+-- rectangle (a room's original packed rectangle, or a hallway floor piece).
+local function lightRect(cfg, x: number, y: number, w: number, h: number, ceilingY: number, namePrefix: string, folder)
+	for _, ox in axisLightOffsets(w, cfg.lightSpacing) do
+		for _, oy in axisLightOffsets(h, cfg.lightSpacing) do
+			local worldX = cfg.origin.X + (x - 1 + ox) * cfg.cellSize
+			local worldZ = cfg.origin.Z + (y - 1 + oy) * cfg.cellSize
+			placeLight(cfg, worldX, worldZ, ceilingY, `{namePrefix}_{x}_{y}_{ox}_{oy}`, folder)
+		end
+	end
+end
+
+local function buildCeilingLights(rooms, hallRects, cfg, folder)
+	local ceilingY = cfg.origin.Y + cfg.wallHeight
+	for _, room in rooms do
+		lightRect(cfg, room.x, room.y, room.w, room.h, ceilingY, "Light_Room", folder)
+	end
+	for _, r in hallRects do
+		lightRect(cfg, r[1], r[2], r[3], r[4], ceilingY, "Light_Hall", folder)
+	end
+end
+
+--------------------------------------------------------------------------------
 
 -- Builds real, collidable geometry from generated grid + room data under a
 -- fresh workspace.MapGenBuild folder (any previous one is replaced).
@@ -386,6 +510,12 @@ function Builder.build(grid, rooms, config: BuildConfig?): Folder
 	local walls = Instance.new("Folder")
 	walls.Name = "Walls"
 	walls.Parent = folder
+	local ceiling = Instance.new("Folder")
+	ceiling.Name = "Ceiling"
+	ceiling.Parent = folder
+	local lights = Instance.new("Folder")
+	lights.Name = "Lights"
+	lights.Parent = folder
 
 	local cellRoom = buildCellRoom(grid, rooms)
 	local roomRects = greedyRectangleCover(grid.width, grid.height, function(x, y)
@@ -404,6 +534,9 @@ function Builder.build(grid, rooms, config: BuildConfig?): Folder
 	end
 	buildHorizontalWalls(grid, cellRoom, doorH, cfg, walls)
 	buildVerticalWalls(grid, cellRoom, doorV, cfg, walls)
+
+	buildCeiling(grid, cellRoom, cfg, ceiling)
+	buildCeilingLights(rooms, hallRects, cfg, lights)
 
 	folder.Parent = workspace
 	return folder

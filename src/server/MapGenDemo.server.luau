@@ -9,8 +9,9 @@
 	Phase 1 shows: hallway network growing, then empty-space detection tinting the
 	reachable pockets, then candidate room rectangles popping in. Phase 2 then
 	builds real, collidable geometry (walls with door openings, room floors,
-	hallway carpet) and hides the debug preview -- press G client-side to bring
-	the debug preview back and compare it against the built map.
+	hallway carpet, a roof, and ceiling lights) and hides the debug preview --
+	press G client-side to bring the debug preview back and compare it against
+	the built map.
 
 	CONFIG below is the single source of truth for a test run — every key it sets
 	overrides MapGen.DefaultConfig (src/shared/MapGen/init.luau), so edit values
@@ -67,6 +68,16 @@ local BUILD_CONFIG = {
 	wallThickness = 1, -- studs
 	wallHeight = 20, -- studs
 	doorWidth = 1, -- cells wide per door opening
+
+	ceilingThickness = 1, -- studs
+
+	-- Ceiling lights: with cellSize=16, spacing 4 cells = 64 studs between
+	-- fixtures. lightRange must clear half that (32 studs) with real margin or
+	-- the roof (which blocks the outdoor sun) leaves dark gaps between lights --
+	-- Ambient is (0,0,0) in this game, so these are the only indoor light source.
+	lightSpacing = 4, -- cells
+	lightRange = 55, -- studs
+	lightBrightness = 0.1,
 }
 
 -- Debug-overlay toggle: the client fires this when G is pressed; the server
@@ -78,6 +89,7 @@ if not toggleDebugEvent then
 	toggleDebugEvent.Parent = ReplicatedStorage
 end
 
+-- was expecting game:GetService("ServerScriptService")
 
 task.spawn(function()
 	local result = MapGen.visualizeAnimated(CONFIG)
@@ -95,6 +107,10 @@ task.spawn(function()
 		wallThickness = BUILD_CONFIG.wallThickness,
 		wallHeight = BUILD_CONFIG.wallHeight,
 		doorWidth = BUILD_CONFIG.doorWidth,
+		ceilingThickness = BUILD_CONFIG.ceilingThickness,
+		lightSpacing = BUILD_CONFIG.lightSpacing,
+		lightRange = BUILD_CONFIG.lightRange,
+		lightBrightness = BUILD_CONFIG.lightBrightness,
 		seed = CONFIG.seed,
 		openEdges = result.openEdges,
 	})
