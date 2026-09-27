@@ -84,7 +84,7 @@ end
 -- client-side firing loop. This sends ONE request asking the server to spawn N
 -- projectiles directly, bypassing that per-click gate entirely (see StressTestFire
 -- in Shooter.server.luau). Press N to fire a stress-test batch.
-local STRESS_TEST_COUNT = 1000
+local STRESS_TEST_COUNT = 10000
 
 local function stressTest()
 	VisualOffload.Fire("StressTestFire", { Count = STRESS_TEST_COUNT })

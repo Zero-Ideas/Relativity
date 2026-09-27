@@ -117,12 +117,9 @@ function Replication.spawnVisual(projectile)
 	})
 end
 
--- Flushes one frame's worth of ProjMove updates for projectiles the client
--- can't currently predict on its own (checked fresh every tick -- see
--- init.luau's server step loop, not a static per-projectile classification)
--- as a single batched event per recipient instead of one event per
--- projectile. Everything else never appears here at all -- see the module
--- doc comment.
+-- Flushes the bounded round-robin slice selected by init.luau's server step
+-- loop as one event per recipient instead of one event per projectile.
+-- Everything else never appears here at all -- see the module doc comment.
 function Replication.flushMoveBatch(moveBatch)
 	if #moveBatch == 0 then
 		return

@@ -36,16 +36,13 @@
 	   differs per observer, so if it rotated toward that position locally, two
 	   clients watching the same missile chase the same target could compute two
 	   different flight paths. While a lock is held, the server streams
-	   authoritative Position/Velocity every tick (batched, one ProjMove per
-	   frame covering everyone who currently needs it, not one event each), and
-	   a rare ProjSync event tells clients when a visual crosses in or out of
-	   that state. The instant the lock drops -- lost, out of range, or the
-	   target destroyed -- streaming stops immediately; the final synced
-	   ProjMove for that tick carries the exact Velocity the server was using at
-	   the moment the lock was dropped, so the client's subsequent local physics
-	   (gravity/acceleration only) continues in exactly the direction the server
-	   itself would have flown, keeping it aligned with the server's own hit
-	   detection even though nothing streams after that point.
+	   authoritative Position/Velocity through a persistent round-robin batch
+	   capped at MAX_SYNC_UPDATES_PER_FRAME. At ordinary counts that is every
+	   tick; at stress-test counts each cohort updates on alternating frames.
+	   The cursor advances in real frame order and is never reset by dilation,
+	   so changing GlobalTimeScale cannot merge staggered cohorts into one spike.
+	   A rare ProjSync event tells clients when a visual crosses in or out of
+	   continuous-sync mode.
 	 - A one-shot correction on every bounce: reproducing a bounce client-side
 	   requires matching the server's exact raycast resolution/timing AND
 	   knowing which hits are really entities (piercable/filterable, server-only
@@ -324,6 +321,11 @@ local MAX_SUBSTEPS = 16
 local CURVE_ERROR = 0.35 -- maximum studs between a curved path and its cast chord
 local MAX_HOMING_TURN_STEP = math.rad(5)
 local MIN_STEP_DT = 1e-5
+-- Network only: authoritative simulation still steps every projectile every
+-- frame. Pose replication is round-robined so one client event never grows
+-- without bound, and its phase cannot be reset by a time-scale change.
+local MAX_SYNC_UPDATES_PER_FRAME = 2500
+local syncCursor = 1
 
 -- Hard real-time (wall-clock, undilated) cap on how long any projectile can
 -- stay alive, regardless of its own dilated Lifetime/Age. A projectile whose
@@ -794,7 +796,7 @@ end
 --------------------------------------------------------------------------------
 
 Heartbeat.Connect(function(globalDt)
-	local moveBatch = {}
+	local syncCandidates = {}
 	for i = #active, 1, -1 do
 		local projectile = active[i]
 		-- Captured BEFORE Step() so a projectile whose homing lock drops
@@ -818,7 +820,7 @@ Heartbeat.Connect(function(globalDt)
 			-- classification) -- see the module doc comment for why this
 			-- is the one case that stays continuously streamed rather
 			-- than left to the client.
-			table.insert(moveBatch, {
+			table.insert(syncCandidates, {
 				VisualRange = projectile.VisualRange,
 				Position = projectile.Position,
 				Payload = {
@@ -834,6 +836,22 @@ Heartbeat.Connect(function(globalDt)
 				},
 			})
 		end
+	end
+
+	local moveBatch = {}
+	local candidateCount = #syncCandidates
+	local updateCount = math.min(candidateCount, MAX_SYNC_UPDATES_PER_FRAME)
+	if candidateCount > 0 then
+		if syncCursor > candidateCount then
+			syncCursor = (syncCursor - 1) % candidateCount + 1
+		end
+		for offset = 0, updateCount - 1 do
+			local index = (syncCursor + offset - 1) % candidateCount + 1
+			table.insert(moveBatch, syncCandidates[index])
+		end
+		syncCursor = (syncCursor + updateCount - 1) % candidateCount + 1
+	else
+		syncCursor = 1
 	end
 	Replication.flushMoveBatch(moveBatch)
 end, { Name = "ProjectileSystem.Step", Priority = 5 })

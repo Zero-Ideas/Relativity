@@ -50,9 +50,17 @@ local SYNCED_VISUAL_STALE_TIMEOUT = 2
 local MAX_PREDICTION_SUBSTEPS = 16
 local PREDICTION_CURVE_ERROR = 0.35
 local MIN_STEP_DT = 1e-5
+-- Hard cap on simulation/Transform work in one client frame. The persistent
+-- round-robin cursor is deliberately independent of dilated time, so changing
+-- GlobalTimeScale cannot collapse previously staggered cohorts onto one frame.
+local MAX_VISUAL_UPDATES_PER_FRAME = 2500
 
 local clientRendering = false
 local visuals = {} -- [id] = { model, position, velocity, gravity, homing/bounce state, ... }
+local visualOrder = {} -- append-only between compactions; dead ids are tombstones
+local visualCursor = 1
+local visualTombstones = 0
+local globalSimulationClock = 0
 
 local function simulateVisual(visual, baseDt: number): (boolean, boolean)
 	if baseDt <= 0 then
@@ -162,6 +170,7 @@ local function destroyVisual(id)
 		return
 	end
 	visuals[id] = nil
+	visualTombstones += 1
 	local delay =
 		math.max(visual.destroyDelay or 0, VisualModel.FadeOut(visual.model, visual.waitForParticles, visual.waitForTrails))
 	if delay > 0 then
@@ -191,6 +200,7 @@ function ProjectileClient.EnableClientRendering()
 			waitForTrails = data.WaitForTrails ~= false,
 			lastUpdate = now,
 			lastRenderStep = now,
+			lastSimulationTime = globalSimulationClock,
 
 			position = data.Position,
 			velocity = data.Velocity,
@@ -215,11 +225,11 @@ function ProjectileClient.EnableClientRendering()
 			spawnRealTime = now,
 			maxRealLifetime = data.MaxRealLifetime or DEFAULT_MAX_REAL_LIFETIME,
 		}
-		VisualModel.Place(visual, data.Position, data.Velocity)
 		if data.ActivateParticlesOnCreate then
 			VisualModel.ActivateParticles(model)
 		end
 		visuals[data.Id] = visual
+		table.insert(visualOrder, data.Id)
 	end)
 
 	-- Fires only when the combined personal/local TimeScale actually changes
@@ -314,7 +324,8 @@ function ProjectileClient.EnableClientRendering()
 	-- -- this includes a bouncer between bounces, since bouncing no longer
 	-- keeps a visual continuously synced, see the module doc comment), this
 	-- loop is the entire simulation in between -- it integrates
-	-- acceleration/gravity/position every frame using the same chunk/global dt
+	-- acceleration/gravity/position on its round-robin update using all global
+	-- dt accumulated since that visual's previous update and the same chunk dt
 	-- pipeline the server's Step uses (ChunkManager.ScaleDt). No raycasting
 	-- ever happens here -- a SYNCED visual (actively homing onto a target)
 	-- skips all of that -- its Position/Velocity/pose are driven entirely by
@@ -326,11 +337,45 @@ function ProjectileClient.EnableClientRendering()
 	-- whatever that correction left behind. All of this is purely cosmetic;
 	-- the server always runs its own independent, authoritative Step, and any
 	-- drift is corrected the instant ProjHit snaps the final position.
+	local function compactVisualOrder()
+		local oldOrder = visualOrder
+		local oldCount = #oldOrder
+		local compacted = table.create(math.max(oldCount - visualTombstones, 0))
+		-- Begin at the next due slot so compaction preserves round-robin fairness.
+		for offset = 0, oldCount - 1 do
+			local index = (visualCursor + offset - 1) % oldCount + 1
+			local id = oldOrder[index]
+			if visuals[id] then
+				table.insert(compacted, id)
+			end
+		end
+		visualOrder = compacted
+		visualCursor = 1
+		visualTombstones = 0
+	end
+
 	Heartbeat.Connect(function(globalDt)
+		globalSimulationClock += globalDt
 		local now = os.clock()
-		for id, visual in visuals do
+		local slotCount = #visualOrder
+		local inspected = 0
+		local updated = 0
+		while inspected < slotCount and updated < MAX_VISUAL_UPDATES_PER_FRAME do
+			if visualCursor > slotCount then
+				visualCursor = 1
+			end
+			local id = visualOrder[visualCursor]
+			visualCursor += 1
+			inspected += 1
+			local visual = visuals[id]
+			if not visual then
+				continue
+			end
+			updated += 1
 			local realDt = math.max(now - visual.lastRenderStep, 0)
 			visual.lastRenderStep = now
+			local elapsedGlobalDt = math.max(globalSimulationClock - visual.lastSimulationTime, 0)
+			visual.lastSimulationTime = globalSimulationClock
 			-- Real (undilated) backstop, checked unconditionally before the
 			-- synced/unsynced split below -- mirrors the server's own
 			-- MaxRealLifetime check (see Step). Primarily this is redundant
@@ -356,9 +401,9 @@ function ProjectileClient.EnableClientRendering()
 				-- "Lifetime elapsed" schedule the client could reconstruct on
 				-- its own without knowing that live ratio (which isn't
 				-- replicated to observers -- see the module doc comment's
-				-- "Personal time" section). Instead: the server includes every
-				-- synced projectile in its ProjMove batch every tick
-				-- regardless of dt (see the server step loop), so as long as
+				-- "Personal time" section). Instead: the server round-robins every
+				-- synced projectile through bounded ProjMove batches regardless of
+				-- dt (see the server step loop), so as long as
 				-- this client is in VisualRange, lastUpdate keeps getting
 				-- refreshed; once it stops (genuinely left range, or the
 				-- projectile is gone), a real-time timeout cleans it up.
@@ -373,7 +418,7 @@ function ProjectileClient.EnableClientRendering()
 			-- only) ProjTimeScale handler above -- see the module doc
 			-- comment's "Local time" section. simulateVisual consumes that
 			-- time across chunk boundaries using each entered chunk's own scale.
-			local alive, moved = simulateVisual(visual, globalDt * visual.timeScale)
+			local alive, moved = simulateVisual(visual, elapsedGlobalDt * visual.timeScale)
 			if moved then
 				VisualModel.Place(visual, visual.position, visual.velocity)
 			end
@@ -383,6 +428,12 @@ function ProjectileClient.EnableClientRendering()
 				-- projectile left this client's VisualRange).
 				destroyVisual(id)
 			end
+		end
+
+		-- Avoid an ever-growing sparse order array without changing which live
+		-- visual is next. This is metadata work only; it performs no transforms.
+		if visualTombstones >= 256 and visualTombstones * 4 >= #visualOrder then
+			compactVisualOrder()
 		end
 	end, { Name = "ProjectileSystem.ClientSimulate", Priority = 5 })
 end

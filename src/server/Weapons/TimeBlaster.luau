@@ -10,7 +10,7 @@
 ]]
 
 return {
-	Model = "Model", -- ReplicatedStorage.Effects.Model
+	Model = "Bullet2", -- ReplicatedStorage.Effects.Model
 
 	Stats = {
 		Speed = 220,

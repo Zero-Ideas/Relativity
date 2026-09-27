@@ -5,8 +5,6 @@
 	Pure presentation -- no networking, no gameplay state.
 ]]
 
-local RunService = game:GetService("RunService")
-
 local VisualModel = {}
 
 -- Defaults for ActivateParticlesOnCreate (see VisualModel.ActivateParticles)
@@ -107,7 +105,6 @@ function VisualModel.Build(data): (Instance, any)
 	end
 
 	model.Parent = workspace
-	RunService.RenderStepped:Wait()
 	return model, rig
 end
 

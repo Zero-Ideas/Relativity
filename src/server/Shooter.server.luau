@@ -455,8 +455,8 @@ end)
 -- guard below): spawning up to MAX_STRESS_COUNT projectiles per request is
 -- itself an "ungodly amounts of projectiles" vector if any client could reach
 -- it in a live game, so this never runs outside of testing.
-local MAX_STRESS_COUNT = 5000
-local STRESS_COOLDOWN = 2
+local MAX_STRESS_COUNT = 50000
+local STRESS_COOLDOWN = 1
 local lastStressTest: { [Player]: number } = {}
 
 local function randomDirection(): Vector3
