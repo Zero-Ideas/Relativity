@@ -19,6 +19,7 @@
 ]]
 
 local RunService = game:GetService("RunService")
+local Players = game:GetService("Players")
 
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local Shared = ReplicatedStorage:WaitForChild("Shared")
@@ -50,10 +51,16 @@ local SYNCED_VISUAL_STALE_TIMEOUT = 2
 local MAX_PREDICTION_SUBSTEPS = 16
 local PREDICTION_CURVE_ERROR = 0.35
 local MIN_STEP_DT = 1e-5
--- Hard cap on simulation/Transform work in one client frame. The persistent
--- round-robin cursor is deliberately independent of dilated time, so changing
+-- Hard cap on visible Transform work in one client frame. Off-screen visuals
+-- still advance logically when visited but consume no transform budget. The
+-- persistent round-robin cursor is independent of dilated time, so changing
 -- GlobalTimeScale cannot collapse previously staggered cohorts onto one frame.
 local MAX_VISUAL_UPDATES_PER_FRAME = 2500
+local VIEWPORT_CULL_MARGIN = 128 -- pixels beyond each edge; avoids boundary flicker
+local SMOOTH_RADIUS = 100
+local MAX_SMOOTH_PROJECTILES = 500
+local SMOOTH_SET_REFRESH_INTERVAL = 0.1 -- real seconds; selection is presentation-only
+local DEFAULT_SMOOTH_DURATION = 1 / 60
 
 local clientRendering = false
 local visuals = {} -- [id] = { model, position, velocity, gravity, homing/bounce state, ... }
@@ -61,6 +68,76 @@ local visualOrder = {} -- append-only between compactions; dead ids are tombston
 local visualCursor = 1
 local visualTombstones = 0
 local globalSimulationClock = 0
+local smoothVisuals = {}
+local nextSmoothSetRefresh = 0
+
+local function isInView(position: Vector3): boolean
+	local camera = workspace.CurrentCamera
+	if not camera then
+		return true
+	end
+	local viewportPoint = camera:WorldToViewportPoint(position)
+	local viewportSize = camera.ViewportSize
+	return viewportPoint.Z > 0
+		and viewportPoint.X >= -VIEWPORT_CULL_MARGIN
+		and viewportPoint.Y >= -VIEWPORT_CULL_MARGIN
+		and viewportPoint.X <= viewportSize.X + VIEWPORT_CULL_MARGIN
+		and viewportPoint.Y <= viewportSize.Y + VIEWPORT_CULL_MARGIN
+end
+
+local function refreshSmoothVisuals(now: number)
+	if now < nextSmoothSetRefresh then
+		return
+	end
+	nextSmoothSetRefresh = now + SMOOTH_SET_REFRESH_INTERVAL
+
+	local player = Players.LocalPlayer
+	local character = player and player.Character
+	local root = character and (character:FindFirstChild("HumanoidRootPart") or character.PrimaryPart)
+	local candidates = {}
+	if root and root:IsA("BasePart") then
+		local radiusSq = SMOOTH_RADIUS * SMOOTH_RADIUS
+		for _, visual in visuals do
+			local offset = visual.position - root.Position
+			local distanceSq = offset:Dot(offset)
+			if distanceSq <= radiusSq and isInView(visual.position) then
+				table.insert(candidates, { Visual = visual, DistanceSq = distanceSq })
+			end
+		end
+		table.sort(candidates, function(a, b)
+			return a.DistanceSq < b.DistanceSq
+		end)
+	end
+
+	local selected = {}
+	local newSmoothVisuals = table.create(math.min(#candidates, MAX_SMOOTH_PROJECTILES))
+	for index = 1, math.min(#candidates, MAX_SMOOTH_PROJECTILES) do
+		local visual = candidates[index].Visual
+		selected[visual] = true
+		table.insert(newSmoothVisuals, visual)
+		if not visual.smoothTransform then
+			visual.smoothTransform = true
+			visual.lastSmoothStep = now
+			visual.lastSmoothTarget = nil
+		end
+	end
+	for _, visual in smoothVisuals do
+		if not selected[visual] then
+			visual.smoothTransform = false
+			visual.lastSmoothStep = nil
+			visual.lastSmoothTarget = nil
+		end
+	end
+	smoothVisuals = newSmoothVisuals
+end
+
+local function setSmoothTarget(visual, now: number)
+	local previousTarget = visual.lastSmoothTarget
+	local duration = if previousTarget then math.clamp(now - previousTarget, DEFAULT_SMOOTH_DURATION, 0.1)
+		else DEFAULT_SMOOTH_DURATION
+	visual.lastSmoothTarget = now
+	VisualModel.SetTarget(visual, visual.position, visual.velocity, duration)
+end
 
 local function simulateVisual(visual, baseDt: number): (boolean, boolean)
 	if baseDt <= 0 then
@@ -192,6 +269,7 @@ function ProjectileClient.EnableClientRendering()
 		local model, rig = VisualModel.Build(data)
 		local now = os.clock()
 		local visual = {
+			id = data.Id,
 			model = model,
 			rig = rig,
 			destroyDelay = data.DestroyDelay or 0,
@@ -224,7 +302,12 @@ function ProjectileClient.EnableClientRendering()
 			-- a generous backstop, not an exact match to the server's own cap.
 			spawnRealTime = now,
 			maxRealLifetime = data.MaxRealLifetime or DEFAULT_MAX_REAL_LIFETIME,
+			inView = isInView(data.Position),
 		}
+		if not visual.inView then
+			VisualModel.SuspendTrails(visual)
+			VisualModel.SetCulled(visual, true)
+		end
 		if data.ActivateParticlesOnCreate then
 			VisualModel.ActivateParticles(model)
 		end
@@ -357,10 +440,11 @@ function ProjectileClient.EnableClientRendering()
 	Heartbeat.Connect(function(globalDt)
 		globalSimulationClock += globalDt
 		local now = os.clock()
+		refreshSmoothVisuals(now)
 		local slotCount = #visualOrder
 		local inspected = 0
-		local updated = 0
-		while inspected < slotCount and updated < MAX_VISUAL_UPDATES_PER_FRAME do
+		local transformed = 0
+		while inspected < slotCount and transformed < MAX_VISUAL_UPDATES_PER_FRAME do
 			if visualCursor > slotCount then
 				visualCursor = 1
 			end
@@ -371,9 +455,6 @@ function ProjectileClient.EnableClientRendering()
 			if not visual then
 				continue
 			end
-			updated += 1
-			local realDt = math.max(now - visual.lastRenderStep, 0)
-			visual.lastRenderStep = now
 			local elapsedGlobalDt = math.max(globalSimulationClock - visual.lastSimulationTime, 0)
 			visual.lastSimulationTime = globalSimulationClock
 			-- Real (undilated) backstop, checked unconditionally before the
@@ -391,7 +472,27 @@ function ProjectileClient.EnableClientRendering()
 			end
 
 			if visual.synced then
-				VisualModel.Step(visual, realDt)
+				local inView = isInView(visual.position)
+				if inView then
+					transformed += 1
+					if not visual.inView then
+						VisualModel.Place(visual, visual.position, visual.velocity)
+						VisualModel.SetCulled(visual, false)
+						visual.resumeTrailsOnNextUpdate = now
+					elseif not visual.smoothTransform then
+						if visual.resumeTrailsOnNextUpdate then
+							VisualModel.ResumeTrails(visual)
+							visual.resumeTrailsOnNextUpdate = nil
+						end
+						local realDt = math.max(now - visual.lastRenderStep, 0)
+						VisualModel.Step(visual, realDt)
+					end
+					visual.lastRenderStep = now
+				elseif visual.inView then
+					VisualModel.SuspendTrails(visual)
+					VisualModel.SetCulled(visual, true)
+				end
+				visual.inView = inView
 				-- Position/velocity/pose come from ProjMove; the only thing
 				-- that runs here is a left-VisualRange safety net. This is
 				-- deliberately wall-clock (os.clock()), NOT a dilated-dt
@@ -419,14 +520,49 @@ function ProjectileClient.EnableClientRendering()
 			-- comment's "Local time" section. simulateVisual consumes that
 			-- time across chunk boundaries using each entered chunk's own scale.
 			local alive, moved = simulateVisual(visual, elapsedGlobalDt * visual.timeScale)
-			if moved then
-				VisualModel.Place(visual, visual.position, visual.velocity)
+			local inView = isInView(visual.position)
+			if inView then
+				transformed += 1
+				if not visual.inView then
+					VisualModel.Place(visual, visual.position, visual.velocity)
+				elseif moved and visual.smoothTransform then
+					setSmoothTarget(visual, now)
+				elseif moved then
+					VisualModel.Place(visual, visual.position, visual.velocity)
+				end
+				if not visual.inView then
+					VisualModel.SetCulled(visual, false)
+					visual.resumeTrailsOnNextUpdate = now
+				elseif visual.resumeTrailsOnNextUpdate then
+					VisualModel.ResumeTrails(visual)
+					visual.resumeTrailsOnNextUpdate = nil
+				end
+				visual.lastRenderStep = now
+			elseif visual.inView then
+				VisualModel.SuspendTrails(visual)
+				VisualModel.SetCulled(visual, true)
 			end
+			visual.inView = inView
 			if not alive then
 				-- Safety net: normally ProjHit arrives first and removes this
 				-- entry. This only fires if it never does (e.g. the
 				-- projectile left this client's VisualRange).
 				destroyVisual(id)
+			end
+		end
+
+		-- Nearby visuals receive presentation-only interpolation every real frame.
+		-- Their logical simulation and network snapshots remain in the bounded
+		-- scheduler above, so this adds at most MAX_SMOOTH_PROJECTILES transforms.
+		for _, visual in smoothVisuals do
+			if visual.inView and visuals[visual.id] == visual then
+				if visual.resumeTrailsOnNextUpdate and visual.resumeTrailsOnNextUpdate < now then
+					VisualModel.ResumeTrails(visual)
+					visual.resumeTrailsOnNextUpdate = nil
+				end
+				local lastStep = visual.lastSmoothStep or now
+				VisualModel.Step(visual, math.max(now - lastStep, 0))
+				visual.lastSmoothStep = now
 			end
 		end
 

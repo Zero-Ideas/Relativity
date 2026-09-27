@@ -1,7 +1,7 @@
 --!optimize 2
 --[[
 	Projectile/Raycast.luau
-	Physical raycast/spherecast movement, world/entity hit resolution, and
+	Physical ray/capsule movement, world/entity hit resolution, and
 	wall penetration. Raycast.Methods gets mixed onto the Projectile class by
 	init.luau (so self:_resolveHit(result) etc. keep working unchanged).
 ]]
@@ -52,6 +52,12 @@ end
 function Raycast.castMovement(projectile, origin: Vector3, displacement: Vector3)
 	local params = projectile._rayParams
 	if projectile.Radius > 0 then
+		-- Sweeping a sphere along a line is exactly a capsule: a cylindrical
+		-- body of Radius around this segment plus spherical caps at both ends.
+		-- Adjacent adaptive substeps share the cap at their common joint, so
+		-- curved paths have no wedge-shaped collision gaps. One Spherecast is
+		-- both more exact and cheaper than a separate cylinder query followed
+		-- by another endpoint query.
 		return workspace:Spherecast(origin, projectile.Radius, displacement, params)
 	end
 	return workspace:Raycast(origin, displacement, params)

@@ -175,7 +175,8 @@
 	   Filter = (entity)->bool  (which entities count as targets; also applied to homing acquisition)
 	   Gravity = 0              (number: studs/s² downward; Vector3: custom
 	              world-space gravity. Integrated as acceleration with dilated dt)
-	   Radius = 0               (>0 uses a spherecast)
+	   Radius = 0               (>0 sweeps a capsule: cylindrical segment body
+	                              plus spherical substep-joint/end caps)
 	   Bounces = 0              (world bounces before it dies; no upper bound is enforced)
 	   Restitution = 0.5        (velocity kept per bounce)
 	   Penetration = 0          (studs of wall material this projectile can punch

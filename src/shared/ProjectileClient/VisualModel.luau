@@ -137,6 +137,54 @@ function VisualModel.Place(visual, position: Vector3, velocity: Vector3)
 	end
 end
 
+-- Preserve exactly which trails were emitting, then clear their positional
+-- history before a culled visual is moved. Keeping them disabled until a later
+-- render turn prevents Roblox from drawing a segment between the old and new
+-- transforms.
+function VisualModel.SuspendTrails(visual)
+	if visual.suspendedTrails then
+		return
+	end
+	local suspended = {}
+	for _, instance in visual.model:GetDescendants() do
+		if instance:IsA("Trail") and instance.Enabled then
+			instance.Enabled = false
+			instance:Clear()
+			table.insert(suspended, instance)
+		end
+	end
+	visual.suspendedTrails = suspended
+end
+
+function VisualModel.ResumeTrails(visual)
+	local suspended = visual.suspendedTrails
+	if not suspended then
+		return
+	end
+	for _, trail in suspended do
+		if trail.Parent then
+			trail:Clear()
+			trail.Enabled = true
+		end
+	end
+	visual.suspendedTrails = nil
+end
+
+-- Unparenting is a cheap, exact visual cull: the projectile cannot remain
+-- frozen at its last on-screen transform, and Roblox has nothing to draw for
+-- it while it is outside the camera. Place it before restoring the parent so
+-- re-entry can never flash the stale exit pose for one frame.
+function VisualModel.SetCulled(visual, culled: boolean)
+	local model = visual.model
+	if culled then
+		if model.Parent then
+			model.Parent = nil
+		end
+	elseif not model.Parent then
+		model.Parent = workspace
+	end
+end
+
 -- Instantly hides a bullet visual without destroying it: every BasePart goes
 -- fully transparent, and every Trail/ParticleEmitter/Beam (and Light) is
 -- either faded or deleted outright depending on waitForParticles/
