@@ -23,6 +23,19 @@
       }
     },
 
+	"StarterPack": {
+	  "$ignoreUnknownInstances": true,
+	  "SpellAssembler": {
+		"$className": "Tool",
+		"$properties": {
+		  "CanBeDropped": false,
+		  "ManualActivationOnly": false,
+		  "RequiresHandle": false,
+		  "ToolTip": "Assemble and cast spell cards"
+		}
+	  }
+	},
+
     "Workspace": {
       "$properties": {
         "FilteringEnabled": true

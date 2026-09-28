@@ -107,6 +107,7 @@ function Replication.spawnVisual(projectile)
 		MaxRealLifetime = projectile.MaxRealLifetime,
 		Model = projectile.Model,
 		Visual = projectile.Visual,
+		VisualScale = projectile.VisualScale,
 		DestroyDelay = projectile.DestroyDelay,
 		-- Client-side effect-cleanup/activation options -- see
 		-- VisualModel.FadeOut / VisualModel.ActivateParticles and the module

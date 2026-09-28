@@ -21,9 +21,8 @@
 	   here regardless of how fast (or how directly) the remote is fired, no
 	   matter what FireRate a weapon module claims -- a misconfigured weapon
 	   can never fire faster than this.
-	 - MAX_ACTIVE_PROJECTILES_PER_PLAYER caps how many of a player's bullets can be
-	   alive at once, so even max-rate firing with a huge Lifetime can't build an
-	   unbounded swarm.
+	 - ProjectileQuota caps the combined number of a player's weapon and spell
+	   projectiles, so swapping casting systems cannot bypass the live-shot limit.
 	 - A shot is only accepted while the firing player's character has one of the
 	   Weapons registry's tools equipped (see Weapons/init.luau).
 	 - The bullet's Model and every gameplay stat are looked up server-side from
@@ -67,6 +66,7 @@ local Shared = ReplicatedStorage:WaitForChild("Shared")
 local Heartbeat = require(Shared.Heartbeat)
 local Entity = require(Shared.Entity)
 local Projectile = require(script.Parent.Projectile)
+local ProjectileQuota = require(script.Parent.ProjectileQuota)
 local VisualOffload = require(Shared.VisualOffload)
 local Weapons = require(script.Parent.Weapons)
 local WeaponsShared = require(script.Parent.Weapons.Shared)
@@ -86,14 +86,12 @@ for toolName, weapon in Weapons do
 end
 
 local MIN_FIRE_INTERVAL = 0.1 -- absolute floor (seconds, real time), regardless of a weapon's own FireRate -- 10/sec hard cap
-local MAX_ACTIVE_PROJECTILES_PER_PLAYER = 150 -- concurrently-alive cap per player
 local MAX_REWIND = 0.4 -- seconds; stays safely under Entity.HistoryWindow (0.5s)
 local MUZZLE_SPAWN_OFFSET = 3 -- studs spawned ahead of the resolved origin, along the aim direction, so a bullet never immediately hits its own shooter
 local TIP_ATTACHMENT_NAME = "Tip"
 local DEFAULT_VISUAL = { Shape = "Ball", Size = Vector3.one * 0.4, Color = Color3.fromRGB(120, 220, 255) }
 
 local lastFire: { [Tool]: number } = {}
-local activeProjectileCount: { [Player]: number } = {}
 
 type WeaponState = {
 	Magazine: number,
@@ -268,12 +266,6 @@ VisualOffload.On("FireBullet", function(data, player)
 		return
 	end
 
-	-- concurrent-projectile cap: stops max-rate firing + a huge Lifetime from
-	-- building an unbounded swarm
-	if (activeProjectileCount[player] or 0) >= MAX_ACTIVE_PROJECTILES_PER_PLAYER then
-		return
-	end
-
 	-- ammo: reject (without consuming the fire-rate cooldown above) while
 	-- empty or mid-reload; otherwise consume one round and sync the client.
 	local state: WeaponState? = nil
@@ -282,6 +274,11 @@ VisualOffload.On("FireBullet", function(data, player)
 		if state.Reloading or state.Magazine <= 0 then
 			return
 		end
+	end
+	-- Shared with compiled spells, so swapping systems cannot double the
+	-- player's live-projectile allowance.
+	if not ProjectileQuota.TryAcquire(player, 1) then
+		return
 	end
 	if lastFire[tool] == nil then
 		-- lastFire is keyed by Tool instance, same as weaponState -- clean
@@ -354,7 +351,7 @@ VisualOffload.On("FireBullet", function(data, player)
 		Projectile = nil :: any, -- filled in immediately below
 	}
 
-	-- counted against MAX_ACTIVE_PROJECTILES_PER_PLAYER above; OnDestroy fires
+	-- counted against ProjectileQuota above; OnDestroy fires
 	-- exactly once per projectile on every removal path (entity hit, world
 	-- hit, dilated lifetime expiry, or the real-time MaxRealLifetime safety
 	-- cap -- see Projectile.luau's Step/Destroy), so this always balances the
@@ -362,17 +359,15 @@ VisualOffload.On("FireBullet", function(data, player)
 	-- penetrating fire it without removing the projectile), which is exactly
 	-- why this uses OnDestroy instead. The real-time cap matters here
 	-- specifically: a shooter who freezes their own personal time with shots
-	-- in flight would otherwise have those shots sit in activeProjectileCount
-	-- forever, silently eating into their MAX_ACTIVE_PROJECTILES_PER_PLAYER
-	-- budget.
-	activeProjectileCount[player] = (activeProjectileCount[player] or 0) + 1
+	-- in flight would otherwise have those shots sit in the quota
+	-- forever, silently eating into their shared projectile budget.
 	local proj = Projectile.new(projectileConfig)
 	ctx.Projectile = proj
 
 	proj.OnDestroy:Connect(function(destroyInfo)
 		-- Unconditional bookkeeping -- never skippable by a weapon's own
 		-- OnDestroyFunction, or the concurrency cap silently breaks.
-		activeProjectileCount[player] = math.max((activeProjectileCount[player] or 1) - 1, 0)
+		ProjectileQuota.Release(player, 1)
 		if weapon.OnDestroyFunction then
 			weapon.OnDestroyFunction(ctx, destroyInfo)
 		end
@@ -530,7 +525,6 @@ end)
 
 Players.PlayerRemoving:Connect(function(player)
 	lastStressTest[player] = nil
-	activeProjectileCount[player] = nil
 	-- lastFire/weaponState are keyed by Tool instance, not Player -- they
 	-- self-clean via tool.Destroying when the character/backpack is torn
 	-- down, so nothing to do here for those.

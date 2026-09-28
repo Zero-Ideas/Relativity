@@ -402,6 +402,8 @@ return ProjectileMotion
 	              -- excluded from acquisition, and Filter (if set) is respected.
 	   Visualize = false, VisualRange = math.huge
 	   Model = Instance?        (cloned client-side) or Visual = {Shape,Size,Color}
+	   VisualScale = 1          (0.05..20; applied once when the client clones
+	                            the visual, with no per-frame scaling cost)
 	   DestroyDelay = 0         (client keeps the visual this long after impact)
 	   WaitForParticles = true (client-side; while true, a ParticleEmitter
 	              under the visual is only disabled on destroy -- already-
@@ -484,6 +486,7 @@ local Homing = require(script.Homing)
 local Raycast = require(script.Raycast)
 local RewindHit = require(script.RewindHit)
 local Replication = require(script.Replication)
+local ProjectileParallel = require(script.Parent.ProjectileParallel)
 
 local Projectile = {}
 Projectile.__index = Projectile
@@ -613,6 +616,7 @@ function Projectile.new(config)
 		VisualRange = config.VisualRange or math.huge,
 		Model = config.Model,
 		Visual = config.Visual,
+		VisualScale = math.clamp(config.VisualScale or 1, 0.05, 20),
 		DestroyDelay = config.DestroyDelay or 0,
 		-- Client-side effect-cleanup/activation options -- see the module doc
 		-- comment's config section and VisualModel.FadeOut /
@@ -705,6 +709,12 @@ function Projectile.Burst(config, count: number)
 	local shots = {}
 	for _ = 1, count do
 		local pelletConfig = table.clone(config)
+		-- Mutable nested configuration must never be shared by sibling shots.
+		-- This is especially important for spell bursts whose homing settings
+		-- may be extended with per-projectile state later.
+		if config.Homing then
+			pelletConfig.Homing = table.clone(config.Homing)
+		end
 		pelletConfig.TargetPosition = nil
 		pelletConfig.Direction = Math.coneDirection(baseDir, spread)
 		table.insert(shots, Projectile.new(pelletConfig))
@@ -823,7 +833,8 @@ function Projectile:Step(globalDt: number): boolean
 	while remaining > MIN_STEP_DT and guard < MAX_SUBSTEPS do
 		guard += 1
 
-		local accelerationVector = ProjectileMotion.GetAcceleration(
+		local parallelHint = if guard == 1 then ProjectileParallel.GetHint(self) else nil
+		local accelerationVector = if parallelHint then parallelHint.AccelerationVector else ProjectileMotion.GetAcceleration(
 			self.Velocity,
 			self.Acceleration,
 			self.AccelerationDirection,
@@ -876,7 +887,9 @@ function Projectile:Step(globalDt: number): boolean
 			)
 			stepDt = math.min(stepDt, chunkBoundaryDt, radialBoundaryDt)
 		end
-		stepDt = math.min(stepDt, ProjectileMotion.GetCurvatureStepDt(self.Velocity, accelerationVector, CURVE_ERROR))
+		local curvatureStepDt = if parallelHint then parallelHint.CurvatureDt
+			else ProjectileMotion.GetCurvatureStepDt(self.Velocity, accelerationVector, CURVE_ERROR)
+		stepDt = math.min(stepDt, curvatureStepDt)
 		if self.HomingTarget and self.Homing then
 			local turnRate = self.Homing.TurnRate or math.rad(120)
 			if turnRate > 0 then
@@ -1001,6 +1014,9 @@ end
 --------------------------------------------------------------------------------
 
 Heartbeat.Connect(function(globalDt)
+	-- Actor results are consumed only here, on the authoritative serial side.
+	-- Workers operate solely on immutable snapshots from the previous frame.
+	ProjectileParallel.Collect()
 	local syncCandidates = {}
 	for i = #active, 1, -1 do
 		local projectile = active[i]
@@ -1059,6 +1075,7 @@ Heartbeat.Connect(function(globalDt)
 		syncCursor = 1
 	end
 	Replication.flushMoveBatch(moveBatch)
+	ProjectileParallel.Dispatch(active)
 end, { Name = "ProjectileSystem.Step", Priority = 5 })
 
 -- Once-a-second ProjMove rate summary (see Replication.DebugSync above) --
@@ -1696,6 +1713,7 @@ function Replication.spawnVisual(projectile)
 		MaxRealLifetime = projectile.MaxRealLifetime,
 		Model = projectile.Model,
 		Visual = projectile.Visual,
+		VisualScale = projectile.VisualScale,
 		DestroyDelay = projectile.DestroyDelay,
 		-- Client-side effect-cleanup/activation options -- see
 		-- VisualModel.FadeOut / VisualModel.ActivateParticles and the module
@@ -1894,6 +1912,244 @@ end
 return RewindHit
 -- =============================================================================
 -- END FILE: src/server/Projectile/RewindHit.luau
+-- =============================================================================
+
+-- =============================================================================
+-- BEGIN FILE: src/server/ProjectileParallel.luau
+-- =============================================================================
+--!strict
+--[[
+	Parallel, read-only projectile math coordinator.
+
+	Actors compute acceleration and curvature hints from immutable snapshots.
+	This module alone consumes their SharedTable results and publishes hints to
+	the authoritative projectile loop. Workers never mutate projectile objects,
+	active arrays, entities, signals, Instances, or replication state.
+]]
+
+local SharedTableRegistry = game:GetService("SharedTableRegistry")
+
+local ProjectileParallel = {}
+
+local MIN_PARALLEL_PROJECTILES = 128
+local HINT_MAX_AGE_FRAMES = 120
+
+type Worker = {
+	actor: Actor,
+	input: SharedTable,
+	output: SharedTable,
+	generation: number,
+	pending: any?,
+}
+
+local workers: { Worker } = {}
+local knownActors: { [Actor]: boolean } = {}
+local hints: { [number]: any } = {}
+local frame = 0
+local stats = {
+	BatchesDispatched = 0,
+	ItemsDispatched = 0,
+	BatchesCompleted = 0,
+	ItemsCompleted = 0,
+	BusyWorkers = 0,
+	HintHits = 0,
+	HintMisses = 0,
+}
+
+local function refreshWorkers()
+	local folder = script.Parent:FindFirstChild("ProjectileActors")
+	if not folder then return end
+	for _, child in folder:GetChildren() do
+		if child:IsA("Actor") and not knownActors[child] then
+			local id = tonumber(string.match(child.Name, "(%d+)$"))
+			if id then
+				knownActors[child] = true
+				table.insert(workers, {
+					actor = child,
+					input = SharedTableRegistry:GetSharedTable(`RelativityProjectileInput{id}`),
+					output = SharedTableRegistry:GetSharedTable(`RelativityProjectileOutput{id}`),
+					generation = 0,
+					pending = nil,
+				})
+			end
+		end
+	end
+	table.sort(workers, function(a, b) return a.actor.Name < b.actor.Name end)
+end
+
+function ProjectileParallel.Collect()
+	refreshWorkers()
+	for _, worker in workers do
+		local pending = worker.pending
+		if pending and worker.output.done == pending.generation then
+			for index, snapshot in pending.snapshots do
+				local base = (index - 1) * 4
+				local id = worker.output[base + 1]
+				if id == snapshot.Id then
+					hints[id] = {
+						Velocity = worker.output[base + 2],
+						AccelerationVector = worker.output[base + 3],
+						CurvatureDt = worker.output[base + 4],
+						Acceleration = snapshot.Acceleration,
+						AccelerationDirection = snapshot.AccelerationDirection,
+						Gravity = snapshot.Gravity,
+						Frame = pending.frame,
+					}
+				end
+			end
+			stats.BatchesCompleted += 1
+			stats.ItemsCompleted += #pending.snapshots
+			worker.pending = nil
+		end
+	end
+end
+
+function ProjectileParallel.GetHint(projectile: any)
+	local hint = hints[projectile.Id]
+	if hint
+		and hint.Velocity == projectile.Velocity
+		and hint.Acceleration == projectile.Acceleration
+		and hint.AccelerationDirection == projectile.AccelerationDirection
+		and hint.Gravity == projectile.Gravity
+	then
+		stats.HintHits += 1
+		return hint
+	end
+	stats.HintMisses += 1
+	return nil
+end
+
+function ProjectileParallel.Dispatch(projectiles: { any })
+	frame += 1
+	refreshWorkers()
+	if #projectiles < MIN_PARALLEL_PROJECTILES or #workers == 0 then
+		if #projectiles == 0 then table.clear(hints) end
+		return
+	end
+
+	local available = {}
+	for _, worker in workers do
+		if not worker.pending then
+			table.insert(available, worker)
+		else
+			stats.BusyWorkers += 1
+		end
+	end
+	if #available == 0 then return end
+
+	local partitions = table.create(#available)
+	for index = 1, #available do partitions[index] = {} end
+	for index, projectile in projectiles do
+		table.insert(partitions[(index - 1) % #available + 1], projectile)
+	end
+
+	for index, worker in available do
+		local list = partitions[index]
+		if #list == 0 then continue end
+		worker.generation += 1
+		local snapshots = table.create(#list)
+		for itemIndex, projectile in list do
+			local base = (itemIndex - 1) * 5
+			worker.input[base + 1] = projectile.Id
+			worker.input[base + 2] = projectile.Velocity
+			worker.input[base + 3] = projectile.Acceleration
+			worker.input[base + 4] = projectile.AccelerationDirection or false
+			worker.input[base + 5] = projectile.Gravity
+			snapshots[itemIndex] = {
+				Id = projectile.Id,
+				Acceleration = projectile.Acceleration,
+				AccelerationDirection = projectile.AccelerationDirection,
+				Gravity = projectile.Gravity,
+			}
+		end
+		worker.pending = { generation = worker.generation, snapshots = snapshots, frame = frame }
+		worker.actor:SendMessage("ComputeProjectileHints", worker.generation, #list)
+		stats.BatchesDispatched += 1
+		stats.ItemsDispatched += #list
+	end
+
+	if frame % HINT_MAX_AGE_FRAMES == 0 then
+		for id, hint in hints do
+			if frame - hint.Frame > HINT_MAX_AGE_FRAMES then hints[id] = nil end
+		end
+	end
+end
+
+function ProjectileParallel.GetStats()
+	return table.clone(stats)
+end
+
+return ProjectileParallel
+-- =============================================================================
+-- END FILE: src/server/ProjectileParallel.luau
+-- =============================================================================
+
+-- =============================================================================
+-- BEGIN FILE: src/server/ProjectileWorkerBootstrap.server.luau
+-- =============================================================================
+--!strict
+-- Creates a small Actor pool, then each clone performs read-only math in a
+-- parallel message callback. Results are written to per-worker SharedTables.
+
+local SharedTableRegistry = game:GetService("SharedTableRegistry")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+
+local actor = script:GetActor()
+if not actor then
+	local folder = script.Parent:FindFirstChild("ProjectileActors")
+	if not folder then
+		folder = Instance.new("Folder")
+		folder.Name = "ProjectileActors"
+		folder.Parent = script.Parent
+	end
+	for index = 1, 4 do
+		local inputKey = `RelativityProjectileInput{index}`
+		local outputKey = `RelativityProjectileOutput{index}`
+		if not SharedTableRegistry:GetSharedTable(inputKey) then
+			SharedTableRegistry:SetSharedTable(inputKey, SharedTable.new())
+		end
+		if not SharedTableRegistry:GetSharedTable(outputKey) then
+			SharedTableRegistry:SetSharedTable(outputKey, SharedTable.new())
+		end
+	end
+	if #folder:GetChildren() == 0 then
+		for index = 1, 4 do
+			local workerActor = Instance.new("Actor")
+			workerActor.Name = `ProjectileWorker{index}`
+			local workerScript = script:Clone()
+			workerScript.Name = "Worker"
+			workerScript.Parent = workerActor
+			workerActor.Parent = folder
+		end
+	end
+	return
+end
+
+local workerId = assert(tonumber(string.match(actor.Name, "(%d+)$")), "Projectile worker requires a numeric suffix")
+local ProjectileMotion = require(ReplicatedStorage:WaitForChild("Shared"):WaitForChild("ProjectileMotion"))
+local input = SharedTableRegistry:GetSharedTable(`RelativityProjectileInput{workerId}`)
+local output = SharedTableRegistry:GetSharedTable(`RelativityProjectileOutput{workerId}`)
+
+actor:BindToMessageParallel("ComputeProjectileHints", function(generation: number, count: number)
+	for index = 1, count do
+		local inputBase = (index - 1) * 5
+		local outputBase = (index - 1) * 4
+		local id = input[inputBase + 1]
+		local velocity = input[inputBase + 2]
+		local acceleration = input[inputBase + 3]
+		local direction = input[inputBase + 4]
+		local gravity = input[inputBase + 5]
+		if direction == false then direction = nil end
+		local accelerationVector = ProjectileMotion.GetAcceleration(velocity, acceleration, direction, gravity)
+		output[outputBase + 1] = id
+		output[outputBase + 2] = velocity
+		output[outputBase + 3] = accelerationVector
+		output[outputBase + 4] = ProjectileMotion.GetCurvatureStepDt(velocity, accelerationVector, 0.35)
+	end
+	output.done = generation
+end)
+-- =============================================================================
+-- END FILE: src/server/ProjectileWorkerBootstrap.server.luau
 -- =============================================================================
 
 -- =============================================================================
@@ -2204,10 +2460,11 @@ function ProjectileClient.EnableClientRendering()
 			spawnRealTime = now,
 			maxRealLifetime = data.MaxRealLifetime or DEFAULT_MAX_REAL_LIFETIME,
 			inView = isInView(data.Position),
+			effectCullDelay = VisualModel.GetLongestEffectLifetime(model),
+			culled = false,
 		}
 		if not visual.inView then
-			VisualModel.SuspendTrails(visual)
-			VisualModel.SetCulled(visual, true)
+			visual.offscreenSince = now
 		end
 		if data.ActivateParticlesOnCreate then
 			VisualModel.ActivateParticles(model)
@@ -2377,21 +2634,35 @@ function ProjectileClient.EnableClientRendering()
 				if inView then
 					transformed += 1
 					if not visual.inView then
+						-- Suppress trail history only for the re-entry teleport.
+						-- Particles kept emitting throughout the off-screen grace
+						-- period unless the visual actually reached full culling.
+						VisualModel.SuspendTrails(visual)
 						VisualModel.Place(visual, visual.position, visual.velocity)
-						VisualModel.SetCulled(visual, false)
-						visual.resumeTrailsOnNextUpdate = now
+						if visual.culled then
+							VisualModel.SetCulled(visual, false)
+							visual.culled = false
+						end
+						visual.resumeEffectsOnNextUpdate = now
+						visual.offscreenSince = nil
 					elseif not visual.smoothTransform then
-						if visual.resumeTrailsOnNextUpdate then
-							VisualModel.ResumeTrails(visual)
-							visual.resumeTrailsOnNextUpdate = nil
+						if visual.resumeEffectsOnNextUpdate then
+							VisualModel.ResumeEffects(visual)
+							visual.resumeEffectsOnNextUpdate = nil
 						end
 						local realDt = math.max(now - visual.lastRenderStep, 0)
 						VisualModel.Step(visual, realDt)
 					end
 					visual.lastRenderStep = now
-				elseif visual.inView then
-					VisualModel.SuspendTrails(visual)
-					VisualModel.SetCulled(visual, true)
+				else
+					if visual.inView or not visual.offscreenSince then
+						visual.offscreenSince = now
+					end
+					if not visual.culled and now - visual.offscreenSince >= visual.effectCullDelay then
+						VisualModel.SuspendEffects(visual)
+						VisualModel.SetCulled(visual, true)
+						visual.culled = true
+					end
 				end
 				visual.inView = inView
 				-- Position/velocity/pose come from ProjMove; the only thing
@@ -2425,6 +2696,7 @@ function ProjectileClient.EnableClientRendering()
 			if inView then
 				transformed += 1
 				if not visual.inView then
+					VisualModel.SuspendTrails(visual)
 					VisualModel.Place(visual, visual.position, visual.velocity)
 				elseif moved and visual.smoothTransform then
 					setSmoothTarget(visual, now)
@@ -2432,16 +2704,26 @@ function ProjectileClient.EnableClientRendering()
 					VisualModel.Place(visual, visual.position, visual.velocity)
 				end
 				if not visual.inView then
-					VisualModel.SetCulled(visual, false)
-					visual.resumeTrailsOnNextUpdate = now
-				elseif visual.resumeTrailsOnNextUpdate then
-					VisualModel.ResumeTrails(visual)
-					visual.resumeTrailsOnNextUpdate = nil
+					if visual.culled then
+						VisualModel.SetCulled(visual, false)
+						visual.culled = false
+					end
+					visual.resumeEffectsOnNextUpdate = now
+					visual.offscreenSince = nil
+				elseif visual.resumeEffectsOnNextUpdate then
+					VisualModel.ResumeEffects(visual)
+					visual.resumeEffectsOnNextUpdate = nil
 				end
 				visual.lastRenderStep = now
-			elseif visual.inView then
-				VisualModel.SuspendTrails(visual)
-				VisualModel.SetCulled(visual, true)
+			else
+				if visual.inView or not visual.offscreenSince then
+					visual.offscreenSince = now
+				end
+				if not visual.culled and now - visual.offscreenSince >= visual.effectCullDelay then
+					VisualModel.SuspendEffects(visual)
+					VisualModel.SetCulled(visual, true)
+					visual.culled = true
+				end
 			end
 			visual.inView = inView
 			if not alive then
@@ -2457,9 +2739,9 @@ function ProjectileClient.EnableClientRendering()
 		-- scheduler above, so this adds at most MAX_SMOOTH_PROJECTILES transforms.
 		for _, visual in smoothVisuals do
 			if visual.inView and visuals[visual.id] == visual then
-				if visual.resumeTrailsOnNextUpdate and visual.resumeTrailsOnNextUpdate < now then
-					VisualModel.ResumeTrails(visual)
-					visual.resumeTrailsOnNextUpdate = nil
+				if visual.resumeEffectsOnNextUpdate and visual.resumeEffectsOnNextUpdate < now then
+					VisualModel.ResumeEffects(visual)
+					visual.resumeEffectsOnNextUpdate = nil
 				end
 				local lastStep = visual.lastSmoothStep or now
 				VisualModel.Step(visual, math.max(now - lastStep, 0))
@@ -2670,6 +2952,17 @@ function VisualModel.Build(data): (Instance, any)
 		part.Material = Enum.Material.Neon
 		model = part
 	end
+
+	-- Scale the cloned presentation once at construction. This does not add
+	-- any per-frame work and keeps gameplay collision radius server-owned.
+	local visualScale = math.clamp(data.VisualScale or 1, 0.05, 20)
+	if visualScale ~= 1 then
+		if model:IsA("Model") then
+			pcall(model.ScaleTo, model, model:GetScale() * visualScale)
+		elseif model:IsA("BasePart") then
+			model.Size *= visualScale
+		end
+	end
 	local root: BasePart?
 	local pivot: CFrame
 	if model:IsA("Model") then
@@ -2791,6 +3084,57 @@ function VisualModel.ResumeTrails(visual)
 		end
 	end
 	visual.suspendedTrails = nil
+end
+
+-- Returns the real-time grace period a visual should remain alive and
+-- emitting after it first leaves the viewport. EmitDelay is included because
+-- one-shot particle bursts may not have fired yet when the projectile exits.
+function VisualModel.GetLongestEffectLifetime(model: Instance): number
+	local longest = 0
+	for _, instance in model:GetDescendants() do
+		if instance:IsA("ParticleEmitter") then
+			local emitDelay = instance:GetAttribute("EmitDelay")
+			if typeof(emitDelay) ~= "number" then
+				emitDelay = 0
+			end
+			longest = math.max(longest, math.max(emitDelay, 0) + instance.Lifetime.Max)
+		elseif instance:IsA("Trail") then
+			longest = math.max(longest, instance.Lifetime)
+		end
+	end
+	return longest
+end
+
+-- Off-screen culling eventually stops both continuous particle emission and
+-- trails, but only after GetLongestEffectLifetime has elapsed. Remember the
+-- exact enabled set so authored-disabled effects stay disabled on re-entry.
+function VisualModel.SuspendEffects(visual)
+	VisualModel.SuspendTrails(visual)
+	if visual.suspendedParticles then
+		return
+	end
+	local suspended = {}
+	for _, instance in visual.model:GetDescendants() do
+		if instance:IsA("ParticleEmitter") and instance.Enabled then
+			instance.Enabled = false
+			table.insert(suspended, instance)
+		end
+	end
+	visual.suspendedParticles = suspended
+end
+
+function VisualModel.ResumeEffects(visual)
+	VisualModel.ResumeTrails(visual)
+	local suspended = visual.suspendedParticles
+	if not suspended then
+		return
+	end
+	for _, emitter in suspended do
+		if emitter.Parent then
+			emitter.Enabled = true
+		end
+	end
+	visual.suspendedParticles = nil
 end
 
 -- Unparenting is a cheap, exact visual cull: the projectile cannot remain
@@ -2922,4 +3266,48 @@ end
 return VisualModel
 -- =============================================================================
 -- END FILE: src/shared/ProjectileClient/VisualModel.luau
+-- =============================================================================
+
+-- =============================================================================
+-- BEGIN FILE: src/server/ProjectileQuota.luau
+-- =============================================================================
+--!strict
+-- Shared live-projectile budget for weapons and compiled spells.
+
+local Players = game:GetService("Players")
+
+local ProjectileQuota = {}
+ProjectileQuota.Maximum = 150
+
+local active: { [Player]: number } = {}
+
+function ProjectileQuota.Get(player: Player): number
+	return active[player] or 0
+end
+
+function ProjectileQuota.TryAcquire(player: Player, count: number?): boolean
+	local amount = math.max(math.floor(count or 1), 0)
+	if amount == 0 then
+		return true
+	end
+	local current = active[player] or 0
+	if current + amount > ProjectileQuota.Maximum then
+		return false
+	end
+	active[player] = current + amount
+	return true
+end
+
+function ProjectileQuota.Release(player: Player, count: number?)
+	local amount = math.max(math.floor(count or 1), 0)
+	active[player] = math.max((active[player] or 0) - amount, 0)
+end
+
+Players.PlayerRemoving:Connect(function(player)
+	active[player] = nil
+end)
+
+return ProjectileQuota
+-- =============================================================================
+-- END FILE: src/server/ProjectileQuota.luau
 -- =============================================================================

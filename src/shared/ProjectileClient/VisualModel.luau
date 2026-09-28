@@ -47,6 +47,17 @@ function VisualModel.Build(data): (Instance, any)
 		part.Material = Enum.Material.Neon
 		model = part
 	end
+
+	-- Scale the cloned presentation once at construction. This does not add
+	-- any per-frame work and keeps gameplay collision radius server-owned.
+	local visualScale = math.clamp(data.VisualScale or 1, 0.05, 20)
+	if visualScale ~= 1 then
+		if model:IsA("Model") then
+			pcall(model.ScaleTo, model, model:GetScale() * visualScale)
+		elseif model:IsA("BasePart") then
+			model.Size *= visualScale
+		end
+	end
 	local root: BasePart?
 	local pivot: CFrame
 	if model:IsA("Model") then
@@ -168,6 +179,57 @@ function VisualModel.ResumeTrails(visual)
 		end
 	end
 	visual.suspendedTrails = nil
+end
+
+-- Returns the real-time grace period a visual should remain alive and
+-- emitting after it first leaves the viewport. EmitDelay is included because
+-- one-shot particle bursts may not have fired yet when the projectile exits.
+function VisualModel.GetLongestEffectLifetime(model: Instance): number
+	local longest = 0
+	for _, instance in model:GetDescendants() do
+		if instance:IsA("ParticleEmitter") then
+			local emitDelay = instance:GetAttribute("EmitDelay")
+			if typeof(emitDelay) ~= "number" then
+				emitDelay = 0
+			end
+			longest = math.max(longest, math.max(emitDelay, 0) + instance.Lifetime.Max)
+		elseif instance:IsA("Trail") then
+			longest = math.max(longest, instance.Lifetime)
+		end
+	end
+	return longest
+end
+
+-- Off-screen culling eventually stops both continuous particle emission and
+-- trails, but only after GetLongestEffectLifetime has elapsed. Remember the
+-- exact enabled set so authored-disabled effects stay disabled on re-entry.
+function VisualModel.SuspendEffects(visual)
+	VisualModel.SuspendTrails(visual)
+	if visual.suspendedParticles then
+		return
+	end
+	local suspended = {}
+	for _, instance in visual.model:GetDescendants() do
+		if instance:IsA("ParticleEmitter") and instance.Enabled then
+			instance.Enabled = false
+			table.insert(suspended, instance)
+		end
+	end
+	visual.suspendedParticles = suspended
+end
+
+function VisualModel.ResumeEffects(visual)
+	VisualModel.ResumeTrails(visual)
+	local suspended = visual.suspendedParticles
+	if not suspended then
+		return
+	end
+	for _, emitter in suspended do
+		if emitter.Parent then
+			emitter.Enabled = true
+		end
+	end
+	visual.suspendedParticles = nil
 end
 
 -- Unparenting is a cheap, exact visual cull: the projectile cannot remain

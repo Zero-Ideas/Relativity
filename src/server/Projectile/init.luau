@@ -198,6 +198,8 @@
 	              -- excluded from acquisition, and Filter (if set) is respected.
 	   Visualize = false, VisualRange = math.huge
 	   Model = Instance?        (cloned client-side) or Visual = {Shape,Size,Color}
+	   VisualScale = 1          (0.05..20; applied once when the client clones
+	                            the visual, with no per-frame scaling cost)
 	   DestroyDelay = 0         (client keeps the visual this long after impact)
 	   WaitForParticles = true (client-side; while true, a ParticleEmitter
 	              under the visual is only disabled on destroy -- already-
@@ -280,6 +282,7 @@ local Homing = require(script.Homing)
 local Raycast = require(script.Raycast)
 local RewindHit = require(script.RewindHit)
 local Replication = require(script.Replication)
+local ProjectileParallel = require(script.Parent.ProjectileParallel)
 
 local Projectile = {}
 Projectile.__index = Projectile
@@ -409,6 +412,7 @@ function Projectile.new(config)
 		VisualRange = config.VisualRange or math.huge,
 		Model = config.Model,
 		Visual = config.Visual,
+		VisualScale = math.clamp(config.VisualScale or 1, 0.05, 20),
 		DestroyDelay = config.DestroyDelay or 0,
 		-- Client-side effect-cleanup/activation options -- see the module doc
 		-- comment's config section and VisualModel.FadeOut /
@@ -501,6 +505,12 @@ function Projectile.Burst(config, count: number)
 	local shots = {}
 	for _ = 1, count do
 		local pelletConfig = table.clone(config)
+		-- Mutable nested configuration must never be shared by sibling shots.
+		-- This is especially important for spell bursts whose homing settings
+		-- may be extended with per-projectile state later.
+		if config.Homing then
+			pelletConfig.Homing = table.clone(config.Homing)
+		end
 		pelletConfig.TargetPosition = nil
 		pelletConfig.Direction = Math.coneDirection(baseDir, spread)
 		table.insert(shots, Projectile.new(pelletConfig))
@@ -619,7 +629,8 @@ function Projectile:Step(globalDt: number): boolean
 	while remaining > MIN_STEP_DT and guard < MAX_SUBSTEPS do
 		guard += 1
 
-		local accelerationVector = ProjectileMotion.GetAcceleration(
+		local parallelHint = if guard == 1 then ProjectileParallel.GetHint(self) else nil
+		local accelerationVector = if parallelHint then parallelHint.AccelerationVector else ProjectileMotion.GetAcceleration(
 			self.Velocity,
 			self.Acceleration,
 			self.AccelerationDirection,
@@ -672,7 +683,9 @@ function Projectile:Step(globalDt: number): boolean
 			)
 			stepDt = math.min(stepDt, chunkBoundaryDt, radialBoundaryDt)
 		end
-		stepDt = math.min(stepDt, ProjectileMotion.GetCurvatureStepDt(self.Velocity, accelerationVector, CURVE_ERROR))
+		local curvatureStepDt = if parallelHint then parallelHint.CurvatureDt
+			else ProjectileMotion.GetCurvatureStepDt(self.Velocity, accelerationVector, CURVE_ERROR)
+		stepDt = math.min(stepDt, curvatureStepDt)
 		if self.HomingTarget and self.Homing then
 			local turnRate = self.Homing.TurnRate or math.rad(120)
 			if turnRate > 0 then
@@ -797,6 +810,9 @@ end
 --------------------------------------------------------------------------------
 
 Heartbeat.Connect(function(globalDt)
+	-- Actor results are consumed only here, on the authoritative serial side.
+	-- Workers operate solely on immutable snapshots from the previous frame.
+	ProjectileParallel.Collect()
 	local syncCandidates = {}
 	for i = #active, 1, -1 do
 		local projectile = active[i]
@@ -855,6 +871,7 @@ Heartbeat.Connect(function(globalDt)
 		syncCursor = 1
 	end
 	Replication.flushMoveBatch(moveBatch)
+	ProjectileParallel.Dispatch(active)
 end, { Name = "ProjectileSystem.Step", Priority = 5 })
 
 -- Once-a-second ProjMove rate summary (see Replication.DebugSync above) --

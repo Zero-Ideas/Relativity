@@ -303,10 +303,11 @@ function ProjectileClient.EnableClientRendering()
 			spawnRealTime = now,
 			maxRealLifetime = data.MaxRealLifetime or DEFAULT_MAX_REAL_LIFETIME,
 			inView = isInView(data.Position),
+			effectCullDelay = VisualModel.GetLongestEffectLifetime(model),
+			culled = false,
 		}
 		if not visual.inView then
-			VisualModel.SuspendTrails(visual)
-			VisualModel.SetCulled(visual, true)
+			visual.offscreenSince = now
 		end
 		if data.ActivateParticlesOnCreate then
 			VisualModel.ActivateParticles(model)
@@ -476,21 +477,35 @@ function ProjectileClient.EnableClientRendering()
 				if inView then
 					transformed += 1
 					if not visual.inView then
+						-- Suppress trail history only for the re-entry teleport.
+						-- Particles kept emitting throughout the off-screen grace
+						-- period unless the visual actually reached full culling.
+						VisualModel.SuspendTrails(visual)
 						VisualModel.Place(visual, visual.position, visual.velocity)
-						VisualModel.SetCulled(visual, false)
-						visual.resumeTrailsOnNextUpdate = now
+						if visual.culled then
+							VisualModel.SetCulled(visual, false)
+							visual.culled = false
+						end
+						visual.resumeEffectsOnNextUpdate = now
+						visual.offscreenSince = nil
 					elseif not visual.smoothTransform then
-						if visual.resumeTrailsOnNextUpdate then
-							VisualModel.ResumeTrails(visual)
-							visual.resumeTrailsOnNextUpdate = nil
+						if visual.resumeEffectsOnNextUpdate then
+							VisualModel.ResumeEffects(visual)
+							visual.resumeEffectsOnNextUpdate = nil
 						end
 						local realDt = math.max(now - visual.lastRenderStep, 0)
 						VisualModel.Step(visual, realDt)
 					end
 					visual.lastRenderStep = now
-				elseif visual.inView then
-					VisualModel.SuspendTrails(visual)
-					VisualModel.SetCulled(visual, true)
+				else
+					if visual.inView or not visual.offscreenSince then
+						visual.offscreenSince = now
+					end
+					if not visual.culled and now - visual.offscreenSince >= visual.effectCullDelay then
+						VisualModel.SuspendEffects(visual)
+						VisualModel.SetCulled(visual, true)
+						visual.culled = true
+					end
 				end
 				visual.inView = inView
 				-- Position/velocity/pose come from ProjMove; the only thing
@@ -524,6 +539,7 @@ function ProjectileClient.EnableClientRendering()
 			if inView then
 				transformed += 1
 				if not visual.inView then
+					VisualModel.SuspendTrails(visual)
 					VisualModel.Place(visual, visual.position, visual.velocity)
 				elseif moved and visual.smoothTransform then
 					setSmoothTarget(visual, now)
@@ -531,16 +547,26 @@ function ProjectileClient.EnableClientRendering()
 					VisualModel.Place(visual, visual.position, visual.velocity)
 				end
 				if not visual.inView then
-					VisualModel.SetCulled(visual, false)
-					visual.resumeTrailsOnNextUpdate = now
-				elseif visual.resumeTrailsOnNextUpdate then
-					VisualModel.ResumeTrails(visual)
-					visual.resumeTrailsOnNextUpdate = nil
+					if visual.culled then
+						VisualModel.SetCulled(visual, false)
+						visual.culled = false
+					end
+					visual.resumeEffectsOnNextUpdate = now
+					visual.offscreenSince = nil
+				elseif visual.resumeEffectsOnNextUpdate then
+					VisualModel.ResumeEffects(visual)
+					visual.resumeEffectsOnNextUpdate = nil
 				end
 				visual.lastRenderStep = now
-			elseif visual.inView then
-				VisualModel.SuspendTrails(visual)
-				VisualModel.SetCulled(visual, true)
+			else
+				if visual.inView or not visual.offscreenSince then
+					visual.offscreenSince = now
+				end
+				if not visual.culled and now - visual.offscreenSince >= visual.effectCullDelay then
+					VisualModel.SuspendEffects(visual)
+					VisualModel.SetCulled(visual, true)
+					visual.culled = true
+				end
 			end
 			visual.inView = inView
 			if not alive then
@@ -556,9 +582,9 @@ function ProjectileClient.EnableClientRendering()
 		-- scheduler above, so this adds at most MAX_SMOOTH_PROJECTILES transforms.
 		for _, visual in smoothVisuals do
 			if visual.inView and visuals[visual.id] == visual then
-				if visual.resumeTrailsOnNextUpdate and visual.resumeTrailsOnNextUpdate < now then
-					VisualModel.ResumeTrails(visual)
-					visual.resumeTrailsOnNextUpdate = nil
+				if visual.resumeEffectsOnNextUpdate and visual.resumeEffectsOnNextUpdate < now then
+					VisualModel.ResumeEffects(visual)
+					visual.resumeEffectsOnNextUpdate = nil
 				end
 				local lastStep = visual.lastSmoothStep or now
 				VisualModel.Step(visual, math.max(now - lastStep, 0))
