@@ -1,0 +1,143 @@
+--!optimize 2
+--[[
+	SpellEffects (client, purely cosmetic)
+	Renders spell Beams and Explosions. Both vessels resolve instantly on the
+	server (see server/SpellRuntime.luau's fireBeam / explode), which
+	broadcasts what happened here; every client draws it locally.
+	Self-registers its listeners at require time, same as WeaponEffects.luau.
+
+	"SpellBeam" payload (server -> all clients):
+	 - Points: { Vector3 } -- start, each bounce point, end
+	 - Width: number -- the beam's hit diameter
+	 - Color: Color3 (glow), Core: Color3 (hot centre)
+	 - Normal: Vector3? -- surface normal where it stopped
+	 - Kind: "entity" | "world" | nil -- what stopped it (nil = ran out of range)
+
+	"SpellExplosion" payload (server -> all clients):
+	 - Position: Vector3, Radius: number (blast radius), Color: Color3
+	 Drawn as a white neon core inside a larger translucent neon shell in the
+	 element colour; both swell quickly, then fade.
+]]
+
+local Debris = game:GetService("Debris")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local TweenService = game:GetService("TweenService")
+
+local Shared = ReplicatedStorage:WaitForChild("Shared")
+local VisualOffload = require(Shared.VisualOffload)
+local Impact = require(Shared.ProjectileClient.Impact)
+
+local SpellEffects = {}
+
+local FADE_TIME = 0.35
+local MIN_WIDTH = 0.35
+
+local fadeInfo = TweenInfo.new(FADE_TIME, Enum.EasingStyle.Quad, Enum.EasingDirection.Out)
+
+local function neon(props: { [string]: any }): Part
+	local part = Instance.new("Part")
+	part.Anchored = true
+	part.CanCollide = false
+	part.CanQuery = false
+	part.CanTouch = false
+	part.CastShadow = false
+	part.Material = Enum.Material.Neon
+	for key, value in props do
+		(part :: any)[key] = value
+	end
+	return part
+end
+
+-- A Cylinder's length runs along its X axis, so turn the segment's look
+-- frame 90 degrees to lay it along a -> b.
+local function cylinderAlong(a: Vector3, b: Vector3): CFrame
+	return CFrame.lookAt((a + b) / 2, b) * CFrame.Angles(0, math.rad(90), 0)
+end
+
+local function segment(a: Vector3, b: Vector3, width: number, core: Color3, glow: Color3)
+	local length = (b - a).Magnitude
+	if length < 0.05 then
+		return
+	end
+	local frame = cylinderAlong(a, b)
+	local inner = neon({ Shape = Enum.PartType.Cylinder, Size = Vector3.new(length, width * 0.45, width * 0.45), CFrame = frame, Color = core })
+	local outer = neon({ Shape = Enum.PartType.Cylinder, Size = Vector3.new(length, width * 1.4, width * 1.4), CFrame = frame, Color = glow, Transparency = 0.5 })
+	inner.Parent = workspace
+	outer.Parent = workspace
+	-- Thin to nothing while the glow swells and fades: a flash, then gone.
+	TweenService:Create(inner, fadeInfo, { Size = Vector3.new(length, 0.02, 0.02), Transparency = 1 }):Play()
+	TweenService:Create(outer, fadeInfo, { Size = Vector3.new(length, width * 2.4, width * 2.4), Transparency = 1 }):Play()
+	Debris:AddItem(inner, FADE_TIME + 0.1)
+	Debris:AddItem(outer, FADE_TIME + 0.1)
+end
+
+local function flare(position: Vector3, width: number, color: Color3)
+	local ball = neon({ Shape = Enum.PartType.Ball, Size = Vector3.one * width * 2, CFrame = CFrame.new(position), Color = color, Transparency = 0.2 })
+	local glow = Instance.new("PointLight")
+	glow.Color = color
+	glow.Range = 16
+	glow.Brightness = 4
+	glow.Parent = ball
+	ball.Parent = workspace
+	TweenService:Create(ball, fadeInfo, { Size = Vector3.one * width * 5, Transparency = 1 }):Play()
+	TweenService:Create(glow, fadeInfo, { Brightness = 0 }):Play()
+	Debris:AddItem(ball, FADE_TIME + 0.1)
+end
+
+VisualOffload.On("SpellBeam", function(data)
+	local points = data.Points
+	if typeof(points) ~= "table" or #points < 2 then
+		return
+	end
+	local width = math.max(data.Width or MIN_WIDTH, MIN_WIDTH)
+	local core = data.Core or Color3.new(1, 1, 1)
+	local glow = data.Color or core
+	for index = 1, #points - 1 do
+		segment(points[index], points[index + 1], width, core, glow)
+	end
+	flare(points[1], width, glow)
+	for index = 2, #points - 1 do
+		Impact.Play(points[index], nil, "bounce")
+	end
+	if data.Kind then
+		flare(points[#points], width * 1.5, glow)
+		Impact.Play(points[#points], data.Normal, data.Kind)
+	end
+end)
+
+local EXPLOSION_GROW = TweenInfo.new(0.16, Enum.EasingStyle.Quint, Enum.EasingDirection.Out)
+local EXPLOSION_FADE = TweenInfo.new(0.4, Enum.EasingStyle.Quad, Enum.EasingDirection.In)
+
+VisualOffload.On("SpellExplosion", function(data)
+	local position = data.Position
+	if typeof(position) ~= "Vector3" then
+		return
+	end
+	local radius = math.max(data.Radius or 6, 1)
+	local color = data.Color or Color3.new(1, 1, 1)
+	local frame = CFrame.new(position)
+	local core = neon({ Shape = Enum.PartType.Ball, Size = Vector3.one * radius * 0.2, CFrame = frame, Color = Color3.new(1, 1, 1) })
+	local shell = neon({ Shape = Enum.PartType.Ball, Size = Vector3.one * radius * 0.4, CFrame = frame, Color = color, Transparency = 0.5 })
+	local glow = Instance.new("PointLight")
+	glow.Color = color
+	glow.Range = radius * 3
+	glow.Brightness = 5
+	glow.Parent = core
+	core.Parent = workspace
+	shell.Parent = workspace
+
+	-- Swell to full size (the shell's diameter is the blast diameter)...
+	TweenService:Create(core, EXPLOSION_GROW, { Size = Vector3.one * radius * 1.1 }):Play()
+	TweenService:Create(shell, EXPLOSION_GROW, { Size = Vector3.one * radius * 2 }):Play()
+	-- ...then fade away while drifting a little larger.
+	task.delay(EXPLOSION_GROW.Time, function()
+		TweenService:Create(core, EXPLOSION_FADE, { Transparency = 1, Size = Vector3.one * radius * 0.8 }):Play()
+		TweenService:Create(shell, EXPLOSION_FADE, { Transparency = 1, Size = Vector3.one * radius * 2.3 }):Play()
+		TweenService:Create(glow, EXPLOSION_FADE, { Brightness = 0 }):Play()
+	end)
+	local lifetime = EXPLOSION_GROW.Time + EXPLOSION_FADE.Time + 0.1
+	Debris:AddItem(core, lifetime)
+	Debris:AddItem(shell, lifetime)
+end)
+
+return SpellEffects

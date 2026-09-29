@@ -13,7 +13,7 @@ local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local SpellCompiler = require(ReplicatedStorage:WaitForChild("Shared"):WaitForChild("SpellCompiler"))
 
 local STORE_NAME = "RelativitySpellCards_v1"
-local SCHEMA_VERSION = 2
+local SCHEMA_VERSION = 3 -- v3 = whiteboard graphs; older cards fail to compile and are dropped
 local SAVE_INTERVAL = 60
 local RETRY_DELAYS = { 1, 2, 4 }
 

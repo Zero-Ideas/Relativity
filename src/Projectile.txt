@@ -195,6 +195,7 @@ function ProjectileMotion.GetTimeScaleBoundaryDt(
 end
 
 return ProjectileMotion
+
 -- =============================================================================
 -- END FILE: src/shared/ProjectileMotion.luau
 -- =============================================================================
@@ -392,7 +393,10 @@ return ProjectileMotion
 	   MaxPierces = 0           (enemies passed through)
 	   PierceFalloff = 0        (damage lost per pierce, 0..1 -- see Damage above)
 	   Homing = { Target?, TargetTag?, TargetTags?, AcquireRadius?, Retarget?,
-	              ReacquireRate?, Permalock?, TurnRate = rad/s, Delay = 0 }
+	              ReacquireRate?, AcquireInterval = 0.1, Permalock?,
+	              TurnRate = rad/s, Delay = 0 }
+	              -- AcquireInterval: dilated seconds between searches while no
+	              -- target is held (jittered 0.5x-1.5x to spread bursts).
 	              -- TargetTags (plural, list of strings) matches any tag in the
 	              -- list; TargetTag (singular) is still supported for a single tag.
 	              -- Permalock (default off): once locked, a Retarget recheck never
@@ -486,7 +490,6 @@ local Homing = require(script.Homing)
 local Raycast = require(script.Raycast)
 local RewindHit = require(script.RewindHit)
 local Replication = require(script.Replication)
-local ProjectileParallel = require(script.Parent.ProjectileParallel)
 
 local Projectile = {}
 Projectile.__index = Projectile
@@ -529,11 +532,12 @@ local MAX_SUBSTEPS = 16
 local CURVE_ERROR = 0.35 -- maximum studs between a curved path and its cast chord
 local MAX_HOMING_TURN_STEP = math.rad(5)
 local MIN_STEP_DT = 1e-5
--- Network only: authoritative simulation still steps every projectile every
--- frame. Pose replication is round-robined so one client event never grows
--- without bound, and its phase cannot be reset by a time-scale change.
+-- Pose replication is round-robined so one client event never grows without
+-- bound, and its phase cannot be reset by a time-scale change.
 local MAX_SYNC_UPDATES_PER_FRAME = 2500
 local syncCursor = 1
+local MAX_VISUAL_SPAWNS_PER_FRAME = 1000
+local MAX_VISUAL_HITS_PER_FRAME = 1000
 
 -- Hard real-time (wall-clock, undilated) cap on how long any projectile can
 -- stay alive, regardless of its own dilated Lifetime/Age. A projectile whose
@@ -611,6 +615,7 @@ function Projectile.new(config)
 		HomingDelay = config.Homing and (config.Homing.Delay or 0) or 0,
 		HomingTarget = config.Homing and config.Homing.Target,
 		ReacquireTimer = 0,
+		_acquireTimer = 0, -- throttles searches while no target is held; see Homing
 
 		Visualize = config.Visualize == true,
 		VisualRange = config.VisualRange or math.huge,
@@ -624,6 +629,7 @@ function Projectile.new(config)
 		WaitForParticles = config.WaitForParticles ~= false,
 		WaitForTrails = config.WaitForTrails ~= false,
 		ActivateParticlesOnCreate = config.ActivateParticlesOnCreate == true,
+		_spawnStreamed = false,
 
 		-- See "Events" in the module doc comment's API section. Fresh Signal
 		-- per projectile -- connect on the returned instance, not via config.
@@ -634,8 +640,6 @@ function Projectile.new(config)
 		RewindSeconds = config.RewindSeconds or 0,
 
 		_ignore = {}, -- entities already pierced
-		_bouncedThisTick = false,
-		_bouncedNormal = Vector3.yAxis,
 		-- Lag-compensation working state, repopulated each Step before
 		-- _checkRewoundHit runs (see Step). rewoundPos is memoized per frame
 		-- since RewindSeconds is fixed and os.clock() is stable across one
@@ -739,6 +743,17 @@ function Projectile.GetAll()
 	return table.clone(active)
 end
 
+function Projectile.GetStats()
+	local queueStats = Replication.getQueueStats()
+	return {
+		Active = #active,
+		VisualSpawnsPerFrame = MAX_VISUAL_SPAWNS_PER_FRAME,
+		VisualHitsPerFrame = MAX_VISUAL_HITS_PER_FRAME,
+		PendingVisualSpawns = queueStats.PendingSpawns,
+		PendingVisualHits = queueStats.PendingHits,
+	}
+end
+
 function Projectile.GetBySource(source: any)
 	local result = {}
 	for _, projectile in active do
@@ -796,10 +811,6 @@ function Projectile:Step(globalDt: number): boolean
 		return self:_expire()
 	end
 
-	-- Reset every tick so a stale true from a previous bounce never leaks into
-	-- a later, non-bouncing tick's streamed payload -- see Raycast._resolveHit.
-	self._bouncedThisTick = false
-
 	-- Personal/global time is consumed below one spatial segment at a time.
 	-- Chunk scale is deliberately NOT folded in here: each segment samples the
 	-- chunk it is entering, so crossing a slow/frozen boundary takes effect at
@@ -829,12 +840,14 @@ function Projectile:Step(globalDt: number): boolean
 
 	local remaining = globalDt * combinedScale + self._simulationDebt
 	self._simulationDebt = 0
+	-- With no dilated chunk or zone anywhere, every boundary search below can
+	-- only return "none", so skip them (they dominate substep cost at scale).
+	local uniformTime = ChunkManager.IsTimeUniform()
 	local guard = 0
 	while remaining > MIN_STEP_DT and guard < MAX_SUBSTEPS do
 		guard += 1
 
-		local parallelHint = if guard == 1 then ProjectileParallel.GetHint(self) else nil
-		local accelerationVector = if parallelHint then parallelHint.AccelerationVector else ProjectileMotion.GetAcceleration(
+		local accelerationVector = ProjectileMotion.GetAcceleration(
 			self.Velocity,
 			self.Acceleration,
 			self.AccelerationDirection,
@@ -845,7 +858,7 @@ function Projectile:Step(globalDt: number): boolean
 			Math.safeUnit(accelerationVector, Vector3.zAxis)
 		)
 		local samplePosition = self.Position + direction * ProjectileMotion.PositionEpsilon
-		local chunkScale = ChunkManager.GetTimeScaleAt(samplePosition)
+		local chunkScale = if uniformTime then 1 else ChunkManager.GetTimeScaleAt(samplePosition)
 		if chunkScale <= 0 then
 			-- Real time spent in a frozen chunk is consumed without building a
 			-- catch-up burst for when the chunk is unfrozen.
@@ -871,25 +884,25 @@ function Projectile:Step(globalDt: number): boolean
 		local stepDt = math.min(availableDt, lifetimeRemaining)
 		if speed > 1e-5 then
 			stepDt = math.min(stepDt, maxDistance / speed)
-			local chunkBoundaryDt = ProjectileMotion.GetTimeScaleBoundaryDt(
-				self.Position,
-				estimatedMovementVelocity,
-				ChunkManager.ChunkSize,
-				ChunkManager.UseY,
-				chunkScale,
-				stepDt,
-				ChunkManager.GetTimeScaleAt
-			)
-			local radialBoundaryDt = ChunkManager.GetRadialTimeScaleBoundaryDt(
-				self.Position,
-				estimatedMovementVelocity,
-				stepDt
-			)
-			stepDt = math.min(stepDt, chunkBoundaryDt, radialBoundaryDt)
+			if not uniformTime then
+				local chunkBoundaryDt = ProjectileMotion.GetTimeScaleBoundaryDt(
+					self.Position,
+					estimatedMovementVelocity,
+					ChunkManager.ChunkSize,
+					ChunkManager.UseY,
+					chunkScale,
+					stepDt,
+					ChunkManager.GetTimeScaleAt
+				)
+				local radialBoundaryDt = ChunkManager.GetRadialTimeScaleBoundaryDt(
+					self.Position,
+					estimatedMovementVelocity,
+					stepDt
+				)
+				stepDt = math.min(stepDt, chunkBoundaryDt, radialBoundaryDt)
+			end
 		end
-		local curvatureStepDt = if parallelHint then parallelHint.CurvatureDt
-			else ProjectileMotion.GetCurvatureStepDt(self.Velocity, accelerationVector, CURVE_ERROR)
-		stepDt = math.min(stepDt, curvatureStepDt)
+		stepDt = math.min(stepDt, ProjectileMotion.GetCurvatureStepDt(self.Velocity, accelerationVector, CURVE_ERROR))
 		if self.HomingTarget and self.Homing then
 			local turnRate = self.Homing.TurnRate or math.rad(120)
 			if turnRate > 0 then
@@ -991,7 +1004,7 @@ function Projectile:Destroy(result, kind: string?)
 	if Replication.DebugSync then
 		print(`[Relativity][sync] ProjHit Id={self.Id} Kind={kind or "fizzle"}`)
 	end
-	Replication.streamTo(self, "ProjHit", { Id = self.Id, Position = hitResult.Position, Normal = hitResult.Normal, Kind = kind })
+	Replication.queueHit(self, { Id = self.Id, Position = hitResult.Position, Normal = hitResult.Normal, Kind = kind })
 
 	-- Exactly-once -- see the module doc comment's "Events" section. Fired
 	-- here (not in Raycast._resolveEntityHit/_resolveHit/_expire) so EVERY
@@ -1014,20 +1027,24 @@ end
 --------------------------------------------------------------------------------
 
 Heartbeat.Connect(function(globalDt)
-	-- Actor results are consumed only here, on the authoritative serial side.
-	-- Workers operate solely on immutable snapshots from the previous frame.
-	ProjectileParallel.Collect()
+	Replication.flushHitBatch(MAX_VISUAL_HITS_PER_FRAME)
+	Replication.flushSpawnBatch(MAX_VISUAL_SPAWNS_PER_FRAME)
+
 	local syncCandidates = {}
+	debug.profilebegin("Projectile.StepAll")
+	-- Backwards with swap-removal: dead projectiles leave `active` the same
+	-- frame (so GetAll/GetInRadius never return them), and anything spawned by
+	-- an OnHit/OnDestroy handler mid-loop is appended past `i` and first steps
+	-- next frame.
 	for i = #active, 1, -1 do
 		local projectile = active[i]
 		-- Captured BEFORE Step() so a projectile whose homing lock drops
 		-- DURING this exact tick still gets this tick's corrected
 		-- post-drop Position/Velocity streamed -- otherwise the client is
 		-- left holding a stale pre-transition pose and resumes local
-		-- physics from the wrong place. Bounce corrections are handled
-		-- separately and immediately inside Raycast._resolveHit -- they
-		-- don't depend on isSynced at all, so a non-homing bouncer never
-		-- reaches this batch outside the tick it actually bounces on.
+		-- physics from the wrong place. Bounce corrections are queued
+		-- separately inside Raycast._resolveHit -- they don't depend on
+		-- isSynced at all, so a non-homing bouncer never enters this batch.
 		local wasSynced = Replication.isSynced(projectile)
 		local alive = projectile:Step(globalDt)
 		if not alive then
@@ -1035,12 +1052,17 @@ Heartbeat.Connect(function(globalDt)
 			active[i] = active[last]
 			active[last] = nil
 			projectile:Destroy({ Position = projectile.Position, Normal = Vector3.yAxis })
-		elseif projectile.Visualize and (wasSynced or Replication.isSynced(projectile)) then
+		elseif
+			projectile.Visualize
+			and projectile._spawnStreamed -- clients would drop poses for visuals they haven't built
+			and (wasSynced or Replication.isSynced(projectile))
+		then
 			-- Currently (or just-formerly, see above) locked onto a homing
 			-- target (checked fresh every tick, not a static
 			-- classification) -- see the module doc comment for why this
 			-- is the one case that stays continuously streamed rather
-			-- than left to the client.
+			-- than left to the client. Bounce snaps travel separately (see
+			-- Replication.queueBounce), so this payload is pose-only.
 			table.insert(syncCandidates, {
 				VisualRange = projectile.VisualRange,
 				Position = projectile.Position,
@@ -1048,16 +1070,11 @@ Heartbeat.Connect(function(globalDt)
 					Id = projectile.Id,
 					Position = projectile.Position,
 					Velocity = projectile.Velocity,
-					-- Set only on the tick a bounce actually happened -- tells
-					-- the client to snap instead of tweening a straight line
-					-- from its last position, which would cut through
-					-- whatever surface sits between the two (see Raycast._resolveHit).
-					Bounced = projectile._bouncedThisTick,
-					Normal = projectile._bouncedThisTick and projectile._bouncedNormal or nil,
 				},
 			})
 		end
 	end
+	debug.profileend()
 
 	local moveBatch = {}
 	local candidateCount = #syncCandidates
@@ -1075,7 +1092,6 @@ Heartbeat.Connect(function(globalDt)
 		syncCursor = 1
 	end
 	Replication.flushMoveBatch(moveBatch)
-	ProjectileParallel.Dispatch(active)
 end, { Name = "ProjectileSystem.Step", Priority = 5 })
 
 -- Once-a-second ProjMove rate summary (see Replication.DebugSync above) --
@@ -1094,6 +1110,7 @@ task.spawn(function()
 end)
 
 return Projectile
+
 -- =============================================================================
 -- END FILE: src/server/Projectile/init.luau
 -- =============================================================================
@@ -1117,6 +1134,13 @@ local Math = require(script.Parent.Math)
 
 local Homing = {}
 Homing.Methods = {}
+
+-- Dilated seconds between searches while a projectile holds no target
+-- (override per shot with Homing.AcquireInterval). Searching on every substep
+-- made a swarm of target-less missiles run up to MAX_SUBSTEPS chunk sweeps
+-- each per frame. The reset is jittered so a burst fired on one frame spreads
+-- its searches across frames instead of spiking together forever.
+local DEFAULT_ACQUIRE_INTERVAL = 0.1
 
 function Homing.targetPosition(target): Vector3?
 	if target == nil then
@@ -1215,8 +1239,13 @@ function Homing.Methods:_updateHoming(dt: number)
 
 	if targetGone then
 		if homing.AcquireRadius or homing.TargetTag or homing.TargetTags then
-			self.HomingTarget = Homing.acquireTarget(self, homing, self.Position)
-			target = self.HomingTarget
+			self._acquireTimer -= dt
+			if self._acquireTimer <= 0 then
+				local interval = homing.AcquireInterval or DEFAULT_ACQUIRE_INTERVAL
+				self._acquireTimer = interval * (0.5 + math.random())
+				self.HomingTarget = Homing.acquireTarget(self, homing, self.Position)
+				target = self.HomingTarget
+			end
 		end
 	elseif not homing.Permalock and homing.Retarget then
 		self.ReacquireTimer -= dt
@@ -1243,6 +1272,7 @@ function Homing.Methods:_updateHoming(dt: number)
 end
 
 return Homing
+
 -- =============================================================================
 -- END FILE: src/server/Projectile/Homing.luau
 -- =============================================================================
@@ -1312,6 +1342,7 @@ function Math.coneDirection(dir: Vector3, spreadDeg: number): Vector3
 end
 
 return Math
+
 -- =============================================================================
 -- END FILE: src/server/Projectile/Math.luau
 -- =============================================================================
@@ -1445,8 +1476,8 @@ function Raycast.Methods:_resolveEntityHit(entity, result, hurtboxName: string?)
 end
 
 -- Returns "continue" | "destroy" after resolving a physical raycast hit. A
--- bounce marks _bouncedThisTick and immediately flushes a one-shot ProjMove
--- correction (Bounced = true) below -- this is now the ONLY streaming a
+-- bounce queues a one-shot ProjMove correction (Bounced = true) below --
+-- this is the ONLY streaming a
 -- non-homing bouncing projectile ever gets; it tells rendering clients to
 -- snap instead of tween (see ProjectileClient) and re-baseline their local
 -- physics from this post-reflection Position/Velocity.
@@ -1501,43 +1532,14 @@ function Raycast.Methods:_resolveHit(result)
 		-- SNAP to it instead of tweening a straight line from its pre-bounce
 		-- position, which would visibly cut through whatever surface sits
 		-- between the two -- exactly where the bounce happened.
-		self._bouncedThisTick = true
-		self._bouncedNormal = normal
-		-- Flush this bounce's snap-to-position immediately instead of waiting
-		-- for the end-of-frame batch in the server step loop. If this is the
-		-- last bounce (BouncesLeft just hit 0) and the reflected path clips
-		-- more geometry later in this SAME tick's substep loop, that next hit
-		-- destroys the projectile and fires ProjHit synchronously -- before
-		-- Step() even returns -- so the outer loop's batching never gets a
-		-- chance to queue this update at all (its "not alive" branch queues
-		-- nothing). Without this, the client would never learn a bounce
-		-- happened here and would keep coasting its stale pre-bounce
-		-- trajectory straight through the surface until ProjHit teleports it
-		-- to the real final position. Sending here guarantees the snap
-		-- always reaches the client before any same-tick Destroy's ProjHit.
-		-- This fires unconditionally on every bounce regardless of homing
-		-- state -- it is the sole sync mechanism for a non-homing bouncer
-		-- (see Replication.isSynced): the client is otherwise fully unsynced
-		-- and coasts on local physics between bounces.
-		if self.Visualize then
-			Replication.flushMoveBatch({ {
-				VisualRange = self.VisualRange,
-				Position = self.Position,
-				Payload = {
-					Id = self.Id,
-					Position = self.Position,
-					Velocity = self.Velocity,
-					Bounced = true,
-					Normal = normal,
-				},
-			} })
-		end
-		-- Consumed for this tick already -- clear it so the outer loop's
-		-- end-of-frame batch (only reachable while actively homing; see
-		-- Replication.isSynced) doesn't re-snap/re-flash a second time at
-		-- wherever the projectile ends up after further substeps this same
-		-- tick.
-		self._bouncedThisTick = false
+		-- Queue this bounce's snap-to-position (captured NOW, not at end of
+		-- tick) for this frame's ProjMove event. It is queued even if a later
+		-- substep this same tick destroys the projectile, and ProjHit is only
+		-- flushed on a later frame, so the snap always reaches the client
+		-- first. This is the sole sync mechanism for a non-homing bouncer (see
+		-- Replication.isSynced): the client otherwise coasts on local physics
+		-- between bounces.
+		Replication.queueBounce(self, normal)
 		if self.OnBounce then
 			task.spawn(self.OnBounce, self, result)
 		end
@@ -1597,6 +1599,7 @@ function Raycast.Methods:_attemptPenetration(result): Vector3?
 end
 
 return Raycast
+
 -- =============================================================================
 -- END FILE: src/server/Projectile/Raycast.luau
 -- =============================================================================
@@ -1621,6 +1624,11 @@ local Shared = ReplicatedStorage:WaitForChild("Shared")
 local VisualOffload = require(Shared.VisualOffload)
 
 local Replication = {}
+local spawnQueue = {}
+local spawnQueueHead = 1
+local hitQueue = {}
+local hitQueueHead = 1
+local pendingBounces = {} -- flushed with this frame's ProjMove; see queueBounce
 
 -- When on, prints every ProjSpawn/ProjSync/ProjHit as they're streamed
 -- (individually rare enough to log one line each), plus a once-a-second rate
@@ -1635,6 +1643,12 @@ Replication.SyncMoveStats = { batches = 0, entries = 0 }
 
 function Replication.streamTo(projectile, channel: string, payload: any)
 	if not projectile.Visualize then
+		return
+	end
+	-- State changes that happen while a visual is still waiting in the bounded
+	-- spawn queue are folded into its eventual spawn snapshot. Sending them
+	-- first would create out-of-order client state for visuals not built yet.
+	if channel ~= "ProjSpawn" and not projectile._spawnStreamed then
 		return
 	end
 	if projectile.VisualRange >= math.huge then
@@ -1680,54 +1694,191 @@ function Replication.combinedTimeScale(projectile): number
 	return sourceScale * projectile.TimeScale
 end
 
-function Replication.spawnVisual(projectile)
-	if Replication.DebugSync then
-		print(`[Relativity][sync] ProjSpawn Id={projectile.Id} Synced={Replication.isSynced(projectile)}`)
-	end
-	Replication.streamTo(projectile, "ProjSpawn", {
+-- Fields equal to ProjectileClient's defaults are omitted: remote events
+-- serialize every key name per entry, so at batch sizes the defaults were most
+-- of the spawn bandwidth.
+local function spawnPayload(projectile)
+	local payload = {
 		Id = projectile.Id,
 		Position = projectile.Position,
 		Velocity = projectile.Velocity,
-		Gravity = projectile.Gravity,
-		Acceleration = projectile.Acceleration,
+		Lifetime = math.max(projectile.Lifetime - projectile.Age, 0),
+		MaxRealLifetime = math.max(projectile.MaxRealLifetime - (os.clock() - projectile._spawnRealTime), 0),
 		AccelerationDirection = projectile.AccelerationDirection,
-		MinSpeed = projectile.MinSpeed,
-		MaxSpeed = projectile.MaxSpeed,
-		Lifetime = projectile.Lifetime,
-		-- Whether it starts out continuously synced -- true only for an
-		-- explicit Homing.Target given at construction (auto-acquire homing
-		-- starts unsynced until it actually locks onto something). If true,
-		-- the client starts in "trust the stream" mode immediately; the
-		-- server's step loop will include it in the very next ProjMove batch.
-		Synced = Replication.isSynced(projectile),
-		-- Initial combined Source.TimeScale * projectile.TimeScale, so the
-		-- client's local dead-reckoning is correct from frame one even if
-		-- this shot was fired while the shooter's ratio was already off 1x --
-		-- see ProjTimeScale / the module doc comment's "Local time" section.
-		TimeScale = projectile._lastStreamedTimeScale,
-		-- Real (undilated) safety cap -- see MaxRealLifetime / the module doc
-		-- comment. Lets the client independently self-destroy the visual as a
-		-- backstop even if it never receives this projectile's ProjHit (e.g.
-		-- it drifted outside VisualRange), rather than being able to leak a
-		-- frozen visual forever -- see ProjectileClient's render loop.
-		MaxRealLifetime = projectile.MaxRealLifetime,
 		Model = projectile.Model,
 		Visual = projectile.Visual,
-		VisualScale = projectile.VisualScale,
-		DestroyDelay = projectile.DestroyDelay,
-		-- Client-side effect-cleanup/activation options -- see
-		-- VisualModel.FadeOut / VisualModel.ActivateParticles and the module
-		-- doc comment's config section.
-		WaitForParticles = projectile.WaitForParticles,
-		WaitForTrails = projectile.WaitForTrails,
-		ActivateParticlesOnCreate = projectile.ActivateParticlesOnCreate,
+	}
+	if projectile.Gravity ~= 0 then payload.Gravity = projectile.Gravity end
+	if projectile.Acceleration ~= 0 then payload.Acceleration = projectile.Acceleration end
+	if projectile.MinSpeed ~= 0 then payload.MinSpeed = projectile.MinSpeed end
+	if projectile.MaxSpeed ~= math.huge then payload.MaxSpeed = projectile.MaxSpeed end
+	if Replication.isSynced(projectile) then payload.Synced = true end
+	if projectile._lastStreamedTimeScale ~= 1 then payload.TimeScale = projectile._lastStreamedTimeScale end
+	if projectile.VisualScale ~= 1 then payload.VisualScale = projectile.VisualScale end
+	if projectile.DestroyDelay ~= 0 then payload.DestroyDelay = projectile.DestroyDelay end
+	if not projectile.WaitForParticles then payload.WaitForParticles = false end
+	if not projectile.WaitForTrails then payload.WaitForTrails = false end
+	if projectile.ActivateParticlesOnCreate then payload.ActivateParticlesOnCreate = true end
+	return payload
+end
+
+function Replication.spawnVisual(projectile)
+	if not projectile.Visualize then return end
+	if Replication.DebugSync then
+		print(`[Relativity][sync] queued ProjSpawn Id={projectile.Id} Synced={Replication.isSynced(projectile)}`)
+	end
+	table.insert(spawnQueue, projectile)
+end
+
+-- Destruction is queued for the same reason creation is: a mass expiry must
+-- become a few bounded batch messages, not thousands of individual remote
+-- invocations in one frame. A projectile that dies before its queued spawn
+-- was streamed needs no hit message because no client visual exists yet.
+function Replication.queueHit(projectile, payload)
+	if not projectile.Visualize or not projectile._spawnStreamed then return end
+	table.insert(hitQueue, {
+		VisualRange = projectile.VisualRange,
+		Position = payload.Position,
+		Payload = payload,
+	})
+end
+
+local function flushRangedBatch(queue, head: number, limit: number, channel: string): number
+	local broadcast = {}
+	local perPlayer: { [Player]: { any } } = {}
+	local players = Players:GetPlayers()
+	local roots = {}
+	for _, player in players do
+		local character = player.Character
+		roots[player] = character and character.PrimaryPart
+	end
+
+	local processed = 0
+	while head <= #queue and processed < limit do
+		local entry = queue[head]
+		queue[head] = false
+		head += 1
+		processed += 1
+		if entry.VisualRange >= math.huge then
+			table.insert(broadcast, entry.Payload)
+		else
+			for _, player in players do
+				local root = roots[player]
+				if root and (root.Position - entry.Position).Magnitude <= entry.VisualRange then
+					local list = perPlayer[player]
+					if not list then list = {}; perPlayer[player] = list end
+					table.insert(list, entry.Payload)
+				end
+			end
+		end
+	end
+
+	if #broadcast > 0 then VisualOffload.Fire(channel, broadcast) end
+	for player, list in perPlayer do
+		if #list > 0 then VisualOffload.FireClient(player, channel, list) end
+	end
+	return head
+end
+
+function Replication.flushHitBatch(limit: number)
+	hitQueueHead = flushRangedBatch(hitQueue, hitQueueHead, limit, "ProjHitBatch")
+	if hitQueueHead > #hitQueue then
+		table.clear(hitQueue)
+		hitQueueHead = 1
+	elseif hitQueueHead > 4096 and hitQueueHead > #hitQueue / 2 then
+		local compacted = {}
+		for index = hitQueueHead, #hitQueue do table.insert(compacted, hitQueue[index]) end
+		hitQueue = compacted
+		hitQueueHead = 1
+	end
+end
+
+function Replication.getQueueStats()
+	return {
+		PendingSpawns = math.max(#spawnQueue - spawnQueueHead + 1, 0),
+		PendingHits = math.max(#hitQueue - hitQueueHead + 1, 0),
+	}
+end
+
+-- Sends at most `limit` new visuals in one frame and combines them into one
+-- RemoteEvent per recipient. Simulation starts immediately on the server;
+-- queued visuals spawn from their latest authoritative pose, so batching never
+-- rewinds or slows gameplay.
+function Replication.flushSpawnBatch(limit: number)
+	local broadcast = {}
+	local perPlayer: { [Player]: { any } } = {}
+	local players = Players:GetPlayers()
+	local roots = {}
+	for _, player in players do
+		local character = player.Character
+		roots[player] = character and character.PrimaryPart
+	end
+	local processed = 0
+	while spawnQueueHead <= #spawnQueue and processed < limit do
+		local projectile = spawnQueue[spawnQueueHead]
+		spawnQueue[spawnQueueHead] = false
+		spawnQueueHead += 1
+		processed += 1
+		if projectile.Dead then continue end
+		projectile._spawnStreamed = true
+		local payload = spawnPayload(projectile)
+		if projectile.VisualRange >= math.huge then
+			table.insert(broadcast, payload)
+		else
+			for _, player in players do
+				local root = roots[player]
+				if root and (root.Position - projectile.Position).Magnitude <= projectile.VisualRange then
+					local list = perPlayer[player]
+					if not list then list = {}; perPlayer[player] = list end
+					table.insert(list, payload)
+				end
+			end
+		end
+	end
+	if #broadcast > 0 then VisualOffload.Fire("ProjSpawnBatch", broadcast) end
+	for player, list in perPlayer do
+		if #list > 0 then VisualOffload.FireClient(player, "ProjSpawnBatch", list) end
+	end
+	if spawnQueueHead > #spawnQueue then
+		table.clear(spawnQueue)
+		spawnQueueHead = 1
+	elseif spawnQueueHead > 4096 and spawnQueueHead > #spawnQueue / 2 then
+		local compacted = {}
+		for index = spawnQueueHead, #spawnQueue do table.insert(compacted, spawnQueue[index]) end
+		spawnQueue = compacted
+		spawnQueueHead = 1
+	end
+end
+
+-- One-shot bounce snap (see Raycast._resolveHit). Queued rather than fired so
+-- a volley bouncing off one floor costs one event per recipient, not one per
+-- projectile. Ordering still holds: this frame's flushMoveBatch sends it, and
+-- any ProjHit for the same projectile is flushed at the start of a LATER frame.
+function Replication.queueBounce(projectile, normal: Vector3)
+	if not projectile.Visualize or not projectile._spawnStreamed then
+		return
+	end
+	table.insert(pendingBounces, {
+		VisualRange = projectile.VisualRange,
+		Position = projectile.Position,
+		Payload = {
+			Id = projectile.Id,
+			Position = projectile.Position,
+			Velocity = projectile.Velocity,
+			Bounced = true,
+			Normal = normal,
+		},
 	})
 end
 
 -- Flushes the bounded round-robin slice selected by init.luau's server step
--- loop as one event per recipient instead of one event per projectile.
--- Everything else never appears here at all -- see the module doc comment.
+-- loop, plus this frame's queued bounce snaps, as one event per recipient
+-- instead of one event per projectile.
 function Replication.flushMoveBatch(moveBatch)
+	if #pendingBounces > 0 then
+		table.move(pendingBounces, 1, #pendingBounces, #moveBatch + 1, moveBatch)
+		table.clear(pendingBounces)
+	end
 	if #moveBatch == 0 then
 		return
 	end
@@ -1776,6 +1927,7 @@ function Replication.flushMoveBatch(moveBatch)
 end
 
 return Replication
+
 -- =============================================================================
 -- END FILE: src/server/Projectile/Replication.luau
 -- =============================================================================
@@ -1910,246 +2062,9 @@ function RewindHit.Methods:_checkRewoundHit(from: Vector3, to: Vector3)
 end
 
 return RewindHit
+
 -- =============================================================================
 -- END FILE: src/server/Projectile/RewindHit.luau
--- =============================================================================
-
--- =============================================================================
--- BEGIN FILE: src/server/ProjectileParallel.luau
--- =============================================================================
---!strict
---[[
-	Parallel, read-only projectile math coordinator.
-
-	Actors compute acceleration and curvature hints from immutable snapshots.
-	This module alone consumes their SharedTable results and publishes hints to
-	the authoritative projectile loop. Workers never mutate projectile objects,
-	active arrays, entities, signals, Instances, or replication state.
-]]
-
-local SharedTableRegistry = game:GetService("SharedTableRegistry")
-
-local ProjectileParallel = {}
-
-local MIN_PARALLEL_PROJECTILES = 128
-local HINT_MAX_AGE_FRAMES = 120
-
-type Worker = {
-	actor: Actor,
-	input: SharedTable,
-	output: SharedTable,
-	generation: number,
-	pending: any?,
-}
-
-local workers: { Worker } = {}
-local knownActors: { [Actor]: boolean } = {}
-local hints: { [number]: any } = {}
-local frame = 0
-local stats = {
-	BatchesDispatched = 0,
-	ItemsDispatched = 0,
-	BatchesCompleted = 0,
-	ItemsCompleted = 0,
-	BusyWorkers = 0,
-	HintHits = 0,
-	HintMisses = 0,
-}
-
-local function refreshWorkers()
-	local folder = script.Parent:FindFirstChild("ProjectileActors")
-	if not folder then return end
-	for _, child in folder:GetChildren() do
-		if child:IsA("Actor") and not knownActors[child] then
-			local id = tonumber(string.match(child.Name, "(%d+)$"))
-			if id then
-				knownActors[child] = true
-				table.insert(workers, {
-					actor = child,
-					input = SharedTableRegistry:GetSharedTable(`RelativityProjectileInput{id}`),
-					output = SharedTableRegistry:GetSharedTable(`RelativityProjectileOutput{id}`),
-					generation = 0,
-					pending = nil,
-				})
-			end
-		end
-	end
-	table.sort(workers, function(a, b) return a.actor.Name < b.actor.Name end)
-end
-
-function ProjectileParallel.Collect()
-	refreshWorkers()
-	for _, worker in workers do
-		local pending = worker.pending
-		if pending and worker.output.done == pending.generation then
-			for index, snapshot in pending.snapshots do
-				local base = (index - 1) * 4
-				local id = worker.output[base + 1]
-				if id == snapshot.Id then
-					hints[id] = {
-						Velocity = worker.output[base + 2],
-						AccelerationVector = worker.output[base + 3],
-						CurvatureDt = worker.output[base + 4],
-						Acceleration = snapshot.Acceleration,
-						AccelerationDirection = snapshot.AccelerationDirection,
-						Gravity = snapshot.Gravity,
-						Frame = pending.frame,
-					}
-				end
-			end
-			stats.BatchesCompleted += 1
-			stats.ItemsCompleted += #pending.snapshots
-			worker.pending = nil
-		end
-	end
-end
-
-function ProjectileParallel.GetHint(projectile: any)
-	local hint = hints[projectile.Id]
-	if hint
-		and hint.Velocity == projectile.Velocity
-		and hint.Acceleration == projectile.Acceleration
-		and hint.AccelerationDirection == projectile.AccelerationDirection
-		and hint.Gravity == projectile.Gravity
-	then
-		stats.HintHits += 1
-		return hint
-	end
-	stats.HintMisses += 1
-	return nil
-end
-
-function ProjectileParallel.Dispatch(projectiles: { any })
-	frame += 1
-	refreshWorkers()
-	if #projectiles < MIN_PARALLEL_PROJECTILES or #workers == 0 then
-		if #projectiles == 0 then table.clear(hints) end
-		return
-	end
-
-	local available = {}
-	for _, worker in workers do
-		if not worker.pending then
-			table.insert(available, worker)
-		else
-			stats.BusyWorkers += 1
-		end
-	end
-	if #available == 0 then return end
-
-	local partitions = table.create(#available)
-	for index = 1, #available do partitions[index] = {} end
-	for index, projectile in projectiles do
-		table.insert(partitions[(index - 1) % #available + 1], projectile)
-	end
-
-	for index, worker in available do
-		local list = partitions[index]
-		if #list == 0 then continue end
-		worker.generation += 1
-		local snapshots = table.create(#list)
-		for itemIndex, projectile in list do
-			local base = (itemIndex - 1) * 5
-			worker.input[base + 1] = projectile.Id
-			worker.input[base + 2] = projectile.Velocity
-			worker.input[base + 3] = projectile.Acceleration
-			worker.input[base + 4] = projectile.AccelerationDirection or false
-			worker.input[base + 5] = projectile.Gravity
-			snapshots[itemIndex] = {
-				Id = projectile.Id,
-				Acceleration = projectile.Acceleration,
-				AccelerationDirection = projectile.AccelerationDirection,
-				Gravity = projectile.Gravity,
-			}
-		end
-		worker.pending = { generation = worker.generation, snapshots = snapshots, frame = frame }
-		worker.actor:SendMessage("ComputeProjectileHints", worker.generation, #list)
-		stats.BatchesDispatched += 1
-		stats.ItemsDispatched += #list
-	end
-
-	if frame % HINT_MAX_AGE_FRAMES == 0 then
-		for id, hint in hints do
-			if frame - hint.Frame > HINT_MAX_AGE_FRAMES then hints[id] = nil end
-		end
-	end
-end
-
-function ProjectileParallel.GetStats()
-	return table.clone(stats)
-end
-
-return ProjectileParallel
--- =============================================================================
--- END FILE: src/server/ProjectileParallel.luau
--- =============================================================================
-
--- =============================================================================
--- BEGIN FILE: src/server/ProjectileWorkerBootstrap.server.luau
--- =============================================================================
---!strict
--- Creates a small Actor pool, then each clone performs read-only math in a
--- parallel message callback. Results are written to per-worker SharedTables.
-
-local SharedTableRegistry = game:GetService("SharedTableRegistry")
-local ReplicatedStorage = game:GetService("ReplicatedStorage")
-
-local actor = script:GetActor()
-if not actor then
-	local folder = script.Parent:FindFirstChild("ProjectileActors")
-	if not folder then
-		folder = Instance.new("Folder")
-		folder.Name = "ProjectileActors"
-		folder.Parent = script.Parent
-	end
-	for index = 1, 4 do
-		local inputKey = `RelativityProjectileInput{index}`
-		local outputKey = `RelativityProjectileOutput{index}`
-		if not SharedTableRegistry:GetSharedTable(inputKey) then
-			SharedTableRegistry:SetSharedTable(inputKey, SharedTable.new())
-		end
-		if not SharedTableRegistry:GetSharedTable(outputKey) then
-			SharedTableRegistry:SetSharedTable(outputKey, SharedTable.new())
-		end
-	end
-	if #folder:GetChildren() == 0 then
-		for index = 1, 4 do
-			local workerActor = Instance.new("Actor")
-			workerActor.Name = `ProjectileWorker{index}`
-			local workerScript = script:Clone()
-			workerScript.Name = "Worker"
-			workerScript.Parent = workerActor
-			workerActor.Parent = folder
-		end
-	end
-	return
-end
-
-local workerId = assert(tonumber(string.match(actor.Name, "(%d+)$")), "Projectile worker requires a numeric suffix")
-local ProjectileMotion = require(ReplicatedStorage:WaitForChild("Shared"):WaitForChild("ProjectileMotion"))
-local input = SharedTableRegistry:GetSharedTable(`RelativityProjectileInput{workerId}`)
-local output = SharedTableRegistry:GetSharedTable(`RelativityProjectileOutput{workerId}`)
-
-actor:BindToMessageParallel("ComputeProjectileHints", function(generation: number, count: number)
-	for index = 1, count do
-		local inputBase = (index - 1) * 5
-		local outputBase = (index - 1) * 4
-		local id = input[inputBase + 1]
-		local velocity = input[inputBase + 2]
-		local acceleration = input[inputBase + 3]
-		local direction = input[inputBase + 4]
-		local gravity = input[inputBase + 5]
-		if direction == false then direction = nil end
-		local accelerationVector = ProjectileMotion.GetAcceleration(velocity, acceleration, direction, gravity)
-		output[outputBase + 1] = id
-		output[outputBase + 2] = velocity
-		output[outputBase + 3] = accelerationVector
-		output[outputBase + 4] = ProjectileMotion.GetCurvatureStepDt(velocity, accelerationVector, 0.35)
-	end
-	output.done = generation
-end)
--- =============================================================================
--- END FILE: src/server/ProjectileWorkerBootstrap.server.luau
 -- =============================================================================
 
 -- =============================================================================
@@ -2221,6 +2136,7 @@ local DEFAULT_SMOOTH_DURATION = 1 / 60
 
 local clientRendering = false
 local visuals = {} -- [id] = { model, position, velocity, gravity, homing/bounce state, ... }
+local visualCount = 0
 local visualOrder = {} -- append-only between compactions; dead ids are tombstones
 local visualCursor = 1
 local visualTombstones = 0
@@ -2228,18 +2144,41 @@ local globalSimulationClock = 0
 local smoothVisuals = {}
 local nextSmoothSetRefresh = 0
 
-local function isInView(position: Vector3): boolean
+-- Camera frustum snapshot, refreshed once per frame by refreshView. isInView
+-- is then pure Luau dot products instead of one WorldToViewportPoint engine
+-- call per visual, which dominated the loop at 10k visuals.
+local viewValid = false
+local viewPosition = Vector3.zero
+local viewRight, viewUp, viewLook = Vector3.xAxis, Vector3.yAxis, -Vector3.zAxis
+local viewLimitX, viewLimitY = 1, 1 -- tan(half-FOV) per axis, widened by the pixel margin
+
+local function refreshView()
 	local camera = workspace.CurrentCamera
-	if not camera then
+	local size = camera and camera.ViewportSize
+	if not size or size.X <= 0 or size.Y <= 0 then
+		viewValid = false
+		return
+	end
+	local cframe = camera.CFrame
+	local tanY = math.tan(math.rad(camera.FieldOfView) * 0.5)
+	local tanX = tanY * size.X / size.Y
+	-- A pixel margin m past an edge is 2m/size in normalized device units.
+	viewLimitX = tanX * (1 + 2 * VIEWPORT_CULL_MARGIN / size.X)
+	viewLimitY = tanY * (1 + 2 * VIEWPORT_CULL_MARGIN / size.Y)
+	viewPosition = cframe.Position
+	viewRight, viewUp, viewLook = cframe.RightVector, cframe.UpVector, cframe.LookVector
+	viewValid = true
+end
+
+local function isInView(position: Vector3): boolean
+	if not viewValid then
 		return true
 	end
-	local viewportPoint = camera:WorldToViewportPoint(position)
-	local viewportSize = camera.ViewportSize
-	return viewportPoint.Z > 0
-		and viewportPoint.X >= -VIEWPORT_CULL_MARGIN
-		and viewportPoint.Y >= -VIEWPORT_CULL_MARGIN
-		and viewportPoint.X <= viewportSize.X + VIEWPORT_CULL_MARGIN
-		and viewportPoint.Y <= viewportSize.Y + VIEWPORT_CULL_MARGIN
+	local offset = position - viewPosition
+	local depth = offset:Dot(viewLook)
+	return depth > 0
+		and math.abs(offset:Dot(viewRight)) <= depth * viewLimitX
+		and math.abs(offset:Dot(viewUp)) <= depth * viewLimitY
 end
 
 local function refreshSmoothVisuals(now: number)
@@ -2251,25 +2190,62 @@ local function refreshSmoothVisuals(now: number)
 	local player = Players.LocalPlayer
 	local character = player and player.Character
 	local root = character and (character:FindFirstChild("HumanoidRootPart") or character.PrimaryPart)
-	local candidates = {}
+	debug.profilebegin("ProjectileClient.RefreshSmoothSet")
+	-- Keep only the nearest K candidates in a max-heap. The previous full sort
+	-- allocated and sorted all 10k nearby stress visuals every 0.1 seconds even
+	-- though only 500 could ever be selected.
+	local heapVisuals = table.create(MAX_SMOOTH_PROJECTILES)
+	local heapDistances = table.create(MAX_SMOOTH_PROJECTILES)
+	local heapSize = 0
+	local function swap(a, b)
+		heapVisuals[a], heapVisuals[b] = heapVisuals[b], heapVisuals[a]
+		heapDistances[a], heapDistances[b] = heapDistances[b], heapDistances[a]
+	end
+	local function push(visual, distanceSq)
+		heapSize += 1
+		local index = heapSize
+		heapVisuals[index] = visual
+		heapDistances[index] = distanceSq
+		while index > 1 do
+			local parent = math.floor(index / 2)
+			if heapDistances[parent] >= distanceSq then break end
+			swap(parent, index)
+			index = parent
+		end
+	end
+	local function replaceRoot(visual, distanceSq)
+		heapVisuals[1] = visual
+		heapDistances[1] = distanceSq
+		local index = 1
+		while true do
+			local left = index * 2
+			if left > heapSize then break end
+			local right = left + 1
+			local largest = if right <= heapSize and heapDistances[right] > heapDistances[left] then right else left
+			if heapDistances[index] >= heapDistances[largest] then break end
+			swap(index, largest)
+			index = largest
+		end
+	end
 	if root and root:IsA("BasePart") then
 		local radiusSq = SMOOTH_RADIUS * SMOOTH_RADIUS
 		for _, visual in visuals do
 			local offset = visual.position - root.Position
 			local distanceSq = offset:Dot(offset)
 			if distanceSq <= radiusSq and isInView(visual.position) then
-				table.insert(candidates, { Visual = visual, DistanceSq = distanceSq })
+				if heapSize < MAX_SMOOTH_PROJECTILES then
+					push(visual, distanceSq)
+				elseif distanceSq < heapDistances[1] then
+					replaceRoot(visual, distanceSq)
+				end
 			end
 		end
-		table.sort(candidates, function(a, b)
-			return a.DistanceSq < b.DistanceSq
-		end)
 	end
 
 	local selected = {}
-	local newSmoothVisuals = table.create(math.min(#candidates, MAX_SMOOTH_PROJECTILES))
-	for index = 1, math.min(#candidates, MAX_SMOOTH_PROJECTILES) do
-		local visual = candidates[index].Visual
+	local newSmoothVisuals = table.create(heapSize)
+	for index = 1, heapSize do
+		local visual = heapVisuals[index]
 		selected[visual] = true
 		table.insert(newSmoothVisuals, visual)
 		if not visual.smoothTransform then
@@ -2286,6 +2262,7 @@ local function refreshSmoothVisuals(now: number)
 		end
 	end
 	smoothVisuals = newSmoothVisuals
+	debug.profileend()
 end
 
 local function setSmoothTarget(visual, now: number)
@@ -2303,6 +2280,33 @@ local function simulateVisual(visual, baseDt: number): (boolean, boolean)
 
 	local remaining = baseDt + (visual.simulationDebt or 0)
 	visual.simulationDebt = 0
+
+	-- Fast path: with no dilation anywhere there are no boundaries to stop at,
+	-- and constant (vector/gravity) acceleration without speed clamps is
+	-- integrated exactly by one averaged-velocity step. The substep loop below
+	-- only exists for boundaries, clamps and velocity-relative acceleration.
+	if
+		ChunkManager.IsTimeUniform()
+		and visual.minSpeed <= 0
+		and visual.maxSpeed == math.huge
+		and (typeof(visual.acceleration) ~= "number" or visual.acceleration == 0)
+	then
+		local dt = math.min(remaining, visual.life)
+		local movementVelocity
+		visual.velocity, movementVelocity = ProjectileMotion.Integrate(
+			visual.velocity,
+			visual.acceleration,
+			visual.accelerationDirection,
+			visual.gravity,
+			visual.minSpeed,
+			visual.maxSpeed,
+			dt
+		)
+		visual.position += movementVelocity * dt
+		visual.life -= dt
+		return visual.life > MIN_STEP_DT, true
+	end
+
 	local moved = false
 	local guard = 0
 	while remaining > MIN_STEP_DT and guard < MAX_PREDICTION_SUBSTEPS do
@@ -2404,16 +2408,9 @@ local function destroyVisual(id)
 		return
 	end
 	visuals[id] = nil
+	visualCount -= 1
 	visualTombstones += 1
-	local delay =
-		math.max(visual.destroyDelay or 0, VisualModel.FadeOut(visual.model, visual.waitForParticles, visual.waitForTrails))
-	if delay > 0 then
-		task.delay(delay, function()
-			visual.model:Destroy()
-		end)
-	else
-		visual.model:Destroy()
-	end
+	VisualModel.Retire(visual, visual.destroyDelay or 0)
 end
 
 function ProjectileClient.EnableClientRendering()
@@ -2422,7 +2419,8 @@ function ProjectileClient.EnableClientRendering()
 	end
 	clientRendering = true
 
-	VisualOffload.On("ProjSpawn", function(data)
+	local function onProjectileSpawn(data)
+		if visuals[data.Id] then return end
 		local model, rig = VisualModel.Build(data)
 		local now = os.clock()
 		local visual = {
@@ -2446,7 +2444,6 @@ function ProjectileClient.EnableClientRendering()
 			maxSpeed = data.MaxSpeed or math.huge,
 			life = data.Lifetime or 5,
 			simulationDebt = 0,
-
 			synced = data.Synced == true,
 			-- Combined Source.TimeScale * projectile.TimeScale at spawn time;
 			-- updated live via ProjTimeScale below, folded into the unsynced
@@ -2470,7 +2467,17 @@ function ProjectileClient.EnableClientRendering()
 			VisualModel.ActivateParticles(model)
 		end
 		visuals[data.Id] = visual
+		visualCount += 1
 		table.insert(visualOrder, data.Id)
+	end
+	-- ProjSpawn remains registered for protocol compatibility with older or
+	-- external producers. The authoritative projectile server uses the bounded
+	-- batch channel so thousands of creations become one client event per frame.
+	VisualOffload.On("ProjSpawn", onProjectileSpawn)
+	VisualOffload.On("ProjSpawnBatch", function(batch)
+		debug.profilebegin("ProjectileClient.BuildSpawnBatch")
+		for _, data in batch do onProjectileSpawn(data) end
+		debug.profileend()
 	end)
 
 	-- Fires only when the combined personal/local TimeScale actually changes
@@ -2542,7 +2549,7 @@ function ProjectileClient.EnableClientRendering()
 		end
 	end)
 
-	VisualOffload.On("ProjHit", function(data)
+	local function onProjectileHit(data)
 		local visual = visuals[data.Id]
 		if visual then
 			-- Snap to the server's exact position before destroying, so any
@@ -2554,6 +2561,10 @@ function ProjectileClient.EnableClientRendering()
 			end
 		end
 		destroyVisual(data.Id)
+	end
+	VisualOffload.On("ProjHit", onProjectileHit)
+	VisualOffload.On("ProjHitBatch", function(batch)
+		for _, data in batch do onProjectileHit(data) end
 	end)
 
 	VisualOffload.On("ProjRay", function(data)
@@ -2595,9 +2606,11 @@ function ProjectileClient.EnableClientRendering()
 		visualTombstones = 0
 	end
 
+	refreshView()
 	Heartbeat.Connect(function(globalDt)
 		globalSimulationClock += globalDt
 		local now = os.clock()
+		refreshView()
 		refreshSmoothVisuals(now)
 		local slotCount = #visualOrder
 		local inspected = 0
@@ -2757,7 +2770,16 @@ function ProjectileClient.EnableClientRendering()
 	end, { Name = "ProjectileSystem.ClientSimulate", Priority = 5 })
 end
 
+function ProjectileClient.GetStats()
+	return {
+		Visuals = visualCount,
+		VisualUpdatesPerFrame = MAX_VISUAL_UPDATES_PER_FRAME,
+		SmoothLimit = MAX_SMOOTH_PROJECTILES,
+	}
+end
+
 return ProjectileClient
+
 -- =============================================================================
 -- END FILE: src/shared/ProjectileClient/init.luau
 -- =============================================================================
@@ -2806,6 +2828,7 @@ function DebugRays.Draw(from: Vector3, to: Vector3, lowRes: boolean?)
 end
 
 return DebugRays
+
 -- =============================================================================
 -- END FILE: src/shared/ProjectileClient/DebugRays.luau
 -- =============================================================================
@@ -2896,6 +2919,7 @@ function Impact.Play(position: Vector3, normal: Vector3?, kind: string?)
 end
 
 return Impact
+
 -- =============================================================================
 -- END FILE: src/shared/ProjectileClient/Impact.luau
 -- =============================================================================
@@ -2929,8 +2953,35 @@ local function poseFrom(position: Vector3, velocity: Vector3): CFrame
 	return CFrame.new(position, position + safeUnit(velocity, Vector3.zAxis))
 end
 
+-- Built-in (non-Model) visuals are pooled per appearance: a burst otherwise
+-- creates two Parts and a Motor6D per projectile and destroys them all on
+-- impact. Custom Models aren't pooled -- their effects/transparency state is
+-- mutated by FadeOut and would need a full restore.
+local POOL_LIMIT = 4096
+local pools: { [string]: { any } } = {}
+
+local function builtinPoolKey(data): string
+	local spec = data.Visual
+	local scale = math.clamp(data.VisualScale or 1, 0.05, 20)
+	if spec then
+		return `{spec.Shape}|{spec.Size}|{spec.Color}|{scale}`
+	end
+	return `default|{scale}`
+end
+
 function VisualModel.Build(data): (Instance, any)
 	local model
+	local poolKey = if data.Model then nil else builtinPoolKey(data)
+
+	local pooledRig = poolKey and pools[poolKey] and table.remove(pools[poolKey])
+	if pooledRig then
+		pooledRig.driver.CFrame = CFrame.new(data.Position)
+		pooledRig.motor.Transform =
+			pooledRig.driver.CFrame:ToObjectSpace(poseFrom(data.Position, data.Velocity) * pooledRig.rootOffset)
+		pooledRig.root.Transparency = 0
+		pooledRig.model.Parent = workspace
+		return pooledRig.model, pooledRig
+	end
 
 	if data.Model then
 		model = data.Model:Clone()
@@ -3017,6 +3068,9 @@ function VisualModel.Build(data): (Instance, any)
 			driver = driver,
 			motor = motor,
 			rootOffset = rootOffset,
+			model = model,
+			root = root,
+			poolKey = poolKey,
 		}
 	end
 
@@ -3202,6 +3256,42 @@ function VisualModel.FadeOut(model: Instance, waitForParticles: boolean, waitFor
 	return grace
 end
 
+local function release(visual)
+	local rig = visual.rig
+	local poolKey = rig and rig.poolKey
+	local pool = poolKey and pools[poolKey]
+	if poolKey and not pool then
+		pool = {}
+		pools[poolKey] = pool
+	end
+	if pool and #pool < POOL_LIMIT then
+		visual.model.Parent = nil
+		table.insert(pool, rig)
+	else
+		visual.model:Destroy()
+	end
+end
+
+-- Hides a finished visual, then destroys it (or returns a built-in one to the
+-- pool) after max(destroyDelay, FadeOut's effect grace period).
+function VisualModel.Retire(visual, destroyDelay: number)
+	local rig = visual.rig
+	local delay = destroyDelay
+	if rig and rig.poolKey then
+		-- Built-in visuals are a bare Part: nothing to fade, only to hide.
+		if delay > 0 then
+			rig.root.Transparency = 1
+		end
+	else
+		delay = math.max(delay, VisualModel.FadeOut(visual.model, visual.waitForParticles, visual.waitForTrails))
+	end
+	if delay > 0 then
+		task.delay(delay, release, visual)
+	else
+		release(visual)
+	end
+end
+
 -- ActivateParticlesOnCreate support: fires every ParticleEmitter under
 -- `model` exactly once via :Emit(), per its own EmitCount/EmitDelay
 -- attributes (defaulting to 5 / 0s when either is missing). EmitDelay is
@@ -3264,6 +3354,7 @@ function VisualModel.Step(visual, dt: number)
 end
 
 return VisualModel
+
 -- =============================================================================
 -- END FILE: src/shared/ProjectileClient/VisualModel.luau
 -- =============================================================================
@@ -3308,6 +3399,7 @@ Players.PlayerRemoving:Connect(function(player)
 end)
 
 return ProjectileQuota
+
 -- =============================================================================
 -- END FILE: src/server/ProjectileQuota.luau
 -- =============================================================================

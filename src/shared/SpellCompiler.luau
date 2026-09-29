@@ -1,53 +1,54 @@
 --!strict
--- Pure shared compiler. V2 replaces fixed rings with player-authored semantic
--- areas and supports one explicit true/false conditional fork.
+--[[
+	SpellCompiler.luau (graph v3)
+	Validates a whiteboard spell graph and compiles it into the plan the
+	server runtime executes (see server/SpellRuntime.luau). Pure and shared:
+	the editor runs it live for feedback and the server runs it again on
+	every save and cast, so a client can never smuggle in an invalid circle.
+
+	Graph format
+	 {
+	   version = 3, name = string,
+	   zones = { { id, kind, label?, locked?, x, y, w, h } },          -- board units
+	   runes = { { id, rune, x, y, locked?, params = { [name]: value } } }, -- x,y = card top-left
+	   wires = { { from, fromPort, to, toPort } },
+	 }
+
+	Compile(graph) -> (compiled?, errors, normalized?)
+	 errors: { { message: string, rune: string?, zone: string? } }
+	 Params are sanitized (clamped / defaulted) rather than rejected.
+]]
+
+local SpellRunes = require(script.Parent.SpellRunes)
+
 local SpellCompiler = {}
 
-SpellCompiler.GraphVersion = 2
-SpellCompiler.MaxNodes = 32
-SpellCompiler.MaxEdges = 48
-SpellCompiler.MaxRegions = 12
-SpellCompiler.RegionKinds = { "Input", "Transform", "Vessel", "Output", "Modifier" }
-SpellCompiler.DefaultRegions = {
-	{ id = "input_area", kind = "Input", x = 0.04, y = 0.57, w = 0.20, h = 0.31 },
-	{ id = "transform_area", kind = "Transform", x = 0.27, y = 0.12, w = 0.22, h = 0.34 },
-	{ id = "vessel_area", kind = "Vessel", x = 0.52, y = 0.12, w = 0.22, h = 0.34 },
-	{ id = "output_area", kind = "Output", x = 0.77, y = 0.57, w = 0.19, h = 0.31 },
-	{ id = "modifier_area", kind = "Modifier", x = 0.27, y = 0.57, w = 0.47, h = 0.31 },
-}
+SpellCompiler.GraphVersion = 3
+SpellCompiler.MaxRunes = 64
+SpellCompiler.MaxWires = 128
+SpellCompiler.MaxZones = 24
+SpellCompiler.MaxTriggerDepth = 3
+SpellCompiler.BoardLimit = 20000
 
-local DAMAGE = { 10, 20, 35, 55, 80 }
-local SPEED = { 140, 200, 280, 390, 550 }
-local RADIUS = { 0.2, 0.35, 0.55, 0.8, 1.2 }
-local VISUAL_SCALE = { 1.15, 1.35, 1.6, 1.95, 2.4 }
-local GRAVITY = { 20, 40, 70, 110, 160 }
-local SPLIT = { 2, 3, 4, 6, 8 }
-local SPREAD = { 4, 7, 10, 14, 18 }
-local HOMING_RADIUS = { 30, 45, 60, 80, 100 }
-local HOMING_TURN = { 75, 105, 140, 180, 230 }
+-- Card geometry shared with the editor. A rune "sits in" a zone when the
+-- middle of its header does.
+SpellCompiler.Layout = { RuneWidth = 176, Header = 30, Row = 22, Footer = 24 }
 
-SpellCompiler.Runes = {
-	Mana = { DisplayName = "Mana", Region = "Input", Kind = "Input", Color = Color3.fromRGB(100, 190, 255) },
-	Fire = { DisplayName = "Fire", Region = "Transform", Kind = "Transform", Color = Color3.fromRGB(255, 105, 50) },
-	Condition = { DisplayName = "Condition", Region = "Transform", Kind = "Control", Tiered = true, Color = Color3.fromRGB(255, 214, 80) },
-	Projectile = { DisplayName = "Projectile", Region = "Vessel", Kind = "Vessel", Color = Color3.fromRGB(184, 110, 255) },
-	Damage = { DisplayName = "Damage", Region = "Output", Kind = "Output", Tiered = true, Color = Color3.fromRGB(255, 75, 75) },
-	Speed = { DisplayName = "Speed", Region = "Modifier", Kind = "Modifier", Tiered = true, Color = Color3.fromRGB(90, 225, 255) },
-	Size = { DisplayName = "Size", Region = "Modifier", Kind = "Modifier", Tiered = true, Color = Color3.fromRGB(130, 255, 170) },
-	Gravity = { DisplayName = "Gravity", Region = "Modifier", Kind = "Modifier", Tiered = true, Color = Color3.fromRGB(135, 145, 205) },
-	Bounce = { DisplayName = "Bounce", Region = "Modifier", Kind = "Modifier", Tiered = true, Color = Color3.fromRGB(255, 205, 80) },
-	Pierce = { DisplayName = "Pierce", Region = "Modifier", Kind = "Modifier", Tiered = true, Color = Color3.fromRGB(255, 145, 190) },
-	Split = { DisplayName = "Split", Region = "Modifier", Kind = "Modifier", Tiered = true, Color = Color3.fromRGB(140, 255, 235) },
-	Homing = { DisplayName = "Homing", Region = "Modifier", Kind = "Modifier", Tiered = true, Color = Color3.fromRGB(215, 125, 255) },
-}
-SpellCompiler.RuneOrder = { "Mana", "Fire", "Condition", "Projectile", "Damage", "Speed", "Size", "Gravity", "Bounce", "Pierce", "Split", "Homing" }
-SpellCompiler.ConditionNames = { [1] = "Target exists", [2] = "Target is living", [3] = "Target is not caster", [4] = "Target is a player", [5] = "Target within 75 studs" }
-
-local function addError(errors: { string }, message: string)
-	if not table.find(errors, message) then table.insert(errors, message) end
+function SpellCompiler.RuneHeight(runeId: string): number
+	local def = SpellRunes.Runes[runeId]
+	local rows = if def then math.max(#def.Inputs, #def.Outputs, 1) else 1
+	local layout = SpellCompiler.Layout
+	return layout.Header + rows * layout.Row + layout.Footer
 end
 
-local function finiteNumber(value: any): boolean
+function SpellCompiler.RuneAnchor(rune: any): (number, number)
+	local layout = SpellCompiler.Layout
+	return rune.x + layout.RuneWidth / 2, rune.y + layout.Header / 2
+end
+
+type Error = { message: string, rune: string?, zone: string? }
+
+local function finite(value: any): boolean
 	return typeof(value) == "number" and value == value and math.abs(value) < math.huge
 end
 
@@ -55,193 +56,420 @@ local function validId(value: any): boolean
 	return typeof(value) == "string" and #value >= 1 and #value <= 32 and string.match(value, "^[%w_%-]+$") ~= nil
 end
 
-local function cloneRegions()
-	local result = {}
-	for _, region in SpellCompiler.DefaultRegions do table.insert(result, table.clone(region)) end
-	return result
-end
-
-local function defaultPosition(runeId: string, modifierIndex: number?): { x: number, y: number }
-	if runeId == "Mana" then return { x = 0.14, y = 0.72 } end
-	if runeId == "Fire" then return { x = 0.34, y = 0.24 } end
-	if runeId == "Condition" then return { x = 0.43, y = 0.37 } end
-	if runeId == "Projectile" then return { x = 0.63, y = 0.27 } end
-	if runeId == "Damage" then return { x = 0.86, y = 0.72 } end
-	local index = modifierIndex or 1
-	return { x = 0.31 + ((index - 1) % 4) * 0.12, y = 0.66 + math.floor((index - 1) / 4) * 0.12 }
-end
-
-local function regionContains(regions: { any }, kind: string, x: number, y: number): boolean
-	for _, region in regions do
-		if region.kind == kind and x >= region.x - 1e-4 and y >= region.y - 1e-4
-			and x <= region.x + region.w + 1e-4 and y <= region.y + region.h + 1e-4 then return true end
-	end
-	return false
-end
-
-local function normalizeGraph(graph: any, errors: { string })
-	if typeof(graph) ~= "table" then addError(errors, "Spell graph must be a table."); return nil end
-	local legacy = graph.version == 1
-	if graph.version ~= SpellCompiler.GraphVersion and not legacy then addError(errors, `Unsupported spell graph version (expected {SpellCompiler.GraphVersion}).`) end
-	if typeof(graph.nodes) ~= "table" or typeof(graph.edges) ~= "table" then addError(errors, "Spell graph requires node and edge arrays."); return nil end
-	if #graph.nodes > SpellCompiler.MaxNodes then addError(errors, `A spell may contain at most {SpellCompiler.MaxNodes} runes.`) end
-	if #graph.edges > SpellCompiler.MaxEdges then addError(errors, `A spell may contain at most {SpellCompiler.MaxEdges} connections.`) end
-
-	local normalized = { version = SpellCompiler.GraphVersion, name = typeof(graph.name) == "string" and string.sub(graph.name, 1, 96) or "Fire Projectile", regions = {}, nodes = {}, edges = {} }
-	local rawRegions = if legacy then cloneRegions() else graph.regions
-	if typeof(rawRegions) ~= "table" or #rawRegions == 0 then addError(errors, "Define at least one spell area."); rawRegions = {} end
-	if #rawRegions > SpellCompiler.MaxRegions then addError(errors, `A spell may contain at most {SpellCompiler.MaxRegions} areas.`) end
-	local regionIds = {}
-	for index, raw in ipairs(rawRegions) do
-		if index > SpellCompiler.MaxRegions then break end
-		local validKind = typeof(raw) == "table" and table.find(SpellCompiler.RegionKinds, raw.kind) ~= nil
-		if typeof(raw) ~= "table" or not validId(raw.id) or regionIds[raw.id] or not validKind
-			or not finiteNumber(raw.x) or not finiteNumber(raw.y) or not finiteNumber(raw.w) or not finiteNumber(raw.h)
-			or raw.x < 0 or raw.y < 0 or raw.w < 0.06 or raw.h < 0.06 or raw.x + raw.w > 1 or raw.y + raw.h > 1 then
-			addError(errors, `Spell area {index} is malformed or outside the canvas.`); continue
+local function sanitizeParams(def: any, raw: any): { [string]: any }
+	local params = {}
+	local source = if typeof(raw) == "table" then raw else {}
+	for _, param in def.Params do
+		local value = source[param.Name]
+		if param.Type == "number" then
+			if not finite(value) then
+				value = param.Default
+			end
+			local step = param.Step or 0
+			if step > 0 then
+				value = math.floor(value / step + 0.5) * step
+				-- Remove float noise from steps like 0.1 so saved values stay tidy.
+				value = tonumber(string.format("%.4f", value)) :: number
+			end
+			value = math.clamp(value, param.Min or -math.huge, param.Max or math.huge)
+		elseif param.Type == "enum" then
+			if typeof(value) ~= "string" or not table.find(param.Options :: { string }, value) then
+				value = param.Default
+			end
+		elseif param.Type == "bool" then
+			if typeof(value) ~= "boolean" then
+				value = param.Default
+			end
 		end
-		regionIds[raw.id] = true
-		table.insert(normalized.regions, { id = raw.id, kind = raw.kind, x = raw.x, y = raw.y, w = raw.w, h = raw.h })
+		params[param.Name] = value
 	end
-
-	local ids, nodeRuneById = {}, {}
-	local modifierIndex = 0
-	for index, raw in ipairs(graph.nodes) do
-		if index > SpellCompiler.MaxNodes then break end
-		if typeof(raw) ~= "table" or not validId(raw.id) then addError(errors, `Rune {index} has an invalid ID.`); continue end
-		if ids[raw.id] then addError(errors, `Duplicate rune ID "{raw.id}".`); continue end
-		local rune = SpellCompiler.Runes[raw.runeId]
-		if not rune then addError(errors, `Rune "{tostring(raw.runeId)}" is not supported.`); continue end
-		if rune.Kind == "Modifier" then modifierIndex += 1 end
-		local position = if legacy then defaultPosition(raw.runeId, modifierIndex) else raw.position
-		local x = typeof(position) == "table" and position.x or nil
-		local y = typeof(position) == "table" and position.y or nil
-		if not finiteNumber(x) or not finiteNumber(y) or x < 0 or x > 1 or y < 0 or y > 1 then addError(errors, `Rune "{raw.id}" has an invalid position.`); continue end
-		if not regionContains(normalized.regions, rune.Region, x, y) then addError(errors, `{rune.DisplayName} must be inside a {rune.Region} area.`) end
-		local tier = raw.tier
-		if rune.Tiered then
-			if not finiteNumber(tier) or tier % 1 ~= 0 or tier < 1 or tier > 5 then addError(errors, `{rune.DisplayName} requires a tier from I to V.`); tier = 1 end
-		elseif tier ~= nil then addError(errors, `{rune.DisplayName} does not accept a tier.`); tier = nil end
-		ids[raw.id], nodeRuneById[raw.id] = true, raw.runeId
-		table.insert(normalized.nodes, { id = raw.id, runeId = raw.runeId, tier = tier, position = { x = x, y = y } })
-	end
-
-	local seenEdges = {}
-	for index, raw in ipairs(graph.edges) do
-		if index > SpellCompiler.MaxEdges then break end
-		if typeof(raw) ~= "table" or not validId(raw.from) or not validId(raw.to) or not ids[raw.from] or not ids[raw.to] then addError(errors, `Connection {index} references an invalid rune.`); continue end
-		if raw.from == raw.to then addError(errors, "A rune cannot connect to itself."); continue end
-		local branch = raw.branch
-		if nodeRuneById[raw.from] == "Condition" then
-			if branch ~= "true" and branch ~= "false" then addError(errors, "Condition connections must use a true or false branch."); continue end
-		elseif branch ~= nil then addError(errors, "Only Condition outputs may be labelled as branches."); continue end
-		local key = raw.from .. ">" .. raw.to .. ">" .. tostring(branch)
-		if seenEdges[key] then addError(errors, "Duplicate connections are not allowed."); continue end
-		seenEdges[key] = true
-		table.insert(normalized.edges, { from = raw.from, to = raw.to, branch = branch })
-	end
-	return normalized
+	return params
 end
 
+local function normalize(graph: any, errors: { Error }): (any, any)
+	local function fail(message: string, rune: string?, zone: string?)
+		table.insert(errors, { message = message, rune = rune, zone = zone })
+	end
+	if typeof(graph) ~= "table" then
+		fail("Spell graph must be a table.")
+		return nil, nil
+	end
+	if graph.version ~= SpellCompiler.GraphVersion then
+		fail("This spell was made with an older editor and can't be loaded.")
+		return nil, nil
+	end
+	if typeof(graph.zones) ~= "table" or typeof(graph.runes) ~= "table" or typeof(graph.wires) ~= "table" then
+		fail("Spell graph needs zones, runes and wires.")
+		return nil, nil
+	end
+	local limit = SpellCompiler.BoardLimit
+	local normalized = {
+		version = SpellCompiler.GraphVersion,
+		name = if typeof(graph.name) == "string" then string.sub(graph.name, 1, 96) else "Untitled Spell",
+		zones = {},
+		runes = {},
+		wires = {},
+	}
+
+	if #graph.zones > SpellCompiler.MaxZones then
+		fail(`A spell may have at most {SpellCompiler.MaxZones} zones.`)
+	end
+	local zoneIds = {}
+	for index, raw in ipairs(graph.zones) do
+		if index > SpellCompiler.MaxZones then break end
+		if typeof(raw) ~= "table" or not validId(raw.id) or zoneIds[raw.id]
+			or not SpellRunes.Zones[raw.kind]
+			or not finite(raw.x) or not finite(raw.y) or not finite(raw.w) or not finite(raw.h)
+			or math.abs(raw.x) > limit or math.abs(raw.y) > limit
+			or raw.w < 80 or raw.h < 60 or raw.w > 8000 or raw.h > 8000 then
+			fail(`Zone {index} is malformed.`)
+			continue
+		end
+		zoneIds[raw.id] = true
+		table.insert(normalized.zones, {
+			id = raw.id,
+			kind = raw.kind,
+			label = if typeof(raw.label) == "string" then string.sub(raw.label, 1, 32) else nil,
+			locked = if raw.locked == true then true else nil,
+			x = raw.x, y = raw.y, w = raw.w, h = raw.h,
+		})
+	end
+
+	if #graph.runes > SpellCompiler.MaxRunes then
+		fail(`A spell may have at most {SpellCompiler.MaxRunes} runes.`)
+	end
+	local runeById = {}
+	for index, raw in ipairs(graph.runes) do
+		if index > SpellCompiler.MaxRunes then break end
+		local def = typeof(raw) == "table" and SpellRunes.Runes[raw.rune] or nil
+		if typeof(raw) ~= "table" or not validId(raw.id) then
+			fail(`Rune {index} has an invalid id.`)
+			continue
+		end
+		if runeById[raw.id] then
+			fail(`Duplicate rune id "{raw.id}".`, raw.id)
+			continue
+		end
+		if not def then
+			fail(`Rune "{tostring(raw.rune)}" doesn't exist.`, raw.id)
+			continue
+		end
+		if not finite(raw.x) or not finite(raw.y) or math.abs(raw.x) > limit or math.abs(raw.y) > limit then
+			fail(`{def.Name} has an invalid position.`, raw.id)
+			continue
+		end
+		local rune = {
+			id = raw.id,
+			rune = def.Id,
+			x = raw.x,
+			y = raw.y,
+			params = sanitizeParams(def, raw.params),
+			locked = if raw.locked == true then true else nil,
+		}
+		runeById[raw.id] = rune
+		table.insert(normalized.runes, rune)
+	end
+
+	if #graph.wires > SpellCompiler.MaxWires then
+		fail(`A spell may have at most {SpellCompiler.MaxWires} wires.`)
+	end
+	local seen = {}
+	for index, raw in ipairs(graph.wires) do
+		if index > SpellCompiler.MaxWires then break end
+		if typeof(raw) ~= "table" or not validId(raw.from) or not validId(raw.to)
+			or typeof(raw.fromPort) ~= "string" or typeof(raw.toPort) ~= "string" then
+			fail(`Wire {index} is malformed.`)
+			continue
+		end
+		local fromRune, toRune = runeById[raw.from], runeById[raw.to]
+		if not fromRune or not toRune then
+			fail(`Wire {index} connects a missing rune.`)
+			continue
+		end
+		if raw.from == raw.to then
+			fail("A rune can't be wired to itself.", raw.from)
+			continue
+		end
+		local fromDef, toDef = SpellRunes.Runes[fromRune.rune], SpellRunes.Runes[toRune.rune]
+		local outPort = SpellRunes.FindPort(fromDef.Outputs, raw.fromPort)
+		local inPort = SpellRunes.FindPort(toDef.Inputs, raw.toPort)
+		if not outPort or not inPort then
+			fail(`Wire {index} uses a port that doesn't exist.`, raw.to)
+			continue
+		end
+		if not SpellRunes.Compatible(outPort.Type, inPort.Type) then
+			fail(`{fromDef.Name} {outPort.Label} ({outPort.Type}) can't feed {toDef.Name} {inPort.Label} ({inPort.Type}).`, raw.to)
+			continue
+		end
+		local key = `{raw.from}.{raw.fromPort}>{raw.to}.{raw.toPort}`
+		if seen[key] then
+			continue -- exact duplicates are harmless; drop them
+		end
+		seen[key] = true
+		table.insert(normalized.wires, { from = raw.from, fromPort = raw.fromPort, to = raw.to, toPort = raw.toPort })
+	end
+	return normalized, runeById
+end
+
+local function zoneContains(zone: any, x: number, y: number): boolean
+	return x >= zone.x and y >= zone.y and x <= zone.x + zone.w and y <= zone.y + zone.h
+end
+
+-- A starter circle: Mana -> Fire -> Orb with a Speed modifier.
 function SpellCompiler.CreateDefaultGraph()
-	return { version = SpellCompiler.GraphVersion, name = "Fire Projectile", regions = cloneRegions(), nodes = {
-		{ id = "mana", runeId = "Mana", position = defaultPosition("Mana") }, { id = "fire", runeId = "Fire", position = defaultPosition("Fire") },
-		{ id = "projectile", runeId = "Projectile", position = defaultPosition("Projectile") }, { id = "damage", runeId = "Damage", tier = 1, position = defaultPosition("Damage") },
-	}, edges = { { from = "mana", to = "fire" }, { from = "fire", to = "projectile" }, { from = "projectile", to = "damage" } } }
-end
-
-local function compileBranch(projectileNode: any, damageNode: any, modifierNodes: { any })
-	local stats = { Speed = 100, MinSpeed = 0, MaxSpeed = 1000, Damage = DAMAGE[damageNode.tier], Lifetime = 5, Gravity = 0, Radius = 0.1, VisualScale = 1, Bounces = 0, Restitution = 0.7, Penetration = 0, MaxPierces = 0, PierceFalloff = 0.15 }
-	local manaCost, count, spread, homing = 10 + 4 * damageNode.tier, 1, 0, nil
-	local modifiers = {}
-	for _, node in modifierNodes do modifiers[node.runeId] = node.tier end
-	local tier = modifiers.Speed
-	if tier then stats.Speed = SPEED[tier]; manaCost += 2 * tier end
-	tier = modifiers.Size
-	if tier then stats.Radius = RADIUS[tier]; stats.VisualScale = VISUAL_SCALE[tier]; manaCost += 3 * tier end
-	tier = modifiers.Gravity
-	if tier then stats.Gravity = GRAVITY[tier]; manaCost += 2 * tier end
-	tier = modifiers.Bounce
-	if tier then stats.Bounces = tier; manaCost += 4 * tier end
-	tier = modifiers.Pierce
-	if tier then stats.MaxPierces = tier; manaCost += 5 * tier end
-	tier = modifiers.Split
-	if tier then count = SPLIT[tier]; spread = math.rad(SPREAD[tier]); manaCost += 6 * count end
-	tier = modifiers.Homing
-	if tier then homing = { AcquireRadius = HOMING_RADIUS[tier], Retarget = true, ReacquireRate = 0.3, Permalock = false, TurnRate = math.rad(HOMING_TURN[tier]), Delay = 0.05 }; manaCost += 5 * tier end
-	return { projectileId = projectileNode.id, stats = stats, count = count, spread = spread, homing = homing, manaCost = manaCost }
+	return {
+		version = SpellCompiler.GraphVersion,
+		name = "Fireball",
+		zones = {
+			{ id = "zone_input", kind = "Input", x = 0, y = 0, w = 260, h = 200 },
+			{ id = "zone_transform", kind = "Transform", x = 320, y = 0, w = 260, h = 200 },
+			{ id = "zone_modifier", kind = "Modifier", x = 320, y = 260, w = 260, h = 200 },
+			{ id = "zone_output", kind = "Output", x = 640, y = 0, w = 280, h = 260 },
+		},
+		runes = {
+			{ id = "mana", rune = "Mana", x = 42, y = 60, params = SpellRunes.DefaultParams("Mana") },
+			{ id = "fire", rune = "Fire", x = 362, y = 60, params = {} },
+			{ id = "speed", rune = "Speed", x = 362, y = 320, params = SpellRunes.DefaultParams("Speed") },
+			{ id = "orb", rune = "Orb", x = 692, y = 60, params = {} },
+		},
+		wires = {
+			{ from = "mana", fromPort = "out", to = "fire", toPort = "in" },
+			{ from = "fire", fromPort = "out", to = "orb", toPort = "in" },
+			{ from = "speed", fromPort = "mod", to = "orb", toPort = "mods" },
+		},
+	}
 end
 
 function SpellCompiler.Compile(graph: any)
-	local errors = {}
-	local normalized = normalizeGraph(graph, errors)
-	if not normalized then return nil, errors, nil end
-	local byId, byRune = {}, {}
-	for _, node in normalized.nodes do byId[node.id] = node; byRune[node.runeId] = byRune[node.runeId] or {}; table.insert(byRune[node.runeId], node) end
-	for _, unique in { "Mana", "Fire", "Condition" } do if #(byRune[unique] or {}) > 1 then addError(errors, `Only one {unique} rune is allowed.`) end end
-	for _, required in { "Mana", "Fire", "Projectile", "Damage" } do if #(byRune[required] or {}) == 0 then addError(errors, `Missing required {required} rune.`) end end
-
-	local adjacency, incoming = {}, {}
-	for _, edge in normalized.edges do adjacency[edge.from] = adjacency[edge.from] or {}; incoming[edge.to] = incoming[edge.to] or {}; table.insert(adjacency[edge.from], edge); table.insert(incoming[edge.to], edge) end
-	local function outgoing(id: string) return adjacency[id] or {} end
-	local function inputs(id: string) return incoming[id] or {} end
-	local mana, fire, condition = (byRune.Mana or {})[1], (byRune.Fire or {})[1], (byRune.Condition or {})[1]
-	local projectiles, damages = byRune.Projectile or {}, byRune.Damage or {}
-	if mana and (#inputs(mana.id) ~= 0 or #outgoing(mana.id) ~= 1 or not fire or outgoing(mana.id)[1].to ~= fire.id) then addError(errors, "Mana must be the sole input to Fire.") end
-	if fire then
-		local expected = condition or projectiles[1]
-		if #inputs(fire.id) ~= 1 or not mana or inputs(fire.id)[1].from ~= mana.id or #outgoing(fire.id) ~= 1 or not expected or outgoing(fire.id)[1].to ~= expected.id then addError(errors, if condition then "Fire must connect to Condition." else "Fire must connect to Projectile.") end
+	local errors: { Error } = {}
+	local normalized, runeById = normalize(graph, errors)
+	if not normalized or not runeById then
+		return nil, errors, nil
 	end
-	local conditionalDestinations = {}
-	if condition then
-		if #projectiles ~= 2 or #damages ~= 2 then addError(errors, "A conditional spell needs exactly two Projectile and two Damage runes.") end
-		for _, edge in outgoing(condition.id) do if byId[edge.to] and byId[edge.to].runeId == "Projectile" then conditionalDestinations[edge.branch] = edge.to end end
-		if #inputs(condition.id) ~= 1 or not fire or inputs(condition.id)[1].from ~= fire.id or #outgoing(condition.id) ~= 2 or not conditionalDestinations["true"] or not conditionalDestinations["false"] or conditionalDestinations["true"] == conditionalDestinations["false"] then addError(errors, "Condition requires distinct true and false Projectile branches.") end
-	elseif #projectiles ~= 1 or #damages ~= 1 then addError(errors, "A spell without a Condition needs exactly one Projectile and one Damage rune.") end
-
-	local branchByProjectile = {}
-	for _, projectile in projectiles do
-		local nonModifierInputs, modifierInputs, seenModifiers = {}, {}, {}
-		for _, edge in inputs(projectile.id) do
-			local source = byId[edge.from]
-			if source and SpellCompiler.Runes[source.runeId].Kind == "Modifier" then
-				if seenModifiers[source.runeId] then addError(errors, `Projectile "{projectile.id}" has duplicate {source.runeId} modifiers.`) end
-				seenModifiers[source.runeId] = true; table.insert(modifierInputs, source)
-			else table.insert(nonModifierInputs, source) end
+	local function fail(message: string, rune: string?, zone: string?)
+		for _, existing in errors do
+			if existing.message == message and existing.rune == rune then return end
 		end
-		local outs = outgoing(projectile.id)
-		local damage = #outs == 1 and byId[outs[1].to] or nil
-		if #nonModifierInputs ~= 1 or (condition and nonModifierInputs[1] ~= condition) or (not condition and nonModifierInputs[1] ~= fire) then addError(errors, `Projectile "{projectile.id}" needs one transform/control input.`) end
-		if not damage or damage.runeId ~= "Damage" then addError(errors, `Projectile "{projectile.id}" needs one Damage output.`) end
-		if damage and damage.runeId == "Damage" then branchByProjectile[projectile.id] = compileBranch(projectile, damage, modifierInputs) end
-	end
-	for _, damage in damages do if #outgoing(damage.id) ~= 0 or #inputs(damage.id) ~= 1 or not byId[inputs(damage.id)[1].from] or byId[inputs(damage.id)[1].from].runeId ~= "Projectile" then addError(errors, `Damage "{damage.id}" must be a final Projectile output.`) end end
-	for _, node in normalized.nodes do
-		if SpellCompiler.Runes[node.runeId].Kind == "Modifier" and (#inputs(node.id) ~= 0 or #outgoing(node.id) ~= 1 or not byId[outgoing(node.id)[1].to] or byId[outgoing(node.id)[1].to].runeId ~= "Projectile") then addError(errors, `{node.runeId} may only modify one Projectile.`) end
+		table.insert(errors, { message = message, rune = rune, zone = zone })
 	end
 
-	local visiting, visited = {}, {}
-	local function visit(id: string): boolean
-		if visiting[id] then return false end; if visited[id] then return true end
-		visiting[id] = true; for _, edge in outgoing(id) do if not visit(edge.to) then return false end end
-		visiting[id] = nil; visited[id] = true; return true
+	-- Adjacency ---------------------------------------------------------------
+	local inputs: { [string]: any } = {}
+	local outputs: { [string]: any } = {}
+	for _, rune in normalized.runes do
+		inputs[rune.id], outputs[rune.id] = {}, {}
 	end
-	for id in byId do if not visit(id) then addError(errors, "Spell graphs cannot contain cycles."); break end end
-	for id in byId do if #inputs(id) == 0 and #outgoing(id) == 0 then addError(errors, `Rune "{id}" is disconnected.`) end end
-	if #errors > 0 then return nil, errors, normalized end
+	for _, wire in normalized.wires do
+		local ins = inputs[wire.to]
+		ins[wire.toPort] = ins[wire.toPort] or {}
+		table.insert(ins[wire.toPort], { from = wire.from, port = wire.fromPort })
+		local outs = outputs[wire.from]
+		outs[wire.fromPort] = outs[wire.fromPort] or {}
+		table.insert(outs[wire.fromPort], { to = wire.to, port = wire.toPort })
+	end
 
-	local execution, manaCost, maxProjectiles
-	if condition then
-		local trueBranch, falseBranch = branchByProjectile[conditionalDestinations["true"]], branchByProjectile[conditionalDestinations["false"]]
-		execution = { kind = "Conditional", predicate = condition.tier, trueBranch = trueBranch, falseBranch = falseBranch }
-		manaCost, maxProjectiles = 3 + math.max(trueBranch.manaCost, falseBranch.manaCost), math.max(trueBranch.count, falseBranch.count)
-	else
-		local branch = branchByProjectile[projectiles[1].id]
-		execution, manaCost, maxProjectiles = { kind = "Single", branch = branch }, branch.manaCost, branch.count
+	-- Per-rune structural rules ------------------------------------------------
+	local counts = {}
+	local manaRoots, vessels = {}, {}
+	for _, rune in normalized.runes do
+		local def = SpellRunes.Runes[rune.rune]
+		counts[def.Id] = (counts[def.Id] or 0) + 1
+		if def.Unique and counts[def.Id] > 1 then
+			fail(`Only one {def.Name} rune is allowed.`, rune.id)
+		end
+		if def.Id == "Mana" then table.insert(manaRoots, rune.id) end
+		if def.Vessel then table.insert(vessels, rune.id) end
+
+		local ax, ay = SpellCompiler.RuneAnchor(rune)
+		local placed = false
+		for _, zone in normalized.zones do
+			if table.find(def.Zones, zone.kind) and zoneContains(zone, ax, ay) then
+				placed = true
+				break
+			end
+		end
+		if not placed then
+			fail(`{def.Name} must sit inside a {table.concat(def.Zones, " or ")} zone.`, rune.id)
+		end
+
+		for _, port in def.Inputs do
+			local wires = inputs[rune.id][port.Name]
+			local n = if wires then #wires else 0
+			if n == 0 and not port.Optional then
+				fail(`{def.Name}: connect its {port.Label} input.`, rune.id)
+			elseif n > 1 and not port.Multi then
+				fail(`{def.Name}: {port.Label} accepts only one wire.`, rune.id)
+			end
+		end
+		for _, port in def.Outputs do
+			local wires = outputs[rune.id][port.Name]
+			local n = if wires then #wires else 0
+			if (port.Type == "flow" or port.Type == "mod") and n > 1 then
+				fail(`{def.Name}: {port.Label} can only feed one wire. Use Divide to split energy.`, rune.id)
+			end
+			if port.Type == "mod" and n == 0 then
+				fail(`{def.Name} isn't attached to a vessel (Orb, Bullet or Beam).`, rune.id)
+			end
+			if def.Id == "Target" and n == 0 then
+				fail("Aim: wire its Aim output into a vessel's Aim port.", rune.id)
+			end
+		end
 	end
-	return { version = SpellCompiler.GraphVersion, name = normalized.name, element = "Fire", vessel = "Projectile", output = "Damage", manaCost = manaCost, maxProjectiles = maxProjectiles, execution = execution,
-		stats = execution.kind == "Single" and execution.branch.stats or nil, count = execution.kind == "Single" and execution.branch.count or nil,
-		spread = execution.kind == "Single" and execution.branch.spread or nil, homing = execution.kind == "Single" and execution.branch.homing or nil }, errors, normalized
+	if #manaRoots == 0 then fail("Add a Mana Well in an Input zone.") end
+	if #vessels == 0 then fail("Add a vessel (Orb, Bullet or Beam) in an Output zone.") end
+
+	-- Vessel modifier/trigger budgets -----------------------------------------
+	local vesselInfo = {}
+	for _, vesselId in vessels do
+		local vesselDef = SpellRunes.Runes[runeById[vesselId].rune]
+		local mods, seenMods, modCost, count = {}, {}, 0, 1
+		for _, link in inputs[vesselId].mods or {} do
+			local source = runeById[link.from]
+			local def = SpellRunes.Runes[source.rune]
+			if seenMods[def.Id] then
+				fail(`{vesselDef.Name} has two {def.Name} modifiers.`, vesselId)
+			end
+			if not SpellRunes.ModifierApplies(vesselDef.Id, def.Id) then
+				fail(`{def.Name} does nothing on this {vesselDef.Name}.`, link.from)
+			end
+			seenMods[def.Id] = true
+			modCost += SpellRunes.ModifierCost(def.Id, source.params)
+			if def.Id == "Quantity" then
+				count = source.params.Count
+			end
+			table.insert(mods, link.from)
+		end
+		if modCost > SpellRunes.MaxModifierCost then
+			fail(`Modifiers on this {vesselDef.Name} would consume {math.floor(modCost * 100)}% of its energy (max {math.floor(SpellRunes.MaxModifierCost * 100)}%).`, vesselId)
+		end
+		local triggers, share = {}, 0
+		for _, link in (outputs[vesselId].vessel or {}) do
+			local trigger = runeById[link.to]
+			if not SpellRunes.TriggerApplies(vesselDef.Id, trigger.rune) then
+				fail(`{SpellRunes.Runes[trigger.rune].Name} can't be used on this {vesselDef.Name}: it has no flight time.`, link.to)
+			end
+			table.insert(triggers, link.to)
+			share += trigger.params.Share / 100
+		end
+		if share > SpellRunes.MaxTriggerShare + 1e-6 then
+			fail(`Triggers on this {vesselDef.Name} claim {math.floor(share * 100 + 0.5)}% of its energy (max {math.floor(SpellRunes.MaxTriggerShare * 100)}%).`, vesselId)
+		end
+		vesselInfo[vesselId] = { mods = mods, modCost = modCost, triggers = triggers, triggerShare = share, count = count }
+	end
+
+	-- Cycles -------------------------------------------------------------------
+	local state = {}
+	local cyclic = false
+	local function visit(id: string)
+		if state[id] == 1 then
+			cyclic = true
+			return
+		end
+		if state[id] == 2 then
+			return
+		end
+		state[id] = 1
+		for _, links in outputs[id] do
+			for _, link in links do visit(link.to) end
+		end
+		state[id] = 2
+	end
+	for id in runeById do visit(id) end
+	if cyclic then fail("Wires form a loop; spells must flow one way.") end
+
+	-- Energy + element propagation (static estimates) -------------------------
+	-- Walks each flow tree from its root carrying energy, element and trigger
+	-- depth. With If both sides get the full amount ("up to").
+	local estimates: { [string]: any } = {}
+	local elements: { [string]: string } = {}
+	local reached = {}
+	local function follow(id: string, port: string, energy: number, element: string?, depth: number)
+		for _, link in (outputs[id][port] or {}) do
+			local rune = runeById[link.to]
+			local def = SpellRunes.Runes[rune.rune]
+			reached[link.to] = true
+			estimates[link.to] = { energy = energy }
+			if def.Element then
+				follow(link.to, "out", energy, def.Element, depth)
+			elseif def.Id == "If" then
+				follow(link.to, "yes", energy, element, depth)
+				follow(link.to, "no", energy, element, depth)
+			elseif def.Id == "Divide" then
+				local share = rune.params.Share / 100
+				follow(link.to, "a", energy * share, element, depth)
+				follow(link.to, "b", energy * (1 - share), element, depth)
+			elseif def.Vessel then
+				if not element then
+					fail(`Energy reaches this {def.Name} without a Transform rune (Fire, Arcane or Shock).`, link.to)
+				else
+					elements[link.to] = element
+				end
+				local info = vesselInfo[link.to]
+				local perBolt = energy * (1 - math.min(info.modCost, 1)) / info.count
+				local elementDef = element and SpellRunes.Elements[element]
+				local impact = (if elementDef then elementDef.Impact else 1) * SpellRunes.Vessels[def.Id].Impact
+				estimates[link.to].count = info.count
+				estimates[link.to].damage = perBolt * (1 - info.triggerShare) * impact
+				estimates[link.to].element = element
+				if #info.triggers > 0 then
+					if depth >= SpellCompiler.MaxTriggerDepth then
+						fail(`Triggers can nest at most {SpellCompiler.MaxTriggerDepth} deep.`, link.to)
+					else
+						for _, triggerId in info.triggers do
+							local triggerEnergy = perBolt * runeById[triggerId].params.Share / 100
+							reached[triggerId] = true
+							estimates[triggerId] = { energy = triggerEnergy }
+							follow(triggerId, "out", triggerEnergy, element, depth + 1)
+						end
+					end
+				end
+			end
+		end
+	end
+	if not cyclic then
+		for _, rootId in manaRoots do
+			local amount = runeById[rootId].params.Amount
+			estimates[rootId] = { energy = amount }
+			reached[rootId] = true
+			follow(rootId, "out", amount, nil, 0)
+		end
+		for _, rune in normalized.runes do
+			local def = SpellRunes.Runes[rune.rune]
+			if SpellRunes.FindPort(def.Inputs, "in") and inputs[rune.id]["in"] and not reached[rune.id] then
+				fail(`{def.Name} never receives energy from a Mana Well.`, rune.id)
+			end
+			if def.Category == "Trigger" and not reached[rune.id] and inputs[rune.id].vessel then
+				fail(`{def.Name}'s vessel never receives energy.`, rune.id)
+			end
+		end
+	end
+
+	local manaCost = 0
+	for _, rootId in manaRoots do
+		manaCost += runeById[rootId].params.Amount
+	end
+
+	local analysis = { estimates = estimates, manaCost = manaCost }
+	if #errors > 0 then
+		return nil, errors, normalized, analysis
+	end
+
+	local runes = {}
+	for _, rune in normalized.runes do
+		runes[rune.id] = { id = rune.id, rune = rune.rune, params = rune.params }
+	end
+	return {
+		version = SpellCompiler.GraphVersion,
+		name = normalized.name,
+		manaCost = manaCost,
+		runes = runes,
+		inputs = inputs,
+		outputs = outputs,
+		manaRoots = manaRoots,
+		vessels = vesselInfo,
+		elements = elements,
+		estimates = estimates,
+	}, errors, normalized, analysis
 end
 
 return SpellCompiler

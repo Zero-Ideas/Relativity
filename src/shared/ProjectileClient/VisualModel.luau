@@ -24,10 +24,184 @@ local function poseFrom(position: Vector3, velocity: Vector3): CFrame
 	return CFrame.new(position, position + safeUnit(velocity, Vector3.zAxis))
 end
 
+-- Built-in (non-Model) visuals are pooled per appearance: a burst otherwise
+-- creates two Parts and a Motor6D per projectile and destroys them all on
+-- impact. Custom Models aren't pooled -- their effects/transparency state is
+-- mutated by FadeOut and would need a full restore.
+local POOL_LIMIT = 4096
+local pools: { [string]: { any } } = {}
+
+local function builtinPoolKey(data): string
+	local spec = data.Visual
+	local scale = math.clamp(data.VisualScale or 1, 0.05, 20)
+	if spec then
+		return `{spec.Shape}|{spec.Size}|{spec.Color}|{scale}`
+	end
+	return `default|{scale}`
+end
+
+--------------------------------------------------------------------------------
+-- Styled visuals: Visual = { Style = "Orb" | "Bullet", Color, Core }
+-- Built procedurally once per (style, colours) as a template Model, then
+-- cloned like an authored Model. Every part is welded to a hot neon core so
+-- the whole thing rides the core's Motor6D; trails/particles fade out
+-- naturally on impact via FadeOut. Not pooled (their effects state changes).
+--------------------------------------------------------------------------------
+
+local SPARK_TEXTURE = "rbxasset://textures/particles/sparkles_main.dds"
+local WISP_TEXTURE = "rbxasset://textures/particles/smoke_main.dds"
+local styledTemplates: { [string]: Model } = {}
+
+local function effectPart(props: { [string]: any }): Part
+	local part = Instance.new("Part")
+	part.Material = Enum.Material.Neon
+	part.CanCollide = false
+	part.CanQuery = false
+	part.CanTouch = false
+	part.CastShadow = false
+	part.Anchored = false
+	for key, value in props do
+		(part :: any)[key] = value
+	end
+	return part
+end
+
+local function weld(part: BasePart, to: BasePart)
+	local constraint = Instance.new("WeldConstraint")
+	constraint.Part0 = to
+	constraint.Part1 = part
+	constraint.Parent = part
+end
+
+local function trail(parent: BasePart, halfWidth: number, lifetime: number, core: Color3, glow: Color3)
+	local a0 = Instance.new("Attachment")
+	a0.Position = Vector3.new(0, halfWidth, 0)
+	a0.Parent = parent
+	local a1 = Instance.new("Attachment")
+	a1.Position = Vector3.new(0, -halfWidth, 0)
+	a1.Parent = parent
+	local effect = Instance.new("Trail")
+	effect.Attachment0 = a0
+	effect.Attachment1 = a1
+	effect.Lifetime = lifetime
+	effect.MinLength = 0
+	effect.FaceCamera = true
+	effect.LightEmission = 1
+	effect.LightInfluence = 0
+	effect.Color = ColorSequence.new(core, glow)
+	effect.Transparency = NumberSequence.new({ NumberSequenceKeypoint.new(0, 0.05), NumberSequenceKeypoint.new(1, 1) })
+	effect.WidthScale = NumberSequence.new({ NumberSequenceKeypoint.new(0, 1), NumberSequenceKeypoint.new(1, 0.1) })
+	effect.Parent = parent
+end
+
+local function light(parent: BasePart, color: Color3, range: number, brightness: number)
+	local effect = Instance.new("PointLight")
+	effect.Color = color
+	effect.Range = range
+	effect.Brightness = brightness
+	effect.Shadows = false
+	effect.Parent = parent
+end
+
+local function buildOrb(core: Color3, glow: Color3): Model
+	local model = Instance.new("Model")
+	model.Name = "SpellOrb"
+	local center = effectPart({ Name = "Core", Shape = Enum.PartType.Ball, Size = Vector3.one * 0.9, Color = core })
+	center.Parent = model
+	model.PrimaryPart = center
+	local shell = effectPart({ Name = "Glow", Shape = Enum.PartType.Ball, Size = Vector3.one * 1.9, Color = glow, Transparency = 0.55 })
+	shell.Parent = model
+	weld(shell, center)
+	local halo = effectPart({ Name = "Halo", Shape = Enum.PartType.Ball, Size = Vector3.one * 3, Color = glow, Transparency = 0.85 })
+	halo.Parent = model
+	weld(halo, center)
+	light(center, glow, 14, 3)
+	trail(center, 0.55, 0.3, core, glow)
+
+	local sparks = Instance.new("ParticleEmitter")
+	sparks.Name = "Sparks"
+	sparks.Texture = SPARK_TEXTURE
+	sparks.Color = ColorSequence.new(core, glow)
+	sparks.LightEmission = 1
+	sparks.LightInfluence = 0
+	sparks.Rate = 45
+	sparks.Lifetime = NumberRange.new(0.25, 0.5)
+	sparks.Speed = NumberRange.new(2, 5)
+	sparks.SpreadAngle = Vector2.new(180, 180)
+	sparks.Drag = 4
+	sparks.Size = NumberSequence.new({ NumberSequenceKeypoint.new(0, 0.45), NumberSequenceKeypoint.new(1, 0) })
+	sparks.Transparency = NumberSequence.new({ NumberSequenceKeypoint.new(0, 0), NumberSequenceKeypoint.new(1, 1) })
+	sparks.Parent = center
+
+	local wisps = Instance.new("ParticleEmitter")
+	wisps.Name = "Wisps"
+	wisps.Texture = WISP_TEXTURE
+	wisps.Color = ColorSequence.new(glow)
+	wisps.LightEmission = 0.8
+	wisps.LightInfluence = 0
+	wisps.Rate = 30
+	wisps.Lifetime = NumberRange.new(0.3, 0.5)
+	wisps.Speed = NumberRange.new(0.3, 1)
+	wisps.SpreadAngle = Vector2.new(180, 180)
+	wisps.Rotation = NumberRange.new(0, 360)
+	wisps.RotSpeed = NumberRange.new(-90, 90)
+	wisps.Size = NumberSequence.new({ NumberSequenceKeypoint.new(0, 1.6), NumberSequenceKeypoint.new(1, 0.2) })
+	wisps.Transparency = NumberSequence.new({ NumberSequenceKeypoint.new(0, 0.45), NumberSequenceKeypoint.new(1, 1) })
+	wisps.Parent = center
+	return model
+end
+
+local function buildBullet(core: Color3, glow: Color3): Model
+	local model = Instance.new("Model")
+	model.Name = "SpellBullet"
+	-- Long axis is Z: the pose CFrame looks along the velocity.
+	local center = effectPart({ Name = "Core", Size = Vector3.new(0.22, 0.22, 1.8), Color = core })
+	center.Parent = model
+	model.PrimaryPart = center
+	local shell = effectPart({ Name = "Glow", Size = Vector3.new(0.55, 0.55, 2.4), Color = glow, Transparency = 0.6 })
+	shell.Parent = model
+	weld(shell, center)
+	light(center, glow, 8, 2)
+	trail(center, 0.14, 0.14, core, glow)
+	return model
+end
+
+local function styledModel(spec: any): Model?
+	local core = spec.Core or Color3.new(1, 1, 1)
+	local glow = spec.Color or core
+	local key = `{spec.Style}|{core}|{glow}`
+	local template = styledTemplates[key]
+	if not template then
+		if spec.Style == "Orb" then
+			template = buildOrb(core, glow)
+		elseif spec.Style == "Bullet" then
+			template = buildBullet(core, glow)
+		else
+			return nil
+		end
+		styledTemplates[key] = template
+	end
+	return template:Clone()
+end
+
 function VisualModel.Build(data): (Instance, any)
 	local model
+	local styled = data.Visual and data.Visual.Style and not data.Model and styledModel(data.Visual)
+	local poolKey = if data.Model or styled then nil else builtinPoolKey(data)
 
-	if data.Model then
+	local pooledRig = poolKey and pools[poolKey] and table.remove(pools[poolKey])
+	if pooledRig then
+		pooledRig.driver.CFrame = CFrame.new(data.Position)
+		pooledRig.motor.Transform =
+			pooledRig.driver.CFrame:ToObjectSpace(poseFrom(data.Position, data.Velocity) * pooledRig.rootOffset)
+		pooledRig.root.Transparency = 0
+		pooledRig.model.Parent = workspace
+		return pooledRig.model, pooledRig
+	end
+
+	if styled then
+		model = styled
+	elseif data.Model then
 		model = data.Model:Clone()
 	else
 		local part = Instance.new("Part")
@@ -112,6 +286,9 @@ function VisualModel.Build(data): (Instance, any)
 			driver = driver,
 			motor = motor,
 			rootOffset = rootOffset,
+			model = model,
+			root = root,
+			poolKey = poolKey,
 		}
 	end
 
@@ -295,6 +472,42 @@ function VisualModel.FadeOut(model: Instance, waitForParticles: boolean, waitFor
 		end
 	end
 	return grace
+end
+
+local function release(visual)
+	local rig = visual.rig
+	local poolKey = rig and rig.poolKey
+	local pool = poolKey and pools[poolKey]
+	if poolKey and not pool then
+		pool = {}
+		pools[poolKey] = pool
+	end
+	if pool and #pool < POOL_LIMIT then
+		visual.model.Parent = nil
+		table.insert(pool, rig)
+	else
+		visual.model:Destroy()
+	end
+end
+
+-- Hides a finished visual, then destroys it (or returns a built-in one to the
+-- pool) after max(destroyDelay, FadeOut's effect grace period).
+function VisualModel.Retire(visual, destroyDelay: number)
+	local rig = visual.rig
+	local delay = destroyDelay
+	if rig and rig.poolKey then
+		-- Built-in visuals are a bare Part: nothing to fade, only to hide.
+		if delay > 0 then
+			rig.root.Transparency = 1
+		end
+	else
+		delay = math.max(delay, VisualModel.FadeOut(visual.model, visual.waitForParticles, visual.waitForTrails))
+	end
+	if delay > 0 then
+		task.delay(delay, release, visual)
+	else
+		release(visual)
+	end
 end
 
 -- ActivateParticlesOnCreate support: fires every ParticleEmitter under

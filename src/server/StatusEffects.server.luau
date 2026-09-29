@@ -43,4 +43,24 @@ StatusEffectSys.Register("Stun", {
 	end,
 })
 
+-- Burn: Potency is the damage still to be dealt and Duration the time left
+-- to deal it, so each tick deals its proportional share and the final tick
+-- deals the remainder. Reapplying stacks both (stock stacking), extending the
+-- burn and adding to the pool. effect.Source (set by the applier -- see
+-- SpellRuntime's Fire element) gets the kill credit.
+StatusEffectSys.Register("Burn", {
+	TickInterval = 0.5,
+	OnTick = function(entity, effect, interval)
+		local amount = effect.Potency * math.min(interval / math.max(effect.Duration, interval), 1)
+		effect.Potency -= amount
+		local info = { Type = "Burn", Element = "Fire", Source = effect.Source }
+		local source = effect.Source
+		if source and not source.IsDestroyed and source.DealDamage then
+			source:DealDamage(entity, amount, info)
+		else
+			entity:TakeDamage(amount, info)
+		end
+	end,
+})
+
 print("[Relativity] status effects registered")

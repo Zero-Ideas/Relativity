@@ -12,7 +12,7 @@ local Impact = {}
 
 -- Custom impact hook: fn(position, normal, model?, kind). When set, it replaces
 -- the built-in effect below. (model is nil for impacts; kind is
--- "entity" | "world" | "bounce".)
+-- "entity" | "world" | "bounce" | "detonate".)
 local impactHandler: ((Vector3, Vector3, Instance?, string?) -> ())? = nil
 
 function Impact.SetHandler(fn)
@@ -23,6 +23,7 @@ local IMPACT_COLORS = {
 	entity = Color3.fromRGB(255, 80, 80), -- hit a damageable target
 	world = Color3.fromRGB(255, 225, 150), -- hit geometry
 	bounce = Color3.fromRGB(120, 220, 255), -- ricochet
+	detonate = Color3.fromRGB(255, 160, 60), -- spell trigger ended the bolt mid-air
 }
 
 local function defaultImpact(position: Vector3, normal: Vector3, kind: string?)

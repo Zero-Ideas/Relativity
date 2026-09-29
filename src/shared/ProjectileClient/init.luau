@@ -64,6 +64,7 @@ local DEFAULT_SMOOTH_DURATION = 1 / 60
 
 local clientRendering = false
 local visuals = {} -- [id] = { model, position, velocity, gravity, homing/bounce state, ... }
+local visualCount = 0
 local visualOrder = {} -- append-only between compactions; dead ids are tombstones
 local visualCursor = 1
 local visualTombstones = 0
@@ -71,18 +72,41 @@ local globalSimulationClock = 0
 local smoothVisuals = {}
 local nextSmoothSetRefresh = 0
 
-local function isInView(position: Vector3): boolean
+-- Camera frustum snapshot, refreshed once per frame by refreshView. isInView
+-- is then pure Luau dot products instead of one WorldToViewportPoint engine
+-- call per visual, which dominated the loop at 10k visuals.
+local viewValid = false
+local viewPosition = Vector3.zero
+local viewRight, viewUp, viewLook = Vector3.xAxis, Vector3.yAxis, -Vector3.zAxis
+local viewLimitX, viewLimitY = 1, 1 -- tan(half-FOV) per axis, widened by the pixel margin
+
+local function refreshView()
 	local camera = workspace.CurrentCamera
-	if not camera then
+	local size = camera and camera.ViewportSize
+	if not size or size.X <= 0 or size.Y <= 0 then
+		viewValid = false
+		return
+	end
+	local cframe = camera.CFrame
+	local tanY = math.tan(math.rad(camera.FieldOfView) * 0.5)
+	local tanX = tanY * size.X / size.Y
+	-- A pixel margin m past an edge is 2m/size in normalized device units.
+	viewLimitX = tanX * (1 + 2 * VIEWPORT_CULL_MARGIN / size.X)
+	viewLimitY = tanY * (1 + 2 * VIEWPORT_CULL_MARGIN / size.Y)
+	viewPosition = cframe.Position
+	viewRight, viewUp, viewLook = cframe.RightVector, cframe.UpVector, cframe.LookVector
+	viewValid = true
+end
+
+local function isInView(position: Vector3): boolean
+	if not viewValid then
 		return true
 	end
-	local viewportPoint = camera:WorldToViewportPoint(position)
-	local viewportSize = camera.ViewportSize
-	return viewportPoint.Z > 0
-		and viewportPoint.X >= -VIEWPORT_CULL_MARGIN
-		and viewportPoint.Y >= -VIEWPORT_CULL_MARGIN
-		and viewportPoint.X <= viewportSize.X + VIEWPORT_CULL_MARGIN
-		and viewportPoint.Y <= viewportSize.Y + VIEWPORT_CULL_MARGIN
+	local offset = position - viewPosition
+	local depth = offset:Dot(viewLook)
+	return depth > 0
+		and math.abs(offset:Dot(viewRight)) <= depth * viewLimitX
+		and math.abs(offset:Dot(viewUp)) <= depth * viewLimitY
 end
 
 local function refreshSmoothVisuals(now: number)
@@ -94,25 +118,62 @@ local function refreshSmoothVisuals(now: number)
 	local player = Players.LocalPlayer
 	local character = player and player.Character
 	local root = character and (character:FindFirstChild("HumanoidRootPart") or character.PrimaryPart)
-	local candidates = {}
+	debug.profilebegin("ProjectileClient.RefreshSmoothSet")
+	-- Keep only the nearest K candidates in a max-heap. The previous full sort
+	-- allocated and sorted all 10k nearby stress visuals every 0.1 seconds even
+	-- though only 500 could ever be selected.
+	local heapVisuals = table.create(MAX_SMOOTH_PROJECTILES)
+	local heapDistances = table.create(MAX_SMOOTH_PROJECTILES)
+	local heapSize = 0
+	local function swap(a, b)
+		heapVisuals[a], heapVisuals[b] = heapVisuals[b], heapVisuals[a]
+		heapDistances[a], heapDistances[b] = heapDistances[b], heapDistances[a]
+	end
+	local function push(visual, distanceSq)
+		heapSize += 1
+		local index = heapSize
+		heapVisuals[index] = visual
+		heapDistances[index] = distanceSq
+		while index > 1 do
+			local parent = math.floor(index / 2)
+			if heapDistances[parent] >= distanceSq then break end
+			swap(parent, index)
+			index = parent
+		end
+	end
+	local function replaceRoot(visual, distanceSq)
+		heapVisuals[1] = visual
+		heapDistances[1] = distanceSq
+		local index = 1
+		while true do
+			local left = index * 2
+			if left > heapSize then break end
+			local right = left + 1
+			local largest = if right <= heapSize and heapDistances[right] > heapDistances[left] then right else left
+			if heapDistances[index] >= heapDistances[largest] then break end
+			swap(index, largest)
+			index = largest
+		end
+	end
 	if root and root:IsA("BasePart") then
 		local radiusSq = SMOOTH_RADIUS * SMOOTH_RADIUS
 		for _, visual in visuals do
 			local offset = visual.position - root.Position
 			local distanceSq = offset:Dot(offset)
 			if distanceSq <= radiusSq and isInView(visual.position) then
-				table.insert(candidates, { Visual = visual, DistanceSq = distanceSq })
+				if heapSize < MAX_SMOOTH_PROJECTILES then
+					push(visual, distanceSq)
+				elseif distanceSq < heapDistances[1] then
+					replaceRoot(visual, distanceSq)
+				end
 			end
 		end
-		table.sort(candidates, function(a, b)
-			return a.DistanceSq < b.DistanceSq
-		end)
 	end
 
 	local selected = {}
-	local newSmoothVisuals = table.create(math.min(#candidates, MAX_SMOOTH_PROJECTILES))
-	for index = 1, math.min(#candidates, MAX_SMOOTH_PROJECTILES) do
-		local visual = candidates[index].Visual
+	local newSmoothVisuals = table.create(heapSize)
+	for index = 1, heapSize do
+		local visual = heapVisuals[index]
 		selected[visual] = true
 		table.insert(newSmoothVisuals, visual)
 		if not visual.smoothTransform then
@@ -129,6 +190,7 @@ local function refreshSmoothVisuals(now: number)
 		end
 	end
 	smoothVisuals = newSmoothVisuals
+	debug.profileend()
 end
 
 local function setSmoothTarget(visual, now: number)
@@ -146,6 +208,33 @@ local function simulateVisual(visual, baseDt: number): (boolean, boolean)
 
 	local remaining = baseDt + (visual.simulationDebt or 0)
 	visual.simulationDebt = 0
+
+	-- Fast path: with no dilation anywhere there are no boundaries to stop at,
+	-- and constant (vector/gravity) acceleration without speed clamps is
+	-- integrated exactly by one averaged-velocity step. The substep loop below
+	-- only exists for boundaries, clamps and velocity-relative acceleration.
+	if
+		ChunkManager.IsTimeUniform()
+		and visual.minSpeed <= 0
+		and visual.maxSpeed == math.huge
+		and (typeof(visual.acceleration) ~= "number" or visual.acceleration == 0)
+	then
+		local dt = math.min(remaining, visual.life)
+		local movementVelocity
+		visual.velocity, movementVelocity = ProjectileMotion.Integrate(
+			visual.velocity,
+			visual.acceleration,
+			visual.accelerationDirection,
+			visual.gravity,
+			visual.minSpeed,
+			visual.maxSpeed,
+			dt
+		)
+		visual.position += movementVelocity * dt
+		visual.life -= dt
+		return visual.life > MIN_STEP_DT, true
+	end
+
 	local moved = false
 	local guard = 0
 	while remaining > MIN_STEP_DT and guard < MAX_PREDICTION_SUBSTEPS do
@@ -247,16 +336,9 @@ local function destroyVisual(id)
 		return
 	end
 	visuals[id] = nil
+	visualCount -= 1
 	visualTombstones += 1
-	local delay =
-		math.max(visual.destroyDelay or 0, VisualModel.FadeOut(visual.model, visual.waitForParticles, visual.waitForTrails))
-	if delay > 0 then
-		task.delay(delay, function()
-			visual.model:Destroy()
-		end)
-	else
-		visual.model:Destroy()
-	end
+	VisualModel.Retire(visual, visual.destroyDelay or 0)
 end
 
 function ProjectileClient.EnableClientRendering()
@@ -265,7 +347,8 @@ function ProjectileClient.EnableClientRendering()
 	end
 	clientRendering = true
 
-	VisualOffload.On("ProjSpawn", function(data)
+	local function onProjectileSpawn(data)
+		if visuals[data.Id] then return end
 		local model, rig = VisualModel.Build(data)
 		local now = os.clock()
 		local visual = {
@@ -289,7 +372,6 @@ function ProjectileClient.EnableClientRendering()
 			maxSpeed = data.MaxSpeed or math.huge,
 			life = data.Lifetime or 5,
 			simulationDebt = 0,
-
 			synced = data.Synced == true,
 			-- Combined Source.TimeScale * projectile.TimeScale at spawn time;
 			-- updated live via ProjTimeScale below, folded into the unsynced
@@ -313,7 +395,17 @@ function ProjectileClient.EnableClientRendering()
 			VisualModel.ActivateParticles(model)
 		end
 		visuals[data.Id] = visual
+		visualCount += 1
 		table.insert(visualOrder, data.Id)
+	end
+	-- ProjSpawn remains registered for protocol compatibility with older or
+	-- external producers. The authoritative projectile server uses the bounded
+	-- batch channel so thousands of creations become one client event per frame.
+	VisualOffload.On("ProjSpawn", onProjectileSpawn)
+	VisualOffload.On("ProjSpawnBatch", function(batch)
+		debug.profilebegin("ProjectileClient.BuildSpawnBatch")
+		for _, data in batch do onProjectileSpawn(data) end
+		debug.profileend()
 	end)
 
 	-- Fires only when the combined personal/local TimeScale actually changes
@@ -385,7 +477,7 @@ function ProjectileClient.EnableClientRendering()
 		end
 	end)
 
-	VisualOffload.On("ProjHit", function(data)
+	local function onProjectileHit(data)
 		local visual = visuals[data.Id]
 		if visual then
 			-- Snap to the server's exact position before destroying, so any
@@ -397,6 +489,10 @@ function ProjectileClient.EnableClientRendering()
 			end
 		end
 		destroyVisual(data.Id)
+	end
+	VisualOffload.On("ProjHit", onProjectileHit)
+	VisualOffload.On("ProjHitBatch", function(batch)
+		for _, data in batch do onProjectileHit(data) end
 	end)
 
 	VisualOffload.On("ProjRay", function(data)
@@ -438,9 +534,11 @@ function ProjectileClient.EnableClientRendering()
 		visualTombstones = 0
 	end
 
+	refreshView()
 	Heartbeat.Connect(function(globalDt)
 		globalSimulationClock += globalDt
 		local now = os.clock()
+		refreshView()
 		refreshSmoothVisuals(now)
 		local slotCount = #visualOrder
 		local inspected = 0
@@ -598,6 +696,14 @@ function ProjectileClient.EnableClientRendering()
 			compactVisualOrder()
 		end
 	end, { Name = "ProjectileSystem.ClientSimulate", Priority = 5 })
+end
+
+function ProjectileClient.GetStats()
+	return {
+		Visuals = visualCount,
+		VisualUpdatesPerFrame = MAX_VISUAL_UPDATES_PER_FRAME,
+		SmoothLimit = MAX_SMOOTH_PROJECTILES,
+	}
 end
 
 return ProjectileClient

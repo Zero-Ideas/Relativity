@@ -15,6 +15,13 @@ local Math = require(script.Parent.Math)
 local Homing = {}
 Homing.Methods = {}
 
+-- Dilated seconds between searches while a projectile holds no target
+-- (override per shot with Homing.AcquireInterval). Searching on every substep
+-- made a swarm of target-less missiles run up to MAX_SUBSTEPS chunk sweeps
+-- each per frame. The reset is jittered so a burst fired on one frame spreads
+-- its searches across frames instead of spiking together forever.
+local DEFAULT_ACQUIRE_INTERVAL = 0.1
+
 function Homing.targetPosition(target): Vector3?
 	if target == nil then
 		return nil
@@ -112,8 +119,13 @@ function Homing.Methods:_updateHoming(dt: number)
 
 	if targetGone then
 		if homing.AcquireRadius or homing.TargetTag or homing.TargetTags then
-			self.HomingTarget = Homing.acquireTarget(self, homing, self.Position)
-			target = self.HomingTarget
+			self._acquireTimer -= dt
+			if self._acquireTimer <= 0 then
+				local interval = homing.AcquireInterval or DEFAULT_ACQUIRE_INTERVAL
+				self._acquireTimer = interval * (0.5 + math.random())
+				self.HomingTarget = Homing.acquireTarget(self, homing, self.Position)
+				target = self.HomingTarget
+			end
 		end
 	elseif not homing.Permalock and homing.Retarget then
 		self.ReacquireTimer -= dt

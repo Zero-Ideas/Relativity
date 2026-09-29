@@ -26,6 +26,7 @@ local ToolManager = require(script.ToolManager)
 -- muzzle blast).
 local _AmmoState = require(script.AmmoState)
 local _WeaponEffects = require(script.WeaponEffects)
+local _SpellEffects = require(script.SpellEffects) -- spell Beam visuals
 
 ChunkManager.EnableReplication()
 ProjectileClient.EnableClientRendering()

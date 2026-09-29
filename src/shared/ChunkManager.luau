@@ -50,6 +50,7 @@ ChunkManager.UseY = false -- 2D (XZ) chunking by default
 
 local chunks: { [Vector3]: any } = {} -- keyed by chunk-coordinate Vector3
 local chunkCount = 0
+local dilatedChunkCount = 0 -- chunks whose TimeScale ~= 1; see IsTimeUniform
 local autoLoadConnection = nil
 local timeZones = {} -- ordered oldest -> newest; newest containing zone wins
 local timeZonesById = {}
@@ -92,6 +93,14 @@ local function maybeCollect(chunk)
 	end
 end
 
+-- Every chunk TimeScale write goes through here so dilatedChunkCount stays exact.
+local function setChunkScale(chunk, scale: number)
+	if (chunk.TimeScale ~= 1) ~= (scale ~= 1) then
+		dilatedChunkCount += if scale ~= 1 then 1 else -1
+	end
+	chunk.TimeScale = scale
+end
+
 function ChunkManager.ToChunkKey(worldPos: Vector3): Vector3
 	return toChunkKey(worldPos)
 end
@@ -124,6 +133,12 @@ function ChunkManager.GetTimeScaleAt(worldPos: Vector3): number
 	end
 	local chunk = chunks[toChunkKey(worldPos)]
 	return chunk and chunk.TimeScale or 1
+end
+
+-- True when GetTimeScaleAt is 1 everywhere (no dilated chunk, no zone), so
+-- per-step boundary searches can be skipped entirely.
+function ChunkManager.IsTimeUniform(): boolean
+	return dilatedChunkCount == 0 and #timeZones == 0
 end
 
 function ChunkManager.GetTimeScaleZones()
@@ -233,7 +248,7 @@ end
 -- previous scale and persistence state without leaking empty default chunks.
 function ChunkManager.SetTimeScaleForKey(key: Vector3, scale: number, persistent: boolean?)
 	local chunk = chunks[key] or newChunk(key)
-	chunk.TimeScale = math.max(scale, 0)
+	setChunkScale(chunk, math.max(scale, 0))
 	if persistent ~= nil then
 		chunk.Persistent = persistent
 	end
@@ -532,14 +547,14 @@ function ChunkManager.EnableReplication()
 	else
 		VisualOffload.On("ChunkScale", function(data)
 			local chunk = chunks[data.Key] or newChunk(data.Key)
-			chunk.TimeScale = data.Scale
+			setChunkScale(chunk, data.Scale)
 			chunk.Persistent = true
 			maybeCollect(chunk)
 		end)
 		VisualOffload.On("ChunkSnapshot", function(data)
 			for _, entry in data.Chunks do
 				local chunk = chunks[entry.Key] or newChunk(entry.Key)
-				chunk.TimeScale = entry.Scale
+				setChunkScale(chunk, entry.Scale)
 				chunk.Persistent = true
 			end
 			for _, zone in data.Zones or {} do

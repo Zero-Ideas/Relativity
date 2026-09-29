@@ -124,8 +124,8 @@ function Raycast.Methods:_resolveEntityHit(entity, result, hurtboxName: string?)
 end
 
 -- Returns "continue" | "destroy" after resolving a physical raycast hit. A
--- bounce marks _bouncedThisTick and immediately flushes a one-shot ProjMove
--- correction (Bounced = true) below -- this is now the ONLY streaming a
+-- bounce queues a one-shot ProjMove correction (Bounced = true) below --
+-- this is the ONLY streaming a
 -- non-homing bouncing projectile ever gets; it tells rendering clients to
 -- snap instead of tween (see ProjectileClient) and re-baseline their local
 -- physics from this post-reflection Position/Velocity.
@@ -180,43 +180,14 @@ function Raycast.Methods:_resolveHit(result)
 		-- SNAP to it instead of tweening a straight line from its pre-bounce
 		-- position, which would visibly cut through whatever surface sits
 		-- between the two -- exactly where the bounce happened.
-		self._bouncedThisTick = true
-		self._bouncedNormal = normal
-		-- Flush this bounce's snap-to-position immediately instead of waiting
-		-- for the end-of-frame batch in the server step loop. If this is the
-		-- last bounce (BouncesLeft just hit 0) and the reflected path clips
-		-- more geometry later in this SAME tick's substep loop, that next hit
-		-- destroys the projectile and fires ProjHit synchronously -- before
-		-- Step() even returns -- so the outer loop's batching never gets a
-		-- chance to queue this update at all (its "not alive" branch queues
-		-- nothing). Without this, the client would never learn a bounce
-		-- happened here and would keep coasting its stale pre-bounce
-		-- trajectory straight through the surface until ProjHit teleports it
-		-- to the real final position. Sending here guarantees the snap
-		-- always reaches the client before any same-tick Destroy's ProjHit.
-		-- This fires unconditionally on every bounce regardless of homing
-		-- state -- it is the sole sync mechanism for a non-homing bouncer
-		-- (see Replication.isSynced): the client is otherwise fully unsynced
-		-- and coasts on local physics between bounces.
-		if self.Visualize then
-			Replication.flushMoveBatch({ {
-				VisualRange = self.VisualRange,
-				Position = self.Position,
-				Payload = {
-					Id = self.Id,
-					Position = self.Position,
-					Velocity = self.Velocity,
-					Bounced = true,
-					Normal = normal,
-				},
-			} })
-		end
-		-- Consumed for this tick already -- clear it so the outer loop's
-		-- end-of-frame batch (only reachable while actively homing; see
-		-- Replication.isSynced) doesn't re-snap/re-flash a second time at
-		-- wherever the projectile ends up after further substeps this same
-		-- tick.
-		self._bouncedThisTick = false
+		-- Queue this bounce's snap-to-position (captured NOW, not at end of
+		-- tick) for this frame's ProjMove event. It is queued even if a later
+		-- substep this same tick destroys the projectile, and ProjHit is only
+		-- flushed on a later frame, so the snap always reaches the client
+		-- first. This is the sole sync mechanism for a non-homing bouncer (see
+		-- Replication.isSynced): the client otherwise coasts on local physics
+		-- between bounces.
+		Replication.queueBounce(self, normal)
 		if self.OnBounce then
 			task.spawn(self.OnBounce, self, result)
 		end

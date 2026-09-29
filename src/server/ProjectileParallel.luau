@@ -2,23 +2,32 @@
 --[[
 	Parallel, read-only projectile math coordinator.
 
-	Actors compute acceleration and curvature hints from immutable snapshots.
+	Actors compute acceleration/curvature hints and bounded homing target scores
+	from immutable snapshots.
 	This module alone consumes their SharedTable results and publishes hints to
 	the authoritative projectile loop. Workers never mutate projectile objects,
 	active arrays, entities, signals, Instances, or replication state.
 ]]
 
 local SharedTableRegistry = game:GetService("SharedTableRegistry")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+
+local Shared = ReplicatedStorage:WaitForChild("Shared")
+local ChunkManager = require(Shared:WaitForChild("ChunkManager"))
+local Entity = require(Shared:WaitForChild("Entity"))
 
 local ProjectileParallel = {}
 
 local MIN_PARALLEL_PROJECTILES = 128
 local HINT_MAX_AGE_FRAMES = 120
+local HOMING_HINT_MAX_AGE_FRAMES = 4
 
 type Worker = {
 	actor: Actor,
 	input: SharedTable,
 	output: SharedTable,
+	homingInput: SharedTable,
+	homingOutput: SharedTable,
 	generation: number,
 	pending: any?,
 }
@@ -26,7 +35,9 @@ type Worker = {
 local workers: { Worker } = {}
 local knownActors: { [Actor]: boolean } = {}
 local hints: { [number]: any } = {}
+local homingHints: { [number]: any } = {}
 local frame = 0
+local parallelEnabled = false
 local stats = {
 	BatchesDispatched = 0,
 	ItemsDispatched = 0,
@@ -35,6 +46,10 @@ local stats = {
 	BusyWorkers = 0,
 	HintHits = 0,
 	HintMisses = 0,
+	HomingJobsDispatched = 0,
+	HomingCandidatesTested = 0,
+	HomingHintHits = 0,
+	HomingHintMisses = 0,
 }
 
 local function refreshWorkers()
@@ -49,6 +64,8 @@ local function refreshWorkers()
 					actor = child,
 					input = SharedTableRegistry:GetSharedTable(`RelativityProjectileInput{id}`),
 					output = SharedTableRegistry:GetSharedTable(`RelativityProjectileOutput{id}`),
+					homingInput = SharedTableRegistry:GetSharedTable(`RelativityProjectileHomingInput{id}`),
+					homingOutput = SharedTableRegistry:GetSharedTable(`RelativityProjectileHomingOutput{id}`),
 					generation = 0,
 					pending = nil,
 				})
@@ -78,11 +95,65 @@ function ProjectileParallel.Collect()
 					}
 				end
 			end
+			if worker.homingOutput.done == pending.generation then
+				for index, job in pending.homingJobs do
+					local base = (index - 1) * 2
+					if worker.homingOutput[base + 1] == job.Id then
+						local bestIndex = worker.homingOutput[base + 2]
+						homingHints[job.Id] = {
+							Target = if bestIndex and bestIndex > 0 then job.Candidates[bestIndex] else false,
+							Origin = job.Origin,
+							Radius = job.Radius,
+							Frame = pending.frame,
+						}
+					end
+				end
+			end
 			stats.BatchesCompleted += 1
 			stats.ItemsCompleted += #pending.snapshots
 			worker.pending = nil
 		end
 	end
+end
+
+local function homingEligible(projectile: any, homing: any, entity: any): boolean
+	if entity == projectile.Source or entity.IsDestroyed then return false end
+	if projectile.Filter and not projectile.Filter(entity) then return false end
+	if homing.TargetTags then
+		for _, tag in homing.TargetTags do if entity:HasTag(tag) then return true end end
+		return false
+	elseif homing.TargetTag then
+		return entity:HasTag(homing.TargetTag)
+	end
+	return true
+end
+
+local function buildHomingJob(projectile: any)
+	local homing = projectile.Homing
+	if not homing or not (homing.AcquireRadius or homing.TargetTag or homing.TargetTags) then return nil end
+	local target = projectile.HomingTarget
+	local targetGone = target == nil
+	if typeof(target) == "Instance" then
+		targetGone = target.Parent == nil
+	elseif typeof(target) == "table" then
+		targetGone = target.IsDestroyed == true
+	end
+	local dueRetarget = target ~= nil and not homing.Permalock and homing.Retarget and projectile.ReacquireTimer <= 1 / 30
+	if not targetGone and not dueRetarget then return nil end
+	local origin = projectile.Position
+	local radius = homing.AcquireRadius or 1e9
+	local function eligible(entity) return homingEligible(projectile, homing, entity) end
+	local candidates
+	if homing.AcquireRadius then
+		candidates = ChunkManager.GetEntityCandidatesInRadius(origin, homing.AcquireRadius, { Filter = eligible })
+	else
+		local source = homing.TargetTag and Entity.GetTagged(homing.TargetTag) or Entity.GetAll()
+		candidates = {}
+		for _, entity in source do if eligible(entity) then table.insert(candidates, entity) end end
+	end
+	local positions = table.create(#candidates)
+	for index, entity in candidates do positions[index] = entity:GetPosition() end
+	return { Id = projectile.Id, Origin = origin, Radius = radius, Candidates = candidates, Positions = positions }
 end
 
 function ProjectileParallel.GetHint(projectile: any)
@@ -100,11 +171,44 @@ function ProjectileParallel.GetHint(projectile: any)
 	return nil
 end
 
-function ProjectileParallel.Dispatch(projectiles: { any })
+-- Returns (ready, target). A ready result may intentionally contain nil when
+-- the parallel search found no valid target. Eligibility and radius are
+-- revalidated here on the authoritative thread before a target is accepted.
+function ProjectileParallel.ConsumeHomingHint(projectile: any): (boolean, any?)
+	local hint = homingHints[projectile.Id]
+	if not hint then stats.HomingHintMisses += 1; return false, nil end
+	homingHints[projectile.Id] = nil
+	if frame - hint.Frame > HOMING_HINT_MAX_AGE_FRAMES then
+		stats.HomingHintMisses += 1
+		return false, nil
+	end
+	local target = hint.Target
+	if target == false then stats.HomingHintHits += 1; return true, nil end
+	local homing = projectile.Homing
+	if not homing or not homingEligible(projectile, homing, target) then
+		stats.HomingHintMisses += 1
+		return false, nil
+	end
+	local position = target:GetPosition()
+	if homing.AcquireRadius and (position - projectile.Position).Magnitude > homing.AcquireRadius then
+		stats.HomingHintMisses += 1
+		return false, nil
+	end
+	stats.HomingHintHits += 1
+	return true, target
+end
+
+function ProjectileParallel.ShouldDeferHoming(): boolean
+	return parallelEnabled
+end
+
+function ProjectileParallel.Dispatch(projectiles: { any }, totalActiveCount: number?)
 	frame += 1
 	refreshWorkers()
-	if #projectiles < MIN_PARALLEL_PROJECTILES or #workers == 0 then
-		if #projectiles == 0 then table.clear(hints) end
+	local scaleCount = totalActiveCount or #projectiles
+	parallelEnabled = scaleCount >= MIN_PARALLEL_PROJECTILES and #workers > 0
+	if scaleCount < MIN_PARALLEL_PROJECTILES or #workers == 0 then
+		if scaleCount == 0 then table.clear(hints); table.clear(homingHints) end
 		return
 	end
 
@@ -129,6 +233,7 @@ function ProjectileParallel.Dispatch(projectiles: { any })
 		if #list == 0 then continue end
 		worker.generation += 1
 		local snapshots = table.create(#list)
+		local homingJobs = {}
 		for itemIndex, projectile in list do
 			local base = (itemIndex - 1) * 5
 			worker.input[base + 1] = projectile.Id
@@ -142,16 +247,32 @@ function ProjectileParallel.Dispatch(projectiles: { any })
 				AccelerationDirection = projectile.AccelerationDirection,
 				Gravity = projectile.Gravity,
 			}
+			local homingJob = buildHomingJob(projectile)
+			if homingJob then table.insert(homingJobs, homingJob) end
 		end
-		worker.pending = { generation = worker.generation, snapshots = snapshots, frame = frame }
-		worker.actor:SendMessage("ComputeProjectileHints", worker.generation, #list)
+		local cursor = 1
+		for _, job in homingJobs do
+			worker.homingInput[cursor] = job.Id
+			worker.homingInput[cursor + 1] = job.Origin
+			worker.homingInput[cursor + 2] = job.Radius
+			worker.homingInput[cursor + 3] = #job.Positions
+			cursor += 4
+			for _, position in job.Positions do worker.homingInput[cursor] = position; cursor += 1 end
+			stats.HomingCandidatesTested += #job.Positions
+		end
+		worker.pending = { generation = worker.generation, snapshots = snapshots, homingJobs = homingJobs, frame = frame }
+		worker.actor:SendMessage("ComputeProjectileHints", worker.generation, #list, #homingJobs)
 		stats.BatchesDispatched += 1
 		stats.ItemsDispatched += #list
+		stats.HomingJobsDispatched += #homingJobs
 	end
 
 	if frame % HINT_MAX_AGE_FRAMES == 0 then
 		for id, hint in hints do
 			if frame - hint.Frame > HINT_MAX_AGE_FRAMES then hints[id] = nil end
+		end
+		for id, hint in homingHints do
+			if frame - hint.Frame > HOMING_HINT_MAX_AGE_FRAMES then homingHints[id] = nil end
 		end
 	end
 end

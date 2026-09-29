@@ -136,7 +136,9 @@
 	                         expiry). Listener receives
 	                           { Position: Vector3, Normal: Vector3, Kind: string? }
 	                         Kind is "entity" | "world" | nil (nil covers both
-	                         a fizzled/expired shot and a bare Destroy() call).
+	                         a fizzled/expired shot and a bare Destroy() call),
+	                         or whatever a caller passes to Destroy(result,
+	                         kind) -- e.g. SpellRuntime's "detonate".
 	                         Use this for exactly-once bookkeeping (e.g.
 	                         Shooter.server.luau's activeProjectileCount
 	                         decrement) -- OnHit is NOT exactly-once, since
@@ -188,7 +190,10 @@
 	   MaxPierces = 0           (enemies passed through)
 	   PierceFalloff = 0        (damage lost per pierce, 0..1 -- see Damage above)
 	   Homing = { Target?, TargetTag?, TargetTags?, AcquireRadius?, Retarget?,
-	              ReacquireRate?, Permalock?, TurnRate = rad/s, Delay = 0 }
+	              ReacquireRate?, AcquireInterval = 0.1, Permalock?,
+	              TurnRate = rad/s, Delay = 0 }
+	              -- AcquireInterval: dilated seconds between searches while no
+	              -- target is held (jittered 0.5x-1.5x to spread bursts).
 	              -- TargetTags (plural, list of strings) matches any tag in the
 	              -- list; TargetTag (singular) is still supported for a single tag.
 	              -- Permalock (default off): once locked, a Retarget recheck never
@@ -282,7 +287,6 @@ local Homing = require(script.Homing)
 local Raycast = require(script.Raycast)
 local RewindHit = require(script.RewindHit)
 local Replication = require(script.Replication)
-local ProjectileParallel = require(script.Parent.ProjectileParallel)
 
 local Projectile = {}
 Projectile.__index = Projectile
@@ -325,11 +329,12 @@ local MAX_SUBSTEPS = 16
 local CURVE_ERROR = 0.35 -- maximum studs between a curved path and its cast chord
 local MAX_HOMING_TURN_STEP = math.rad(5)
 local MIN_STEP_DT = 1e-5
--- Network only: authoritative simulation still steps every projectile every
--- frame. Pose replication is round-robined so one client event never grows
--- without bound, and its phase cannot be reset by a time-scale change.
+-- Pose replication is round-robined so one client event never grows without
+-- bound, and its phase cannot be reset by a time-scale change.
 local MAX_SYNC_UPDATES_PER_FRAME = 2500
 local syncCursor = 1
+local MAX_VISUAL_SPAWNS_PER_FRAME = 1000
+local MAX_VISUAL_HITS_PER_FRAME = 1000
 
 -- Hard real-time (wall-clock, undilated) cap on how long any projectile can
 -- stay alive, regardless of its own dilated Lifetime/Age. A projectile whose
@@ -407,6 +412,7 @@ function Projectile.new(config)
 		HomingDelay = config.Homing and (config.Homing.Delay or 0) or 0,
 		HomingTarget = config.Homing and config.Homing.Target,
 		ReacquireTimer = 0,
+		_acquireTimer = 0, -- throttles searches while no target is held; see Homing
 
 		Visualize = config.Visualize == true,
 		VisualRange = config.VisualRange or math.huge,
@@ -420,6 +426,7 @@ function Projectile.new(config)
 		WaitForParticles = config.WaitForParticles ~= false,
 		WaitForTrails = config.WaitForTrails ~= false,
 		ActivateParticlesOnCreate = config.ActivateParticlesOnCreate == true,
+		_spawnStreamed = false,
 
 		-- See "Events" in the module doc comment's API section. Fresh Signal
 		-- per projectile -- connect on the returned instance, not via config.
@@ -430,8 +437,6 @@ function Projectile.new(config)
 		RewindSeconds = config.RewindSeconds or 0,
 
 		_ignore = {}, -- entities already pierced
-		_bouncedThisTick = false,
-		_bouncedNormal = Vector3.yAxis,
 		-- Lag-compensation working state, repopulated each Step before
 		-- _checkRewoundHit runs (see Step). rewoundPos is memoized per frame
 		-- since RewindSeconds is fixed and os.clock() is stable across one
@@ -535,6 +540,17 @@ function Projectile.GetAll()
 	return table.clone(active)
 end
 
+function Projectile.GetStats()
+	local queueStats = Replication.getQueueStats()
+	return {
+		Active = #active,
+		VisualSpawnsPerFrame = MAX_VISUAL_SPAWNS_PER_FRAME,
+		VisualHitsPerFrame = MAX_VISUAL_HITS_PER_FRAME,
+		PendingVisualSpawns = queueStats.PendingSpawns,
+		PendingVisualHits = queueStats.PendingHits,
+	}
+end
+
 function Projectile.GetBySource(source: any)
 	local result = {}
 	for _, projectile in active do
@@ -592,10 +608,6 @@ function Projectile:Step(globalDt: number): boolean
 		return self:_expire()
 	end
 
-	-- Reset every tick so a stale true from a previous bounce never leaks into
-	-- a later, non-bouncing tick's streamed payload -- see Raycast._resolveHit.
-	self._bouncedThisTick = false
-
 	-- Personal/global time is consumed below one spatial segment at a time.
 	-- Chunk scale is deliberately NOT folded in here: each segment samples the
 	-- chunk it is entering, so crossing a slow/frozen boundary takes effect at
@@ -625,12 +637,14 @@ function Projectile:Step(globalDt: number): boolean
 
 	local remaining = globalDt * combinedScale + self._simulationDebt
 	self._simulationDebt = 0
+	-- With no dilated chunk or zone anywhere, every boundary search below can
+	-- only return "none", so skip them (they dominate substep cost at scale).
+	local uniformTime = ChunkManager.IsTimeUniform()
 	local guard = 0
 	while remaining > MIN_STEP_DT and guard < MAX_SUBSTEPS do
 		guard += 1
 
-		local parallelHint = if guard == 1 then ProjectileParallel.GetHint(self) else nil
-		local accelerationVector = if parallelHint then parallelHint.AccelerationVector else ProjectileMotion.GetAcceleration(
+		local accelerationVector = ProjectileMotion.GetAcceleration(
 			self.Velocity,
 			self.Acceleration,
 			self.AccelerationDirection,
@@ -641,7 +655,7 @@ function Projectile:Step(globalDt: number): boolean
 			Math.safeUnit(accelerationVector, Vector3.zAxis)
 		)
 		local samplePosition = self.Position + direction * ProjectileMotion.PositionEpsilon
-		local chunkScale = ChunkManager.GetTimeScaleAt(samplePosition)
+		local chunkScale = if uniformTime then 1 else ChunkManager.GetTimeScaleAt(samplePosition)
 		if chunkScale <= 0 then
 			-- Real time spent in a frozen chunk is consumed without building a
 			-- catch-up burst for when the chunk is unfrozen.
@@ -667,25 +681,25 @@ function Projectile:Step(globalDt: number): boolean
 		local stepDt = math.min(availableDt, lifetimeRemaining)
 		if speed > 1e-5 then
 			stepDt = math.min(stepDt, maxDistance / speed)
-			local chunkBoundaryDt = ProjectileMotion.GetTimeScaleBoundaryDt(
-				self.Position,
-				estimatedMovementVelocity,
-				ChunkManager.ChunkSize,
-				ChunkManager.UseY,
-				chunkScale,
-				stepDt,
-				ChunkManager.GetTimeScaleAt
-			)
-			local radialBoundaryDt = ChunkManager.GetRadialTimeScaleBoundaryDt(
-				self.Position,
-				estimatedMovementVelocity,
-				stepDt
-			)
-			stepDt = math.min(stepDt, chunkBoundaryDt, radialBoundaryDt)
+			if not uniformTime then
+				local chunkBoundaryDt = ProjectileMotion.GetTimeScaleBoundaryDt(
+					self.Position,
+					estimatedMovementVelocity,
+					ChunkManager.ChunkSize,
+					ChunkManager.UseY,
+					chunkScale,
+					stepDt,
+					ChunkManager.GetTimeScaleAt
+				)
+				local radialBoundaryDt = ChunkManager.GetRadialTimeScaleBoundaryDt(
+					self.Position,
+					estimatedMovementVelocity,
+					stepDt
+				)
+				stepDt = math.min(stepDt, chunkBoundaryDt, radialBoundaryDt)
+			end
 		end
-		local curvatureStepDt = if parallelHint then parallelHint.CurvatureDt
-			else ProjectileMotion.GetCurvatureStepDt(self.Velocity, accelerationVector, CURVE_ERROR)
-		stepDt = math.min(stepDt, curvatureStepDt)
+		stepDt = math.min(stepDt, ProjectileMotion.GetCurvatureStepDt(self.Velocity, accelerationVector, CURVE_ERROR))
 		if self.HomingTarget and self.Homing then
 			local turnRate = self.Homing.TurnRate or math.rad(120)
 			if turnRate > 0 then
@@ -787,7 +801,7 @@ function Projectile:Destroy(result, kind: string?)
 	if Replication.DebugSync then
 		print(`[Relativity][sync] ProjHit Id={self.Id} Kind={kind or "fizzle"}`)
 	end
-	Replication.streamTo(self, "ProjHit", { Id = self.Id, Position = hitResult.Position, Normal = hitResult.Normal, Kind = kind })
+	Replication.queueHit(self, { Id = self.Id, Position = hitResult.Position, Normal = hitResult.Normal, Kind = kind })
 
 	-- Exactly-once -- see the module doc comment's "Events" section. Fired
 	-- here (not in Raycast._resolveEntityHit/_resolveHit/_expire) so EVERY
@@ -810,20 +824,24 @@ end
 --------------------------------------------------------------------------------
 
 Heartbeat.Connect(function(globalDt)
-	-- Actor results are consumed only here, on the authoritative serial side.
-	-- Workers operate solely on immutable snapshots from the previous frame.
-	ProjectileParallel.Collect()
+	Replication.flushHitBatch(MAX_VISUAL_HITS_PER_FRAME)
+	Replication.flushSpawnBatch(MAX_VISUAL_SPAWNS_PER_FRAME)
+
 	local syncCandidates = {}
+	debug.profilebegin("Projectile.StepAll")
+	-- Backwards with swap-removal: dead projectiles leave `active` the same
+	-- frame (so GetAll/GetInRadius never return them), and anything spawned by
+	-- an OnHit/OnDestroy handler mid-loop is appended past `i` and first steps
+	-- next frame.
 	for i = #active, 1, -1 do
 		local projectile = active[i]
 		-- Captured BEFORE Step() so a projectile whose homing lock drops
 		-- DURING this exact tick still gets this tick's corrected
 		-- post-drop Position/Velocity streamed -- otherwise the client is
 		-- left holding a stale pre-transition pose and resumes local
-		-- physics from the wrong place. Bounce corrections are handled
-		-- separately and immediately inside Raycast._resolveHit -- they
-		-- don't depend on isSynced at all, so a non-homing bouncer never
-		-- reaches this batch outside the tick it actually bounces on.
+		-- physics from the wrong place. Bounce corrections are queued
+		-- separately inside Raycast._resolveHit -- they don't depend on
+		-- isSynced at all, so a non-homing bouncer never enters this batch.
 		local wasSynced = Replication.isSynced(projectile)
 		local alive = projectile:Step(globalDt)
 		if not alive then
@@ -831,12 +849,17 @@ Heartbeat.Connect(function(globalDt)
 			active[i] = active[last]
 			active[last] = nil
 			projectile:Destroy({ Position = projectile.Position, Normal = Vector3.yAxis })
-		elseif projectile.Visualize and (wasSynced or Replication.isSynced(projectile)) then
+		elseif
+			projectile.Visualize
+			and projectile._spawnStreamed -- clients would drop poses for visuals they haven't built
+			and (wasSynced or Replication.isSynced(projectile))
+		then
 			-- Currently (or just-formerly, see above) locked onto a homing
 			-- target (checked fresh every tick, not a static
 			-- classification) -- see the module doc comment for why this
 			-- is the one case that stays continuously streamed rather
-			-- than left to the client.
+			-- than left to the client. Bounce snaps travel separately (see
+			-- Replication.queueBounce), so this payload is pose-only.
 			table.insert(syncCandidates, {
 				VisualRange = projectile.VisualRange,
 				Position = projectile.Position,
@@ -844,16 +867,11 @@ Heartbeat.Connect(function(globalDt)
 					Id = projectile.Id,
 					Position = projectile.Position,
 					Velocity = projectile.Velocity,
-					-- Set only on the tick a bounce actually happened -- tells
-					-- the client to snap instead of tweening a straight line
-					-- from its last position, which would cut through
-					-- whatever surface sits between the two (see Raycast._resolveHit).
-					Bounced = projectile._bouncedThisTick,
-					Normal = projectile._bouncedThisTick and projectile._bouncedNormal or nil,
 				},
 			})
 		end
 	end
+	debug.profileend()
 
 	local moveBatch = {}
 	local candidateCount = #syncCandidates
@@ -871,7 +889,6 @@ Heartbeat.Connect(function(globalDt)
 		syncCursor = 1
 	end
 	Replication.flushMoveBatch(moveBatch)
-	ProjectileParallel.Dispatch(active)
 end, { Name = "ProjectileSystem.Step", Priority = 5 })
 
 -- Once-a-second ProjMove rate summary (see Replication.DebugSync above) --
