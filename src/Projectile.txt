@@ -115,7 +115,6 @@ end
 
 return SafeMath
 
--- =============================================================================
 -- END FILE: src/shared/SafeMath.luau
 -- =============================================================================
 
@@ -349,7 +348,6 @@ end
 
 return ProjectileMotion
 
--- =============================================================================
 -- END FILE: src/shared/ProjectileMotion.luau
 -- =============================================================================
 
@@ -457,7 +455,6 @@ end
 
 return Planner
 
--- =============================================================================
 -- END FILE: src/shared/ProjectileStepPlanner.luau
 -- =============================================================================
 
@@ -516,6 +513,7 @@ export type SpawnPayload = {
 	Synced: boolean?, -- false
 	TimeScale: number?, -- 1
 	VisualScale: number?, -- 1
+	Beam: { Length: number, Radius: number, Origin: Vector3, ChannelId: number? }?, -- ChannelId merges sustained packets into one tube
 	DestroyDelay: number?, -- 0
 	WaitForParticles: boolean?, -- true
 	WaitForTrails: boolean?, -- true
@@ -559,7 +557,6 @@ export type RayPayload = {
 
 return Protocol
 
--- =============================================================================
 -- END FILE: src/shared/ProjectileProtocol.luau
 -- =============================================================================
 
@@ -775,6 +772,12 @@ return Protocol
 	   Model = Instance?        (cloned client-side) or Visual = {Shape,Size,Color}
 	   VisualScale = 1          (0.05..20; applied once when the client clones
 	                            the visual, with no per-frame scaling cost)
+	   Beam = { Length = 24 }   (optional traveling cylinder path tail; defaults
+	                            Speed to 2000 and Radius to 0.35 when omitted.
+	                            Length clamps to 0.05..512 studs; swept-radius
+	                            head collision is unchanged. The visual tail
+	                            follows the already-swept path, including bends,
+	                            and drains after impact instead of vanishing.)
 	   DestroyDelay = 0         (client keeps the visual this long after impact)
 	   WaitForParticles = true (client-side; while true, a ParticleEmitter
 	              under the visual is only disabled on destroy -- already-
@@ -980,6 +983,8 @@ function Projectile.new(config: Config): Projectile
 		Model = settings.Model,
 		Visual = settings.Visual,
 		VisualScale = settings.VisualScale,
+		Beam = settings.Beam,
+		_beamOrigin = if settings.Beam then settings.Origin else nil,
 		DestroyDelay = settings.DestroyDelay,
 		WaitForParticles = settings.WaitForParticles,
 		WaitForTrails = settings.WaitForTrails,
@@ -1404,7 +1409,6 @@ end, { Name = "ProjectileSystem.Step", Priority = 5 })
 
 return Projectile
 
--- =============================================================================
 -- END FILE: src/server/Projectile/init.luau
 -- =============================================================================
 
@@ -1541,6 +1545,7 @@ export type Config = {
 	Model: Instance?,
 	Visual: VisualSpec?,
 	VisualScale: number?,
+	Beam: { Length: number?, ChannelId: number? }?, -- optional shared sustained-beam visual
 	DestroyDelay: number?,
 	WaitForParticles: boolean?,
 	WaitForTrails: boolean?,
@@ -1591,6 +1596,7 @@ export type State = {
 	Model: Instance?,
 	Visual: VisualSpec?,
 	VisualScale: number,
+	Beam: { Length: number, ChannelId: number? }?,
 	DestroyDelay: number,
 	WaitForParticles: boolean,
 	WaitForTrails: boolean,
@@ -1613,6 +1619,7 @@ export type State = {
 	_spawnStreamed: boolean,
 	_streamedSynced: boolean,
 	_lastStreamedTimeScale: number,
+	_beamOrigin: Vector3?,
 }
 
 -- What a hit resolver decided:
@@ -1626,7 +1633,6 @@ export type Verdict = "pass" | "bounce" | "destroy" | "fallthrough"
 -- ModuleScripts must return exactly one non-nil value.
 return {}
 
--- =============================================================================
 -- END FILE: src/server/Projectile/Types.luau
 -- =============================================================================
 
@@ -1689,6 +1695,7 @@ export type Settings = {
 	Model: Instance?,
 	Visual: Types.VisualSpec?,
 	VisualScale: number,
+	Beam: { Length: number, ChannelId: number? }?,
 	DestroyDelay: number,
 	WaitForParticles: boolean,
 	WaitForTrails: boolean,
@@ -1778,14 +1785,14 @@ function Config.normalize(raw: Types.Config, defaultMaxRealLifetime: number): Se
 	return {
 		Origin = origin,
 		Direction = Config.direction(raw, origin),
-		Speed = SafeMath.number(raw.Speed, DEFAULT_SPEED, 0),
+		Speed = SafeMath.number(raw.Speed, if typeof(raw.Beam) == "table" then 2000 else DEFAULT_SPEED, 0),
 		Acceleration = acceleration(raw.Acceleration),
 		AccelerationDirection = optionalDirection(raw.AccelerationDirection),
 		MinSpeed = minSpeed,
 		-- math.huge stays the "no cap" sentinel; a cap below MinSpeed is raised to it.
 		MaxSpeed = SafeMath.cap(raw.MaxSpeed, minSpeed),
 		Gravity = acceleration(raw.Gravity),
-		Radius = SafeMath.number(raw.Radius, 0, 0),
+		Radius = SafeMath.number(raw.Radius, if typeof(raw.Beam) == "table" then 0.35 else 0, 0),
 		Lifetime = SafeMath.number(raw.Lifetime, DEFAULT_LIFETIME, 0),
 		MaxRealLifetime = SafeMath.number(raw.MaxRealLifetime, defaultMaxRealLifetime, 0),
 		TimeScale = SafeMath.number(raw.TimeScale, 1, 0),
@@ -1804,6 +1811,10 @@ function Config.normalize(raw: Types.Config, defaultMaxRealLifetime: number): Se
 		Model = if typeof(model) == "Instance" then model else nil,
 		Visual = if typeof(visual) == "table" then visual else nil,
 		VisualScale = SafeMath.number(raw.VisualScale, 1, 0.05, 20),
+		Beam = if typeof(raw.Beam) == "table" then {
+			Length = SafeMath.number(raw.Beam.Length, 24, 0.05, 512),
+			ChannelId = if typeof(raw.Beam.ChannelId) == "number" then math.floor(SafeMath.number(raw.Beam.ChannelId, 1, 1)) else nil,
+		} else nil,
 		DestroyDelay = SafeMath.number(raw.DestroyDelay, 0, 0),
 		WaitForParticles = raw.WaitForParticles ~= false,
 		WaitForTrails = raw.WaitForTrails ~= false,
@@ -1820,7 +1831,6 @@ end
 
 return Config
 
--- =============================================================================
 -- END FILE: src/server/Projectile/Config.luau
 -- =============================================================================
 
@@ -1977,7 +1987,6 @@ end
 
 return Homing
 
--- =============================================================================
 -- END FILE: src/server/Projectile/Homing.luau
 -- =============================================================================
 
@@ -2055,7 +2064,6 @@ end
 
 return Math
 
--- =============================================================================
 -- END FILE: src/server/Projectile/Math.luau
 -- =============================================================================
 
@@ -2285,6 +2293,7 @@ function Raycast.resolveHit(projectile: State, contact: Types.Contact): (Verdict
 		local velocity = projectile.Velocity
 		projectile.Velocity = (velocity - 2 * velocity:Dot(normal) * normal) * projectile.Restitution
 		projectile.Position = contact.Position + normal * (projectile.Radius + BOUNCE_CLEARANCE)
+		if projectile.Beam and not projectile._spawnStreamed then projectile._beamOrigin = projectile.Position end
 		-- The client must SNAP on a bounce instead of tweening a straight line
 		-- from its pre-bounce position, which would visibly cut through the
 		-- surface it bounced off. The snap goes out with this frame's ProjMove
@@ -2307,7 +2316,6 @@ end
 
 return Raycast
 
--- =============================================================================
 -- END FILE: src/server/Projectile/Raycast.luau
 -- =============================================================================
 
@@ -2479,6 +2487,9 @@ local function spawnPayload(projectile: State): Protocol.SpawnPayload
 	if Replication.isSynced(projectile) then payload.Synced = true end
 	if projectile._lastStreamedTimeScale ~= 1 then payload.TimeScale = projectile._lastStreamedTimeScale end
 	if projectile.VisualScale ~= 1 then payload.VisualScale = projectile.VisualScale end
+	if projectile.Beam then
+		payload.Beam = { Length = projectile.Beam.Length, Radius = projectile.Radius, Origin = projectile._beamOrigin or projectile.Position, ChannelId = projectile.Beam.ChannelId }
+	end
 	if projectile.DestroyDelay ~= 0 then payload.DestroyDelay = projectile.DestroyDelay end
 	if not projectile.WaitForParticles then payload.WaitForParticles = false end
 	if not projectile.WaitForTrails then payload.WaitForTrails = false end
@@ -2714,7 +2725,6 @@ end)
 
 return Replication
 
--- =============================================================================
 -- END FILE: src/server/Projectile/Replication.luau
 -- =============================================================================
 
@@ -2865,7 +2875,6 @@ end
 
 return RewindHit
 
--- =============================================================================
 -- END FILE: src/server/Projectile/RewindHit.luau
 -- =============================================================================
 
@@ -2915,6 +2924,12 @@ local Prediction = require(script.Prediction)
 local Types = require(script.Types)
 local View = require(script.View)
 local VisualModel = require(script.VisualModel)
+local BeamVisual = require(script.BeamVisual)
+
+local function visualInView(visual: Types.Visual, position: Vector3): boolean
+	local beam = visual.rig and visual.rig.beam
+	return View.contains(position, beam and beam.maxLength)
+end
 
 type Visual = Types.Visual
 
@@ -3102,7 +3117,7 @@ local function onSpawn(data: Protocol.SpawnPayload)
 	end
 	local model, rig = VisualModel.Build(data)
 	local now = os.clock()
-	local inView = View.contains(data.Position)
+	local inView = View.contains(data.Position, data.Beam and data.Beam.Length)
 	local visual: Visual = {
 		id = data.Id,
 		model = model,
@@ -3144,6 +3159,7 @@ local function onSpawn(data: Protocol.SpawnPayload)
 		transformElapsed = 0,
 		transformDuration = 0,
 	}
+	BeamVisual.Attach(visual)
 	if data.ActivateParticlesOnCreate then
 		VisualModel.ActivateParticles(model)
 	end
@@ -3217,18 +3233,29 @@ local function onMove(batch: { Protocol.MovePayload })
 		if data.Bounced then
 			visual.lastUpdate = now
 			rebaseline(visual, data.Position, data.Velocity)
-			if View.contains(data.Position) then
+			BeamVisual.Correct(visual, data.Point or data.Position)
+			if visual.rig and visual.rig.beam and visual.rig.beam.group then
+				BeamVisual.Update(visual, data.Position, data.Velocity)
+			end
+			if visualInView(visual, data.Position) then
 				VisualModel.SuspendTrails(visual)
 				VisualModel.Place(visual, data.Position, data.Velocity)
 				visual.resumeEffectsOnNextUpdate = now
-				Impact.Play(data.Point or data.Position, data.Normal, "bounce")
+				if BeamVisual.ShouldPlayImpact(visual, data.Point or data.Position) then
+					Impact.Play(data.Point or data.Position, data.Normal, "bounce")
+				end
 			end
 		elseif visual.synced then
 			local duration = math.clamp(now - visual.lastUpdate, 0.03, 0.2)
 			visual.lastUpdate = now
 			visual.position = data.Position
 			visual.velocity = data.Velocity
-			if visual.inView and View.contains(data.Position) then
+			if visual.rig and visual.rig.beam and visual.rig.beam.group then
+				-- Retain authoritative curvature while offscreen; no Instances
+				-- are moved here. Re-entry must not invent a homing shortcut.
+				BeamVisual.Update(visual, data.Position, data.Velocity)
+			end
+			if visual.inView and visualInView(visual, data.Position) then
 				VisualModel.SetTarget(visual, data.Position, data.Velocity, duration)
 			end
 		end
@@ -3241,8 +3268,9 @@ local function onHit(data: Protocol.HitPayload)
 		-- Snap to the server's exact position before destroying, so any
 		-- imperceptible mid-flight drift from local simulation never shows at
 		-- the one moment it would be visible.
+		BeamVisual.Correct(visual, data.Position)
 		VisualModel.Place(visual, data.Position, visual.velocity)
-		if data.Kind then
+		if data.Kind and BeamVisual.ShouldPlayImpact(visual, data.Position) then
 			Impact.Play(data.Position, data.Normal, data.Kind)
 		end
 	end
@@ -3258,6 +3286,7 @@ end
 -- later update.
 local function reenterView(visual: Visual, now: number)
 	VisualModel.SuspendTrails(visual)
+	BeamVisual.Reset(visual)
 	VisualModel.Place(visual, visual.position, visual.velocity)
 	visual.culled = false
 	visual.resumeEffectsOnNextUpdate = now
@@ -3268,6 +3297,7 @@ end
 -- effects' grace period we suspend emission and prediction/interpolation work.
 local function recoverStalePose(visual: Visual, position: Vector3, now: number)
 	local rig = visual.rig
+	if rig and rig.beam and rig.beam.group then return end -- shared geometry is flushed once per channel
 	-- Native culling uses the Instance's last rendered bounds. If a camera turn
 	-- exposes those stale bounds while the current trajectory is still outside
 	-- view, move them outside too. No scene unparenting/visibility override.
@@ -3276,7 +3306,7 @@ local function recoverStalePose(visual: Visual, position: Vector3, now: number)
 		elseif model:IsA("Model") then model:GetPivot().Position
 		elseif model:IsA("BasePart") then model.Position
 		else position
-	if View.contains(renderedPosition) then
+	if visualInView(visual, renderedPosition) then
 		VisualModel.SuspendTrails(visual)
 		VisualModel.Place(visual, position, visual.velocity)
 		if not visual.culled then visual.resumeEffectsOnNextUpdate = now end
@@ -3307,7 +3337,7 @@ end
 -- advances its tween and handles visibility. Returns whether it used
 -- transform budget, or nil if it was destroyed.
 local function updateSynced(visual: Visual, now: number): boolean?
-	local inView = View.contains(visual.position)
+	local inView = visualInView(visual, visual.position)
 	if inView then
 		if not visual.inView then
 			reenterView(visual, now)
@@ -3341,7 +3371,7 @@ local function updatePredicted(visual: Visual, elapsedGlobalDt: number, now: num
 	if not visual.inView and visual.culled and Prediction.canDefer(visual) then
 		local dt = elapsedGlobalDt * visual.timeScale
 		local projectedPosition = Prediction.projectDeferred(visual, dt)
-		if dt < visual.life and not View.contains(projectedPosition) then
+		if dt < visual.life and not visualInView(visual, projectedPosition) then
 			-- Leave the baseline timestamp untouched. Re-entry consumes the whole
 			-- interval exactly once; corrections replace that baseline immediately.
 			visual.deferredPrediction = true
@@ -3354,7 +3384,7 @@ local function updatePredicted(visual: Visual, elapsedGlobalDt: number, now: num
 	visual.lastSimulationTime = globalSimulationClock
 	visual.deferredPrediction = false
 	deferredVisuals[visual.id] = nil
-	local inView = View.contains(visual.position)
+	local inView = visualInView(visual, visual.position)
 	if inView then
 		if not visual.inView then
 			reenterView(visual, now)
@@ -3401,6 +3431,7 @@ end
 -- transforms have been spent (or every visual was visited once).
 local function renderStep(globalDt: number)
 	globalSimulationClock += globalDt
+	BeamVisual.StepRetired(globalDt)
 	local now = os.clock()
 	View.refresh()
 	refreshSmoothVisuals(now)
@@ -3456,6 +3487,7 @@ local function renderStep(globalDt: number)
 	if visualTombstones >= 256 and visualTombstones * 4 >= #visualOrder then
 		compactVisualOrder()
 	end
+	BeamVisual.FlushGroups()
 end
 
 function ProjectileClient.EnableClientRendering()
@@ -3506,7 +3538,6 @@ end
 
 return ProjectileClient
 
--- =============================================================================
 -- END FILE: src/shared/ProjectileClient/init.luau
 -- =============================================================================
 
@@ -3530,6 +3561,7 @@ export type Rig = {
 	model: Instance,
 	root: BasePart,
 	poolKey: string?,
+	beam: any?, -- bounded cylindrical path geometry (BeamVisual)
 }
 
 -- One rendered projectile. Physics fields mirror the server projectile and
@@ -3583,7 +3615,6 @@ export type Visual = {
 -- ModuleScripts must return exactly one non-nil value.
 return {}
 
--- =============================================================================
 -- END FILE: src/shared/ProjectileClient/Types.luau
 -- =============================================================================
 
@@ -3737,7 +3768,6 @@ end
 
 return Prediction
 
--- =============================================================================
 -- END FILE: src/shared/ProjectileClient/Prediction.luau
 -- =============================================================================
 
@@ -3783,18 +3813,22 @@ end
 
 -- Whether `position` is on screen (with margin). Everything counts as
 -- visible while no camera snapshot is available.
-function View.contains(position: Vector3): boolean
+function View.contains(position: Vector3, radius: number?): boolean
 	if not valid then
 		return true
 	end
 	local offset = position - viewPosition
 	local depth = offset:Dot(viewLook)
+	if radius and radius > 0 then
+		return depth + radius > 0
+			and math.abs(offset:Dot(viewRight)) <= depth * limitX + radius * math.sqrt(1 + limitX * limitX)
+			and math.abs(offset:Dot(viewUp)) <= depth * limitY + radius * math.sqrt(1 + limitY * limitY)
+	end
 	return depth > 0 and math.abs(offset:Dot(viewRight)) <= depth * limitX and math.abs(offset:Dot(viewUp)) <= depth * limitY
 end
 
 return View
 
--- =============================================================================
 -- END FILE: src/shared/ProjectileClient/View.luau
 -- =============================================================================
 
@@ -3844,7 +3878,6 @@ end
 
 return DebugRays
 
--- =============================================================================
 -- END FILE: src/shared/ProjectileClient/DebugRays.luau
 -- =============================================================================
 
@@ -3937,7 +3970,6 @@ end
 
 return Impact
 
--- =============================================================================
 -- END FILE: src/shared/ProjectileClient/Impact.luau
 -- =============================================================================
 
@@ -3956,6 +3988,7 @@ local Protocol = require(script.Parent.Parent:WaitForChild("ProjectileProtocol")
 local SafeMath = require(script.Parent.Parent:WaitForChild("SafeMath"))
 
 local Types = require(script.Parent.Types)
+local BeamVisual = require(script.Parent.BeamVisual)
 
 type Visual = Types.Visual
 type Rig = Types.Rig
@@ -4167,6 +4200,7 @@ local function makeCosmetic(part: BasePart)
 end
 
 function VisualModel.Build(data: Protocol.SpawnPayload): (Instance, Rig?)
+	if data.Beam then return BeamVisual.Build(data) end
 	local spec = data.Visual
 	local authored = data.Model
 	local styled = if spec and spec.Style and not authored then styledModel(spec) else nil
@@ -4267,6 +4301,8 @@ end
 function VisualModel.Place(visual: Visual, position: Vector3, velocity: Vector3)
 	visual.transformFrom = nil
 	visual.transformTo = nil
+	BeamVisual.Update(visual, position, velocity)
+	if visual.rig and visual.rig.beam and visual.rig.beam.group then return end
 
 	local pose = poseFrom(position, velocity)
 	local rig = visual.rig
@@ -4430,6 +4466,7 @@ end
 -- Hides a finished visual, then destroys it (or returns a built-in one to the
 -- pool) after max(destroyDelay, FadeOut's effect grace period).
 function VisualModel.Retire(visual: Visual, destroyDelay: number)
+	if BeamVisual.Retire(visual, destroyDelay) then return end
 	local rig = visual.rig
 	local delay = destroyDelay
 	if rig and rig.poolKey then
@@ -4476,6 +4513,9 @@ end
 -- loop advances it by writing Motor6D.Transform; no Tween objects are created.
 function VisualModel.SetTarget(visual: Visual, position: Vector3, velocity: Vector3, duration: number)
 	local rig = visual.rig
+	-- Cylinders use their own traveled path, never a pose tween that rotates
+	-- an entire tail across a corner. Homing still adopts every server pose.
+	if rig and rig.beam then VisualModel.Place(visual, position, velocity); return end
 	if not rig or not (duration > 0) then
 		VisualModel.Place(visual, position, velocity)
 		return
@@ -4508,7 +4548,6 @@ end
 
 return VisualModel
 
--- =============================================================================
 -- END FILE: src/shared/ProjectileClient/VisualModel.luau
 -- =============================================================================
 
@@ -4553,6 +4592,587 @@ end)
 
 return ProjectileQuota
 
--- =============================================================================
 -- END FILE: src/server/ProjectileQuota.luau
 -- =============================================================================
+
+-- =============================================================================
+-- BEGIN FILE: src/shared/ProjectileClient/BeamGeometry.luau
+-- =============================================================================
+--!strict
+-- Pure geometry union for a sustained channel. Overlapping collinear packet
+-- tails become one cylinder, not stacked bars/glow. Distinct paths stay
+-- distinct: never invent a connecting chord through untraveled geometry.
+local Geometry = {}
+
+function Geometry.Merge(paths: { any }, radius: number): ({ any }, { Vector3 })
+	local families: { [string]: any } = {}
+	local order: { any } = {}
+	local tolerance = math.max(radius * .15, .005)
+	local function quant(value: number, scale: number): number return math.floor(value / scale + .5) end
+	for _, points in paths do
+		for index = 1, #points - 1 do
+			local a, b = points[index], points[index + 1]
+			local offset = b - a
+			if offset.Magnitude < 1e-4 then continue end
+			local direction = offset.Unit
+			local abs = Vector3.new(math.abs(direction.X), math.abs(direction.Y), math.abs(direction.Z))
+			local main = if abs.X >= abs.Y and abs.X >= abs.Z then direction.X elseif abs.Y >= abs.Z then direction.Y else direction.Z
+			if main < 0 then direction = -direction end
+			local directionKey = `{quant(direction.X, 1/4096)}:{quant(direction.Y, 1/4096)}:{quant(direction.Z, 1/4096)}`
+			local family = families[directionKey]
+			if not family then
+				family = { direction = direction, cells = {} }
+				families[directionKey] = family
+			end
+			-- Use one representative direction for spatial hashing. Computing a
+			-- perpendicular origin with EACH segment's float-rounded direction
+			-- amplified tiny angle errors at long range and split a straight beam
+			-- back into dozens of bars. Neighbor cells handle grid boundaries.
+			local origin = a - family.direction * a:Dot(family.direction)
+			local x, y, z = quant(origin.X, tolerance), quant(origin.Y, tolerance), quant(origin.Z, tolerance)
+			local function cellKey(dx, dy, dz) return `{x+dx}:{y+dy}:{z+dz}` end
+			local function fits(candidate)
+				for _, point in { a, b } do
+					local delta = point - candidate.origin
+					if (delta - candidate.direction * delta:Dot(candidate.direction)).Magnitude > tolerance then return false end
+				end
+				return true
+			end
+			local bucket
+			local key = cellKey(0,0,0)
+			for _, candidate in family.cells[key] or {} do if fits(candidate) then bucket = candidate; break end end
+			if not bucket then
+				for dx = -1, 1 do
+					for dy = -1, 1 do
+						for dz = -1, 1 do
+							for _, candidate in family.cells[cellKey(dx,dy,dz)] or {} do
+								if fits(candidate) then bucket = candidate; break end
+							end
+							if bucket then break end
+						end
+						if bucket then break end
+					end
+					if bucket then break end
+				end
+			end
+			if not bucket then
+				bucket = { key = directionKey .. ":" .. key .. ":" .. tostring(#order + 1), origin = a, direction = direction, intervals = {} }
+				local cell = family.cells[key]
+				if not cell then cell = {}; family.cells[key] = cell end
+				table.insert(cell, bucket)
+				table.insert(order, bucket)
+			end
+			local from = (a - bucket.origin):Dot(bucket.direction)
+			local to = (b - bucket.origin):Dot(bucket.direction)
+			table.insert(bucket.intervals, { math.min(from, to), math.max(from, to) })
+		end
+	end
+	table.sort(order, function(a, b) return a.key < b.key end)
+	local segments, joints, seenJoints = {}, {}, {}
+	local function add(bucket, from, to)
+		local a = bucket.origin + bucket.direction * from
+		local b = bucket.origin + bucket.direction * to
+		table.insert(segments, { a, b })
+		for _, point in { a, b } do
+			local key = `{quant(point.X,tolerance)}:{quant(point.Y,tolerance)}:{quant(point.Z,tolerance)}`
+			if not seenJoints[key] then seenJoints[key] = true; table.insert(joints, point) end
+		end
+	end
+	for _, bucket in order do
+		table.sort(bucket.intervals, function(a, b) return a[1] < b[1] end)
+		local from, to = bucket.intervals[1][1], bucket.intervals[1][2]
+		for index = 2, #bucket.intervals do
+			local interval = bucket.intervals[index]
+			if interval[1] <= to + tolerance then to = math.max(to, interval[2])
+			else add(bucket, from, to); from, to = interval[1], interval[2] end
+		end
+		add(bucket, from, to)
+	end
+	return segments, joints
+end
+
+return Geometry
+
+-- END FILE: src/shared/ProjectileClient/BeamGeometry.luau
+-- =============================================================================
+
+-- =============================================================================
+-- BEGIN FILE: src/shared/ProjectileClient/BeamVisual.luau
+-- =============================================================================
+--!strict
+-- Finite, traveling cylinders along a bounded path, not an instantaneous ray
+-- from the muzzle to the cursor. Only the existing projectile head drives this
+-- cosmetic tail. Collision/damage/bounce/pierce/homing stay server-owned.
+local ChunkManager = require(script.Parent.Parent.ChunkManager)
+local Types = require(script.Parent.Types)
+local Protocol = require(script.Parent.Parent.ProjectileProtocol)
+local Geometry = require(script.Parent.BeamGeometry)
+local View = require(script.Parent.View)
+local RunService = game:GetService("RunService")
+local Prediction = require(script.Parent.Prediction)
+local Motion = require(script.Parent.Parent.ProjectileMotion)
+
+local BeamVisual = {}
+local MAX_SEGMENTS = 8
+local MAX_RETIRE_UPDATES = 128
+local retired: { any } = {}
+local retireCursor = 1
+local clock = 0
+local ROTATION = CFrame.Angles(0, math.pi / 2, 0) -- cylinder's X axis -> path Z
+local groups: { [number]: any } = {}
+local pending: { [any]: any } = {}
+local applyConnection: RBXScriptConnection? = nil
+
+local function part(parent: Instance, name: string, color: Color3, transparency: number, initialPose: CFrame?): Part
+	local p = Instance.new("Part")
+	p.Name, p.Color, p.Transparency = name, color, transparency
+	p.Shape = Enum.PartType.Cylinder
+	p.Size = Vector3.one * 0.05
+	p.Material = Enum.Material.Neon
+	p.CanCollide, p.CanQuery, p.CanTouch, p.CastShadow = false, false, false, false
+	-- Motor6D.Transform is applied in the engine's simulation phase. New
+	-- cylinders need their correct world pose BEFORE being made visible;
+	-- otherwise their default X-axis orientation flashes for one frame.
+	if initialPose then p.CFrame = initialPose end
+	p.Parent = parent
+	return p
+end
+
+local function motor(driver: BasePart, p: BasePart, initialPose: CFrame?): Motor6D
+	local joint = Instance.new("Motor6D")
+	-- Connecting Part1 immediately applies C0/C1, before Transform's deferred
+	-- engine update. Seed C0 as well as the Part pose to prevent an axis flash.
+	joint.C0 = if initialPose then driver.CFrame:ToObjectSpace(initialPose) else CFrame.identity
+	joint.Part0, joint.Part1, joint.Parent = driver, p, driver
+	return joint
+end
+
+local function shape(group: any, pool: any, index: number, pose: CFrame, size: Vector3, ball: boolean)
+	local pair = pool[index]
+	if not pair then
+		local core = part(group.model, if ball then "BeamJointCore" else "BeamCore", group.core, 1, pose)
+		local glow = part(group.model, if ball then "BeamJointGlow" else "BeamGlow", group.color, 1, pose)
+		if ball then core.Shape = Enum.PartType.Ball; glow.Shape = Enum.PartType.Ball end
+		pair = { core = core, glow = glow, coreMotor = motor(group.driver, core, pose), glowMotor = motor(group.driver, glow, pose) }
+		pool[index] = pair
+	end
+	local transform = group.driver.CFrame:ToObjectSpace(pose)
+	pair.core.Size = if ball then size * .55 else Vector3.new(size.X, size.Y * .55, size.Z * .55)
+	pair.glow.Size = size
+	pair.coreMotor.Transform = pair.coreMotor.C0:Inverse() * transform
+	pair.glowMotor.Transform = pair.glowMotor.C0:Inverse() * transform
+	pair.core.Transparency, pair.glow.Transparency = 0, .5
+end
+
+local function hideAfter(pool: any, used: number)
+	for index = used + 1, #pool do
+		pool[index].core.Transparency, pool[index].glow.Transparency = 1, 1
+	end
+end
+
+-- Apply size and Motor6D pose together before the engine commits transforms.
+-- Reusing a long cylinder at a new angle during Heartbeat otherwise exposes
+-- its new length at the old orientation for a rendered frame.
+function BeamVisual.ApplyGroups()
+	for group, geometry in pending do
+		pending[group] = nil
+		if not group.model.Parent then continue end
+		for index, span in geometry.segments do
+			local a, b = span[1], span[2]
+			local length = (b - a).Magnitude
+			local up = if math.abs((b - a).Y / length) > .99 then Vector3.xAxis else Vector3.yAxis
+			shape(group, group.segments, index, CFrame.lookAt((a + b) * .5, b, up) * ROTATION,
+				Vector3.new(length, group.radius * 2, group.radius * 2), false)
+		end
+		hideAfter(group.segments, #geometry.segments)
+		for index, point in geometry.joints do
+			shape(group, group.joints, index, CFrame.new(point), Vector3.one * group.radius * 2, true)
+		end
+		hideAfter(group.joints, #geometry.joints)
+	end
+end
+
+-- One aggregation per channel per frame, never one visible bar per packet.
+-- Only already-simulated paths enter the union. Offscreen packets retain the
+-- normal prediction timestamp/correction rules and resume through Reset.
+function BeamVisual.FlushGroups()
+	for _, group in groups do
+		local paths = {}
+		for state in group.members do
+			local visual = state.visual
+			local inView = if state.retired then View.contains(state.points[#state.points], state.maxLength)
+				else visual and visual.inView
+			if inView and state.length > 1e-4 then table.insert(paths, state.points) end
+		end
+		if #paths > 0 then
+			local segments, joints = Geometry.Merge(paths, group.radius)
+			pending[group] = { segments = segments, joints = joints }
+		elseif group.visible then
+			-- Do not leave stale cylinders at their exit pose where a camera turn
+			-- could expose them while their authoritative heads are elsewhere.
+			pending[group] = { segments = {}, joints = {} }
+		end
+		group.visible = #paths > 0
+	end
+end
+
+local function releaseState(visual: Types.Visual)
+	local state = (visual.rig :: Types.Rig).beam
+	local group = state.group
+	if group then
+		group.members[state] = nil
+		if next(group.members) == nil then
+			groups[group.id], pending[group] = nil, nil
+			group.model:Destroy()
+		end
+	end
+	visual.model:Destroy()
+end
+
+local function trim(state: any, distance: number)
+	local points = state.points
+	while distance > 0 and #points > 1 do
+		local length = (points[2] - points[1]).Magnitude
+		if distance >= length then
+			table.remove(points, 1)
+			distance -= length
+			state.length -= length
+		else
+			points[1] = points[1]:Lerp(points[2], distance / length)
+			state.length -= distance
+			distance = 0
+		end
+	end
+	state.length = math.max(state.length, 0)
+end
+
+local function append(state: any, position: Vector3)
+	local points = state.points
+	local last = points[#points]
+	local offset = position - last
+	local distance = offset.Magnitude
+	if distance < 1e-4 then return end
+	if #points >= 2 then
+		local previous = last - points[#points - 1]
+		if previous.Magnitude > 1e-4 and previous.Unit:Dot(offset.Unit) > 0.9999 then
+			points[#points] = position
+		else
+			table.insert(points, position)
+		end
+	else
+		table.insert(points, position)
+	end
+	state.length += distance
+	trim(state, math.max(state.length - state.maxLength, 0))
+	-- Drop old detail instead of drawing a shortcut across a bend/wall.
+	while #points > MAX_SEGMENTS + 1 do trim(state, (points[2] - points[1]).Magnitude) end
+end
+
+local function draw(rig: Types.Rig)
+	local state = rig.beam
+	if state.group then return end
+	for index = 1, #state.points - 1 do
+		local a, b = state.points[index], state.points[index + 1]
+		local length = (b - a).Magnitude
+		local up = if length > 1e-4 and math.abs((b - a).Y / length) > .99 then Vector3.xAxis else Vector3.yAxis
+		local pose = if length > 1e-4 then CFrame.lookAt((a + b) * 0.5, b, up) * ROTATION else CFrame.new(a)
+		local segment = state.segments[index]
+		if not segment then
+			local core = part(rig.model, "BeamCore", state.core, 0, pose)
+			local glow = part(rig.model, "BeamGlow", state.color, 0.5, pose)
+			segment = { core = core, glow = glow, coreMotor = motor(rig.driver, core, pose), glowMotor = motor(rig.driver, glow, pose) }
+			state.segments[index] = segment
+		end
+		if length > 1e-4 then
+			local transform = rig.driver.CFrame:ToObjectSpace(pose)
+			segment.core.Size = Vector3.new(length + state.radius * 0.1, state.radius * 1.1, state.radius * 1.1)
+			segment.glow.Size = Vector3.new(length + state.radius * 0.1, state.radius * 2, state.radius * 2)
+			segment.coreMotor.Transform = segment.coreMotor.C0:Inverse() * transform
+			segment.glowMotor.Transform = segment.glowMotor.C0:Inverse() * transform
+			segment.core.Transparency, segment.glow.Transparency = 0, 0.5
+		else
+			segment.core.Transparency, segment.glow.Transparency = 1, 1
+		end
+	end
+	for index = #state.points, #state.segments do
+		state.segments[index].core.Transparency = 1
+		state.segments[index].glow.Transparency = 1
+	end
+end
+
+function BeamVisual.Build(data: Protocol.SpawnPayload): (Instance, Types.Rig)
+	local beam = assert(data.Beam)
+	local spec = data.Visual
+	local color = spec and spec.Color or Color3.fromRGB(255, 96, 28)
+	if beam.ChannelId then
+		local group = groups[beam.ChannelId]
+		if not group then
+			local model = Instance.new("Model")
+			model.Name = "SustainedBeam_" .. beam.ChannelId
+			local driver = part(model, "ProjectileMotorRoot", color, 1)
+			driver.Anchored = true
+			driver.CFrame = CFrame.new(beam.Origin)
+			local root = part(model, "BeamHead", color, 1)
+			group = { id = beam.ChannelId, model = model, driver = driver, root = root,
+				motor = motor(driver, root), color = color, core = spec and spec.Core or Color3.new(1, 1, 1),
+				radius = math.max(beam.Radius, .025), segments = {}, joints = {}, members = {}, visible = false }
+			groups[beam.ChannelId] = group
+			model.Parent = workspace
+			if not applyConnection then applyConnection = RunService.PreSimulation:Connect(BeamVisual.ApplyGroups) end
+		end
+		-- Each logical packet owns only metadata, not cylinders/Motor6Ds. Its
+		-- placeholder can retire without deleting another packet's shared rig.
+		local placeholder = Instance.new("Folder")
+		placeholder.Name = "BeamPacket_" .. data.Id
+		placeholder.Parent = group.model
+		local state = { points = { beam.Origin }, length = 0, maxLength = beam.Length,
+			radius = group.radius, speed = data.Velocity.Magnitude, group = group }
+		group.members[state] = true
+		append(state, data.Position)
+		return placeholder, { model = placeholder, driver = group.driver, root = group.root,
+			motor = group.motor, rootOffset = CFrame.identity, beam = state }
+	end
+	local model = Instance.new("Model")
+	model.Name = "ProjectileBeam"
+	local driver = part(model, "ProjectileMotorRoot", color, 1)
+	driver.Anchored = true
+	driver.CFrame = CFrame.new(data.Position)
+	local root = part(model, "BeamHead", color, 1)
+	model.PrimaryPart = root
+	local rig: Types.Rig = {
+		driver = driver, root = root, motor = motor(driver, root), model = model,
+		rootOffset = CFrame.identity,
+		beam = { points = { beam.Origin }, segments = {}, length = 0,
+			maxLength = beam.Length, radius = math.max(beam.Radius, 0.025),
+			color = color, core = spec and spec.Core or Color3.new(1, 1, 1), speed = data.Velocity.Magnitude },
+	}
+	append(rig.beam, data.Position)
+	draw(rig)
+	model.Parent = workspace
+	return model, rig
+end
+
+function BeamVisual.Attach(visual: Types.Visual)
+	local rig = visual.rig
+	if rig and rig.beam then rig.beam.visual = visual end
+end
+
+function BeamVisual.ShouldPlayImpact(visual: Types.Visual, point: Vector3): boolean
+	local rig = visual.rig
+	local group = rig and rig.beam and rig.beam.group
+	if not group then return true end
+	-- Cosmetic throttle only: every packet still delivers its server damage.
+	local now = os.clock()
+	if group.lastImpact and now - group.lastImpact < .1 and (point - group.impactPoint).Magnitude < 4 then return false end
+	group.lastImpact, group.impactPoint = now, point
+	return true
+end
+
+function BeamVisual.Update(visual: Types.Visual, position: Vector3, velocity: Vector3)
+	local rig = visual.rig
+	if not rig or not rig.beam then return end
+	append(rig.beam, position)
+	rig.beam.speed = velocity.Magnitude
+	draw(rig)
+end
+
+-- Remove predicted overshoot before an authoritative bounce/impact. Retain
+-- the incoming path up to the contact, then let the new heading extend it.
+function BeamVisual.Correct(visual: Types.Visual, contact: Vector3)
+	local rig = visual.rig
+	if not rig or not rig.beam then return end
+	local state, bestIndex, bestDistance = rig.beam, 1, math.huge
+	for index = 1, #state.points - 1 do
+		local a, b = state.points[index], state.points[index + 1]
+		local offset = b - a
+		local t = math.clamp((contact - a):Dot(offset) / math.max(offset:Dot(offset), 1e-8), 0, 1)
+		local distance = (a + offset * t - contact).Magnitude
+		if distance < bestDistance then bestIndex, bestDistance = index, distance end
+	end
+	while #state.points > bestIndex + 1 do table.remove(state.points) end
+	if #state.points > 1 then state.points[#state.points] = contact else table.insert(state.points, contact) end
+	state.length = 0
+	for index = 1, #state.points - 1 do state.length += (state.points[index + 1] - state.points[index]).Magnitude end
+	trim(state, math.max(state.length - state.maxLength, 0))
+end
+
+function BeamVisual.Reset(visual: Types.Visual)
+	local rig = visual.rig
+	if rig and rig.beam then
+		local state = rig.beam
+		if state.group then
+			local delta = (visual.position - state.points[#state.points]).Magnitude
+			if not visual.synced and delta > state.maxLength and Prediction.canDefer(visual) then
+				-- Rebuild only the recent tail after a long offscreen interval.
+				-- The settled velocity/position already include elapsed time; this
+				-- is a cosmetic backwards sample, never a second simulation step.
+				local acceleration = Motion.GetAcceleration(visual.velocity, visual.acceleration, visual.accelerationDirection, visual.gravity)
+				local duration = math.min(state.maxLength / math.max(visual.velocity.Magnitude, 1), 1)
+				state.points, state.length = {}, 0
+				for index = 0, MAX_SEGMENTS do
+					local t = duration * (1 - index / MAX_SEGMENTS)
+					local point = visual.position - visual.velocity * t + acceleration * (.5 * t * t)
+					if index == 0 then table.insert(state.points, point) else append(state, point) end
+				end
+			else
+				append(state, visual.position)
+			end
+			return
+		end
+		rig.beam.points = { visual.position }
+		rig.beam.length = 0
+		draw(rig)
+	end
+end
+
+function BeamVisual.Retire(visual: Types.Visual, delay: number): boolean
+	local rig = visual.rig
+	if not rig or not rig.beam then return false end
+	if rig.beam.retired then return true end
+	rig.beam.retired = true
+	-- Drain already-traveled geometry from the tail. Hiding the whole packet
+	-- on impact would leave a frame-sized hole in a sustained beam.
+	table.insert(retired, { visual = visual, lastClock = clock, started = os.clock(), delay = delay })
+	return true
+end
+
+function BeamVisual.StepRetired(globalDt: number)
+	clock += globalDt
+	local visited = 0
+	local budget = math.min(#retired, MAX_RETIRE_UPDATES)
+	while #retired > 0 and visited < budget do
+		if retireCursor > #retired then retireCursor = 1 end
+		local item = retired[retireCursor]
+		local visual = item.visual
+		local rig = visual.rig :: Types.Rig
+		local state = rig.beam
+		local elapsed = (clock - item.lastClock) * visual.timeScale * ChunkManager.GetTimeScaleAt(visual.position)
+		item.lastClock = clock
+		trim(state, math.max(elapsed, 0) * state.speed)
+		draw(rig)
+		visited += 1
+		if (state.length <= 1e-4 and os.clock() - item.started >= item.delay) or os.clock() - item.started >= 60 then
+			releaseState(visual)
+			table.remove(retired, retireCursor)
+		else
+			retireCursor += 1
+		end
+	end
+end
+
+return BeamVisual
+
+-- END FILE: src/shared/ProjectileClient/BeamVisual.luau
+-- =============================================================================
+
+-- =============================================================================
+-- BEGIN FILE: src/server/BeamProjectileHandler.luau
+-- =============================================================================
+--!strict
+-- Beam-specific launch/channel policy. Physics and damage events still use
+-- Projectile's authoritative swept-radius pipeline; there is no second ray
+-- simulation racing it. One bounded loop owns all channel state.
+local Players = game:GetService("Players")
+local Shared = game:GetService("ReplicatedStorage").Shared
+local Heartbeat = require(Shared.Heartbeat)
+local ChunkManager = require(Shared.ChunkManager)
+local Projectile = require(script.Parent.Projectile)
+
+local Handler = {}
+Handler.Interval = 1 / 30
+local INPUT_TIMEOUT = .75
+local MAX_PACKETS_PER_CHANNEL_FRAME = 2
+local MAX_CHANNELS_PER_PLAYER = 32
+local channels: { any } = {}
+local lastInput: { [Player]: number } = {}
+local nextChannelId = 0
+
+function Handler.Launch(config: any): any
+	local beamConfig = table.clone(config)
+	beamConfig.Beam = config.Beam or {}
+	-- No vessel-imposed range: normal lifetime/real-lifetime safety bounds
+	-- apply, as they do for every other flying projectile.
+	return Projectile.new(beamConfig)
+end
+
+function Handler.IsActive(player: Player): boolean
+	for _, channel in channels do if channel.Player == player then return true end end
+	return false
+end
+
+function Handler.Stop(player: Player)
+	for index = #channels, 1, -1 do
+		if channels[index].Player == player then table.remove(channels, index) end
+	end
+	lastInput[player] = nil
+end
+
+-- KeepAlive cannot begin a cast or modify its duration/stats. Only the
+-- server's validated SpellCast path can call Start.
+function Handler.KeepAlive(player: Player)
+	if lastInput[player] then lastInput[player] = os.clock() end
+end
+
+function Handler.BeginCast(player: Player)
+	lastInput[player] = os.clock()
+end
+
+function Handler.Start(options: any): boolean
+	if not lastInput[options.Player] or os.clock() - lastInput[options.Player] > INPUT_TIMEOUT then return false end
+	local count = 0
+	for _, channel in channels do if channel.Player == options.Player then count += 1 end end
+	if count >= MAX_CHANNELS_PER_PLAYER then return false end
+	local channel = table.clone(options)
+	nextChannelId += 1
+	channel.Id = nextChannelId
+	channel.Remaining = options.Duration
+	channel.NextEmit = options.Delay or 0
+	channel.Started = os.clock()
+	if channel.NextEmit == 0 then
+		local slice = math.min(Handler.Interval, channel.Remaining)
+		channel.Emit(slice / options.Duration, channel.Id)
+		channel.Remaining -= slice
+		channel.NextEmit = Handler.Interval
+	end
+	table.insert(channels, channel)
+	return true
+end
+
+Heartbeat.Connect(function(globalDt: number)
+	local now = os.clock()
+	for index = #channels, 1, -1 do
+		local channel = channels[index]
+		local player, character = channel.Player, channel.Character
+		local humanoid = character:FindFirstChildOfClass("Humanoid")
+		local tool = character:FindFirstChild("SpellAssembler")
+		if channel.Remaining <= 1e-8 or not player.Parent or player.Character ~= character
+			or not humanoid or humanoid.Health <= 0 or not tool or not tool:IsA("Tool")
+			or now - (lastInput[player] or 0) > INPUT_TIMEOUT or now - channel.Started >= 60 then
+			table.remove(channels, index)
+			continue
+		end
+		local caster = channel.Caster
+		if caster and (caster.IsDestroyed or caster.Health <= 0) then
+			table.remove(channels, index)
+			continue
+		end
+		local scale = ChunkManager.GetTimeScaleAt(channel.Origin()) * (caster and caster.TimeScale or 1)
+		if scale <= 0 then continue end
+		channel.NextEmit -= globalDt * scale
+		local emitted = 0
+		while channel.NextEmit <= 0 and channel.Remaining > 1e-8 and emitted < MAX_PACKETS_PER_CHANNEL_FRAME do
+			local slice = math.min(Handler.Interval, channel.Remaining)
+			channel.Emit(slice / channel.Duration, channel.Id)
+			channel.Remaining -= slice
+			channel.NextEmit += Handler.Interval
+			emitted += 1
+		end
+	end
+end, { Name = "BeamProjectileHandler.Channel", Priority = 4 })
+
+Players.PlayerRemoving:Connect(Handler.Stop)
+return Handler
+
+-- END FILE: src/server/BeamProjectileHandler.luau
+-- =============================================================================
+

@@ -355,7 +355,7 @@ local defs: { RuneDef } = {
 	},
 	{
 		Id = "Sustain", Name = "Sustain", Category = "Modifier", Zones = { "Modifier" }, ModifierCost = 0.04,
-		Description = "Beam only: continuously emits for 1–5 seconds, following live aim. Energy is shared across the duration; each segment keeps all flight modifiers and triggers.",
+		Description = "Beam only: hold to channel for up to 1–5 seconds; release to stop. Follows live aim. Energy is shared across the maximum duration; segments keep all flight modifiers and triggers.",
 		Inputs = {}, Outputs = { modOut() }, Params = { LEVEL },
 	},
 
@@ -434,7 +434,7 @@ SpellRunes.ModifierTables = {
 SpellRunes.Vessels = {
 	Orb = { Speed = 85, Radius = 0.7, Lifetime = 4, Scale = 1, Impact = 1.0 },
 	Bullet = { Speed = 300, Radius = 0.15, Lifetime = 2, Scale = 1, Impact = 0.9 },
-	Beam = { Speed = 2000, Lifetime = 90 / 2000, Radius = 0.35, Scale = 1, Impact = 0.8 },
+	Beam = { Speed = 2000, Lifetime = 5, Radius = 0.35, Scale = 1, Impact = 0.8 },
 	-- Radius is the blast radius; MaxCastRange keeps a cast-time blast near you.
 	Explosion = { Radius = 8, Impact = 0.9, MaxCastRange = 80 },
 }

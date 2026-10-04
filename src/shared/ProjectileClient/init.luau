@@ -276,6 +276,7 @@ local function onSpawn(data: Protocol.SpawnPayload)
 		transformElapsed = 0,
 		transformDuration = 0,
 	}
+	BeamVisual.Attach(visual)
 	if data.ActivateParticlesOnCreate then
 		VisualModel.ActivateParticles(model)
 	end
@@ -350,17 +351,27 @@ local function onMove(batch: { Protocol.MovePayload })
 			visual.lastUpdate = now
 			rebaseline(visual, data.Position, data.Velocity)
 			BeamVisual.Correct(visual, data.Point or data.Position)
+			if visual.rig and visual.rig.beam and visual.rig.beam.group then
+				BeamVisual.Update(visual, data.Position, data.Velocity)
+			end
 			if visualInView(visual, data.Position) then
 				VisualModel.SuspendTrails(visual)
 				VisualModel.Place(visual, data.Position, data.Velocity)
 				visual.resumeEffectsOnNextUpdate = now
-				Impact.Play(data.Point or data.Position, data.Normal, "bounce")
+				if BeamVisual.ShouldPlayImpact(visual, data.Point or data.Position) then
+					Impact.Play(data.Point or data.Position, data.Normal, "bounce")
+				end
 			end
 		elseif visual.synced then
 			local duration = math.clamp(now - visual.lastUpdate, 0.03, 0.2)
 			visual.lastUpdate = now
 			visual.position = data.Position
 			visual.velocity = data.Velocity
+			if visual.rig and visual.rig.beam and visual.rig.beam.group then
+				-- Retain authoritative curvature while offscreen; no Instances
+				-- are moved here. Re-entry must not invent a homing shortcut.
+				BeamVisual.Update(visual, data.Position, data.Velocity)
+			end
 			if visual.inView and visualInView(visual, data.Position) then
 				VisualModel.SetTarget(visual, data.Position, data.Velocity, duration)
 			end
@@ -376,7 +387,7 @@ local function onHit(data: Protocol.HitPayload)
 		-- the one moment it would be visible.
 		BeamVisual.Correct(visual, data.Position)
 		VisualModel.Place(visual, data.Position, visual.velocity)
-		if data.Kind then
+		if data.Kind and BeamVisual.ShouldPlayImpact(visual, data.Position) then
 			Impact.Play(data.Position, data.Normal, data.Kind)
 		end
 	end
@@ -403,6 +414,7 @@ end
 -- effects' grace period we suspend emission and prediction/interpolation work.
 local function recoverStalePose(visual: Visual, position: Vector3, now: number)
 	local rig = visual.rig
+	if rig and rig.beam and rig.beam.group then return end -- shared geometry is flushed once per channel
 	-- Native culling uses the Instance's last rendered bounds. If a camera turn
 	-- exposes those stale bounds while the current trajectory is still outside
 	-- view, move them outside too. No scene unparenting/visibility override.
@@ -592,6 +604,7 @@ local function renderStep(globalDt: number)
 	if visualTombstones >= 256 and visualTombstones * 4 >= #visualOrder then
 		compactVisualOrder()
 	end
+	BeamVisual.FlushGroups()
 end
 
 function ProjectileClient.EnableClientRendering()

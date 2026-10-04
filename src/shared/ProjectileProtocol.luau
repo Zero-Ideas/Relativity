@@ -50,7 +50,8 @@ export type SpawnPayload = {
 	Synced: boolean?, -- false
 	TimeScale: number?, -- 1
 	VisualScale: number?, -- 1
-	Beam: { Length: number, Radius: number, Origin: Vector3 }?, -- finite cylinder tail, head uses normal projectile physics
+	Beam: { Length: number, Radius: number, Origin: Vector3, ChannelId: number?, PreviousId: number?,
+		PreviousPosition: Vector3?, PreviousTurns: { Vector3 }?, Turns: { Vector3 }? }?, -- linked stream centerline
 	DestroyDelay: number?, -- 0
 	WaitForParticles: boolean?, -- true
 	WaitForTrails: boolean?, -- true
@@ -63,6 +64,8 @@ export type MovePayload = {
 	Position: Vector3,
 	Velocity: Vector3,
 	Bounced: boolean?,
+	Corrected: boolean?, -- authoritative beam-body contact, not a ricochet flash
+	BeamTurns: { Vector3 }?,
 	Point: Vector3?, -- bounce contact point
 	Normal: Vector3?, -- bounce surface normal
 }
@@ -72,6 +75,7 @@ export type HitPayload = {
 	Position: Vector3,
 	Normal: Vector3,
 	Kind: string?, -- nil: expired without hitting anything
+	BeamTurns: { Vector3 }?,
 }
 
 export type SyncPayload = {

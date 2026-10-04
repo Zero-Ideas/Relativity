@@ -53,6 +53,7 @@ type BounceSnap = {
 	Projectile: State,
 	Point: Vector3,
 	Normal: Vector3,
+	Corrected: boolean?,
 }
 
 local spawnQueue: { State } = {}
@@ -164,7 +165,11 @@ local function spawnPayload(projectile: State): Protocol.SpawnPayload
 	if projectile._lastStreamedTimeScale ~= 1 then payload.TimeScale = projectile._lastStreamedTimeScale end
 	if projectile.VisualScale ~= 1 then payload.VisualScale = projectile.VisualScale end
 	if projectile.Beam then
-		payload.Beam = { Length = projectile.Beam.Length, Radius = projectile.Radius, Origin = projectile._beamOrigin or projectile.Position }
+		local previous = projectile._beamPrevious
+		payload.Beam = { Length = projectile.Beam.Length, Radius = projectile.Radius, Origin = projectile._beamOrigin or projectile.Position,
+			ChannelId = projectile.Beam.ChannelId, PreviousId = projectile.Beam.PreviousId,
+			PreviousPosition = previous and previous.Position, PreviousTurns = previous and previous._beamTurns,
+			Turns = projectile._beamTurns }
 	end
 	if projectile.DestroyDelay ~= 0 then payload.DestroyDelay = projectile.DestroyDelay end
 	if not projectile.WaitForParticles then payload.WaitForParticles = false end
@@ -329,6 +334,11 @@ function Replication.queueBounce(projectile: State, point: Vector3, normal: Vect
 	table.insert(pendingBounces, { Projectile = projectile, Point = point, Normal = normal })
 end
 
+function Replication.queueCorrection(projectile: State, point: Vector3, normal: Vector3)
+	if not projectile.Visualize or not projectile._spawnStreamed then return end
+	table.insert(pendingBounces, { Projectile = projectile, Point = point, Normal = normal, Corrected = true })
+end
+
 -- Marks a homing-synced projectile as due a pose this frame (see isSynced).
 -- Payloads are only built for the round-robin slice actually sent.
 function Replication.queuePose(projectile: State)
@@ -356,7 +366,9 @@ function Replication.flushMoveBatch()
 			Id = projectile.Id,
 			Position = projectile.Position,
 			Velocity = projectile.Velocity,
-			Bounced = true,
+			Bounced = if bounce.Corrected then nil else true,
+			Corrected = bounce.Corrected,
+			BeamTurns = projectile._beamTurns,
 			Point = bounce.Point,
 			Normal = bounce.Normal,
 		}

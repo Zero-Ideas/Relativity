@@ -1,0 +1,7 @@
+{
+  "name": "RelativitySpellCards",
+  "tree": {
+    "$className": "Model",
+    "SpellCardsPlugin": { "$path": "studio/SpellCards.plugin.server.luau" }
+  }
+}

@@ -324,6 +324,7 @@ function VisualModel.Place(visual: Visual, position: Vector3, velocity: Vector3)
 	visual.transformFrom = nil
 	visual.transformTo = nil
 	BeamVisual.Update(visual, position, velocity)
+	if visual.rig and visual.rig.beam and visual.rig.beam.group then return end
 
 	local pose = poseFrom(position, velocity)
 	local rig = visual.rig

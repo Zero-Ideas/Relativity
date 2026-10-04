@@ -128,7 +128,7 @@ export type Config = {
 	Model: Instance?,
 	Visual: VisualSpec?,
 	VisualScale: number?,
-	Beam: { Length: number? }?, -- swept-radius projectile with a cylindrical path tail
+	Beam: { Length: number?, ChannelId: number?, PreviousId: number? }?, -- linked sustained stream
 	DestroyDelay: number?,
 	WaitForParticles: boolean?,
 	WaitForTrails: boolean?,
@@ -179,7 +179,7 @@ export type State = {
 	Model: Instance?,
 	Visual: VisualSpec?,
 	VisualScale: number,
-	Beam: { Length: number }?,
+	Beam: { Length: number, ChannelId: number?, PreviousId: number? }?,
 	DestroyDelay: number,
 	WaitForParticles: boolean,
 	WaitForTrails: boolean,
@@ -203,6 +203,8 @@ export type State = {
 	_streamedSynced: boolean,
 	_lastStreamedTimeScale: number,
 	_beamOrigin: Vector3?,
+	_beamTurns: { Vector3 }?,
+	_beamPrevious: any?,
 }
 
 -- What a hit resolver decided:

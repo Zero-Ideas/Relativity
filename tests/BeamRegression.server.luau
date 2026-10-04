@@ -12,6 +12,7 @@ local Projectile = require(server.Projectile)
 local Config = require(server.Projectile.Config)
 local Quota = require(server.ProjectileQuota)
 local Entity = require(shared.Entity)
+local BeamHandler = require(server.BeamProjectileHandler)
 
 local function plan(modifiers, vessel)
 	local graph = Compiler.CreateDefaultGraph()
@@ -40,24 +41,35 @@ assert(not plan({ "Sustain", "Sustain" }), "duplicate Sustain accepted")
 assert(Runes.TriggerApplies("Beam", "OnTimer") and Runes.TriggerApplies("Beam", "OnProximity"))
 for tier, duration in Runes.ModifierTables.Sustain do assert(duration == tier) end
 
-local player = game.Players:GetPlayers()[1]
-assert(player and player.Character, "a playtest player is required")
-local character = player.Character
-local assembler = player.Backpack:FindFirstChild("SpellAssembler") or character:FindFirstChild("SpellAssembler")
-character.Humanoid:EquipTool(assembler)
-local caster = Entity.Get(character)
-assert(caster, "caster Entity not registered yet")
-local origin = character:GetPivot().Position + Vector3.new(0, 100, 0)
+local viewer = game.Players:GetPlayers()[1]
+assert(viewer and viewer.Character, "a playtest player is required")
+-- Isolate the test from real mouse releases, tool swaps and the player's
+-- existing projectile quota. Nothing modifies their spell cards or caster.
+local character = game.ReplicatedStorage.Dummy:Clone()
+for _, v in character:GetDescendants() do if v:IsA("BaseScript") then v:Destroy() end end
+character.Name = "BeamRegressionCaster"
+character:PivotTo(viewer.Character:GetPivot() * CFrame.new(0, 100, 0))
+character.HumanoidRootPart.Anchored = true
+character.Parent = workspace
+local assembler = Instance.new("Tool")
+assembler.Name = "SpellAssembler"
+assembler.RequiresHandle = false
+assembler.Parent = character
+local player = { UserId = -42424243, Parent = game.Players, Character = character }
+local caster = Entity.new(character, { ScaleHumanoid = true })
+local origin = character:GetPivot().Position + Vector3.new(0, 5, 0)
 local aim = origin + Vector3.new(0, 0, -500)
 local request = { player = player, character = character, caster = caster, origin = origin, cursorPoint = aim,
 	live = function() return origin, aim end }
 local baseline = Quota.Get(player)
 local sustainPlan = assert(plan({ "Sustain" }))
-local seen, energy, count, changed = {}, 0, 0, false
+local seen, spawned, energy, count, changed = {}, {}, 0, 0, false
 local capture = RunService.Heartbeat:Connect(function()
+	BeamHandler.KeepAlive(player)
 	for _, p in Projectile.GetBySource(caster) do
 		if p.Beam and not seen[p.Id] then
 			seen[p.Id] = true
+			table.insert(spawned, p)
 			energy += p.Damage
 			count += 1
 			if p.Velocity.X > 1000 then changed = true end
@@ -76,14 +88,18 @@ assert(count == 30, "expected 30 packets, got " .. count)
 local expected = 30 * (1 - .15 - .04) * .8 * .8
 assert(math.abs(energy - expected) < .001, "sustain multiplied/lost cast energy")
 assert(not Runtime.IsSustaining(player), "sustain did not finish")
+for _, p in spawned do p:Destroy() end
 assert(Quota.Get(player) == baseline, "sustain leaked projectile quota")
 
 Runtime.Cast(sustainPlan, request)
 task.wait(.05)
+BeamHandler.Stop(player)
+assert(not Runtime.IsSustaining(player), "release didn't stop channel")
 character.Humanoid:UnequipTools()
+assembler.Parent = nil
 task.wait(.05)
 assert(not Runtime.IsSustaining(player), "unequip didn't cancel sustain")
-task.wait(.2)
+for _, p in Projectile.GetBySource(caster) do if p.Beam then p:Destroy() end end
 assert(Quota.Get(player) == baseline, "cancel leaked projectile quota")
 
 -- Ordinary cylinder-head sweeps must hit a target away from the center ray.
@@ -99,6 +115,10 @@ p.OnHit:Connect(function(info) hit = info.Part == target end)
 task.wait(.15)
 target:Destroy()
 assert(hit and p.Dead, "beam radius missed off-axis geometry")
+BeamHandler.Stop(player)
+caster:Destroy()
+character:Destroy()
+assembler:Destroy()
 script:SetAttribute("Packets", count)
 script:SetAttribute("DamageEnergy", energy)
 script:SetAttribute("Complete", true)

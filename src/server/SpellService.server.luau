@@ -12,6 +12,8 @@ local SafeMath = require(Shared:WaitForChild("SafeMath"))
 local SpellCompiler = require(Shared:WaitForChild("SpellCompiler"))
 local SpellStore = require(script.Parent:WaitForChild("SpellStore"))
 local SpellRuntime = require(script.Parent:WaitForChild("SpellRuntime"))
+local BeamHandler = require(script.Parent:WaitForChild("BeamProjectileHandler"))
+local RunService = game:GetService("RunService")
 
 local MANA = 10_000_000_000_000
 local CAST_INTERVAL = 0.25
@@ -28,6 +30,14 @@ command.Parent = remoteFolder
 local cast = remoteFolder:FindFirstChild("SpellCast") or Instance.new("RemoteEvent")
 cast.Name = "SpellCast"
 cast.Parent = remoteFolder
+
+local channel = remoteFolder:FindFirstChild("SpellChannel") or Instance.new("RemoteEvent")
+channel.Name = "SpellChannel"
+channel.Parent = remoteFolder
+channel.OnServerEvent:Connect(function(player: Player, action: any)
+	if action == "Stop" then BeamHandler.Stop(player)
+	elseif action == "KeepAlive" then BeamHandler.KeepAlive(player) end
+end)
 
 -- While the tool is held the client streams its cursor here (unreliable,
 -- ~20 Hz) so Stream copies can re-aim mid-cast. Only positions newer than
@@ -91,6 +101,9 @@ local function filterName(player: Player, raw: any): (string?, string?)
 	name = string.gsub(name, "%s+$", "")
 	name = truncateCharacters(name, 24)
 	if name == "" then name = "Untitled Spell" end
+	-- Local Studio test cards never reach production/player-visible storage.
+	-- Authentication failure must not prevent offline editor testing.
+	if RunService:IsStudio() then return name, nil end
 	local ok, filtered = pcall(function()
 		local result = TextService:FilterStringAsync(name, player.UserId)
 		return result:GetNonChatStringForUserAsync(player.UserId)
@@ -101,7 +114,7 @@ local function filterName(player: Player, raw: any): (string?, string?)
 	return truncateCharacters(filtered, 24), nil
 end
 
-command.OnServerInvoke = function(player: Player, action: any, payload: any)
+local function handleCommand(player: Player, action: any, payload: any)
 	if typeof(action) ~= "string" then
 		return response(false, nil, nil, "Invalid spell command.")
 	end
@@ -137,10 +150,24 @@ command.OnServerInvoke = function(player: Player, action: any, payload: any)
 		local ok, err, state = SpellStore.DeleteSlot(player, slot)
 		return response(ok, state or SpellStore.GetState(player), nil, err or "Spell card deleted.")
 	elseif action == "SetActive" then
+		BeamHandler.Stop(player)
 		local ok, err, state = SpellStore.SetActive(player, slot)
 		return response(ok, state or SpellStore.GetState(player), nil, err or "Spell card equipped.")
 	end
 	return response(false, SpellStore.GetState(player), nil, "Unknown spell command.")
+end
+
+local commandBusy: { [Player]: boolean } = {}
+command.OnServerInvoke = function(player: Player, action: any, payload: any)
+	if commandBusy[player] then return response(false, nil, nil, "A spell command is already in progress.") end
+	commandBusy[player] = true
+	local ok, result = pcall(handleCommand, player, action, payload)
+	commandBusy[player] = nil
+	if not ok then
+		warn(`[SpellService] command failed: {tostring(result)}`)
+		return response(false, nil, nil, "The spell command could not be completed.")
+	end
+	return result
 end
 
 local function equippedAssembler(player: Player): Tool?
@@ -225,6 +252,7 @@ cast.OnServerEvent:Connect(function(player: Player, rawTarget: any)
 end)
 
 Players.PlayerRemoving:Connect(function(player)
+	commandBusy[player] = nil
 	liveAim[player] = nil
 	lastCast[player] = nil
 	lastCommand[player] = nil

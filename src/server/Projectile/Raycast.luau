@@ -61,8 +61,8 @@ end
 -- plain table (see Types.Contact) or nil. Distance is how far the ray -- or
 -- the sphere's center -- travelled, which is what the time accounting in
 -- init.luau needs; for a Spherecast, Position is the surface point instead.
-function Raycast.castMovement(projectile: State, origin: Vector3, displacement: Vector3): Types.Contact?
-	local params = projectile._rayParams
+function Raycast.castMovement(projectile: State, origin: Vector3, displacement: Vector3, overrideParams: RaycastParams?): Types.Contact?
+	local params = overrideParams or projectile._rayParams
 	local result
 	if projectile.Radius > 0 then
 		-- Sweeping a sphere along a line is exactly a capsule: a cylindrical
@@ -222,6 +222,7 @@ function Raycast.resolveHit(projectile: State, contact: Types.Contact): (Verdict
 		projectile.Velocity = (velocity - 2 * velocity:Dot(normal) * normal) * projectile.Restitution
 		projectile.Position = contact.Position + normal * (projectile.Radius + BOUNCE_CLEARANCE)
 		if projectile.Beam and not projectile._spawnStreamed then projectile._beamOrigin = projectile.Position end
+		if projectile._beamTurns then table.insert(projectile._beamTurns, contact.Position) end
 		-- The client must SNAP on a bounce instead of tweening a straight line
 		-- from its pre-bounce position, which would visibly cut through the
 		-- surface it bounced off. The snap goes out with this frame's ProjMove

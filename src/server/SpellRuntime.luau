@@ -35,6 +35,7 @@ local SpellRunes = require(Shared:WaitForChild("SpellRunes"))
 local StatusEffectSys = require(Shared:WaitForChild("StatusEffectSys"))
 local Projectile = require(script.Parent:WaitForChild("Projectile"))
 local ProjectileQuota = require(script.Parent:WaitForChild("ProjectileQuota"))
+local BeamHandler = require(script.Parent:WaitForChild("BeamProjectileHandler"))
 
 local SpellRuntime = {}
 
@@ -42,9 +43,7 @@ local CAST_SPAWN_OFFSET = 3 -- studs in front of the caster's head
 local TRIGGER_SPAWN_OFFSET = 0.75 -- studs off the trigger point
 local PROXIMITY_CHECK_INTERVAL = 0.05 -- real seconds between proximity scans
 local VISUAL_RANGE = 800
-local SUSTAIN_INTERVAL = 1 / 30 -- caster-dilated seconds between overlapping packets
-local MAX_SUSTAIN_PACKETS_PER_FRAME = 2 -- carry debt rather than catch-up spikes
-local MAX_SUSTAIN_REAL_LIFETIME = 60
+local SUSTAIN_INTERVAL = BeamHandler.Interval
 local PIERCE_FALLOFF = 0.15
 
 export type Context = {
@@ -266,13 +265,9 @@ type Watch = {
 	nextCheck: number,
 }
 local watches: { Watch } = {}
-local sustains: { any } = {}
 
 function SpellRuntime.IsSustaining(player: Player): boolean
-	for _, sustain in sustains do
-		if sustain.shot.ctx.player == player then return true end
-	end
-	return false
+	return BeamHandler.IsActive(player)
 end
 
 local runFlow: (compiled: any, ctx: Context, fromId: string, port: string, energy: number, element: string?) -> ()
@@ -408,6 +403,7 @@ type Shot = {
 	perCopy: number, -- energy one copy carries (triggers take shares of this)
 	damageEnergy: number, -- the part of it spent on hits
 	impact: number, -- damage per damage-energy (element x vessel)
+	channelId: number?,
 }
 
 -- All flying vessels use the same swept-radius simulation and trigger pipeline.
@@ -426,9 +422,9 @@ local function launch(shot: Shot, direction: Vector3)
 		Retarget = true,
 		ReacquireRate = 0.3,
 		TurnRate = stats.homing.turnRate,
-		Delay = 0.05,
+		Delay = if shot.vessel == "Beam" then 0 else 0.05,
 	}
-	local projectile = Projectile.new({
+	local projectile = (if shot.vessel == "Beam" then BeamHandler.Launch else Projectile.new)({
 		Origin = ctx.origin + direction * ctx.spawnOffset,
 		Direction = direction,
 		Speed = stats.speed,
@@ -449,7 +445,7 @@ local function launch(shot: Shot, direction: Vector3)
 		Visualize = true,
 		VisualRange = VISUAL_RANGE,
 		VisualScale = stats.scale,
-		Beam = if shot.vessel == "Beam" then { Length = if stats.sustain then math.max(24, stats.speed * SUSTAIN_INTERVAL * 1.05) else 24 } else nil,
+		Beam = if shot.vessel == "Beam" then { Length = if stats.sustain then math.max(24, stats.speed * SUSTAIN_INTERVAL * 2) else 24, ChannelId = shot.channelId } else nil,
 		-- Built procedurally on the client -- see VisualModel's styled visuals.
 		Visual = { Style = shot.vessel, Color = elementDef.Color, Core = elementDef.Core },
 	})
@@ -515,15 +511,14 @@ local function liveContext(ctx: Context): Context
 	return fresh
 end
 
-local function emitSustain(sustain: any)
-	local shot = table.clone(sustain.shot)
+local function emitSustain(parent: Shot, index: number, share: number, channelId: number)
+	local shot = table.clone(parent)
+	shot.channelId = channelId
 	shot.ctx = liveContext(shot.ctx)
-	local share = math.min(SUSTAIN_INTERVAL, sustain.remaining) / shot.stats.sustain
 	shot.perCopy *= share
 	shot.damageEnergy *= share
 	local directions = spreadDirections(aimDirection(shot.compiled, shot.ctx, shot.id), shot.stats.quantity)
-	launch(shot, directions[sustain.index])
-	sustain.remaining -= math.min(SUSTAIN_INTERVAL, sustain.remaining)
+	launch(shot, directions[index])
 end
 
 -- Explosion: damages every living entity (never the caster) in the radius,
@@ -584,16 +579,13 @@ local function fireVessel(compiled: any, ctx: Context, id: string, energy: numbe
 	local stream = stats.quantity and stats.quantity.Pattern == "Stream"
 	if vessel == "Beam" and stats.sustain then
 		for index = 1, info.count do
-			local sustain = {
-				shot = shot, index = index, remaining = stats.sustain,
-				nextEmit = if stream then (index - 1) * stats.quantity.Interval else 0,
-				started = os.clock(),
-			}
-			if sustain.nextEmit == 0 then
-				emitSustain(sustain)
-				sustain.nextEmit = SUSTAIN_INTERVAL
-			end
-			table.insert(sustains, sustain)
+			BeamHandler.Start({
+				Player = ctx.player, Character = ctx.character, Caster = ctx.caster,
+				Duration = stats.sustain,
+				Delay = if stream then (index - 1) * stats.quantity.Interval else 0,
+				Origin = function() return liveContext(ctx).origin end,
+				Emit = function(share, channelId) emitSustain(shot, index, share, channelId) end,
+			})
 		end
 		return
 	end
@@ -603,7 +595,7 @@ local function fireVessel(compiled: any, ctx: Context, id: string, energy: numbe
 				-- Re-aim each later copy from where the caster is pointing now.
 				local liveShot = table.clone(shot)
 				liveShot.ctx = liveContext(ctx)
-				if liveShot.ctx.character.Parent and alive(liveShot.ctx.caster) then
+				if liveShot.ctx.character.Parent and (not liveShot.ctx.caster or alive(liveShot.ctx.caster)) then
 					launch(liveShot, aimDirection(compiled, liveShot.ctx, id))
 				end
 			end)
@@ -652,6 +644,7 @@ export type CastRequest = {
 
 -- Runs every Mana Well's flow. Mana is charged by the caller.
 function SpellRuntime.Cast(compiled: any, request: CastRequest)
+	BeamHandler.BeginCast(request.player)
 	local offset = request.cursorPoint - request.origin
 	local ctx: Context = {
 		player = request.player,
@@ -703,32 +696,5 @@ Heartbeat.Connect(function()
 	end
 end, { Name = "SpellRuntime.Triggers", Priority = 6 })
 
--- One bounded centralized emitter loop, not a task/coroutine per packet.
--- Old packets keep their physics; only newly emitted packets use live aim.
-Heartbeat.Connect(function(globalDt: number)
-	local now = os.clock()
-	for index = #sustains, 1, -1 do
-		local sustain = sustains[index]
-		local ctx = sustain.shot.ctx
-		local humanoid = ctx.character:FindFirstChildOfClass("Humanoid")
-		local tool = ctx.character:FindFirstChild("SpellAssembler")
-		if sustain.remaining <= 1e-8 or not ctx.player.Parent or ctx.player.Character ~= ctx.character
-			or not tool or not tool:IsA("Tool") or not humanoid or humanoid.Health <= 0
-			or (ctx.caster and not alive(ctx.caster)) or now - sustain.started >= MAX_SUSTAIN_REAL_LIFETIME then
-			table.remove(sustains, index)
-			continue
-		end
-		local live = liveContext(ctx)
-		local scale = ChunkManager.GetTimeScaleAt(live.origin) * (ctx.caster and ctx.caster.TimeScale or 1)
-		if scale <= 0 then continue end
-		sustain.nextEmit -= globalDt * scale
-		local emitted = 0
-		while sustain.nextEmit <= 0 and sustain.remaining > 1e-8 and emitted < MAX_SUSTAIN_PACKETS_PER_FRAME do
-			emitSustain(sustain)
-			sustain.nextEmit += SUSTAIN_INTERVAL
-			emitted += 1
-		end
-	end
-end, { Name = "SpellRuntime.Sustain", Priority = 4 })
 
 return SpellRuntime

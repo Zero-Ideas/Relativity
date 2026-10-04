@@ -31,6 +31,8 @@ local remotes = ReplicatedStorage:WaitForChild("SpellRemotes")
 local command = remotes:WaitForChild("SpellCommand") :: RemoteFunction
 local castRemote = remotes:WaitForChild("SpellCast") :: RemoteEvent
 local aimRemote = remotes:WaitForChild("SpellAim") :: UnreliableRemoteEvent
+local channelRemote = remotes:WaitForChild("SpellChannel") :: RemoteEvent
+local holdingCast = false
 
 local EditorFolder = script.Parent:WaitForChild("SpellEditor")
 local Theme = require(EditorFolder:WaitForChild("Theme"))
@@ -79,6 +81,8 @@ local problems: any = nil
 local serverState: any = { slots = {}, activeSlot = nil }
 local selectedSlot = 1
 local savedSignature: string? = nil
+local savingCard = false
+local hasLoadedCards = false
 local errors: { any } = {}
 local analysis: any = nil
 local compiledOk = false
@@ -146,9 +150,10 @@ local function updateTopBar()
 		button.TextColor3 = if record then Colors.text else Colors.muted
 	end
 	if saveButton then
-		saveButton.Text = if dirty then `Save to {selectedSlot} •` else `Saved`
-		saveButton.BackgroundColor3 = if compiledOk and dirty then Color3.fromRGB(58, 128, 86) else Colors.panel3
-		saveButton.AutoButtonColor = compiledOk
+		local available = serverState.available == true
+		saveButton.Text = if savingCard then "Saving…" elseif not available then "Save unavailable" elseif dirty then `Save to {selectedSlot} •` else "Saved"
+		saveButton.BackgroundColor3 = if compiledOk and dirty and available and not savingCard then Color3.fromRGB(58, 128, 86) else Colors.panel3
+		saveButton.AutoButtonColor = compiledOk and available and not savingCard
 	end
 	local active = serverState.activeSlot and slotRecord(serverState.activeSlot)
 	if activeLabel then
@@ -213,19 +218,32 @@ end
 -- Saves the circle to the selected slot. The first saved spell is equipped
 -- automatically, so a fresh card is castable right after saving.
 local function saveCard(): boolean
+	if savingCard then return false end
+	if serverState.available ~= true then
+		setStatus(serverState.error or "Spell storage is unavailable.", false, true)
+		return false
+	end
 	if not compiledOk then
 		local first = errors[1]
 		setStatus(if first then `Can't save yet: {first.message}` else "Fix the problems on the board before saving.", false)
 		return false
 	end
 	setStatus("Saving…", nil, true)
+	savingCard = true
+	updateTopBar()
 	local result = invoke("SaveCard", { slot = selectedSlot, name = currentName(), graph = doc.graph })
+	savingCard = false
+	-- Apply the authoritative state BEFORE reading the saved record. Loading
+	-- its normalized graph/name avoids marking an older local copy as Saved.
+	if result.state then serverState = result.state end
 	if result.ok then
 		local record = slotRecord(selectedSlot)
+		if record and record.graph then doc:load(record.graph) end
 		if record and nameBox then nameBox.Text = record.name end
 		savedSignature = signature()
 	end
 	applyServerResult(result)
+	refresh()
 	if result.ok and not serverState.activeSlot then
 		task.wait(COMMAND_GAP)
 		equipSlot(selectedSlot)
@@ -250,6 +268,12 @@ end
 local function loadSlot(slot: number)
 	selectedSlot = slot
 	local record = slotRecord(slot)
+	if record and record.invalid then
+		savedSignature = nil
+		setStatus(record.error or "This older card cannot be compiled; its saved data has been preserved.", false, true)
+		updateTopBar()
+		return
+	end
 	if record and record.graph then
 		doc:load(record.graph)
 		if nameBox then nameBox.Text = record.name end
@@ -260,6 +284,7 @@ local function loadSlot(slot: number)
 		savedSignature = signature()
 		setStatus(`Loaded "{record.name}".`)
 	else
+		savedSignature = nil
 		setStatus(`Slot {slot} is empty: saving will put this circle there.`)
 	end
 	refresh()
@@ -624,7 +649,12 @@ local function buildGui()
 	local edit = Theme.button(compact, "Edit [E]", { Position = UDim2.new(1, -134, 0, 9), Size = UDim2.fromOffset(70, 36) })
 	edit.Activated:Connect(function() SpellAssemblerGui.Open() end)
 	local castButton = Theme.button(compact, "Cast", { Position = UDim2.new(1, -58, 0, 9), Size = UDim2.fromOffset(48, 36), BackgroundColor3 = Color3.fromRGB(128, 58, 44) })
-	castButton.Activated:Connect(function() SpellAssemblerGui.Cast() end)
+	castButton.InputBegan:Connect(function(input)
+		if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then SpellAssemblerGui.Cast() end
+	end)
+	castButton.InputEnded:Connect(function(input)
+		if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then SpellAssemblerGui.StopCast() end
+	end)
 
 	--------------------------------------------------------------------------
 	-- Input routing. Mouse input goes to the board whenever it's over the
@@ -690,6 +720,7 @@ local function buildGui()
 	end)
 
 	UserInputService.InputEnded:Connect(function(input)
+		if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then SpellAssemblerGui.StopCast() end
 		if not visible then return end
 		local release = input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch
 		if resizing and release then
@@ -722,6 +753,7 @@ local function sinkMovement(): Enum.ContextActionResult
 end
 
 function SpellAssemblerGui.Open()
+	SpellAssemblerGui.StopCast()
 	buildGui()
 	visible = true;
 	(gui :: ScreenGui).Enabled = true;
@@ -752,7 +784,7 @@ function SpellAssemblerGui.Toggle()
 end
 
 function SpellAssemblerGui.Cast()
-	if not equippedTool or visible then return end
+	if not equippedTool or visible or holdingCast then return end
 	if not serverState.activeSlot then
 		if activeLabel then
 			activeLabel.Text = "No spell equipped: press E, then Save"
@@ -765,7 +797,14 @@ function SpellAssemblerGui.Cast()
 		return
 	end
 	local mouse = player:GetMouse()
+	holdingCast = true
 	castRemote:FireServer(mouse.Hit.Position)
+end
+
+function SpellAssemblerGui.StopCast()
+	if not holdingCast then return end
+	holdingCast = false
+	channelRemote:FireServer("Stop")
 end
 
 local aimConnection: RBXScriptConnection? = nil
@@ -784,6 +823,7 @@ local function startAimStream()
 			last = position
 			sinceSend = 0
 			aimRemote:FireServer(position)
+			if holdingCast then channelRemote:FireServer("KeepAlive") end
 		end
 	end)
 end
@@ -802,6 +842,14 @@ function SpellAssemblerGui.Equip(tool: Tool)
 	setStatus("Loading spell cards…", nil, true)
 	local result = invoke("GetState")
 	if result.state then serverState = result.state end
+	if result.ok and serverState.available and not hasLoadedCards then
+		hasLoadedCards = true
+		local initialSlot = serverState.activeSlot
+		if not initialSlot then
+			for slot = 1, SLOT_COUNT do if slotRecord(slot) then initialSlot = slot; break end end
+		end
+		if initialSlot then loadSlot(initialSlot) end
+	end
 	if result.state and result.state.error then
 		setStatus(result.state.error, result.state.sessionOnly)
 	else
@@ -813,6 +861,7 @@ end
 
 function SpellAssemblerGui.Unequip(tool: Tool)
 	if equippedTool ~= tool then return end
+	SpellAssemblerGui.StopCast()
 	equippedTool = nil
 	stopAimStream()
 	if visible then SpellAssemblerGui.Close() end

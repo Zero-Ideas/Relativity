@@ -4610,6 +4610,7 @@ local function onSpawn(data: Protocol.SpawnPayload)
 		transformElapsed = 0,
 		transformDuration = 0,
 	}
+	BeamVisual.Attach(visual)
 	if data.ActivateParticlesOnCreate then
 		VisualModel.ActivateParticles(model)
 	end
@@ -4684,17 +4685,27 @@ local function onMove(batch: { Protocol.MovePayload })
 			visual.lastUpdate = now
 			rebaseline(visual, data.Position, data.Velocity)
 			BeamVisual.Correct(visual, data.Point or data.Position)
+			if visual.rig and visual.rig.beam and visual.rig.beam.group then
+				BeamVisual.Update(visual, data.Position, data.Velocity)
+			end
 			if visualInView(visual, data.Position) then
 				VisualModel.SuspendTrails(visual)
 				VisualModel.Place(visual, data.Position, data.Velocity)
 				visual.resumeEffectsOnNextUpdate = now
-				Impact.Play(data.Point or data.Position, data.Normal, "bounce")
+				if BeamVisual.ShouldPlayImpact(visual, data.Point or data.Position) then
+					Impact.Play(data.Point or data.Position, data.Normal, "bounce")
+				end
 			end
 		elseif visual.synced then
 			local duration = math.clamp(now - visual.lastUpdate, 0.03, 0.2)
 			visual.lastUpdate = now
 			visual.position = data.Position
 			visual.velocity = data.Velocity
+			if visual.rig and visual.rig.beam and visual.rig.beam.group then
+				-- Retain authoritative curvature while offscreen; no Instances
+				-- are moved here. Re-entry must not invent a homing shortcut.
+				BeamVisual.Update(visual, data.Position, data.Velocity)
+			end
 			if visual.inView and visualInView(visual, data.Position) then
 				VisualModel.SetTarget(visual, data.Position, data.Velocity, duration)
 			end
@@ -4710,7 +4721,7 @@ local function onHit(data: Protocol.HitPayload)
 		-- the one moment it would be visible.
 		BeamVisual.Correct(visual, data.Position)
 		VisualModel.Place(visual, data.Position, visual.velocity)
-		if data.Kind then
+		if data.Kind and BeamVisual.ShouldPlayImpact(visual, data.Position) then
 			Impact.Play(data.Position, data.Normal, data.Kind)
 		end
 	end
@@ -4737,6 +4748,7 @@ end
 -- effects' grace period we suspend emission and prediction/interpolation work.
 local function recoverStalePose(visual: Visual, position: Vector3, now: number)
 	local rig = visual.rig
+	if rig and rig.beam and rig.beam.group then return end -- shared geometry is flushed once per channel
 	-- Native culling uses the Instance's last rendered bounds. If a camera turn
 	-- exposes those stale bounds while the current trajectory is still outside
 	-- view, move them outside too. No scene unparenting/visibility override.
@@ -4926,6 +4938,7 @@ local function renderStep(globalDt: number)
 	if visualTombstones >= 256 and visualTombstones * 4 >= #visualOrder then
 		compactVisualOrder()
 	end
+	BeamVisual.FlushGroups()
 end
 
 function ProjectileClient.EnableClientRendering()
@@ -4979,6 +4992,106 @@ return ProjectileClient
         </Properties>
         <Item class="ModuleScript" referent="23">
           <Properties>
+            <string name="Name">BeamGeometry</string>
+            <string name="Source"><![CDATA[--!strict
+-- Pure geometry union for a sustained channel. Overlapping collinear packet
+-- tails become one cylinder, not stacked bars/glow. Distinct paths stay
+-- distinct: never invent a connecting chord through untraveled geometry.
+local Geometry = {}
+
+function Geometry.Merge(paths: { any }, radius: number): ({ any }, { Vector3 })
+	local families: { [string]: any } = {}
+	local order: { any } = {}
+	local tolerance = math.max(radius * .15, .005)
+	local function quant(value: number, scale: number): number return math.floor(value / scale + .5) end
+	for _, points in paths do
+		for index = 1, #points - 1 do
+			local a, b = points[index], points[index + 1]
+			local offset = b - a
+			if offset.Magnitude < 1e-4 then continue end
+			local direction = offset.Unit
+			local abs = Vector3.new(math.abs(direction.X), math.abs(direction.Y), math.abs(direction.Z))
+			local main = if abs.X >= abs.Y and abs.X >= abs.Z then direction.X elseif abs.Y >= abs.Z then direction.Y else direction.Z
+			if main < 0 then direction = -direction end
+			local directionKey = `{quant(direction.X, 1/4096)}:{quant(direction.Y, 1/4096)}:{quant(direction.Z, 1/4096)}`
+			local family = families[directionKey]
+			if not family then
+				family = { direction = direction, cells = {} }
+				families[directionKey] = family
+			end
+			-- Use one representative direction for spatial hashing. Computing a
+			-- perpendicular origin with EACH segment's float-rounded direction
+			-- amplified tiny angle errors at long range and split a straight beam
+			-- back into dozens of bars. Neighbor cells handle grid boundaries.
+			local origin = a - family.direction * a:Dot(family.direction)
+			local x, y, z = quant(origin.X, tolerance), quant(origin.Y, tolerance), quant(origin.Z, tolerance)
+			local function cellKey(dx, dy, dz) return `{x+dx}:{y+dy}:{z+dz}` end
+			local function fits(candidate)
+				for _, point in { a, b } do
+					local delta = point - candidate.origin
+					if (delta - candidate.direction * delta:Dot(candidate.direction)).Magnitude > tolerance then return false end
+				end
+				return true
+			end
+			local bucket
+			local key = cellKey(0,0,0)
+			for _, candidate in family.cells[key] or {} do if fits(candidate) then bucket = candidate; break end end
+			if not bucket then
+				for dx = -1, 1 do
+					for dy = -1, 1 do
+						for dz = -1, 1 do
+							for _, candidate in family.cells[cellKey(dx,dy,dz)] or {} do
+								if fits(candidate) then bucket = candidate; break end
+							end
+							if bucket then break end
+						end
+						if bucket then break end
+					end
+					if bucket then break end
+				end
+			end
+			if not bucket then
+				bucket = { key = directionKey .. ":" .. key .. ":" .. tostring(#order + 1), origin = a, direction = direction, intervals = {} }
+				local cell = family.cells[key]
+				if not cell then cell = {}; family.cells[key] = cell end
+				table.insert(cell, bucket)
+				table.insert(order, bucket)
+			end
+			local from = (a - bucket.origin):Dot(bucket.direction)
+			local to = (b - bucket.origin):Dot(bucket.direction)
+			table.insert(bucket.intervals, { math.min(from, to), math.max(from, to) })
+		end
+	end
+	table.sort(order, function(a, b) return a.key < b.key end)
+	local segments, joints, seenJoints = {}, {}, {}
+	local function add(bucket, from, to)
+		local a = bucket.origin + bucket.direction * from
+		local b = bucket.origin + bucket.direction * to
+		table.insert(segments, { a, b })
+		for _, point in { a, b } do
+			local key = `{quant(point.X,tolerance)}:{quant(point.Y,tolerance)}:{quant(point.Z,tolerance)}`
+			if not seenJoints[key] then seenJoints[key] = true; table.insert(joints, point) end
+		end
+	end
+	for _, bucket in order do
+		table.sort(bucket.intervals, function(a, b) return a[1] < b[1] end)
+		local from, to = bucket.intervals[1][1], bucket.intervals[1][2]
+		for index = 2, #bucket.intervals do
+			local interval = bucket.intervals[index]
+			if interval[1] <= to + tolerance then to = math.max(to, interval[2])
+			else add(bucket, from, to); from, to = interval[1], interval[2] end
+		end
+		add(bucket, from, to)
+	end
+	return segments, joints
+end
+
+return Geometry
+]]></string>
+          </Properties>
+        </Item>
+        <Item class="ModuleScript" referent="24">
+          <Properties>
             <string name="Name">BeamVisual</string>
             <string name="Source"><![CDATA[--!strict
 -- Finite, traveling cylinders along a bounded path, not an instantaneous ray
@@ -4987,6 +5100,11 @@ return ProjectileClient
 local ChunkManager = require(script.Parent.Parent.ChunkManager)
 local Types = require(script.Parent.Types)
 local Protocol = require(script.Parent.Parent.ProjectileProtocol)
+local Geometry = require(script.Parent.BeamGeometry)
+local View = require(script.Parent.View)
+local RunService = game:GetService("RunService")
+local Prediction = require(script.Parent.Prediction)
+local Motion = require(script.Parent.Parent.ProjectileMotion)
 
 local BeamVisual = {}
 local MAX_SEGMENTS = 8
@@ -4995,22 +5113,114 @@ local retired: { any } = {}
 local retireCursor = 1
 local clock = 0
 local ROTATION = CFrame.Angles(0, math.pi / 2, 0) -- cylinder's X axis -> path Z
+local groups: { [number]: any } = {}
+local pending: { [any]: any } = {}
+local applyConnection: RBXScriptConnection? = nil
 
-local function part(parent: Instance, name: string, color: Color3, transparency: number): Part
+local function part(parent: Instance, name: string, color: Color3, transparency: number, initialPose: CFrame?): Part
 	local p = Instance.new("Part")
 	p.Name, p.Color, p.Transparency = name, color, transparency
 	p.Shape = Enum.PartType.Cylinder
 	p.Size = Vector3.one * 0.05
 	p.Material = Enum.Material.Neon
 	p.CanCollide, p.CanQuery, p.CanTouch, p.CastShadow = false, false, false, false
+	-- Motor6D.Transform is applied in the engine's simulation phase. New
+	-- cylinders need their correct world pose BEFORE being made visible;
+	-- otherwise their default X-axis orientation flashes for one frame.
+	if initialPose then p.CFrame = initialPose end
 	p.Parent = parent
 	return p
 end
 
-local function motor(driver: BasePart, p: BasePart): Motor6D
+local function motor(driver: BasePart, p: BasePart, initialPose: CFrame?): Motor6D
 	local joint = Instance.new("Motor6D")
+	-- Connecting Part1 immediately applies C0/C1, before Transform's deferred
+	-- engine update. Seed C0 as well as the Part pose to prevent an axis flash.
+	joint.C0 = if initialPose then driver.CFrame:ToObjectSpace(initialPose) else CFrame.identity
 	joint.Part0, joint.Part1, joint.Parent = driver, p, driver
 	return joint
+end
+
+local function shape(group: any, pool: any, index: number, pose: CFrame, size: Vector3, ball: boolean)
+	local pair = pool[index]
+	if not pair then
+		local core = part(group.model, if ball then "BeamJointCore" else "BeamCore", group.core, 1, pose)
+		local glow = part(group.model, if ball then "BeamJointGlow" else "BeamGlow", group.color, 1, pose)
+		if ball then core.Shape = Enum.PartType.Ball; glow.Shape = Enum.PartType.Ball end
+		pair = { core = core, glow = glow, coreMotor = motor(group.driver, core, pose), glowMotor = motor(group.driver, glow, pose) }
+		pool[index] = pair
+	end
+	local transform = group.driver.CFrame:ToObjectSpace(pose)
+	pair.core.Size = if ball then size * .55 else Vector3.new(size.X, size.Y * .55, size.Z * .55)
+	pair.glow.Size = size
+	pair.coreMotor.Transform = pair.coreMotor.C0:Inverse() * transform
+	pair.glowMotor.Transform = pair.glowMotor.C0:Inverse() * transform
+	pair.core.Transparency, pair.glow.Transparency = 0, .5
+end
+
+local function hideAfter(pool: any, used: number)
+	for index = used + 1, #pool do
+		pool[index].core.Transparency, pool[index].glow.Transparency = 1, 1
+	end
+end
+
+-- Apply size and Motor6D pose together before the engine commits transforms.
+-- Reusing a long cylinder at a new angle during Heartbeat otherwise exposes
+-- its new length at the old orientation for a rendered frame.
+function BeamVisual.ApplyGroups()
+	for group, geometry in pending do
+		pending[group] = nil
+		if not group.model.Parent then continue end
+		for index, span in geometry.segments do
+			local a, b = span[1], span[2]
+			local length = (b - a).Magnitude
+			local up = if math.abs((b - a).Y / length) > .99 then Vector3.xAxis else Vector3.yAxis
+			shape(group, group.segments, index, CFrame.lookAt((a + b) * .5, b, up) * ROTATION,
+				Vector3.new(length, group.radius * 2, group.radius * 2), false)
+		end
+		hideAfter(group.segments, #geometry.segments)
+		for index, point in geometry.joints do
+			shape(group, group.joints, index, CFrame.new(point), Vector3.one * group.radius * 2, true)
+		end
+		hideAfter(group.joints, #geometry.joints)
+	end
+end
+
+-- One aggregation per channel per frame, never one visible bar per packet.
+-- Only already-simulated paths enter the union. Offscreen packets retain the
+-- normal prediction timestamp/correction rules and resume through Reset.
+function BeamVisual.FlushGroups()
+	for _, group in groups do
+		local paths = {}
+		for state in group.members do
+			local visual = state.visual
+			local inView = if state.retired then View.contains(state.points[#state.points], state.maxLength)
+				else visual and visual.inView
+			if inView and state.length > 1e-4 then table.insert(paths, state.points) end
+		end
+		if #paths > 0 then
+			local segments, joints = Geometry.Merge(paths, group.radius)
+			pending[group] = { segments = segments, joints = joints }
+		elseif group.visible then
+			-- Do not leave stale cylinders at their exit pose where a camera turn
+			-- could expose them while their authoritative heads are elsewhere.
+			pending[group] = { segments = {}, joints = {} }
+		end
+		group.visible = #paths > 0
+	end
+end
+
+local function releaseState(visual: Types.Visual)
+	local state = (visual.rig :: Types.Rig).beam
+	local group = state.group
+	if group then
+		group.members[state] = nil
+		if next(group.members) == nil then
+			groups[group.id], pending[group] = nil, nil
+			group.model:Destroy()
+		end
+	end
+	visual.model:Destroy()
 end
 
 local function trim(state: any, distance: number)
@@ -5054,23 +5264,28 @@ end
 
 local function draw(rig: Types.Rig)
 	local state = rig.beam
+	if state.group then return end
 	for index = 1, #state.points - 1 do
-		local segment = state.segments[index]
-		if not segment then
-			local core = part(rig.model, "BeamCore", state.core, 0)
-			local glow = part(rig.model, "BeamGlow", state.color, 0.5)
-			segment = { core = core, glow = glow, coreMotor = motor(rig.driver, core), glowMotor = motor(rig.driver, glow) }
-			state.segments[index] = segment
-		end
 		local a, b = state.points[index], state.points[index + 1]
 		local length = (b - a).Magnitude
+		local up = if length > 1e-4 and math.abs((b - a).Y / length) > .99 then Vector3.xAxis else Vector3.yAxis
+		local pose = if length > 1e-4 then CFrame.lookAt((a + b) * 0.5, b, up) * ROTATION else CFrame.new(a)
+		local segment = state.segments[index]
+		if not segment then
+			local core = part(rig.model, "BeamCore", state.core, 0, pose)
+			local glow = part(rig.model, "BeamGlow", state.color, 0.5, pose)
+			segment = { core = core, glow = glow, coreMotor = motor(rig.driver, core, pose), glowMotor = motor(rig.driver, glow, pose) }
+			state.segments[index] = segment
+		end
 		if length > 1e-4 then
-			local pose = CFrame.lookAt((a + b) * 0.5, b) * ROTATION
 			local transform = rig.driver.CFrame:ToObjectSpace(pose)
 			segment.core.Size = Vector3.new(length + state.radius * 0.1, state.radius * 1.1, state.radius * 1.1)
 			segment.glow.Size = Vector3.new(length + state.radius * 0.1, state.radius * 2, state.radius * 2)
-			segment.coreMotor.Transform, segment.glowMotor.Transform = transform, transform
+			segment.coreMotor.Transform = segment.coreMotor.C0:Inverse() * transform
+			segment.glowMotor.Transform = segment.glowMotor.C0:Inverse() * transform
 			segment.core.Transparency, segment.glow.Transparency = 0, 0.5
+		else
+			segment.core.Transparency, segment.glow.Transparency = 1, 1
 		end
 	end
 	for index = #state.points, #state.segments do
@@ -5081,10 +5296,38 @@ end
 
 function BeamVisual.Build(data: Protocol.SpawnPayload): (Instance, Types.Rig)
 	local beam = assert(data.Beam)
-	local model = Instance.new("Model")
-	model.Name = "ProjectileBeam"
 	local spec = data.Visual
 	local color = spec and spec.Color or Color3.fromRGB(255, 96, 28)
+	if beam.ChannelId then
+		local group = groups[beam.ChannelId]
+		if not group then
+			local model = Instance.new("Model")
+			model.Name = "SustainedBeam_" .. beam.ChannelId
+			local driver = part(model, "ProjectileMotorRoot", color, 1)
+			driver.Anchored = true
+			driver.CFrame = CFrame.new(beam.Origin)
+			local root = part(model, "BeamHead", color, 1)
+			group = { id = beam.ChannelId, model = model, driver = driver, root = root,
+				motor = motor(driver, root), color = color, core = spec and spec.Core or Color3.new(1, 1, 1),
+				radius = math.max(beam.Radius, .025), segments = {}, joints = {}, members = {}, visible = false }
+			groups[beam.ChannelId] = group
+			model.Parent = workspace
+			if not applyConnection then applyConnection = RunService.PreSimulation:Connect(BeamVisual.ApplyGroups) end
+		end
+		-- Each logical packet owns only metadata, not cylinders/Motor6Ds. Its
+		-- placeholder can retire without deleting another packet's shared rig.
+		local placeholder = Instance.new("Folder")
+		placeholder.Name = "BeamPacket_" .. data.Id
+		placeholder.Parent = group.model
+		local state = { points = { beam.Origin }, length = 0, maxLength = beam.Length,
+			radius = group.radius, speed = data.Velocity.Magnitude, group = group }
+		group.members[state] = true
+		append(state, data.Position)
+		return placeholder, { model = placeholder, driver = group.driver, root = group.root,
+			motor = group.motor, rootOffset = CFrame.identity, beam = state }
+	end
+	local model = Instance.new("Model")
+	model.Name = "ProjectileBeam"
 	local driver = part(model, "ProjectileMotorRoot", color, 1)
 	driver.Anchored = true
 	driver.CFrame = CFrame.new(data.Position)
@@ -5101,6 +5344,22 @@ function BeamVisual.Build(data: Protocol.SpawnPayload): (Instance, Types.Rig)
 	draw(rig)
 	model.Parent = workspace
 	return model, rig
+end
+
+function BeamVisual.Attach(visual: Types.Visual)
+	local rig = visual.rig
+	if rig and rig.beam then rig.beam.visual = visual end
+end
+
+function BeamVisual.ShouldPlayImpact(visual: Types.Visual, point: Vector3): boolean
+	local rig = visual.rig
+	local group = rig and rig.beam and rig.beam.group
+	if not group then return true end
+	-- Cosmetic throttle only: every packet still delivers its server damage.
+	local now = os.clock()
+	if group.lastImpact and now - group.lastImpact < .1 and (point - group.impactPoint).Magnitude < 4 then return false end
+	group.lastImpact, group.impactPoint = now, point
+	return true
 end
 
 function BeamVisual.Update(visual: Types.Visual, position: Vector3, velocity: Vector3)
@@ -5134,6 +5393,26 @@ end
 function BeamVisual.Reset(visual: Types.Visual)
 	local rig = visual.rig
 	if rig and rig.beam then
+		local state = rig.beam
+		if state.group then
+			local delta = (visual.position - state.points[#state.points]).Magnitude
+			if not visual.synced and delta > state.maxLength and Prediction.canDefer(visual) then
+				-- Rebuild only the recent tail after a long offscreen interval.
+				-- The settled velocity/position already include elapsed time; this
+				-- is a cosmetic backwards sample, never a second simulation step.
+				local acceleration = Motion.GetAcceleration(visual.velocity, visual.acceleration, visual.accelerationDirection, visual.gravity)
+				local duration = math.min(state.maxLength / math.max(visual.velocity.Magnitude, 1), 1)
+				state.points, state.length = {}, 0
+				for index = 0, MAX_SEGMENTS do
+					local t = duration * (1 - index / MAX_SEGMENTS)
+					local point = visual.position - visual.velocity * t + acceleration * (.5 * t * t)
+					if index == 0 then table.insert(state.points, point) else append(state, point) end
+				end
+			else
+				append(state, visual.position)
+			end
+			return
+		end
 		rig.beam.points = { visual.position }
 		rig.beam.length = 0
 		draw(rig)
@@ -5143,6 +5422,8 @@ end
 function BeamVisual.Retire(visual: Types.Visual, delay: number): boolean
 	local rig = visual.rig
 	if not rig or not rig.beam then return false end
+	if rig.beam.retired then return true end
+	rig.beam.retired = true
 	-- Drain already-traveled geometry from the tail. Hiding the whole packet
 	-- on impact would leave a frame-sized hole in a sustained beam.
 	table.insert(retired, { visual = visual, lastClock = clock, started = os.clock(), delay = delay })
@@ -5152,7 +5433,8 @@ end
 function BeamVisual.StepRetired(globalDt: number)
 	clock += globalDt
 	local visited = 0
-	while #retired > 0 and visited < math.min(#retired, MAX_RETIRE_UPDATES) do
+	local budget = math.min(#retired, MAX_RETIRE_UPDATES)
+	while #retired > 0 and visited < budget do
 		if retireCursor > #retired then retireCursor = 1 end
 		local item = retired[retireCursor]
 		local visual = item.visual
@@ -5164,7 +5446,7 @@ function BeamVisual.StepRetired(globalDt: number)
 		draw(rig)
 		visited += 1
 		if (state.length <= 1e-4 and os.clock() - item.started >= item.delay) or os.clock() - item.started >= 60 then
-			visual.model:Destroy()
+			releaseState(visual)
 			table.remove(retired, retireCursor)
 		else
 			retireCursor += 1
@@ -5176,7 +5458,7 @@ return BeamVisual
 ]]></string>
           </Properties>
         </Item>
-        <Item class="ModuleScript" referent="24">
+        <Item class="ModuleScript" referent="25">
           <Properties>
             <string name="Name">DebugRays</string>
             <string name="Source"><![CDATA[--!strict
@@ -5224,7 +5506,7 @@ return DebugRays
 ]]></string>
           </Properties>
         </Item>
-        <Item class="ModuleScript" referent="25">
+        <Item class="ModuleScript" referent="26">
           <Properties>
             <string name="Name">Impact</string>
             <string name="Source"><![CDATA[--!strict
@@ -5315,7 +5597,7 @@ return Impact
 ]]></string>
           </Properties>
         </Item>
-        <Item class="ModuleScript" referent="26">
+        <Item class="ModuleScript" referent="27">
           <Properties>
             <string name="Name">Prediction</string>
             <string name="Source"><![CDATA[--!strict
@@ -5467,7 +5749,7 @@ return Prediction
 ]]></string>
           </Properties>
         </Item>
-        <Item class="ModuleScript" referent="27">
+        <Item class="ModuleScript" referent="28">
           <Properties>
             <string name="Name">Types</string>
             <string name="Source"><![CDATA[--!strict
@@ -5543,7 +5825,7 @@ return {}
 ]]></string>
           </Properties>
         </Item>
-        <Item class="ModuleScript" referent="28">
+        <Item class="ModuleScript" referent="29">
           <Properties>
             <string name="Name">View</string>
             <string name="Source"><![CDATA[--!strict
@@ -5603,7 +5885,7 @@ return View
 ]]></string>
           </Properties>
         </Item>
-        <Item class="ModuleScript" referent="29">
+        <Item class="ModuleScript" referent="30">
           <Properties>
             <string name="Name">VisualModel</string>
             <string name="Source"><![CDATA[--!strict
@@ -5932,6 +6214,7 @@ function VisualModel.Place(visual: Visual, position: Vector3, velocity: Vector3)
 	visual.transformFrom = nil
 	visual.transformTo = nil
 	BeamVisual.Update(visual, position, velocity)
+	if visual.rig and visual.rig.beam and visual.rig.beam.group then return end
 
 	local pose = poseFrom(position, velocity)
 	local rig = visual.rig
@@ -6180,7 +6463,7 @@ return VisualModel
           </Properties>
         </Item>
       </Item>
-      <Item class="ModuleScript" referent="30">
+      <Item class="ModuleScript" referent="31">
         <Properties>
           <string name="Name">ProjectileMotion</string>
           <string name="Source"><![CDATA[--!strict
@@ -6412,7 +6695,7 @@ return ProjectileMotion
 ]]></string>
         </Properties>
       </Item>
-      <Item class="ModuleScript" referent="31">
+      <Item class="ModuleScript" referent="32">
         <Properties>
           <string name="Name">ProjectileProtocol</string>
           <string name="Source"><![CDATA[--!strict
@@ -6467,7 +6750,7 @@ export type SpawnPayload = {
 	Synced: boolean?, -- false
 	TimeScale: number?, -- 1
 	VisualScale: number?, -- 1
-	Beam: { Length: number, Radius: number, Origin: Vector3 }?, -- finite cylinder tail, head uses normal projectile physics
+	Beam: { Length: number, Radius: number, Origin: Vector3, ChannelId: number? }?, -- ChannelId merges sustained packets into one tube
 	DestroyDelay: number?, -- 0
 	WaitForParticles: boolean?, -- true
 	WaitForTrails: boolean?, -- true
@@ -6513,7 +6796,7 @@ return Protocol
 ]]></string>
         </Properties>
       </Item>
-      <Item class="ModuleScript" referent="32">
+      <Item class="ModuleScript" referent="33">
         <Properties>
           <string name="Name">ProjectileStepPlanner</string>
           <string name="Source"><![CDATA[--!strict
@@ -6619,7 +6902,7 @@ return Planner
 ]]></string>
         </Properties>
       </Item>
-      <Item class="ModuleScript" referent="33">
+      <Item class="ModuleScript" referent="34">
         <Properties>
           <string name="Name">SafeMath</string>
           <string name="Source"><![CDATA[--!strict
@@ -6734,7 +7017,7 @@ return SafeMath
 ]]></string>
         </Properties>
       </Item>
-      <Item class="ModuleScript" referent="34">
+      <Item class="ModuleScript" referent="35">
         <Properties>
           <string name="Name">Signal</string>
           <string name="Source"><![CDATA[--!optimize 2
@@ -6840,7 +7123,7 @@ return Signal
 ]]></string>
         </Properties>
       </Item>
-      <Item class="ModuleScript" referent="35">
+      <Item class="ModuleScript" referent="36">
         <Properties>
           <string name="Name">SpellCompiler</string>
           <string name="Source"><![CDATA[--!strict
@@ -7321,7 +7604,7 @@ return SpellCompiler
 ]]></string>
         </Properties>
       </Item>
-      <Item class="ModuleScript" referent="36">
+      <Item class="ModuleScript" referent="37">
         <Properties>
           <string name="Name">SpellRunes</string>
           <string name="Source"><![CDATA[--!strict
@@ -7681,7 +7964,7 @@ local defs: { RuneDef } = {
 	},
 	{
 		Id = "Sustain", Name = "Sustain", Category = "Modifier", Zones = { "Modifier" }, ModifierCost = 0.04,
-		Description = "Beam only: continuously emits for 1–5 seconds, following live aim. Energy is shared across the duration; each segment keeps all flight modifiers and triggers.",
+		Description = "Beam only: hold to channel for up to 1–5 seconds; release to stop. Follows live aim. Energy is shared across the maximum duration; segments keep all flight modifiers and triggers.",
 		Inputs = {}, Outputs = { modOut() }, Params = { LEVEL },
 	},
 
@@ -7760,7 +8043,7 @@ SpellRunes.ModifierTables = {
 SpellRunes.Vessels = {
 	Orb = { Speed = 85, Radius = 0.7, Lifetime = 4, Scale = 1, Impact = 1.0 },
 	Bullet = { Speed = 300, Radius = 0.15, Lifetime = 2, Scale = 1, Impact = 0.9 },
-	Beam = { Speed = 2000, Lifetime = 90 / 2000, Radius = 0.35, Scale = 1, Impact = 0.8 },
+	Beam = { Speed = 2000, Lifetime = 5, Radius = 0.35, Scale = 1, Impact = 0.8 },
 	-- Radius is the blast radius; MaxCastRange keeps a cast-time blast near you.
 	Explosion = { Radius = 8, Impact = 0.9, MaxCastRange = 80 },
 }
@@ -7819,7 +8102,7 @@ return SpellRunes
 ]]></string>
         </Properties>
       </Item>
-      <Item class="ModuleScript" referent="37">
+      <Item class="ModuleScript" referent="38">
         <Properties>
           <string name="Name">StatusEffectSys</string>
           <string name="Source"><![CDATA[--!optimize 2
@@ -8062,7 +8345,7 @@ return StatusEffectSys
 ]]></string>
         </Properties>
       </Item>
-      <Item class="ModuleScript" referent="38">
+      <Item class="ModuleScript" referent="39">
         <Properties>
           <string name="Name">VisualOffload</string>
           <string name="Source"><![CDATA[--!optimize 2
@@ -8187,15 +8470,125 @@ return VisualOffload
       </Item>
     </Item>
   </Item>
-  <Item class="ServerScriptService" referent="39">
+  <Item class="ServerScriptService" referent="40">
     <Properties>
       <string name="Name">ServerScriptService</string>
     </Properties>
-    <Item class="Folder" referent="40">
+    <Item class="Folder" referent="41">
       <Properties>
         <string name="Name">Server</string>
       </Properties>
-      <Item class="Script" referent="41">
+      <Item class="ModuleScript" referent="42">
+        <Properties>
+          <string name="Name">BeamProjectileHandler</string>
+          <string name="Source"><![CDATA[--!strict
+-- Beam-specific launch/channel policy. Physics and damage events still use
+-- Projectile's authoritative swept-radius pipeline; there is no second ray
+-- simulation racing it. One bounded loop owns all channel state.
+local Players = game:GetService("Players")
+local Shared = game:GetService("ReplicatedStorage").Shared
+local Heartbeat = require(Shared.Heartbeat)
+local ChunkManager = require(Shared.ChunkManager)
+local Projectile = require(script.Parent.Projectile)
+
+local Handler = {}
+Handler.Interval = 1 / 30
+local INPUT_TIMEOUT = .75
+local MAX_PACKETS_PER_CHANNEL_FRAME = 2
+local MAX_CHANNELS_PER_PLAYER = 32
+local channels: { any } = {}
+local lastInput: { [Player]: number } = {}
+local nextChannelId = 0
+
+function Handler.Launch(config: any): any
+	local beamConfig = table.clone(config)
+	beamConfig.Beam = config.Beam or {}
+	-- No vessel-imposed range: normal lifetime/real-lifetime safety bounds
+	-- apply, as they do for every other flying projectile.
+	return Projectile.new(beamConfig)
+end
+
+function Handler.IsActive(player: Player): boolean
+	for _, channel in channels do if channel.Player == player then return true end end
+	return false
+end
+
+function Handler.Stop(player: Player)
+	for index = #channels, 1, -1 do
+		if channels[index].Player == player then table.remove(channels, index) end
+	end
+	lastInput[player] = nil
+end
+
+-- KeepAlive cannot begin a cast or modify its duration/stats. Only the
+-- server's validated SpellCast path can call Start.
+function Handler.KeepAlive(player: Player)
+	if lastInput[player] then lastInput[player] = os.clock() end
+end
+
+function Handler.BeginCast(player: Player)
+	lastInput[player] = os.clock()
+end
+
+function Handler.Start(options: any): boolean
+	if not lastInput[options.Player] or os.clock() - lastInput[options.Player] > INPUT_TIMEOUT then return false end
+	local count = 0
+	for _, channel in channels do if channel.Player == options.Player then count += 1 end end
+	if count >= MAX_CHANNELS_PER_PLAYER then return false end
+	local channel = table.clone(options)
+	nextChannelId += 1
+	channel.Id = nextChannelId
+	channel.Remaining = options.Duration
+	channel.NextEmit = options.Delay or 0
+	channel.Started = os.clock()
+	if channel.NextEmit == 0 then
+		local slice = math.min(Handler.Interval, channel.Remaining)
+		channel.Emit(slice / options.Duration, channel.Id)
+		channel.Remaining -= slice
+		channel.NextEmit = Handler.Interval
+	end
+	table.insert(channels, channel)
+	return true
+end
+
+Heartbeat.Connect(function(globalDt: number)
+	local now = os.clock()
+	for index = #channels, 1, -1 do
+		local channel = channels[index]
+		local player, character = channel.Player, channel.Character
+		local humanoid = character:FindFirstChildOfClass("Humanoid")
+		local tool = character:FindFirstChild("SpellAssembler")
+		if channel.Remaining <= 1e-8 or not player.Parent or player.Character ~= character
+			or not humanoid or humanoid.Health <= 0 or not tool or not tool:IsA("Tool")
+			or now - (lastInput[player] or 0) > INPUT_TIMEOUT or now - channel.Started >= 60 then
+			table.remove(channels, index)
+			continue
+		end
+		local caster = channel.Caster
+		if caster and (caster.IsDestroyed or caster.Health <= 0) then
+			table.remove(channels, index)
+			continue
+		end
+		local scale = ChunkManager.GetTimeScaleAt(channel.Origin()) * (caster and caster.TimeScale or 1)
+		if scale <= 0 then continue end
+		channel.NextEmit -= globalDt * scale
+		local emitted = 0
+		while channel.NextEmit <= 0 and channel.Remaining > 1e-8 and emitted < MAX_PACKETS_PER_CHANNEL_FRAME do
+			local slice = math.min(Handler.Interval, channel.Remaining)
+			channel.Emit(slice / channel.Duration, channel.Id)
+			channel.Remaining -= slice
+			channel.NextEmit += Handler.Interval
+			emitted += 1
+		end
+	end
+end, { Name = "BeamProjectileHandler.Channel", Priority = 4 })
+
+Players.PlayerRemoving:Connect(Handler.Stop)
+return Handler
+]]></string>
+        </Properties>
+      </Item>
+      <Item class="Script" referent="43">
         <Properties>
           <string name="Name">DilationBubbleTest</string>
           <token name="RunContext">0</token>
@@ -8424,7 +8817,7 @@ end)
 ]]></string>
         </Properties>
       </Item>
-      <Item class="Script" referent="42">
+      <Item class="Script" referent="44">
         <Properties>
           <string name="Name">DummyManager</string>
           <token name="RunContext">0</token>
@@ -8508,7 +8901,7 @@ print("[Relativity] dummy manager online")
 ]]></string>
         </Properties>
       </Item>
-      <Item class="Script" referent="43">
+      <Item class="Script" referent="45">
         <Properties>
           <string name="Name">DummySpawner</string>
           <token name="RunContext">0</token>
@@ -8774,7 +9167,7 @@ end)
 ]]></string>
         </Properties>
       </Item>
-      <Item class="Script" referent="44">
+      <Item class="Script" referent="46">
         <Properties>
           <string name="Name">MapGenDemo</string>
           <token name="RunContext">0</token>
@@ -8907,7 +9300,7 @@ end)
 ]]></string>
         </Properties>
       </Item>
-      <Item class="Script" referent="45">
+      <Item class="Script" referent="47">
         <Properties>
           <string name="Name">PlayerManager</string>
           <token name="RunContext">0</token>
@@ -9009,7 +9402,7 @@ print("[Relativity] player manager online")
 ]]></string>
         </Properties>
       </Item>
-      <Item class="ModuleScript" referent="46">
+      <Item class="ModuleScript" referent="48">
         <Properties>
           <string name="Name">Projectile</string>
           <string name="Source"><![CDATA[--!strict
@@ -9221,6 +9614,12 @@ print("[Relativity] player manager online")
 	   Model = Instance?        (cloned client-side) or Visual = {Shape,Size,Color}
 	   VisualScale = 1          (0.05..20; applied once when the client clones
 	                            the visual, with no per-frame scaling cost)
+	   Beam = { Length = 24 }   (optional traveling cylinder path tail; defaults
+	                            Speed to 2000 and Radius to 0.35 when omitted.
+	                            Length clamps to 0.05..512 studs; swept-radius
+	                            head collision is unchanged. The visual tail
+	                            follows the already-swept path, including bends,
+	                            and drains after impact instead of vanishing.)
 	   DestroyDelay = 0         (client keeps the visual this long after impact)
 	   WaitForParticles = true (client-side; while true, a ParticleEmitter
 	              under the visual is only disabled on destroy -- already-
@@ -9853,7 +10252,7 @@ end, { Name = "ProjectileSystem.Step", Priority = 5 })
 return Projectile
 ]]></string>
         </Properties>
-        <Item class="ModuleScript" referent="47">
+        <Item class="ModuleScript" referent="49">
           <Properties>
             <string name="Name">Config</string>
             <string name="Source"><![CDATA[--!strict
@@ -9912,7 +10311,7 @@ export type Settings = {
 	Model: Instance?,
 	Visual: Types.VisualSpec?,
 	VisualScale: number,
-	Beam: { Length: number }?,
+	Beam: { Length: number, ChannelId: number? }?,
 	DestroyDelay: number,
 	WaitForParticles: boolean,
 	WaitForTrails: boolean,
@@ -10028,7 +10427,10 @@ function Config.normalize(raw: Types.Config, defaultMaxRealLifetime: number): Se
 		Model = if typeof(model) == "Instance" then model else nil,
 		Visual = if typeof(visual) == "table" then visual else nil,
 		VisualScale = SafeMath.number(raw.VisualScale, 1, 0.05, 20),
-		Beam = if typeof(raw.Beam) == "table" then { Length = SafeMath.number(raw.Beam.Length, 24, 0.05, 512) } else nil,
+		Beam = if typeof(raw.Beam) == "table" then {
+			Length = SafeMath.number(raw.Beam.Length, 24, 0.05, 512),
+			ChannelId = if typeof(raw.Beam.ChannelId) == "number" then math.floor(SafeMath.number(raw.Beam.ChannelId, 1, 1)) else nil,
+		} else nil,
 		DestroyDelay = SafeMath.number(raw.DestroyDelay, 0, 0),
 		WaitForParticles = raw.WaitForParticles ~= false,
 		WaitForTrails = raw.WaitForTrails ~= false,
@@ -10047,7 +10449,7 @@ return Config
 ]]></string>
           </Properties>
         </Item>
-        <Item class="ModuleScript" referent="48">
+        <Item class="ModuleScript" referent="50">
           <Properties>
             <string name="Name">Homing</string>
             <string name="Source"><![CDATA[--!strict
@@ -10202,7 +10604,7 @@ return Homing
 ]]></string>
           </Properties>
         </Item>
-        <Item class="ModuleScript" referent="49">
+        <Item class="ModuleScript" referent="51">
           <Properties>
             <string name="Name">Math</string>
             <string name="Source"><![CDATA[--!strict
@@ -10278,7 +10680,7 @@ return Math
 ]]></string>
           </Properties>
         </Item>
-        <Item class="ModuleScript" referent="50">
+        <Item class="ModuleScript" referent="52">
           <Properties>
             <string name="Name">Raycast</string>
             <string name="Source"><![CDATA[--!strict
@@ -10529,7 +10931,7 @@ return Raycast
 ]]></string>
           </Properties>
         </Item>
-        <Item class="ModuleScript" referent="51">
+        <Item class="ModuleScript" referent="53">
           <Properties>
             <string name="Name">Replication</string>
             <string name="Source"><![CDATA[--!strict
@@ -10698,7 +11100,7 @@ local function spawnPayload(projectile: State): Protocol.SpawnPayload
 	if projectile._lastStreamedTimeScale ~= 1 then payload.TimeScale = projectile._lastStreamedTimeScale end
 	if projectile.VisualScale ~= 1 then payload.VisualScale = projectile.VisualScale end
 	if projectile.Beam then
-		payload.Beam = { Length = projectile.Beam.Length, Radius = projectile.Radius, Origin = projectile._beamOrigin or projectile.Position }
+		payload.Beam = { Length = projectile.Beam.Length, Radius = projectile.Radius, Origin = projectile._beamOrigin or projectile.Position, ChannelId = projectile.Beam.ChannelId }
 	end
 	if projectile.DestroyDelay ~= 0 then payload.DestroyDelay = projectile.DestroyDelay end
 	if not projectile.WaitForParticles then payload.WaitForParticles = false end
@@ -10937,7 +11339,7 @@ return Replication
 ]]></string>
           </Properties>
         </Item>
-        <Item class="ModuleScript" referent="52">
+        <Item class="ModuleScript" referent="54">
           <Properties>
             <string name="Name">RewindHit</string>
             <string name="Source"><![CDATA[--!strict
@@ -11086,7 +11488,7 @@ return RewindHit
 ]]></string>
           </Properties>
         </Item>
-        <Item class="ModuleScript" referent="53">
+        <Item class="ModuleScript" referent="55">
           <Properties>
             <string name="Name">Types</string>
             <string name="Source"><![CDATA[--!strict
@@ -11219,7 +11621,7 @@ export type Config = {
 	Model: Instance?,
 	Visual: VisualSpec?,
 	VisualScale: number?,
-	Beam: { Length: number? }?, -- swept-radius projectile with a cylindrical path tail
+	Beam: { Length: number?, ChannelId: number? }?, -- optional shared sustained-beam visual
 	DestroyDelay: number?,
 	WaitForParticles: boolean?,
 	WaitForTrails: boolean?,
@@ -11270,7 +11672,7 @@ export type State = {
 	Model: Instance?,
 	Visual: VisualSpec?,
 	VisualScale: number,
-	Beam: { Length: number }?,
+	Beam: { Length: number, ChannelId: number? }?,
 	DestroyDelay: number,
 	WaitForParticles: boolean,
 	WaitForTrails: boolean,
@@ -11310,7 +11712,7 @@ return {}
           </Properties>
         </Item>
       </Item>
-      <Item class="ModuleScript" referent="54">
+      <Item class="ModuleScript" referent="56">
         <Properties>
           <string name="Name">ProjectileParallel</string>
           <string name="Source"><![CDATA[--!strict
@@ -11600,7 +12002,7 @@ return ProjectileParallel
 ]]></string>
         </Properties>
       </Item>
-      <Item class="ModuleScript" referent="55">
+      <Item class="ModuleScript" referent="57">
         <Properties>
           <string name="Name">ProjectileQuota</string>
           <string name="Source"><![CDATA[--!strict
@@ -11643,7 +12045,7 @@ return ProjectileQuota
 ]]></string>
         </Properties>
       </Item>
-      <Item class="Script" referent="56">
+      <Item class="Script" referent="58">
         <Properties>
           <string name="Name">ProjectileWorkerBootstrap</string>
           <token name="RunContext">0</token>
@@ -11745,7 +12147,7 @@ end)
 ]]></string>
         </Properties>
       </Item>
-      <Item class="ModuleScript" referent="57">
+      <Item class="ModuleScript" referent="59">
         <Properties>
           <string name="Name">Ragdoll</string>
           <string name="Source"><![CDATA[---@module Easy Ragdoll by theonlyflare
@@ -12161,7 +12563,7 @@ return RagdollModule
 ]]></string>
         </Properties>
       </Item>
-      <Item class="Script" referent="58">
+      <Item class="Script" referent="60">
         <Properties>
           <string name="Name">Shooter</string>
           <token name="RunContext">0</token>
@@ -12705,7 +13107,7 @@ print("[Relativity] shooter online")
 ]]></string>
         </Properties>
       </Item>
-      <Item class="ModuleScript" referent="59">
+      <Item class="ModuleScript" referent="61">
         <Properties>
           <string name="Name">SpellRuntime</string>
           <string name="Source"><![CDATA[--!strict
@@ -12745,6 +13147,7 @@ local SpellRunes = require(Shared:WaitForChild("SpellRunes"))
 local StatusEffectSys = require(Shared:WaitForChild("StatusEffectSys"))
 local Projectile = require(script.Parent:WaitForChild("Projectile"))
 local ProjectileQuota = require(script.Parent:WaitForChild("ProjectileQuota"))
+local BeamHandler = require(script.Parent:WaitForChild("BeamProjectileHandler"))
 
 local SpellRuntime = {}
 
@@ -12752,9 +13155,7 @@ local CAST_SPAWN_OFFSET = 3 -- studs in front of the caster's head
 local TRIGGER_SPAWN_OFFSET = 0.75 -- studs off the trigger point
 local PROXIMITY_CHECK_INTERVAL = 0.05 -- real seconds between proximity scans
 local VISUAL_RANGE = 800
-local SUSTAIN_INTERVAL = 1 / 30 -- caster-dilated seconds between overlapping packets
-local MAX_SUSTAIN_PACKETS_PER_FRAME = 2 -- carry debt rather than catch-up spikes
-local MAX_SUSTAIN_REAL_LIFETIME = 60
+local SUSTAIN_INTERVAL = BeamHandler.Interval
 local PIERCE_FALLOFF = 0.15
 
 export type Context = {
@@ -12976,13 +13377,9 @@ type Watch = {
 	nextCheck: number,
 }
 local watches: { Watch } = {}
-local sustains: { any } = {}
 
 function SpellRuntime.IsSustaining(player: Player): boolean
-	for _, sustain in sustains do
-		if sustain.shot.ctx.player == player then return true end
-	end
-	return false
+	return BeamHandler.IsActive(player)
 end
 
 local runFlow: (compiled: any, ctx: Context, fromId: string, port: string, energy: number, element: string?) -> ()
@@ -13118,6 +13515,7 @@ type Shot = {
 	perCopy: number, -- energy one copy carries (triggers take shares of this)
 	damageEnergy: number, -- the part of it spent on hits
 	impact: number, -- damage per damage-energy (element x vessel)
+	channelId: number?,
 }
 
 -- All flying vessels use the same swept-radius simulation and trigger pipeline.
@@ -13136,9 +13534,9 @@ local function launch(shot: Shot, direction: Vector3)
 		Retarget = true,
 		ReacquireRate = 0.3,
 		TurnRate = stats.homing.turnRate,
-		Delay = 0.05,
+		Delay = if shot.vessel == "Beam" then 0 else 0.05,
 	}
-	local projectile = Projectile.new({
+	local projectile = (if shot.vessel == "Beam" then BeamHandler.Launch else Projectile.new)({
 		Origin = ctx.origin + direction * ctx.spawnOffset,
 		Direction = direction,
 		Speed = stats.speed,
@@ -13159,7 +13557,7 @@ local function launch(shot: Shot, direction: Vector3)
 		Visualize = true,
 		VisualRange = VISUAL_RANGE,
 		VisualScale = stats.scale,
-		Beam = if shot.vessel == "Beam" then { Length = if stats.sustain then math.max(24, stats.speed * SUSTAIN_INTERVAL * 1.05) else 24 } else nil,
+		Beam = if shot.vessel == "Beam" then { Length = if stats.sustain then math.max(24, stats.speed * SUSTAIN_INTERVAL * 2) else 24, ChannelId = shot.channelId } else nil,
 		-- Built procedurally on the client -- see VisualModel's styled visuals.
 		Visual = { Style = shot.vessel, Color = elementDef.Color, Core = elementDef.Core },
 	})
@@ -13225,15 +13623,14 @@ local function liveContext(ctx: Context): Context
 	return fresh
 end
 
-local function emitSustain(sustain: any)
-	local shot = table.clone(sustain.shot)
+local function emitSustain(parent: Shot, index: number, share: number, channelId: number)
+	local shot = table.clone(parent)
+	shot.channelId = channelId
 	shot.ctx = liveContext(shot.ctx)
-	local share = math.min(SUSTAIN_INTERVAL, sustain.remaining) / shot.stats.sustain
 	shot.perCopy *= share
 	shot.damageEnergy *= share
 	local directions = spreadDirections(aimDirection(shot.compiled, shot.ctx, shot.id), shot.stats.quantity)
-	launch(shot, directions[sustain.index])
-	sustain.remaining -= math.min(SUSTAIN_INTERVAL, sustain.remaining)
+	launch(shot, directions[index])
 end
 
 -- Explosion: damages every living entity (never the caster) in the radius,
@@ -13294,16 +13691,13 @@ local function fireVessel(compiled: any, ctx: Context, id: string, energy: numbe
 	local stream = stats.quantity and stats.quantity.Pattern == "Stream"
 	if vessel == "Beam" and stats.sustain then
 		for index = 1, info.count do
-			local sustain = {
-				shot = shot, index = index, remaining = stats.sustain,
-				nextEmit = if stream then (index - 1) * stats.quantity.Interval else 0,
-				started = os.clock(),
-			}
-			if sustain.nextEmit == 0 then
-				emitSustain(sustain)
-				sustain.nextEmit = SUSTAIN_INTERVAL
-			end
-			table.insert(sustains, sustain)
+			BeamHandler.Start({
+				Player = ctx.player, Character = ctx.character, Caster = ctx.caster,
+				Duration = stats.sustain,
+				Delay = if stream then (index - 1) * stats.quantity.Interval else 0,
+				Origin = function() return liveContext(ctx).origin end,
+				Emit = function(share, channelId) emitSustain(shot, index, share, channelId) end,
+			})
 		end
 		return
 	end
@@ -13313,7 +13707,7 @@ local function fireVessel(compiled: any, ctx: Context, id: string, energy: numbe
 				-- Re-aim each later copy from where the caster is pointing now.
 				local liveShot = table.clone(shot)
 				liveShot.ctx = liveContext(ctx)
-				if liveShot.ctx.character.Parent and alive(liveShot.ctx.caster) then
+				if liveShot.ctx.character.Parent and (not liveShot.ctx.caster or alive(liveShot.ctx.caster)) then
 					launch(liveShot, aimDirection(compiled, liveShot.ctx, id))
 				end
 			end)
@@ -13362,6 +13756,7 @@ export type CastRequest = {
 
 -- Runs every Mana Well's flow. Mana is charged by the caller.
 function SpellRuntime.Cast(compiled: any, request: CastRequest)
+	BeamHandler.BeginCast(request.player)
 	local offset = request.cursorPoint - request.origin
 	local ctx: Context = {
 		player = request.player,
@@ -13413,39 +13808,12 @@ Heartbeat.Connect(function()
 	end
 end, { Name = "SpellRuntime.Triggers", Priority = 6 })
 
--- One bounded centralized emitter loop, not a task/coroutine per packet.
--- Old packets keep their physics; only newly emitted packets use live aim.
-Heartbeat.Connect(function(globalDt: number)
-	local now = os.clock()
-	for index = #sustains, 1, -1 do
-		local sustain = sustains[index]
-		local ctx = sustain.shot.ctx
-		local humanoid = ctx.character:FindFirstChildOfClass("Humanoid")
-		local tool = ctx.character:FindFirstChild("SpellAssembler")
-		if sustain.remaining <= 1e-8 or not ctx.player.Parent or ctx.player.Character ~= ctx.character
-			or not tool or not tool:IsA("Tool") or not humanoid or humanoid.Health <= 0
-			or (ctx.caster and not alive(ctx.caster)) or now - sustain.started >= MAX_SUSTAIN_REAL_LIFETIME then
-			table.remove(sustains, index)
-			continue
-		end
-		local live = liveContext(ctx)
-		local scale = ChunkManager.GetTimeScaleAt(live.origin) * (ctx.caster and ctx.caster.TimeScale or 1)
-		if scale <= 0 then continue end
-		sustain.nextEmit -= globalDt * scale
-		local emitted = 0
-		while sustain.nextEmit <= 0 and sustain.remaining > 1e-8 and emitted < MAX_SUSTAIN_PACKETS_PER_FRAME do
-			emitSustain(sustain)
-			sustain.nextEmit += SUSTAIN_INTERVAL
-			emitted += 1
-		end
-	end
-end, { Name = "SpellRuntime.Sustain", Priority = 4 })
 
 return SpellRuntime
 ]]></string>
         </Properties>
       </Item>
-      <Item class="Script" referent="60">
+      <Item class="Script" referent="62">
         <Properties>
           <string name="Name">SpellService</string>
           <token name="RunContext">0</token>
@@ -13463,6 +13831,8 @@ local SafeMath = require(Shared:WaitForChild("SafeMath"))
 local SpellCompiler = require(Shared:WaitForChild("SpellCompiler"))
 local SpellStore = require(script.Parent:WaitForChild("SpellStore"))
 local SpellRuntime = require(script.Parent:WaitForChild("SpellRuntime"))
+local BeamHandler = require(script.Parent:WaitForChild("BeamProjectileHandler"))
+local RunService = game:GetService("RunService")
 
 local MANA = 10_000_000_000_000
 local CAST_INTERVAL = 0.25
@@ -13479,6 +13849,14 @@ command.Parent = remoteFolder
 local cast = remoteFolder:FindFirstChild("SpellCast") or Instance.new("RemoteEvent")
 cast.Name = "SpellCast"
 cast.Parent = remoteFolder
+
+local channel = remoteFolder:FindFirstChild("SpellChannel") or Instance.new("RemoteEvent")
+channel.Name = "SpellChannel"
+channel.Parent = remoteFolder
+channel.OnServerEvent:Connect(function(player: Player, action: any)
+	if action == "Stop" then BeamHandler.Stop(player)
+	elseif action == "KeepAlive" then BeamHandler.KeepAlive(player) end
+end)
 
 -- While the tool is held the client streams its cursor here (unreliable,
 -- ~20 Hz) so Stream copies can re-aim mid-cast. Only positions newer than
@@ -13542,6 +13920,9 @@ local function filterName(player: Player, raw: any): (string?, string?)
 	name = string.gsub(name, "%s+$", "")
 	name = truncateCharacters(name, 24)
 	if name == "" then name = "Untitled Spell" end
+	-- Local Studio test cards never reach production/player-visible storage.
+	-- Authentication failure must not prevent offline editor testing.
+	if RunService:IsStudio() then return name, nil end
 	local ok, filtered = pcall(function()
 		local result = TextService:FilterStringAsync(name, player.UserId)
 		return result:GetNonChatStringForUserAsync(player.UserId)
@@ -13552,7 +13933,7 @@ local function filterName(player: Player, raw: any): (string?, string?)
 	return truncateCharacters(filtered, 24), nil
 end
 
-command.OnServerInvoke = function(player: Player, action: any, payload: any)
+local function handleCommand(player: Player, action: any, payload: any)
 	if typeof(action) ~= "string" then
 		return response(false, nil, nil, "Invalid spell command.")
 	end
@@ -13588,10 +13969,24 @@ command.OnServerInvoke = function(player: Player, action: any, payload: any)
 		local ok, err, state = SpellStore.DeleteSlot(player, slot)
 		return response(ok, state or SpellStore.GetState(player), nil, err or "Spell card deleted.")
 	elseif action == "SetActive" then
+		BeamHandler.Stop(player)
 		local ok, err, state = SpellStore.SetActive(player, slot)
 		return response(ok, state or SpellStore.GetState(player), nil, err or "Spell card equipped.")
 	end
 	return response(false, SpellStore.GetState(player), nil, "Unknown spell command.")
+end
+
+local commandBusy: { [Player]: boolean } = {}
+command.OnServerInvoke = function(player: Player, action: any, payload: any)
+	if commandBusy[player] then return response(false, nil, nil, "A spell command is already in progress.") end
+	commandBusy[player] = true
+	local ok, result = pcall(handleCommand, player, action, payload)
+	commandBusy[player] = nil
+	if not ok then
+		warn(`[SpellService] command failed: {tostring(result)}`)
+		return response(false, nil, nil, "The spell command could not be completed.")
+	end
+	return result
 end
 
 local function equippedAssembler(player: Player): Tool?
@@ -13676,6 +14071,7 @@ cast.OnServerEvent:Connect(function(player: Player, rawTarget: any)
 end)
 
 Players.PlayerRemoving:Connect(function(player)
+	commandBusy[player] = nil
 	liveAim[player] = nil
 	lastCast[player] = nil
 	lastCommand[player] = nil
@@ -13685,7 +14081,7 @@ print("[Relativity] spell service online")
 ]]></string>
         </Properties>
       </Item>
-      <Item class="ModuleScript" referent="61">
+      <Item class="ModuleScript" referent="63">
         <Properties>
           <string name="Name">SpellStore</string>
           <string name="Source"><![CDATA[--!strict
@@ -13699,11 +14095,13 @@ local DataStoreService = game:GetService("DataStoreService")
 local Players = game:GetService("Players")
 local RunService = game:GetService("RunService")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local ServerStorage = game:GetService("ServerStorage")
+local HttpService = game:GetService("HttpService")
 
 local SpellCompiler = require(ReplicatedStorage:WaitForChild("Shared"):WaitForChild("SpellCompiler"))
 
 local STORE_NAME = "RelativitySpellCards_v1"
-local SCHEMA_VERSION = 3 -- v3 = whiteboard graphs; older cards fail to compile and are dropped
+local SCHEMA_VERSION = 3 -- never silently discard cards that no longer compile
 local SAVE_INTERVAL = 60
 local RETRY_DELAYS = { 1, 2, 4 }
 
@@ -13718,6 +14116,8 @@ type Entry = {
 	saving: boolean,
 	error: string?,
 	data: any,
+	localRevision: number,
+	persistedRevision: number,
 }
 
 local entries: { [Player]: Entry } = {}
@@ -13728,6 +14128,7 @@ local function blankData()
 		activeSlot = nil,
 		slots = {},
 		updatedAt = os.time(),
+		revision = 0,
 	}
 end
 
@@ -13755,13 +14156,19 @@ local function sanitizeLoaded(raw: any)
 	for slot = 1, 5 do
 		local record = rawSlots[tostring(slot)] or rawSlots[slot]
 		if typeof(record) == "table" then
-			local compiled, _, normalized = SpellCompiler.Compile(record.graph)
+			local compiled, errors, normalized = SpellCompiler.Compile(record.graph)
 			if compiled and normalized then
 				normalized.name = typeof(record.name) == "string" and string.sub(record.name, 1, 96) or compiled.name
 				data.slots[tostring(slot)] = {
 					name = normalized.name,
 					graph = normalized,
 					savedAt = typeof(record.savedAt) == "number" and record.savedAt or 0,
+				}
+			else
+				data.slots[tostring(slot)] = {
+					name = typeof(record.name) == "string" and string.sub(record.name, 1, 96) or "Unrecognized spell",
+					graph = copy(record.graph), savedAt = record.savedAt or 0, invalid = true,
+					error = errors[1] and errors[1].message or "This saved graph cannot be compiled.",
 				}
 			end
 		end
@@ -13771,7 +14178,15 @@ local function sanitizeLoaded(raw: any)
 		data.activeSlot = active
 	end
 	data.updatedAt = typeof(raw.updatedAt) == "number" and raw.updatedAt or 0
+	data.revision = typeof(raw.revision) == "number" and raw.revision or 0
 	return data
+end
+
+local function studioBridge(): BindableFunction
+	local bridge = ServerStorage:WaitForChild("RelativityStudioSpellStore", 3)
+	assert(bridge and bridge:IsA("BindableFunction") and bridge:GetAttribute("Ready"),
+		"Local Studio spell plugin is not loaded. Reopen Studio after installing RelativitySpellCards.rbxm.")
+	return bridge :: BindableFunction
 end
 
 local function keyFor(player: Player): string
@@ -13800,6 +14215,9 @@ local function publicState(entry: Entry)
 		error = entry.error,
 		activeSlot = entry.data.activeSlot,
 		slots = copy(entry.data.slots),
+		dirty = entry.dirty,
+		saving = entry.saving,
+		storageMode = if RunService:IsStudio() then "StudioLocal" else "DataStore",
 	}
 end
 
@@ -13815,28 +14233,49 @@ function SpellStore.Load(player: Player)
 		saving = false,
 		error = nil,
 		data = blankData(),
+		localRevision = 0,
+		persistedRevision = 0,
 	}
 	entries[player] = entry
+	local ok, result
 	if RunService:IsStudio() then
-		entry.loaded = true
-		entry.available = true
-		entry.sessionOnly = true
-		entry.error = "Studio session-only mode; production spell cards are untouched."
-		warn("[SpellStore] Studio session-only mode; skipping DataStore access.")
-		return
+		ok, result = pcall(function() return studioBridge():Invoke("Load", player.UserId) end)
+	else
+		ok, result = withRetries(function() return store:GetAsync(keyFor(player)) end)
 	end
-
-	local ok, result = withRetries(function()
-		return store:GetAsync(keyFor(player))
-	end)
 	if entries[player] ~= entry then
 		return
 	end
+	if ok and result ~= nil then
+		if typeof(result) ~= "table" or (result.slots ~= nil and typeof(result.slots) ~= "table") then
+			ok, result = false, "Stored spell book is malformed; refusing to overwrite it."
+		elseif result.revision ~= nil and (typeof(result.revision) ~= "number" or result.revision ~= result.revision
+			or result.revision < 0 or result.revision % 1 ~= 0 or result.revision >= 1e15) then
+			ok, result = false, "Stored spell revision is malformed; refusing to overwrite it."
+		end
+		if ok and result.schemaVersion ~= nil and (typeof(result.schemaVersion) ~= "number"
+			or result.schemaVersion % 1 ~= 0 or result.schemaVersion < 1) then
+			ok, result = false, "Stored spell schema is malformed; refusing to overwrite it."
+		end
+		if ok and result.slots then
+			for slot, record in result.slots do
+				local index = tonumber(slot)
+				if not index or index % 1 ~= 0 or index < 1 or index > 5 or typeof(record) ~= "table" then
+					ok, result = false, "Stored spell slot is malformed; refusing to overwrite it."
+					break
+				end
+			end
+		end
+	end
+	if ok and typeof(result) == "table" and typeof(result.schemaVersion) == "number" and result.schemaVersion > SCHEMA_VERSION then
+		ok, result = false, "A newer spell-card schema exists; this server must not overwrite it."
+	end
 	if ok then
 		entry.data = sanitizeLoaded(result)
+		entry.persistedRevision = entry.data.revision
 		entry.available = true
 	else
-		entry.error = "Spell cards could not be loaded; saving is disabled to protect existing data."
+		entry.error = if RunService:IsStudio() then tostring(result) else "Spell cards could not be loaded; saving is disabled to protect existing data."
 		warn(`[SpellStore] load failed for {player.UserId}: {tostring(result)}`)
 	end
 	entry.loaded = true
@@ -13856,6 +14295,15 @@ end
 function SpellStore.GetState(player: Player)
 	SpellStore.WaitForLoad(player, 15)
 	local entry = entries[player]
+	-- A newly loaded local plugin may become available after this player's
+	-- startup load. Retry only the failed Studio load, never replace a live
+	-- in-session book or silently retry production failures on every request.
+	local bridge = RunService:IsStudio() and ServerStorage:FindFirstChild("RelativityStudioSpellStore")
+	if entry and entry.loaded and not entry.available and not entry.dirty and bridge and bridge:GetAttribute("Ready") then
+		entries[player] = nil
+		SpellStore.Load(player)
+		entry = entries[player]
+	end
 	if not entry then
 		return { available = false, sessionOnly = false, error = "Spell state is unavailable.", slots = {} }
 	end
@@ -13875,29 +14323,46 @@ function SpellStore.Save(player: Player): (boolean, string?)
 	if not entry or not entry.loaded or not entry.available then
 		return false, entry and entry.error or "Spell data has not loaded."
 	end
-	if entry.sessionOnly then
-		entry.dirty = false
-		return true, entry.error
-	end
 	if entry.saving then
 		return false, "A spell save is already in progress."
 	end
 	entry.saving = true
 	entry.data.updatedAt = os.time()
 	local snapshot = copy(entry.data)
-	local ok, result = withRetries(function()
-		return store:UpdateAsync(keyFor(player), function(_old)
-			return snapshot
+	local localRevision = entry.localRevision
+	local expectedRevision = entry.persistedRevision
+	snapshot.revision = expectedRevision + 1
+	snapshot.saveId = HttpService:GenerateGUID(false)
+	local ok, result
+	if RunService:IsStudio() then
+		ok, result = pcall(function() return studioBridge():Invoke("Save", player.UserId, snapshot, expectedRevision) end)
+	else
+		ok, result = withRetries(function()
+			return store:UpdateAsync(keyFor(player), function(old)
+				if old ~= nil and typeof(old) ~= "table" then return nil end
+				-- Idempotent retry if the first write succeeded but its response
+				-- failed. Otherwise reject an older server overwriting a new one.
+				if typeof(old) == "table" and old.saveId == snapshot.saveId then return old end
+				if typeof(old) == "table" and typeof(old.schemaVersion) == "number" and old.schemaVersion > SCHEMA_VERSION then return nil end
+				local revision = typeof(old) == "table" and old.revision or 0
+				if revision ~= expectedRevision then return nil end
+				return snapshot
+			end)
 		end)
-	end)
+	end
 	entry.saving = false
-	if ok then
-		entry.dirty = false
+	if ok and typeof(result) == "table" then
+		entry.persistedRevision = snapshot.revision
+		entry.data.revision = snapshot.revision
+		entry.dirty = entry.localRevision ~= localRevision
 		entry.error = nil
 		return true, nil
 	end
 	entry.dirty = true
-	entry.error = "Spell save failed; the in-session copy is still available."
+	entry.error = if ok then "Spell cards changed in another session. Rejoin before saving; no stored data was overwritten."
+		else "Spell save failed; the in-session copy is still available."
+	if RunService:IsStudio() and not ok then entry.error = tostring(result) end
+	if ok then entry.available = false end
 	warn(`[SpellStore] save failed for {player.UserId}: {tostring(result)}`)
 	return false, entry.error
 end
@@ -13910,7 +14375,11 @@ function SpellStore.PutSlot(player: Player, slot: number, name: string, graph: a
 	if slot % 1 ~= 0 or slot < 1 or slot > 5 then
 		return false, "Slot must be from 1 to 5."
 	end
-	entry.data.slots[tostring(slot)] = { name = name, graph = copy(graph), savedAt = os.time() }
+	if entry.saving then return false, "A spell save is already in progress." end
+	local compiled, errors, normalized = SpellCompiler.Compile(graph)
+	if not compiled then return false, errors[1] and errors[1].message or "Invalid spell graph." end
+	entry.data.slots[tostring(slot)] = { name = name, graph = copy(normalized), savedAt = os.time() }
+	entry.localRevision += 1
 	entry.dirty = true
 	local ok, err = SpellStore.Save(player)
 	return ok, err, publicState(entry)
@@ -13924,11 +14393,13 @@ function SpellStore.DeleteSlot(player: Player, slot: number)
 	if slot % 1 ~= 0 or slot < 1 or slot > 5 then
 		return false, "Slot must be from 1 to 5."
 	end
+	if entry.saving then return false, "A spell save is already in progress." end
 	entry.data.slots[tostring(slot)] = nil
 	if entry.data.activeSlot == slot then
 		entry.data.activeSlot = nil
 	end
 	entry.dirty = true
+	entry.localRevision += 1
 	local ok, err = SpellStore.Save(player)
 	return ok, err, publicState(entry)
 end
@@ -13941,8 +14412,11 @@ function SpellStore.SetActive(player: Player, slot: number)
 	if slot % 1 ~= 0 or slot < 1 or slot > 5 or not entry.data.slots[tostring(slot)] then
 		return false, "That spell card does not exist."
 	end
+	if entry.saving then return false, "A spell save is already in progress." end
+	if entry.data.slots[tostring(slot)].invalid then return false, "This saved spell no longer compiles; its original graph has been preserved." end
 	entry.data.activeSlot = slot
 	entry.dirty = true
+	entry.localRevision += 1
 	local ok, err = SpellStore.Save(player)
 	return ok, err, publicState(entry)
 end
@@ -13996,7 +14470,7 @@ return SpellStore
 ]]></string>
         </Properties>
       </Item>
-      <Item class="Script" referent="62">
+      <Item class="Script" referent="64">
         <Properties>
           <string name="Name">StatusEffects</string>
           <token name="RunContext">0</token>
@@ -14069,7 +14543,7 @@ print("[Relativity] status effects registered")
 ]]></string>
         </Properties>
       </Item>
-      <Item class="ModuleScript" referent="63">
+      <Item class="ModuleScript" referent="65">
         <Properties>
           <string name="Name">Weapons</string>
           <string name="Source"><![CDATA[--!optimize 2
@@ -14153,7 +14627,7 @@ end
 return Weapons
 ]]></string>
         </Properties>
-        <Item class="ModuleScript" referent="64">
+        <Item class="ModuleScript" referent="66">
           <Properties>
             <string name="Name">Pheonix</string>
             <string name="Source"><![CDATA[--!optimize 2
@@ -14229,7 +14703,7 @@ return {
 ]]></string>
           </Properties>
         </Item>
-        <Item class="ModuleScript" referent="65">
+        <Item class="ModuleScript" referent="67">
           <Properties>
             <string name="Name">Railgun</string>
             <string name="Source"><![CDATA[--!optimize 2
@@ -14359,7 +14833,7 @@ return {
 ]]></string>
           </Properties>
         </Item>
-        <Item class="ModuleScript" referent="66">
+        <Item class="ModuleScript" referent="68">
           <Properties>
             <string name="Name">Shared</string>
             <string name="Source"><![CDATA[--!optimize 2
@@ -14419,7 +14893,7 @@ return WeaponsShared
 ]]></string>
           </Properties>
         </Item>
-        <Item class="ModuleScript" referent="67">
+        <Item class="ModuleScript" referent="69">
           <Properties>
             <string name="Name">TimeBlaster</string>
             <string name="Source"><![CDATA[--!optimize 2
@@ -14463,7 +14937,7 @@ return {
           </Properties>
         </Item>
       </Item>
-      <Item class="Script" referent="68">
+      <Item class="Script" referent="70">
         <Properties>
           <string name="Name">example</string>
           <token name="RunContext">0</token>
@@ -14537,17 +15011,17 @@ print("[Relativity] server systems online")
       </Item>
     </Item>
   </Item>
-  <Item class="SoundService" referent="69">
+  <Item class="SoundService" referent="71">
     <Properties>
       <string name="Name">SoundService</string>
       <bool name="RespectFilteringEnabled">true</bool>
     </Properties>
   </Item>
-  <Item class="StarterPack" referent="70">
+  <Item class="StarterPack" referent="72">
     <Properties>
       <string name="Name">StarterPack</string>
     </Properties>
-    <Item class="Tool" referent="71">
+    <Item class="Tool" referent="73">
       <Properties>
         <string name="Name">DummySpawner</string>
         <BinaryString name="AttributesSerialize">AgAAAAsAAABEdW1teUhlYWx0aAYAAAAAAECPQAoAAABEdW1teU1vZGVsAgUAAABEdW1teQ==</BinaryString>
@@ -14557,7 +15031,7 @@ print("[Relativity] server systems online")
         <string name="ToolTip">Click to spawn; E selects/deselects; click to move; R removes selected or clears all</string>
       </Properties>
     </Item>
-    <Item class="Tool" referent="72">
+    <Item class="Tool" referent="74">
       <Properties>
         <string name="Name">SpellAssembler</string>
         <bool name="CanBeDropped">false</bool>
@@ -14568,15 +15042,15 @@ print("[Relativity] server systems online")
       </Properties>
     </Item>
   </Item>
-  <Item class="StarterPlayer" referent="73">
+  <Item class="StarterPlayer" referent="75">
     <Properties>
       <string name="Name">StarterPlayer</string>
     </Properties>
-    <Item class="StarterPlayerScripts" referent="74">
+    <Item class="StarterPlayerScripts" referent="76">
       <Properties>
         <string name="Name">StarterPlayerScripts</string>
       </Properties>
-      <Item class="LocalScript" referent="75">
+      <Item class="LocalScript" referent="77">
         <Properties>
           <string name="Name">Client</string>
           <string name="Source"><![CDATA[--[[
@@ -14631,7 +15105,7 @@ ToolManager.start()
 print("[Relativity] client render systems online")
 ]]></string>
         </Properties>
-        <Item class="ModuleScript" referent="76">
+        <Item class="ModuleScript" referent="78">
           <Properties>
             <string name="Name">AmmoState</string>
             <string name="Source"><![CDATA[--!optimize 2
@@ -14682,7 +15156,7 @@ return AmmoState
 ]]></string>
           </Properties>
         </Item>
-        <Item class="ModuleScript" referent="77">
+        <Item class="ModuleScript" referent="79">
           <Properties>
             <string name="Name">ChunkVisualizer</string>
             <string name="Source"><![CDATA[--!optimize 2
@@ -14848,7 +15322,7 @@ return ChunkVisualizer
 ]]></string>
           </Properties>
         </Item>
-        <Item class="ModuleScript" referent="78">
+        <Item class="ModuleScript" referent="80">
           <Properties>
             <string name="Name">DilationBubbleGui</string>
             <string name="Source"><![CDATA[--!optimize 2
@@ -15001,7 +15475,7 @@ return DilationBubbleGui
 ]]></string>
           </Properties>
         </Item>
-        <Item class="ModuleScript" referent="79">
+        <Item class="ModuleScript" referent="81">
           <Properties>
             <string name="Name">DummyEffects</string>
             <string name="Source"><![CDATA[--!strict
@@ -15056,7 +15530,7 @@ return {}
 ]]></string>
           </Properties>
         </Item>
-        <Item class="LocalScript" referent="80">
+        <Item class="LocalScript" referent="82">
           <Properties>
             <string name="Name">MapGenToggleDebug</string>
             <string name="Source"><![CDATA[--[[
@@ -15080,7 +15554,7 @@ end)
 ]]></string>
           </Properties>
         </Item>
-        <Item class="ModuleScript" referent="81">
+        <Item class="ModuleScript" referent="83">
           <Properties>
             <string name="Name">MovementController</string>
             <string name="Source"><![CDATA[--!optimize 2
@@ -15246,7 +15720,7 @@ return MovementController
 ]]></string>
           </Properties>
         </Item>
-        <Item class="ModuleScript" referent="82">
+        <Item class="ModuleScript" referent="84">
           <Properties>
             <string name="Name">ShooterConfigGui</string>
             <string name="Source"><![CDATA[--!optimize 2
@@ -15475,7 +15949,7 @@ return ShooterConfigGui
 ]]></string>
           </Properties>
         </Item>
-        <Item class="ModuleScript" referent="83">
+        <Item class="ModuleScript" referent="85">
           <Properties>
             <string name="Name">ShooterController</string>
             <string name="Source"><![CDATA[--!optimize 2
@@ -15612,7 +16086,7 @@ return ShooterController
 ]]></string>
           </Properties>
         </Item>
-        <Item class="ModuleScript" referent="84">
+        <Item class="ModuleScript" referent="86">
           <Properties>
             <string name="Name">SpellAssemblerGui</string>
             <string name="Source"><![CDATA[--!strict
@@ -15648,6 +16122,8 @@ local remotes = ReplicatedStorage:WaitForChild("SpellRemotes")
 local command = remotes:WaitForChild("SpellCommand") :: RemoteFunction
 local castRemote = remotes:WaitForChild("SpellCast") :: RemoteEvent
 local aimRemote = remotes:WaitForChild("SpellAim") :: UnreliableRemoteEvent
+local channelRemote = remotes:WaitForChild("SpellChannel") :: RemoteEvent
+local holdingCast = false
 
 local EditorFolder = script.Parent:WaitForChild("SpellEditor")
 local Theme = require(EditorFolder:WaitForChild("Theme"))
@@ -15664,7 +16140,7 @@ local HANDLE = 6
 local LEFT_RANGE = Vector2.new(200, 480)
 local RIGHT_RANGE = Vector2.new(240, 520)
 local SINK_ACTION = "SpellEditorSinkMovement"
-local AIM_SEND_INTERVAL = 0.05 -- live cursor for Stream re-aiming (see SpellService)
+local AIM_SEND_INTERVAL = 0.05 -- live cursor for Stream/Sustain re-aiming
 local SINK_KEYS = {
 	Enum.KeyCode.W, Enum.KeyCode.A, Enum.KeyCode.S, Enum.KeyCode.D, Enum.KeyCode.Space,
 	Enum.KeyCode.Up, Enum.KeyCode.Down, Enum.KeyCode.Left, Enum.KeyCode.Right,
@@ -15696,6 +16172,8 @@ local problems: any = nil
 local serverState: any = { slots = {}, activeSlot = nil }
 local selectedSlot = 1
 local savedSignature: string? = nil
+local savingCard = false
+local hasLoadedCards = false
 local errors: { any } = {}
 local analysis: any = nil
 local compiledOk = false
@@ -15763,9 +16241,10 @@ local function updateTopBar()
 		button.TextColor3 = if record then Colors.text else Colors.muted
 	end
 	if saveButton then
-		saveButton.Text = if dirty then `Save to {selectedSlot} •` else `Saved`
-		saveButton.BackgroundColor3 = if compiledOk and dirty then Color3.fromRGB(58, 128, 86) else Colors.panel3
-		saveButton.AutoButtonColor = compiledOk
+		local available = serverState.available == true
+		saveButton.Text = if savingCard then "Saving…" elseif not available then "Save unavailable" elseif dirty then `Save to {selectedSlot} •` else "Saved"
+		saveButton.BackgroundColor3 = if compiledOk and dirty and available and not savingCard then Color3.fromRGB(58, 128, 86) else Colors.panel3
+		saveButton.AutoButtonColor = compiledOk and available and not savingCard
 	end
 	local active = serverState.activeSlot and slotRecord(serverState.activeSlot)
 	if activeLabel then
@@ -15830,19 +16309,32 @@ end
 -- Saves the circle to the selected slot. The first saved spell is equipped
 -- automatically, so a fresh card is castable right after saving.
 local function saveCard(): boolean
+	if savingCard then return false end
+	if serverState.available ~= true then
+		setStatus(serverState.error or "Spell storage is unavailable.", false, true)
+		return false
+	end
 	if not compiledOk then
 		local first = errors[1]
 		setStatus(if first then `Can't save yet: {first.message}` else "Fix the problems on the board before saving.", false)
 		return false
 	end
 	setStatus("Saving…", nil, true)
+	savingCard = true
+	updateTopBar()
 	local result = invoke("SaveCard", { slot = selectedSlot, name = currentName(), graph = doc.graph })
+	savingCard = false
+	-- Apply the authoritative state BEFORE reading the saved record. Loading
+	-- its normalized graph/name avoids marking an older local copy as Saved.
+	if result.state then serverState = result.state end
 	if result.ok then
 		local record = slotRecord(selectedSlot)
+		if record and record.graph then doc:load(record.graph) end
 		if record and nameBox then nameBox.Text = record.name end
 		savedSignature = signature()
 	end
 	applyServerResult(result)
+	refresh()
 	if result.ok and not serverState.activeSlot then
 		task.wait(COMMAND_GAP)
 		equipSlot(selectedSlot)
@@ -15867,6 +16359,12 @@ end
 local function loadSlot(slot: number)
 	selectedSlot = slot
 	local record = slotRecord(slot)
+	if record and record.invalid then
+		savedSignature = nil
+		setStatus(record.error or "This older card cannot be compiled; its saved data has been preserved.", false, true)
+		updateTopBar()
+		return
+	end
 	if record and record.graph then
 		doc:load(record.graph)
 		if nameBox then nameBox.Text = record.name end
@@ -15877,6 +16375,7 @@ local function loadSlot(slot: number)
 		savedSignature = signature()
 		setStatus(`Loaded "{record.name}".`)
 	else
+		savedSignature = nil
 		setStatus(`Slot {slot} is empty: saving will put this circle there.`)
 	end
 	refresh()
@@ -16241,7 +16740,12 @@ local function buildGui()
 	local edit = Theme.button(compact, "Edit [E]", { Position = UDim2.new(1, -134, 0, 9), Size = UDim2.fromOffset(70, 36) })
 	edit.Activated:Connect(function() SpellAssemblerGui.Open() end)
 	local castButton = Theme.button(compact, "Cast", { Position = UDim2.new(1, -58, 0, 9), Size = UDim2.fromOffset(48, 36), BackgroundColor3 = Color3.fromRGB(128, 58, 44) })
-	castButton.Activated:Connect(function() SpellAssemblerGui.Cast() end)
+	castButton.InputBegan:Connect(function(input)
+		if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then SpellAssemblerGui.Cast() end
+	end)
+	castButton.InputEnded:Connect(function(input)
+		if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then SpellAssemblerGui.StopCast() end
+	end)
 
 	--------------------------------------------------------------------------
 	-- Input routing. Mouse input goes to the board whenever it's over the
@@ -16307,6 +16811,7 @@ local function buildGui()
 	end)
 
 	UserInputService.InputEnded:Connect(function(input)
+		if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then SpellAssemblerGui.StopCast() end
 		if not visible then return end
 		local release = input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch
 		if resizing and release then
@@ -16339,6 +16844,7 @@ local function sinkMovement(): Enum.ContextActionResult
 end
 
 function SpellAssemblerGui.Open()
+	SpellAssemblerGui.StopCast()
 	buildGui()
 	visible = true;
 	(gui :: ScreenGui).Enabled = true;
@@ -16369,7 +16875,7 @@ function SpellAssemblerGui.Toggle()
 end
 
 function SpellAssemblerGui.Cast()
-	if not equippedTool or visible then return end
+	if not equippedTool or visible or holdingCast then return end
 	if not serverState.activeSlot then
 		if activeLabel then
 			activeLabel.Text = "No spell equipped: press E, then Save"
@@ -16382,7 +16888,14 @@ function SpellAssemblerGui.Cast()
 		return
 	end
 	local mouse = player:GetMouse()
+	holdingCast = true
 	castRemote:FireServer(mouse.Hit.Position)
+end
+
+function SpellAssemblerGui.StopCast()
+	if not holdingCast then return end
+	holdingCast = false
+	channelRemote:FireServer("Stop")
 end
 
 local aimConnection: RBXScriptConnection? = nil
@@ -16390,15 +16903,18 @@ local aimConnection: RBXScriptConnection? = nil
 local function startAimStream()
 	if aimConnection then return end
 	local mouse = player:GetMouse()
-	local elapsed, last = 0, nil
+	local elapsed, last, sinceSend = 0, nil, 0
 	aimConnection = game:GetService("RunService").Heartbeat:Connect(function(dt)
 		elapsed += dt
+		sinceSend += dt
 		if elapsed < AIM_SEND_INTERVAL or visible then return end
 		elapsed = 0
 		local position = mouse.Hit.Position
-		if not last or (position - last).Magnitude > 0.1 then
+		if not last or (position - last).Magnitude > 0.1 or sinceSend >= 0.2 then
 			last = position
+			sinceSend = 0
 			aimRemote:FireServer(position)
+			if holdingCast then channelRemote:FireServer("KeepAlive") end
 		end
 	end)
 end
@@ -16417,6 +16933,14 @@ function SpellAssemblerGui.Equip(tool: Tool)
 	setStatus("Loading spell cards…", nil, true)
 	local result = invoke("GetState")
 	if result.state then serverState = result.state end
+	if result.ok and serverState.available and not hasLoadedCards then
+		hasLoadedCards = true
+		local initialSlot = serverState.activeSlot
+		if not initialSlot then
+			for slot = 1, SLOT_COUNT do if slotRecord(slot) then initialSlot = slot; break end end
+		end
+		if initialSlot then loadSlot(initialSlot) end
+	end
 	if result.state and result.state.error then
 		setStatus(result.state.error, result.state.sessionOnly)
 	else
@@ -16428,6 +16952,7 @@ end
 
 function SpellAssemblerGui.Unequip(tool: Tool)
 	if equippedTool ~= tool then return end
+	SpellAssemblerGui.StopCast()
 	equippedTool = nil
 	stopAimStream()
 	if visible then SpellAssemblerGui.Close() end
@@ -16438,11 +16963,11 @@ return SpellAssemblerGui
 ]]></string>
           </Properties>
         </Item>
-        <Item class="Folder" referent="85">
+        <Item class="Folder" referent="87">
           <Properties>
             <string name="Name">SpellEditor</string>
           </Properties>
-          <Item class="ModuleScript" referent="86">
+          <Item class="ModuleScript" referent="88">
             <Properties>
               <string name="Name">Board</string>
               <string name="Source"><![CDATA[--!strict
@@ -17537,7 +18062,7 @@ return Board
 ]]></string>
             </Properties>
           </Item>
-          <Item class="ModuleScript" referent="87">
+          <Item class="ModuleScript" referent="89">
             <Properties>
               <string name="Name">Document</string>
               <string name="Source"><![CDATA[--!strict
@@ -17731,7 +18256,7 @@ return Document
 ]]></string>
             </Properties>
           </Item>
-          <Item class="ModuleScript" referent="88">
+          <Item class="ModuleScript" referent="90">
             <Properties>
               <string name="Name">Panels</string>
               <string name="Source"><![CDATA[--!strict
@@ -18210,7 +18735,7 @@ function Inspector:showOverview(context: any)
 	sectionTitle(self.scroll, "How it works", self:nextOrder())
 	for _, line in {
 		"Mana is energy. Wire a Mana Well through a Transform (Fire, Arcane, Shock) into a Vessel; its damage comes from the mana that reaches it.",
-		"The Vessel is the form the magic takes: Orb (slow, heavy), Bullet (fast tracer) or Beam (instant ray). Quantity fires several.",
+		"The Vessel gives magic its form: Orb (slow, heavy), Bullet (fast tracer), Beam (traveling cylinder at 2000 studs/s), or Explosion. Sustain makes a Beam follow live aim for 1–5 seconds; Quantity fires several.",
 		"Every rune must sit inside a zone of the right kind. Pick a zone pen in the toolbox and drag on the board to draw one.",
 		"If routes all energy one way, Divide splits it. Sensors and Logic feed conditions and targeting.",
 		"Vessels aim at your mouse unless something is wired into their Aim port: put an Aim rune in a Targeting zone and wire it in (feed it Nearest Entity, Cursor, etc.).",
@@ -18337,7 +18862,7 @@ return Panels
 ]]></string>
             </Properties>
           </Item>
-          <Item class="ModuleScript" referent="89">
+          <Item class="ModuleScript" referent="91">
             <Properties>
               <string name="Name">Theme</string>
               <string name="Source"><![CDATA[--!strict
@@ -18447,15 +18972,15 @@ return Theme
             </Properties>
           </Item>
         </Item>
-        <Item class="ModuleScript" referent="90">
+        <Item class="ModuleScript" referent="92">
           <Properties>
             <string name="Name">SpellEffects</string>
             <string name="Source"><![CDATA[--!optimize 2
 --[[
 	SpellEffects (client, purely cosmetic)
-	Renders spell Beams and Explosions. Both vessels resolve instantly on the
-	server (see server/SpellRuntime.luau's fireBeam / explode), which
-	broadcasts what happened here; every client draws it locally.
+	Renders instant Explosions and legacy SpellBeam flashes. New traveling
+	Beams use ProjectileClient/BeamVisual and the regular projectile protocol;
+	SpellRuntime no longer emits fixed SpellBeam rays.
 	Self-registers its listeners at require time, same as WeaponEffects.luau.
 
 	"SpellBeam" payload (server -> all clients):
@@ -18596,7 +19121,7 @@ return SpellEffects
 ]]></string>
           </Properties>
         </Item>
-        <Item class="ModuleScript" referent="91">
+        <Item class="ModuleScript" referent="93">
           <Properties>
             <string name="Name">TimeControlGui</string>
             <string name="Source"><![CDATA[--!optimize 2
@@ -18863,11 +19388,11 @@ return TimeControlGui
 ]]></string>
           </Properties>
         </Item>
-        <Item class="Folder" referent="92">
+        <Item class="Folder" referent="94">
           <Properties>
             <string name="Name">ToolControllers</string>
           </Properties>
-          <Item class="ModuleScript" referent="93">
+          <Item class="ModuleScript" referent="95">
             <Properties>
               <string name="Name">DilationBubble</string>
               <string name="Source"><![CDATA[--!optimize 2
@@ -18913,7 +19438,7 @@ return Controller
 ]]></string>
             </Properties>
           </Item>
-          <Item class="ModuleScript" referent="94">
+          <Item class="ModuleScript" referent="96">
             <Properties>
               <string name="Name">DummySpawner</string>
               <string name="Source"><![CDATA[--!strict
@@ -19016,7 +19541,7 @@ return Controller
 ]]></string>
             </Properties>
           </Item>
-          <Item class="ModuleScript" referent="95">
+          <Item class="ModuleScript" referent="97">
             <Properties>
               <string name="Name">Pheonix</string>
               <string name="Source"><![CDATA[--!optimize 2
@@ -19028,7 +19553,7 @@ return require(script.Parent._ShootingWeapon)
 ]]></string>
             </Properties>
           </Item>
-          <Item class="ModuleScript" referent="96">
+          <Item class="ModuleScript" referent="98">
             <Properties>
               <string name="Name">Railgun</string>
               <string name="Source"><![CDATA[--!optimize 2
@@ -19040,29 +19565,33 @@ return require(script.Parent._ShootingWeapon)
 ]]></string>
             </Properties>
           </Item>
-          <Item class="ModuleScript" referent="97">
+          <Item class="ModuleScript" referent="99">
             <Properties>
               <string name="Name">SpellAssembler</string>
               <string name="Source"><![CDATA[-- Thin Tool launcher; SpellAssemblerGui can later be opened by any menu.
 
 local controller = require(script.Parent.Parent.SpellAssemblerGui)
 local activation: RBXScriptConnection? = nil
+local deactivation: RBXScriptConnection? = nil
 
 return {
 	Equip = function(tool: Tool, _character: Model)
 		if activation then activation:Disconnect() end
+		if deactivation then deactivation:Disconnect() end
 		activation = tool.Activated:Connect(controller.Cast)
+		deactivation = tool.Deactivated:Connect(controller.StopCast)
 		controller.Equip(tool)
 	end,
 	Unequip = function(tool: Tool, _character: Model)
 		if activation then activation:Disconnect(); activation = nil end
+		if deactivation then deactivation:Disconnect(); deactivation = nil end
 		controller.Unequip(tool)
 	end,
 }
 ]]></string>
             </Properties>
           </Item>
-          <Item class="ModuleScript" referent="98">
+          <Item class="ModuleScript" referent="100">
             <Properties>
               <string name="Name">TimeBlaster</string>
               <string name="Source"><![CDATA[--!optimize 2
@@ -19072,7 +19601,7 @@ return require(script.Parent._ShootingWeapon)
 ]]></string>
             </Properties>
           </Item>
-          <Item class="ModuleScript" referent="99">
+          <Item class="ModuleScript" referent="101">
             <Properties>
               <string name="Name">_ShootingWeapon</string>
               <string name="Source"><![CDATA[--!optimize 2
@@ -19128,7 +19657,7 @@ return ShootingWeapon
             </Properties>
           </Item>
         </Item>
-        <Item class="ModuleScript" referent="100">
+        <Item class="ModuleScript" referent="102">
           <Properties>
             <string name="Name">ToolManager</string>
             <string name="Source"><![CDATA[--!optimize 2
@@ -19284,7 +19813,7 @@ return ToolManager
 ]]></string>
           </Properties>
         </Item>
-        <Item class="ModuleScript" referent="101">
+        <Item class="ModuleScript" referent="103">
           <Properties>
             <string name="Name">Viewmodel</string>
             <string name="Source"><![CDATA[--!optimize 2
@@ -19812,7 +20341,7 @@ end
 return Viewmodel
 ]]></string>
           </Properties>
-          <Item class="ModuleScript" referent="102">
+          <Item class="ModuleScript" referent="104">
             <Properties>
               <string name="Name">ArmRig</string>
               <string name="Source"><![CDATA[--!optimize 2
@@ -20162,7 +20691,7 @@ return ArmRig
 ]]></string>
             </Properties>
           </Item>
-          <Item class="ModuleScript" referent="103">
+          <Item class="ModuleScript" referent="105">
             <Properties>
               <string name="Name">Sway</string>
               <string name="Source"><![CDATA[--!optimize 2
@@ -20239,7 +20768,7 @@ return Sway
             </Properties>
           </Item>
         </Item>
-        <Item class="ModuleScript" referent="104">
+        <Item class="ModuleScript" referent="106">
           <Properties>
             <string name="Name">WeaponEffects</string>
             <string name="Source"><![CDATA[--!optimize 2
@@ -20387,13 +20916,13 @@ return WeaponEffects
       </Item>
     </Item>
   </Item>
-  <Item class="Workspace" referent="105">
+  <Item class="Workspace" referent="107">
     <Properties>
       <string name="Name">Workspace</string>
       <bool name="FilteringEnabled">true</bool>
       <bool name="NeedsPivotMigration">false</bool>
     </Properties>
-    <Item class="Part" referent="106">
+    <Item class="Part" referent="108">
       <Properties>
         <string name="Name">Baseplate</string>
         <bool name="Anchored">true</bool>
