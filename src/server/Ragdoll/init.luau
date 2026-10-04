@@ -23,6 +23,7 @@ local RAGDOLL_INSTANCE_NAMES = {
 
 local SCALE_EPSILON = 1e-4
 local trackedRagdolls = {}
+local originalRigSettings = setmetatable({}, { __mode = "k" })
 
 local function getRoot(character: Model): BasePart?
 	local humanoid = character:FindFirstChildOfClass("Humanoid")
@@ -169,12 +170,25 @@ end)
 	with physics-based constraints.
 ]]
 local function replaceJoints(character: Model, humanoid: Humanoid)
+	local animateScript = character:FindFirstChild("Animate")
+	local motors = {}
+	for _, joint in character:GetDescendants() do
+		if joint:IsA("Motor6D") then motors[joint] = joint.Enabled end
+	end
+	originalRigSettings[character] = {
+		RequiresNeck = humanoid.RequiresNeck,
+		BreakJointsOnDeath = humanoid.BreakJointsOnDeath,
+		AutoRotate = humanoid.AutoRotate,
+		GettingUp = humanoid:GetStateEnabled(Enum.HumanoidStateType.GettingUp),
+		AnimateEnabled = animateScript and animateScript:IsA("LocalScript") and animateScript.Enabled,
+		Motors = motors,
+	}
 	-- Necessary for Ragdolling to function properly
 	humanoid.BreakJointsOnDeath = false
-	humanoid.RequiresNeck = true
+	-- Disable the neck requirement BEFORE disconnecting the neck joint.
+	humanoid.RequiresNeck = false
 
 	-- Disable the 'Animate' script to stop character animations
-	local animateScript = character:FindFirstChild("Animate")
 	if animateScript and animateScript:IsA("LocalScript") then
 		animateScript.Enabled = false
 	end
@@ -255,6 +269,7 @@ end
 local function resetJoints(character: Model, humanoid: Humanoid)
 	-- Do not unragdoll if the humanoid is dead
 	if humanoid.Health < 1 then return end
+	local original = originalRigSettings[character]
 
 	for _, instance in pairs(character:GetDescendants()) do
 		-- Destroy instances created by the ragdoll system
@@ -264,17 +279,22 @@ local function resetJoints(character: Model, humanoid: Humanoid)
 
 		-- Re-enable original Motor6D joints
 		if instance:IsA("Motor6D") then
-			instance.Enabled = true
+			instance.Enabled = if original and original.Motors[instance] ~= nil then original.Motors[instance] else true
 		end
 	end
 
-	humanoid.AutoRotate = true
+	-- Restore the neck requirement only after its joint is connected again.
+	humanoid.RequiresNeck = if original then original.RequiresNeck else true
+	humanoid.BreakJointsOnDeath = if original then original.BreakJointsOnDeath else humanoid.BreakJointsOnDeath
+	humanoid.AutoRotate = if original then original.AutoRotate else true
+	humanoid:SetStateEnabled(Enum.HumanoidStateType.GettingUp, if original then original.GettingUp else true)
 
 	-- Re-enable the 'Animate' script
 	local animateScript = character:FindFirstChild("Animate")
 	if animateScript and animateScript:IsA("LocalScript") then
-		animateScript.Enabled = true
+		animateScript.Enabled = if original then original.AnimateEnabled == true else true
 	end
+	originalRigSettings[character] = nil
 end
 
 --[[
@@ -317,8 +337,12 @@ function RagdollModule.SetRagdoll(character: Model, value: boolean, applyPushOnR
 	pushMagnitude = pushMagnitude or 100
 
 	if value then -- Ragdoll the character
-		replaceJoints(character, humanoid)
-		beginTracking(character)
+		-- Repeated requests must not create duplicate constraints or overwrite
+		-- the pre-stun settings with the already-ragdolled state.
+		if not trackedRagdolls[character] then
+			replaceJoints(character, humanoid)
+			beginTracking(character)
+		end
 		
 		--> Check to see if the module is being called from client/server
 		if RunService:IsClient() then
@@ -327,7 +351,7 @@ function RagdollModule.SetRagdoll(character: Model, value: boolean, applyPushOnR
 			
 		elseif RunService:IsServer() then
 			local root = getRoot(character)
-			if root then
+			if root and root:CanSetNetworkOwnership() then
 				root:SetNetworkOwner(nil)
 			end
 			
@@ -340,21 +364,22 @@ function RagdollModule.SetRagdoll(character: Model, value: boolean, applyPushOnR
 			applyPush(character, pushMagnitude)
 		end
 	else -- Unragdoll the character
+		-- A corpse remains a ragdoll, not a permanently stunned living entity.
+		-- Keep dilation tracking too: removing it would strand gravity forces.
+		if humanoid.Health <= 0 or not trackedRagdolls[character] then return end
 		removeTracking(character)
 		resetJoints(character, humanoid)
 		
 		if RunService:IsClient() then
-			humanoid:SetStateEnabled(Enum.HumanoidStateType.GettingUp, true)
 			humanoid:ChangeState(Enum.HumanoidStateType.GettingUp)
 			
 		elseif RunService:IsServer() then
-			humanoid:SetStateEnabled(Enum.HumanoidStateType.GettingUp, true)
 			humanoid:ChangeState(Enum.HumanoidStateType.GettingUp)
 			
 			-- Fix network ownership for players
 			local player: Player? = Players:GetPlayerFromCharacter(character)
 			local root = getRoot(character)
-			if player and root then
+			if player and root and root:CanSetNetworkOwnership() then
 				root:SetNetworkOwner(player)
 			end
 		end

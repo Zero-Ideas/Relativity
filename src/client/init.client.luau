@@ -27,6 +27,7 @@ local ToolManager = require(script.ToolManager)
 local _AmmoState = require(script.AmmoState)
 local _WeaponEffects = require(script.WeaponEffects)
 local _SpellEffects = require(script.SpellEffects) -- spell Beam visuals
+local _DummyEffects = require(script.DummyEffects) -- test dummy damage flashes
 
 ChunkManager.EnableReplication()
 ProjectileClient.EnableClientRendering()

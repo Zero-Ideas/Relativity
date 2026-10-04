@@ -47,7 +47,7 @@ local function emitMuzzleBlast(tool: Tool, origin: Vector3, direction: Vector3)
 end
 
 local STUN_DURATION = 10 -- seconds a hit entity is ragdolled for (see StatusEffects.server.luau's "Stun")
-local FLING_FORCE = 250 -- studs/s of instantaneous velocity kick along the shot's travel direction
+local FLING_FORCE = 500 -- studs/s of instantaneous velocity kick along the shot's travel direction
 local FLING_UP_RATIO = 0.4 -- fraction of FLING_FORCE added straight up, for a launch arc instead of a flat shove
 local FLING_SPIN_FORCE = 25 -- rad/s; max per-axis magnitude of the random tumble applied alongside the fling
 

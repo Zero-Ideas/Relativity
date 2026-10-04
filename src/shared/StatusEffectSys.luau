@@ -103,27 +103,37 @@ local function ensureDriver(entity)
 			return
 		end
 		for name, effect in effects do
+			local elapsed = math.min(dt, math.max(effect.Duration, 0))
 			effect.Duration -= dt
 
 			local interval = effect.Definition.TickInterval
 			if interval and interval > 0 then
-				effect._tickAccumulator += dt
-				if effect._tickAccumulator >= interval then
+				effect._tickAccumulator += elapsed
+				if effect._tickAccumulator >= interval or (effect.Duration <= 0 and effect._tickAccumulator > 0) then
+					-- Coalesce elapsed ticks into one callback, including the final
+					-- partial tick. Lag must not silently discard burn damage/time.
+					local tickElapsed = effect._tickAccumulator
 					effect._tickAccumulator = 0
 					local onTick = effect.Definition.OnTick
 					if onTick then
-						onTick(entity, effect, interval)
+						onTick(entity, effect, tickElapsed)
 					end
 				end
 			end
 
-			if effect.Duration <= 0 or effect.Potency <= 0 then
+			if effects[name] == effect and (effect.Duration <= 0 or effect.Potency <= 0) then
 				expireEffect(entity, name, effect)
 			end
 		end
 	end)
 
 	entity.Destroyed:Connect(function()
+		local effects = activeEffects[entity]
+		if effects then
+			for name, effect in effects do
+				expireEffect(entity, name, effect)
+			end
+		end
 		activeEffects[entity] = nil
 		hasDriver[entity] = nil
 	end)
@@ -134,6 +144,11 @@ end
 --------------------------------------------------------------------------------
 
 function StatusEffectSys:ApplyEffect(entity, name: string, duration: number, potency: number?)
+	-- Non-finite timers would leave a status active forever.
+	if entity.IsDestroyed or typeof(duration) ~= "number" or duration ~= duration
+		or duration <= 0 or duration == math.huge then return nil end
+	if potency ~= nil and (typeof(potency) ~= "number" or potency ~= potency
+		or potency <= 0 or potency == math.huge) then return nil end
 	local definition = definitions[name]
 	if not definition then
 		warn(`[StatusEffectSys] "{name}" is not registered -- call StatusEffectSys.Register() first`)
