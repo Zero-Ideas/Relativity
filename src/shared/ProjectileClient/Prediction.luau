@@ -42,6 +42,33 @@ local function integrate(visual: Visual, dt: number)
 	visual.life -= dt
 end
 
+-- Only these trajectories have an exact elapsed-time solution. Everything
+-- else keeps the normal planner so skipping frames cannot change its path.
+function Prediction.canDefer(visual: Visual): boolean
+	return ChunkManager.IsTimeUniform()
+		and visual.simulationDebt == 0
+		and visual.minSpeed <= 0
+		and visual.maxSpeed == math.huge
+		and (typeof(visual.acceleration) ~= "number" or visual.acceleration == 0)
+end
+
+-- Cheap visibility probe without advancing any simulation state. Using the
+-- current projected position (not the frozen exit pose) also detects shots
+-- that fly into view while the camera stays still.
+function Prediction.projectDeferred(visual: Visual, dt: number): Vector3
+	dt = math.min(math.max(dt, 0), math.max(visual.life, 0))
+	local acceleration = ProjectileMotion.GetAcceleration(
+		visual.velocity, visual.acceleration, visual.accelerationDirection, visual.gravity
+	)
+	return visual.position + visual.velocity * dt + acceleration * (0.5 * dt * dt)
+end
+
+-- Used before a world time-field mutation: settle the old uniform interval
+-- before any new zone could be applied retroactively to the deferred time.
+function Prediction.settleDeferred(visual: Visual, dt: number)
+	if dt > 0 then integrate(visual, math.min(dt, math.max(visual.life, 0))) end
+end
+
 function Prediction.simulate(visual: Visual, baseDt: number): (boolean, boolean)
 	if not (baseDt > 0) then
 		return true, false

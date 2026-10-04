@@ -31,6 +31,7 @@ local Players = game:GetService("Players")
 
 local Shared = script.Parent
 local Heartbeat = require(Shared:WaitForChild("Heartbeat"))
+local ChunkManager = require(Shared:WaitForChild("ChunkManager"))
 local VisualOffload = require(Shared:WaitForChild("VisualOffload"))
 local Protocol = require(Shared:WaitForChild("ProjectileProtocol"))
 
@@ -60,8 +61,8 @@ local DEFAULT_MAX_REAL_LIFETIME = 60
 -- loop below. Generous on purpose: ProjMove batches normally arrive every
 -- server tick, so anything this stale really has stopped, not just lagged.
 local SYNCED_VISUAL_STALE_TIMEOUT = 2
--- Hard cap on visible Transform work in one client frame. Off-screen visuals
--- still advance logically when visited but consume no transform budget. The
+-- Hard cap on visible Transform work in one client frame. Exact off-screen
+-- trajectories defer prediction until needed; complex ones retain simulation. The
 -- persistent round-robin cursor is independent of dilated time, so changing
 -- GlobalTimeScale cannot collapse previously staggered cohorts onto one frame.
 local MAX_VISUAL_UPDATES_PER_FRAME = 2500
@@ -72,6 +73,7 @@ local DEFAULT_SMOOTH_DURATION = 1 / 60
 
 local clientRendering = false
 local visuals: { [number]: Visual } = {}
+local deferredVisuals: { [number]: Visual } = {}
 local visualCount = 0
 local visualOrder: { number } = {} -- append-only between compactions; dead ids are tombstones
 local visualCursor = 1
@@ -200,6 +202,7 @@ local function destroyVisual(id: number)
 		return
 	end
 	visuals[id] = nil
+	deferredVisuals[id] = nil
 	visualCount -= 1
 	visualTombstones += 1
 	VisualModel.Retire(visual, visual.destroyDelay)
@@ -215,6 +218,8 @@ local function rebaseline(visual: Visual, position: Vector3, velocity: Vector3)
 	visual.velocity = velocity
 	visual.simulationDebt = 0
 	visual.lastSimulationTime = globalSimulationClock
+	visual.deferredPrediction = false
+	deferredVisuals[visual.id] = nil
 end
 
 local function onSpawn(data: Protocol.SpawnPayload)
@@ -246,6 +251,7 @@ local function onSpawn(data: Protocol.SpawnPayload)
 		-- ProjTimeScale -- see the "Local time" section of the server module.
 		timeScale = data.TimeScale or 1,
 		lastSimulationTime = globalSimulationClock,
+		deferredPrediction = false,
 		synced = data.Synced == true,
 
 		-- Real (undilated) safety-net cap. spawnRealTime is THIS client's own
@@ -293,6 +299,8 @@ local function onTimeScale(data: Protocol.TimeScalePayload)
 			Prediction.simulate(visual, elapsed * visual.timeScale)
 		end
 		visual.lastSimulationTime = globalSimulationClock
+		visual.deferredPrediction = false
+		deferredVisuals[visual.id] = nil
 	end
 	visual.timeScale = data.TimeScale
 end
@@ -335,14 +343,20 @@ local function onMove(batch: { Protocol.MovePayload })
 		if data.Bounced then
 			visual.lastUpdate = now
 			rebaseline(visual, data.Position, data.Velocity)
-			VisualModel.Place(visual, data.Position, data.Velocity)
-			Impact.Play(data.Point or data.Position, data.Normal, "bounce")
+			if View.contains(data.Position) then
+				VisualModel.SuspendTrails(visual)
+				VisualModel.Place(visual, data.Position, data.Velocity)
+				visual.resumeEffectsOnNextUpdate = now
+				Impact.Play(data.Point or data.Position, data.Normal, "bounce")
+			end
 		elseif visual.synced then
 			local duration = math.clamp(now - visual.lastUpdate, 0.03, 0.2)
 			visual.lastUpdate = now
 			visual.position = data.Position
 			visual.velocity = data.Velocity
-			VisualModel.SetTarget(visual, data.Position, data.Velocity, duration)
+			if visual.inView and View.contains(data.Position) then
+				VisualModel.SetTarget(visual, data.Position, data.Velocity, duration)
+			end
 		end
 	end
 end
@@ -371,24 +385,41 @@ end
 local function reenterView(visual: Visual, now: number)
 	VisualModel.SuspendTrails(visual)
 	VisualModel.Place(visual, visual.position, visual.velocity)
-	if visual.culled then
-		VisualModel.SetCulled(visual, false)
-		visual.culled = false
-	end
+	visual.culled = false
 	visual.resumeEffectsOnNextUpdate = now
 	visual.offscreenSince = nil
 end
 
--- Visual is off screen: once it has been gone longer than its effects take
--- to fade, stop them and unparent it.
+-- Roblox performs draw culling. Keep the rig parented; after the authored
+-- effects' grace period we suspend emission and prediction/interpolation work.
+local function recoverStalePose(visual: Visual, position: Vector3, now: number)
+	local rig = visual.rig
+	-- Native culling uses the Instance's last rendered bounds. If a camera turn
+	-- exposes those stale bounds while the current trajectory is still outside
+	-- view, move them outside too. No scene unparenting/visibility override.
+	local model = visual.model
+	local renderedPosition = if rig then rig.root.Position
+		elseif model:IsA("Model") then model:GetPivot().Position
+		elseif model:IsA("BasePart") then model.Position
+		else position
+	if View.contains(renderedPosition) then
+		VisualModel.SuspendTrails(visual)
+		VisualModel.Place(visual, position, visual.velocity)
+		if not visual.culled then visual.resumeEffectsOnNextUpdate = now end
+	end
+end
+
 local function updateOffscreen(visual: Visual, now: number)
 	local since: number = if visual.inView then now else visual.offscreenSince or now
 	visual.offscreenSince = since
 	if not visual.culled and now - since >= visual.effectCullDelay then
 		VisualModel.SuspendEffects(visual)
-		VisualModel.SetCulled(visual, true)
 		visual.culled = true
 	end
+	recoverStalePose(visual, visual.position, now)
+	-- Targets received before leaving view must not continue tweening later.
+	visual.transformFrom = nil
+	visual.transformTo = nil
 end
 
 local function resumeEffectsIfDue(visual: Visual)
@@ -433,7 +464,22 @@ end
 -- since its previous visit. Returns whether it used transform budget, or nil
 -- if it was destroyed.
 local function updatePredicted(visual: Visual, elapsedGlobalDt: number, now: number): boolean?
+	if not visual.inView and visual.culled and Prediction.canDefer(visual) then
+		local dt = elapsedGlobalDt * visual.timeScale
+		local projectedPosition = Prediction.projectDeferred(visual, dt)
+		if dt < visual.life and not View.contains(projectedPosition) then
+			-- Leave the baseline timestamp untouched. Re-entry consumes the whole
+			-- interval exactly once; corrections replace that baseline immediately.
+			visual.deferredPrediction = true
+			deferredVisuals[visual.id] = visual
+			recoverStalePose(visual, projectedPosition, now)
+			return false
+		end
+	end
 	local alive, moved = Prediction.simulate(visual, elapsedGlobalDt * visual.timeScale)
+	visual.lastSimulationTime = globalSimulationClock
+	visual.deferredPrediction = false
+	deferredVisuals[visual.id] = nil
 	local inView = View.contains(visual.position)
 	if inView then
 		if not visual.inView then
@@ -500,7 +546,6 @@ local function renderStep(globalDt: number)
 			continue
 		end
 		local elapsedGlobalDt = math.max(globalSimulationClock - visual.lastSimulationTime, 0)
-		visual.lastSimulationTime = globalSimulationClock
 
 		-- Real (undilated) backstop mirroring the server's MaxRealLifetime.
 		-- Normally ProjHit removes the visual first; this only matters if that
@@ -544,6 +589,15 @@ function ProjectileClient.EnableClientRendering()
 		return
 	end
 	clientRendering = true
+	ChunkManager.BeforeTimeScaleChange:Connect(function()
+		for _, visual in deferredVisuals do
+				Prediction.settleDeferred(visual,
+					math.max(globalSimulationClock - visual.lastSimulationTime, 0) * visual.timeScale)
+				visual.lastSimulationTime = globalSimulationClock
+				visual.deferredPrediction = false
+		end
+		table.clear(deferredVisuals)
+	end)
 
 	VisualOffload.On(Channels.SpawnBatch, function(batch: { Protocol.SpawnPayload })
 		debug.profilebegin("ProjectileClient.BuildSpawnBatch")

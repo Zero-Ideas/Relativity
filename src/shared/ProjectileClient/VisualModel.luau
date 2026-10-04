@@ -413,21 +413,6 @@ function VisualModel.ResumeEffects(visual: Visual)
 	visual.suspendedParticles = nil
 end
 
--- Unparenting is a cheap, exact visual cull: the projectile cannot remain
--- frozen at its last on-screen transform, and Roblox has nothing to draw for
--- it while it is outside the camera. Place it before restoring the parent so
--- re-entry can never flash the stale exit pose for one frame.
-function VisualModel.SetCulled(visual: Visual, culled: boolean)
-	local model = visual.model
-	if culled then
-		if model.Parent then
-			model.Parent = nil
-		end
-	elseif not model.Parent then
-		model.Parent = workspace
-	end
-end
-
 -- Instantly hides a bullet visual without destroying it: every BasePart goes
 -- fully transparent, and every Trail/ParticleEmitter/Beam (and Light) is
 -- either faded or deleted outright depending on waitForParticles/

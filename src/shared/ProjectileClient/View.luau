@@ -2,7 +2,8 @@
 --!optimize 2
 --[[
 	ProjectileClient/View.luau
-	Camera frustum snapshot, refreshed once per frame. View.contains is then
+	Calculation-visibility snapshot, refreshed once per frame. This gates Lua
+	work only; Roblox retains ownership of draw culling. View.contains is then
 	pure Luau dot products instead of one WorldToViewportPoint engine call per
 	visual, which dominated the render loop at 10k visuals.
 ]]

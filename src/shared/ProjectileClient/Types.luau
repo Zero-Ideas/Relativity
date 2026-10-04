@@ -39,6 +39,7 @@ export type Visual = {
 	simulationDebt: number, -- personal/global seconds carried across visits
 	timeScale: number, -- combined Source * projectile TimeScale
 	lastSimulationTime: number, -- global simulation clock the pose corresponds to
+	deferredPrediction: boolean,
 	synced: boolean, -- homing: driven by ProjMove instead of Prediction
 
 	-- lifetime backstops

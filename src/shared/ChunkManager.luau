@@ -42,8 +42,12 @@ local RunService = game:GetService("RunService")
 local Players = game:GetService("Players")
 
 local Heartbeat = require(script.Parent.Heartbeat)
+local Signal = require(script.Parent.Signal)
 
 local ChunkManager = {}
+-- Observers settle deferred uniform motion before the time field changes.
+-- Handlers must not yield.
+ChunkManager.BeforeTimeScaleChange = Signal.new()
 ChunkManager.ChunkSize = 64 -- studs per chunk edge
 ChunkManager.FreezeUnloaded = true -- skip updates/queries in unloaded chunks
 ChunkManager.UseY = false -- 2D (XZ) chunking by default
@@ -95,6 +99,7 @@ end
 
 -- Every chunk TimeScale write goes through here so dilatedChunkCount stays exact.
 local function setChunkScale(chunk, scale: number)
+	if chunk.TimeScale ~= scale then ChunkManager.BeforeTimeScaleChange:Fire() end
 	if (chunk.TimeScale ~= 1) ~= (scale ~= 1) then
 		dilatedChunkCount += if scale ~= 1 then 1 else -1
 	end
@@ -154,6 +159,7 @@ local function replicateZone(channel: string, payload)
 end
 
 function ChunkManager.AddTimeScaleZone(id: any, position: Vector3, radius: number, scale: number)
+	ChunkManager.BeforeTimeScaleChange:Fire()
 	local existing = timeZonesById[id]
 	if existing then
 		local index = table.find(timeZones, existing)
@@ -178,6 +184,7 @@ function ChunkManager.RemoveTimeScaleZone(id: any)
 	if not zone then
 		return
 	end
+	ChunkManager.BeforeTimeScaleChange:Fire()
 	timeZonesById[id] = nil
 	local index = table.find(timeZones, zone)
 	if index then
