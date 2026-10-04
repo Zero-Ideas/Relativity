@@ -8,6 +8,7 @@ local TextService = game:GetService("TextService")
 
 local Shared = ReplicatedStorage:WaitForChild("Shared")
 local Entity = require(Shared:WaitForChild("Entity"))
+local SafeMath = require(Shared:WaitForChild("SafeMath"))
 local SpellCompiler = require(Shared:WaitForChild("SpellCompiler"))
 local SpellStore = require(script.Parent:WaitForChild("SpellStore"))
 local SpellRuntime = require(script.Parent:WaitForChild("SpellRuntime"))
@@ -168,17 +169,13 @@ local function compiledFor(record: any): any?
 	return cached or nil
 end
 
-cast.OnServerEvent:Connect(function(player: Player, targetPoint: any)
-	if typeof(targetPoint) ~= "Vector3"
-		or targetPoint.X ~= targetPoint.X
-		or targetPoint.Y ~= targetPoint.Y
-		or targetPoint.Z ~= targetPoint.Z
-		or math.abs(targetPoint.X) == math.huge
-		or math.abs(targetPoint.Y) == math.huge
-		or math.abs(targetPoint.Z) == math.huge
-	then
+cast.OnServerEvent:Connect(function(player: Player, rawTarget: any)
+	-- A NaN aim has no recoverable direction, so reject it; +-inf components
+	-- clamp to SafeMath.Limit so an absurd aim still fires the way it points.
+	if typeof(rawTarget) ~= "Vector3" or SafeMath.hasNaN(rawTarget) then
 		return
 	end
+	local targetPoint = SafeMath.vector(rawTarget, Vector3.zero)
 	local tool = equippedAssembler(player)
 	local character = player.Character
 	local root = character and (character.PrimaryPart or character:FindFirstChild("HumanoidRootPart"))

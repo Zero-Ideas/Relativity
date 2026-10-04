@@ -1,9 +1,18 @@
+--!strict
 --!optimize 2
 --[[
 	ProjectileClient/VisualModel.luau
 	Builds and positions the actual Instance a projectile visual renders as.
 	Pure presentation -- no networking, no gameplay state.
 ]]
+
+local Protocol = require(script.Parent.Parent:WaitForChild("ProjectileProtocol"))
+local SafeMath = require(script.Parent.Parent:WaitForChild("SafeMath"))
+
+local Types = require(script.Parent.Types)
+
+type Visual = Types.Visual
+type Rig = Types.Rig
 
 local VisualModel = {}
 
@@ -12,16 +21,17 @@ local VisualModel = {}
 local DEFAULT_EMIT_COUNT = 5
 local DEFAULT_EMIT_DELAY = 0
 
-local function safeUnit(v: Vector3, fallback: Vector3): Vector3
-	local magnitude = v.Magnitude
-	if magnitude < 1e-5 then
-		return fallback
-	end
-	return v / magnitude
+local function poseFrom(position: Vector3, velocity: Vector3): CFrame
+	return CFrame.lookAt(position, position + SafeMath.direction(velocity, Vector3.zAxis))
 end
 
-local function poseFrom(position: Vector3, velocity: Vector3): CFrame
-	return CFrame.new(position, position + safeUnit(velocity, Vector3.zAxis))
+-- `model` itself plus every descendant, without first copying them all into
+-- one table (unpacking GetDescendants() also errors on very large models).
+local function forSelfAndDescendants(model: Instance, fn: (Instance) -> ())
+	fn(model)
+	for _, instance in model:GetDescendants() do
+		fn(instance)
+	end
 end
 
 -- Built-in (non-Model) visuals are pooled per appearance: a burst otherwise
@@ -29,9 +39,9 @@ end
 -- impact. Custom Models aren't pooled -- their effects/transparency state is
 -- mutated by FadeOut and would need a full restore.
 local POOL_LIMIT = 4096
-local pools: { [string]: { any } } = {}
+local pools: { [string]: { Rig } } = {}
 
-local function builtinPoolKey(data): string
+local function builtinPoolKey(data: Protocol.SpawnPayload): string
 	local spec = data.Visual
 	local scale = math.clamp(data.VisualScale or 1, 0.05, 20)
 	if spec then
@@ -166,7 +176,7 @@ local function buildBullet(core: Color3, glow: Color3): Model
 	return model
 end
 
-local function styledModel(spec: any): Model?
+local function styledModel(spec: Protocol.VisualSpec): Model?
 	local core = spec.Core or Color3.new(1, 1, 1)
 	local glow = spec.Color or core
 	local key = `{spec.Style}|{core}|{glow}`
@@ -184,12 +194,40 @@ local function styledModel(spec: any): Model?
 	return template:Clone()
 end
 
-function VisualModel.Build(data): (Instance, any)
-	local model
-	local styled = data.Visual and data.Visual.Style and not data.Model and styledModel(data.Visual)
-	local poolKey = if data.Model or styled then nil else builtinPoolKey(data)
+local function builtinPart(spec: Protocol.VisualSpec?): Part
+	local part = Instance.new("Part")
+	if spec then
+		if spec.Shape == "Ball" then
+			part.Shape = Enum.PartType.Ball
+		elseif spec.Shape == "Cylinder" then
+			part.Shape = Enum.PartType.Cylinder
+		end
+		part.Size = spec.Size or Vector3.one * 0.5
+		part.Color = spec.Color or Color3.new(1, 1, 1)
+	else
+		part.Size = Vector3.one * 0.4
+		part.Color = Color3.fromRGB(255, 220, 120)
+	end
+	part.Material = Enum.Material.Neon
+	return part
+end
 
-	local pooledRig = poolKey and pools[poolKey] and table.remove(pools[poolKey])
+local function makeCosmetic(part: BasePart)
+	part.Anchored = false
+	part.CanCollide = false
+	part.CanQuery = false
+	part.CanTouch = false
+	part.CastShadow = false
+end
+
+function VisualModel.Build(data: Protocol.SpawnPayload): (Instance, Rig?)
+	local spec = data.Visual
+	local authored = data.Model
+	local styled = if spec and spec.Style and not authored then styledModel(spec) else nil
+	local poolKey = if authored or styled then nil else builtinPoolKey(data)
+
+	local pool = if poolKey then pools[poolKey] else nil
+	local pooledRig = if pool then table.remove(pool) else nil
 	if pooledRig then
 		pooledRig.driver.CFrame = CFrame.new(data.Position)
 		pooledRig.motor.Transform =
@@ -199,68 +237,40 @@ function VisualModel.Build(data): (Instance, any)
 		return pooledRig.model, pooledRig
 	end
 
-	if styled then
-		model = styled
-	elseif data.Model then
-		model = data.Model:Clone()
-	else
-		local part = Instance.new("Part")
-		local spec = data.Visual
-		if spec then
-			if spec.Shape == "Ball" then
-				part.Shape = Enum.PartType.Ball
-			elseif spec.Shape == "Cylinder" then
-				part.Shape = Enum.PartType.Cylinder
-			end
-			part.Size = spec.Size or Vector3.one * 0.5
-			part.Color = spec.Color or Color3.new(1, 1, 1)
-		else
-			part.Size = Vector3.one * 0.4
-			part.Color = Color3.fromRGB(255, 220, 120)
-		end
-		part.Material = Enum.Material.Neon
-		model = part
-	end
+	local model: Instance = styled or (if authored then authored:Clone() else builtinPart(spec))
 
 	-- Scale the cloned presentation once at construction. This does not add
 	-- any per-frame work and keeps gameplay collision radius server-owned.
 	local visualScale = math.clamp(data.VisualScale or 1, 0.05, 20)
-	if visualScale ~= 1 then
-		if model:IsA("Model") then
-			pcall(model.ScaleTo, model, model:GetScale() * visualScale)
-		elseif model:IsA("BasePart") then
-			model.Size *= visualScale
-		end
-	end
 	local root: BasePart?
 	local pivot: CFrame
 	if model:IsA("Model") then
+		if visualScale ~= 1 then
+			pcall(model.ScaleTo, model, model:GetScale() * visualScale)
+		end
 		root = model.PrimaryPart or model:FindFirstChildWhichIsA("BasePart", true)
 		pivot = model:GetPivot()
-		for _, part in { model, table.unpack(model:GetDescendants()) } do
-			if part:IsA("BasePart") then
-				part.Anchored = false
-				part.CanCollide = false
-				part.CanQuery = false
-				part.CanTouch = false
-				part.CastShadow = false
+		forSelfAndDescendants(model, function(instance)
+			if instance:IsA("BasePart") then
+				makeCosmetic(instance)
 			end
+		end)
+	elseif model:IsA("BasePart") then
+		if visualScale ~= 1 then
+			model.Size *= visualScale
 		end
-	else
 		root = model
 		pivot = model.CFrame
-		model.Anchored = false
-		model.CanCollide = false
-		model.CanQuery = false
-		model.CanTouch = false
-		model.CastShadow = false
+		makeCosmetic(model)
+	else
+		pivot = CFrame.identity
 	end
 
 	-- Drive the visual as an assembly from one stationary, invisible root. A
 	-- Motor6D Transform is considerably cheaper to update every render frame
 	-- than creating/cancelling Tween instances or repeatedly moving a model
 	-- pivot. rootOffset preserves a custom Model's authored pivot.
-	local rig
+	local rig: Rig? = nil
 	if root then
 		local driver = Instance.new("Part")
 		driver.Name = "ProjectileMotorRoot"
@@ -283,7 +293,7 @@ function VisualModel.Build(data): (Instance, any)
 		local rootOffset = pivot:ToObjectSpace(root.CFrame)
 		motor.Transform = driver.CFrame:ToObjectSpace(poseFrom(data.Position, data.Velocity) * rootOffset)
 		rig = {
-			driver = driver,
+			driver = driver :: BasePart,
 			motor = motor,
 			rootOffset = rootOffset,
 			model = model,
@@ -296,11 +306,7 @@ function VisualModel.Build(data): (Instance, any)
 	return model, rig
 end
 
-local function transformFor(visual, pose: CFrame): CFrame?
-	local rig = visual.rig
-	if not rig then
-		return nil
-	end
+local function transformFor(rig: Rig, pose: CFrame): CFrame
 	return rig.driver.CFrame:ToObjectSpace(pose * rig.rootOffset)
 end
 
@@ -312,14 +318,14 @@ local function placeFallback(model: Instance, pose: CFrame)
 	end
 end
 
-function VisualModel.Place(visual, position: Vector3, velocity: Vector3)
+function VisualModel.Place(visual: Visual, position: Vector3, velocity: Vector3)
 	visual.transformFrom = nil
 	visual.transformTo = nil
 
 	local pose = poseFrom(position, velocity)
-	local transform = transformFor(visual, pose)
-	if transform then
-		visual.rig.motor.Transform = transform
+	local rig = visual.rig
+	if rig then
+		rig.motor.Transform = transformFor(rig, pose)
 	else
 		placeFallback(visual.model, pose)
 	end
@@ -329,11 +335,11 @@ end
 -- history before a culled visual is moved. Keeping them disabled until a later
 -- render turn prevents Roblox from drawing a segment between the old and new
 -- transforms.
-function VisualModel.SuspendTrails(visual)
+function VisualModel.SuspendTrails(visual: Visual)
 	if visual.suspendedTrails then
 		return
 	end
-	local suspended = {}
+	local suspended: { Trail } = {}
 	for _, instance in visual.model:GetDescendants() do
 		if instance:IsA("Trail") and instance.Enabled then
 			instance.Enabled = false
@@ -344,7 +350,7 @@ function VisualModel.SuspendTrails(visual)
 	visual.suspendedTrails = suspended
 end
 
-function VisualModel.ResumeTrails(visual)
+function VisualModel.ResumeTrails(visual: Visual)
 	local suspended = visual.suspendedTrails
 	if not suspended then
 		return
@@ -365,11 +371,9 @@ function VisualModel.GetLongestEffectLifetime(model: Instance): number
 	local longest = 0
 	for _, instance in model:GetDescendants() do
 		if instance:IsA("ParticleEmitter") then
-			local emitDelay = instance:GetAttribute("EmitDelay")
-			if typeof(emitDelay) ~= "number" then
-				emitDelay = 0
-			end
-			longest = math.max(longest, math.max(emitDelay, 0) + instance.Lifetime.Max)
+			local rawDelay = instance:GetAttribute("EmitDelay")
+			local emitDelay = if typeof(rawDelay) == "number" then math.max(rawDelay, 0) else 0
+			longest = math.max(longest, emitDelay + instance.Lifetime.Max)
 		elseif instance:IsA("Trail") then
 			longest = math.max(longest, instance.Lifetime)
 		end
@@ -380,12 +384,12 @@ end
 -- Off-screen culling eventually stops both continuous particle emission and
 -- trails, but only after GetLongestEffectLifetime has elapsed. Remember the
 -- exact enabled set so authored-disabled effects stay disabled on re-entry.
-function VisualModel.SuspendEffects(visual)
+function VisualModel.SuspendEffects(visual: Visual)
 	VisualModel.SuspendTrails(visual)
 	if visual.suspendedParticles then
 		return
 	end
-	local suspended = {}
+	local suspended: { ParticleEmitter } = {}
 	for _, instance in visual.model:GetDescendants() do
 		if instance:IsA("ParticleEmitter") and instance.Enabled then
 			instance.Enabled = false
@@ -395,7 +399,7 @@ function VisualModel.SuspendEffects(visual)
 	visual.suspendedParticles = suspended
 end
 
-function VisualModel.ResumeEffects(visual)
+function VisualModel.ResumeEffects(visual: Visual)
 	VisualModel.ResumeTrails(visual)
 	local suspended = visual.suspendedParticles
 	if not suspended then
@@ -413,7 +417,7 @@ end
 -- frozen at its last on-screen transform, and Roblox has nothing to draw for
 -- it while it is outside the camera. Place it before restoring the parent so
 -- re-entry can never flash the stale exit pose for one frame.
-function VisualModel.SetCulled(visual, culled: boolean)
+function VisualModel.SetCulled(visual: Visual, culled: boolean)
 	local model = visual.model
 	if culled then
 		if model.Parent then
@@ -444,7 +448,7 @@ end
 -- flag false and the model has none of the other kind.
 function VisualModel.FadeOut(model: Instance, waitForParticles: boolean, waitForTrails: boolean): number
 	local grace = 0
-	for _, inst in { model, table.unpack(model:GetDescendants()) } do
+	forSelfAndDescendants(model, function(inst)
 		if inst:IsA("BasePart") then
 			inst.Transparency = 1
 		elseif inst:IsA("ParticleEmitter") then
@@ -470,29 +474,31 @@ function VisualModel.FadeOut(model: Instance, waitForParticles: boolean, waitFor
 		elseif inst:IsA("Light") then
 			inst.Enabled = false
 		end
-	end
+	end)
 	return grace
 end
 
-local function release(visual)
+local function release(visual: Visual)
 	local rig = visual.rig
 	local poolKey = rig and rig.poolKey
-	local pool = poolKey and pools[poolKey]
-	if poolKey and not pool then
-		pool = {}
-		pools[poolKey] = pool
+	if rig and poolKey then
+		local pool = pools[poolKey]
+		if not pool then
+			pool = {}
+			pools[poolKey] = pool
+		end
+		if #pool < POOL_LIMIT then
+			visual.model.Parent = nil
+			table.insert(pool, rig)
+			return
+		end
 	end
-	if pool and #pool < POOL_LIMIT then
-		visual.model.Parent = nil
-		table.insert(pool, rig)
-	else
-		visual.model:Destroy()
-	end
+	visual.model:Destroy()
 end
 
 -- Hides a finished visual, then destroys it (or returns a built-in one to the
 -- pool) after max(destroyDelay, FadeOut's effect grace period).
-function VisualModel.Retire(visual, destroyDelay: number)
+function VisualModel.Retire(visual: Visual, destroyDelay: number)
 	local rig = visual.rig
 	local delay = destroyDelay
 	if rig and rig.poolKey then
@@ -516,16 +522,12 @@ end
 -- seconds from THIS call until that emitter actually emits -- 0 emits
 -- inline, synchronously. Call once, right after VisualModel.Build.
 function VisualModel.ActivateParticles(model: Instance)
-	for _, inst in { model, table.unpack(model:GetDescendants()) } do
+	forSelfAndDescendants(model, function(inst)
 		if inst:IsA("ParticleEmitter") then
-			local emitCount = inst:GetAttribute("EmitCount")
-			if typeof(emitCount) ~= "number" then
-				emitCount = DEFAULT_EMIT_COUNT
-			end
-			local emitDelay = inst:GetAttribute("EmitDelay")
-			if typeof(emitDelay) ~= "number" then
-				emitDelay = DEFAULT_EMIT_DELAY
-			end
+			local rawCount = inst:GetAttribute("EmitCount")
+			local emitCount = if typeof(rawCount) == "number" then rawCount else DEFAULT_EMIT_COUNT
+			local rawDelay = inst:GetAttribute("EmitDelay")
+			local emitDelay = if typeof(rawDelay) == "number" then rawDelay else DEFAULT_EMIT_DELAY
 			if emitDelay > 0 then
 				task.delay(emitDelay, function()
 					if inst.Parent then
@@ -536,34 +538,36 @@ function VisualModel.ActivateParticles(model: Instance)
 				inst:Emit(emitCount)
 			end
 		end
-	end
+	end)
 end
 
 -- Starts a linear pose interpolation for a server-synced visual. The render
 -- loop advances it by writing Motor6D.Transform; no Tween objects are created.
-function VisualModel.SetTarget(visual, position: Vector3, velocity: Vector3, duration: number)
-	local target = transformFor(visual, poseFrom(position, velocity))
-	if not target or duration <= 0 then
+function VisualModel.SetTarget(visual: Visual, position: Vector3, velocity: Vector3, duration: number)
+	local rig = visual.rig
+	if not rig or not (duration > 0) then
 		VisualModel.Place(visual, position, velocity)
 		return
 	end
 
-	visual.transformFrom = visual.rig.motor.Transform
-	visual.transformTo = target
+	visual.transformFrom = rig.motor.Transform
+	visual.transformTo = transformFor(rig, poseFrom(position, velocity))
 	visual.transformElapsed = 0
 	visual.transformDuration = duration
 end
 
-function VisualModel.Step(visual, dt: number)
+function VisualModel.Step(visual: Visual, dt: number)
 	local from = visual.transformFrom
 	local target = visual.transformTo
-	if not from or not target then
+	local rig = visual.rig
+	if not from or not target or not rig then
 		return
 	end
 
 	local elapsed = visual.transformElapsed + dt
+	-- SetTarget only starts a tween with a positive duration.
 	local alpha = math.min(elapsed / visual.transformDuration, 1)
-	visual.rig.motor.Transform = from:Lerp(target, alpha)
+	rig.motor.Transform = from:Lerp(target, alpha)
 	visual.transformElapsed = elapsed
 	if alpha >= 1 then
 		visual.transformFrom = nil

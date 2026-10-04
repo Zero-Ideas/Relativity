@@ -1,3 +1,4 @@
+--!strict
 --!optimize 2
 --[[
 	ProjectileClient/Impact.luau
@@ -15,11 +16,11 @@ local Impact = {}
 -- "entity" | "world" | "bounce" | "detonate".)
 local impactHandler: ((Vector3, Vector3, Instance?, string?) -> ())? = nil
 
-function Impact.SetHandler(fn)
+function Impact.SetHandler(fn: ((Vector3, Vector3, Instance?, string?) -> ())?)
 	impactHandler = fn
 end
 
-local IMPACT_COLORS = {
+local IMPACT_COLORS: { [string]: Color3 } = {
 	entity = Color3.fromRGB(255, 80, 80), -- hit a damageable target
 	world = Color3.fromRGB(255, 225, 150), -- hit geometry
 	bounce = Color3.fromRGB(120, 220, 255), -- ricochet
@@ -52,8 +53,8 @@ local function defaultImpact(position: Vector3, normal: Vector3, kind: string?)
 	local ring = Instance.new("Part")
 	ring.Shape = Enum.PartType.Cylinder
 	ring.Size = Vector3.new(0.12, 0.5, 0.5)
-	local n = normal.Magnitude > 1e-3 and normal.Unit or Vector3.yAxis
-	ring.CFrame = CFrame.new(position, position + n) * CFrame.Angles(0, math.rad(90), 0)
+	local n = if normal.Magnitude > 1e-3 then normal.Unit else Vector3.yAxis
+	ring.CFrame = CFrame.lookAt(position, position + n) * CFrame.Angles(0, math.rad(90), 0)
 	ring.Anchored = true
 	ring.CanCollide = false
 	ring.CanQuery = false

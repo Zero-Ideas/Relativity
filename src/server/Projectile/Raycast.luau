@@ -1,21 +1,31 @@
+--!strict
 --!optimize 2
 --[[
 	Projectile/Raycast.luau
-	Physical ray/capsule movement, world/entity hit resolution, and
-	wall penetration. Raycast.Methods gets mixed onto the Projectile class by
-	init.luau (so self:_resolveHit(result) etc. keep working unchanged).
+	Physical ray/capsule movement casts, world/entity hit resolution, and wall
+	penetration. The resolvers decide what a contact does and apply its
+	immediate effects (OnHit, pierce bookkeeping, reflection, nudging past the
+	surface), then return a Types.Verdict; lifecycle -- Destroy(), time
+	accounting -- stays with the caller in init.luau.
 ]]
 
-local ReplicatedStorage = game:GetService("ReplicatedStorage")
-local Shared = ReplicatedStorage:WaitForChild("Shared")
-local Entity = require(Shared.Entity)
-local ChunkManager = require(Shared.ChunkManager)
+local Shared = game:GetService("ReplicatedStorage"):WaitForChild("Shared")
+local Entity = require(Shared:WaitForChild("Entity"))
+local ChunkManager = require(Shared:WaitForChild("ChunkManager"))
+local SafeMath = require(Shared:WaitForChild("SafeMath"))
 
-local Math = require(script.Parent.Math)
 local Replication = require(script.Parent.Replication)
+local Types = require(script.Parent.Types)
+
+type State = Types.State
+type Verdict = Types.Verdict
 
 local Raycast = {}
-Raycast.Methods = {}
+
+-- Clearance when stepping just past a surface after a pass-through contact.
+local PASS_CLEARANCE = 0.1
+-- Clearance off a surface after a bounce.
+local BOUNCE_CLEARANCE = 0.05
 
 -- Built once per projectile and cached on it (Source never changes after
 -- construction), reused for every raycast that projectile makes -- Roblox
@@ -26,177 +36,107 @@ Raycast.Methods = {}
 -- adding pierced entities instead of the current position-nudge approach),
 -- mutating `ignore` in place won't take effect -- FilterDescendantsInstances
 -- would need reassigning.
-function Raycast.buildRayParams(projectile)
+function Raycast.buildRayParams(source: Types.EntityLike?, ignoreInstances: { Instance }?): RaycastParams
 	local params = RaycastParams.new()
 	params.FilterType = Enum.RaycastFilterType.Exclude
-	local ignore = {}
-	local source = projectile.Source
-	if source and source.Instance then
-		table.insert(ignore, source.Instance)
+	local ignore: { Instance } = {}
+	local sourceInstance = source and source.Instance
+	if sourceInstance then
+		table.insert(ignore, sourceInstance)
 	end
 	-- Excluded independently of Source: Source only exists once the firing
 	-- entity is registered with the Entity system (see PlayerManager.server.luau),
 	-- so a shot fired in the window before that registration lands would
 	-- otherwise have nothing excluding the shooter's own character from this
 	-- raycast -- IgnoreInstances closes that gap without depending on timing.
-	if projectile.IgnoreInstances then
-		for _, instance in projectile.IgnoreInstances do
-			table.insert(ignore, instance)
-		end
+	if ignoreInstances then
+		table.move(ignoreInstances, 1, #ignoreInstances, #ignore + 1, ignore)
 	end
 	params.FilterDescendantsInstances = ignore
 	params.IgnoreWater = true
 	return params
 end
 
-function Raycast.castMovement(projectile, origin: Vector3, displacement: Vector3)
+-- Sweeps the projectile's body along `displacement`. Returns the contact as a
+-- plain table (see Types.Contact) or nil. Distance is how far the ray -- or
+-- the sphere's center -- travelled, which is what the time accounting in
+-- init.luau needs; for a Spherecast, Position is the surface point instead.
+function Raycast.castMovement(projectile: State, origin: Vector3, displacement: Vector3): Types.Contact?
 	local params = projectile._rayParams
+	local result
 	if projectile.Radius > 0 then
 		-- Sweeping a sphere along a line is exactly a capsule: a cylindrical
 		-- body of Radius around this segment plus spherical caps at both ends.
 		-- Adjacent adaptive substeps share the cap at their common joint, so
-		-- curved paths have no wedge-shaped collision gaps. One Spherecast is
-		-- both more exact and cheaper than a separate cylinder query followed
-		-- by another endpoint query.
-		return workspace:Spherecast(origin, projectile.Radius, displacement, params)
+		-- curved paths have no wedge-shaped collision gaps.
+		result = workspace:Spherecast(origin, projectile.Radius, displacement, params)
+	else
+		result = workspace:Raycast(origin, displacement, params)
 	end
-	return workspace:Raycast(origin, displacement, params)
+	if not result then
+		return nil
+	end
+	return {
+		Position = result.Position,
+		Normal = result.Normal,
+		Instance = result.Instance,
+		Distance = result.Distance,
+	}
 end
 
 -- Does the chunk containing `position` currently hold any entities? Drives the
--- high/low resolution decision each frame.
+-- high/low resolution decision each substep.
 function Raycast.chunkHasEntities(position: Vector3): boolean
 	local chunk = ChunkManager.GetChunk(position)
 	return chunk ~= nil and chunk.EntityCount > 0
 end
 
--- Builds the { CFrame, Part, Entity?, Hurtbox? } table passed to every
--- projectile.OnHit listener -- see the module doc comment's "Events"
--- section. `result` is a RaycastResult (or an equivalent plain table shape
--- for a bounce/penetration point); entity is nil for a pure world/wall
--- contact. hurtboxName is "Head" | "Body" | nil -- see _resolveHit /
--- RewindHit, which resolve it analytically against
--- entity:GetHeadPosition()/GetBodyPosition() (see Entity.luau's "Head +
--- Body hurtboxes" section).
-function Raycast.buildHitInfo(result, entity, hurtboxName: string?)
-	local normal = result.Normal and Math.safeUnit(result.Normal, Vector3.zAxis) or Vector3.zAxis
+-- Builds the table passed to every projectile.OnHit listener -- see the
+-- "Events" section in init.luau. `entity` is nil for a pure world/wall contact.
+function Raycast.buildHitInfo(contact: Types.Contact, entity: Types.EntityLike?, hurtbox: Types.Hurtbox?): Types.HitInfo
+	local normal = SafeMath.direction(contact.Normal, Vector3.zAxis)
 	return {
-		CFrame = CFrame.lookAt(result.Position, result.Position + normal),
-		Part = result.Instance,
+		CFrame = CFrame.lookAt(contact.Position, contact.Position + normal),
+		Part = contact.Instance,
 		Entity = entity,
-		Hurtbox = hurtboxName,
+		Hurtbox = hurtbox,
 	}
 end
 
--- Broadcasts a single movement raycast segment for debug visualization.
--- lowRes marks the coarse casts taken through empty (entity-free) chunks.
-function Raycast.Methods:_streamRay(from: Vector3, to: Vector3, lowRes: boolean)
-	Replication.streamTo(self, "ProjRay", { From = from, To = to, LowRes = lowRes })
+-- Steps the projectile just past `surface` along its direction of travel.
+function Raycast.nudgePast(projectile: State, surface: Vector3)
+	projectile.Position = surface
+		+ SafeMath.direction(projectile.Velocity, Vector3.zAxis) * (projectile.Radius + PASS_CLEARANCE)
 end
+local nudgePast = Raycast.nudgePast
 
--- Handles the case where a raycast (or a lag-compensated rewind check, see
--- RewindHit) resolved to hitting `entity` at `result`. Returns "continue" if
--- the projectile keeps flying (pierced, or a self/ignored hit), "destroy" if
--- it called Destroy() itself, or nil if the entity should be treated as a
--- fallthrough (filtered out) -- the caller decides what happens next
--- (bounce/world resolution).
-function Raycast.Methods:_resolveEntityHit(entity, result, hurtboxName: string?): string?
-	if entity == self.Source or self._ignore[entity] then
-		-- can't collide with ourselves or an already-pierced target;
-		-- nudge past the surface and keep going
-		self.Position = result.Position + Math.safeUnit(self.Velocity, Vector3.zAxis) * (self.Radius + 0.1)
-		return "continue"
+-- Resolves `entity` being struck at `contact` (by a raycast, or by a
+-- lag-compensated rewind check -- see RewindHit). "destroy" means the caller
+-- must Destroy(contact, "entity").
+function Raycast.resolveEntityHit(
+	projectile: State,
+	entity: Types.EntityLike,
+	contact: Types.Contact,
+	hurtbox: Types.Hurtbox?
+): Verdict
+	if entity == projectile.Source or projectile._ignore[entity] then
+		-- can't collide with ourselves or an already-pierced target
+		nudgePast(projectile, contact.Position)
+		return "pass"
 	end
-	if self.Filter and not self.Filter(entity) then
-		return nil -- fallthrough: filtered out, treat like world geometry
-	end
-
-	self.OnHit:Fire(Raycast.buildHitInfo(result, entity, hurtboxName))
-	if self.PiercesLeft > 0 then
-		self.PiercesLeft -= 1
-		self.DamageMultiplier *= (1 - self.PierceFalloff)
-		self._ignore[entity] = true
-		self.Position = result.Position + Math.safeUnit(self.Velocity, Vector3.zAxis) * (self.Radius + 0.1)
-		return "continue"
-	end
-	self:Destroy(result, "entity")
-	return "destroy"
-end
-
--- Returns "continue" | "destroy" after resolving a physical raycast hit. A
--- bounce queues a one-shot ProjMove correction (Bounced = true) below --
--- this is the ONLY streaming a
--- non-homing bouncing projectile ever gets; it tells rendering clients to
--- snap instead of tween (see ProjectileClient) and re-baseline their local
--- physics from this post-reflection Position/Velocity.
-function Raycast.Methods:_resolveHit(result)
-	local instance = result.Instance
-	local entity = instance and Entity.Get(instance)
-
-	if entity then
-		-- Head/Body classification is purely analytic here (no synthetic
-		-- hurtbox Parts, no CanQuery/CollisionGroup tricks -- see the module
-		-- doc comment's "Head + Body hurtboxes" section): the raycast hits
-		-- whatever real rig geometry is physically in the way, exactly as
-		-- before this feature existed; we just check whether that hit POINT
-		-- happens to fall within HeadRadius of the entity's Head center.
-		local hurtboxName = "Body"
-		local headPosition = entity:GetHeadPosition()
-		if headPosition and (result.Position - headPosition).Magnitude <= entity.HeadRadius then
-			hurtboxName = "Head"
-		end
-
-		local verdict = self:_resolveEntityHit(entity, result, hurtboxName)
-		if verdict then
-			return verdict
-		end
-		-- fallthrough (filtered out): treat like world geometry below
+	local filter = projectile.Filter
+	if filter and not filter(entity) then
+		return "fallthrough"
 	end
 
-	-- world geometry (or a filtered-out entity): try to punch straight through
-	-- before considering a bounce -- see _attemptPenetration / the module doc
-	-- comment's config section.
-	if self.Penetration > 0 then
-		local exitPosition = self:_attemptPenetration(result)
-		if exitPosition then
-			self.OnHit:Fire(Raycast.buildHitInfo(result, entity))
-			self.Position = exitPosition
-			return "continue"
-		end
-		-- Blocked (wall thicker than remaining Penetration): fall through to
-		-- the normal bounce/destroy resolution below, same as if Penetration
-		-- had been 0 all along.
+	projectile.OnHit:Fire(Raycast.buildHitInfo(contact, entity, hurtbox))
+	if projectile.PiercesLeft > 0 then
+		projectile.PiercesLeft -= 1
+		projectile.DamageMultiplier *= (1 - projectile.PierceFalloff)
+		projectile._ignore[entity] = true
+		nudgePast(projectile, contact.Position)
+		return "pass"
 	end
-
-	-- world geometry (or a filtered-out entity): bounce if we can
-	if self.BouncesLeft > 0 then
-		self.BouncesLeft -= 1
-		local normal = result.Normal
-		local reflected = self.Velocity - 2 * self.Velocity:Dot(normal) * normal
-		self.Velocity = reflected * self.Restitution
-		self.Position = result.Position + normal * (self.Radius + 0.05)
-		-- Flags this tick's streamed position as a bounce (see the module doc
-		-- comment / _checkSyncTransition's Step-level reset): the client must
-		-- SNAP to it instead of tweening a straight line from its pre-bounce
-		-- position, which would visibly cut through whatever surface sits
-		-- between the two -- exactly where the bounce happened.
-		-- Queue this bounce's snap-to-position (captured NOW, not at end of
-		-- tick) for this frame's ProjMove event. It is queued even if a later
-		-- substep this same tick destroys the projectile, and ProjHit is only
-		-- flushed on a later frame, so the snap always reaches the client
-		-- first. This is the sole sync mechanism for a non-homing bouncer (see
-		-- Replication.isSynced): the client otherwise coasts on local physics
-		-- between bounces.
-		Replication.queueBounce(self, normal)
-		if self.OnBounce then
-			task.spawn(self.OnBounce, self, result)
-		end
-		self.OnHit:Fire(Raycast.buildHitInfo(result, entity))
-		return "continue"
-	end
-
-	self.OnHit:Fire(Raycast.buildHitInfo(result, entity))
-	self:Destroy(result, "world")
 	return "destroy"
 end
 
@@ -204,46 +144,101 @@ end
 -- point Penetration studs further along the ray past the entry point, then
 -- raycasts BACKWARD from that probe to the entry point, whitelisted to ONLY
 -- the part that was just hit:
---  - Hit (not nil): the probe already crossed back into the SAME part from
---    outside it, meaning the wall's far/exit surface is somewhere between the
---    probe and the entry point -- i.e. the wall is thinner than the current
---    Penetration budget. The distance from the entry point to that exit
---    surface is the wall's actual thickness; that amount (not the probe
---    distance) is subtracted from Penetration, since a thin wall should
---    barely dent the budget and a thick one should nearly exhaust it.
---  - Nil: the probe point is still INSIDE the wall's solid (Roblox raycasts
---    never register a hit against a part the ray starts inside of), meaning
---    the wall is thicker than the entire Penetration budget -- can't punch
---    through at all.
--- Returns the position just past the exit surface on success, or nil if
--- blocked (caller falls through to bounce/destroy as normal).
-function Raycast.Methods:_attemptPenetration(result): Vector3?
-	local instance = result.Instance
+--  - Hit: the wall's far/exit surface lies between the probe and the entry
+--    point, i.e. the wall is thinner than the remaining budget. The wall's
+--    actual thickness (not the probe distance) is subtracted, so a thin wall
+--    barely dents the budget and a thick one nearly exhausts it.
+--  - Nil: the probe point is still INSIDE the wall (Roblox raycasts never hit
+--    a part they start inside), so the wall is thicker than the budget.
+-- Returns the position just past the exit surface, or nil if blocked.
+local function attemptPenetration(projectile: State, contact: Types.Contact): Vector3?
+	local instance = contact.Instance
 	if not instance then
 		return nil
 	end
 
-	local direction = Math.safeUnit(self.Velocity, Vector3.zAxis)
-	local probeOrigin = result.Position + direction * self.Penetration
+	local direction = SafeMath.direction(projectile.Velocity, Vector3.zAxis)
+	local probeOrigin = contact.Position + direction * projectile.Penetration
 
 	local probeParams = RaycastParams.new()
 	probeParams.FilterType = Enum.RaycastFilterType.Include
 	probeParams.FilterDescendantsInstances = { instance }
 
-	local probeResult = workspace:Raycast(probeOrigin, result.Position - probeOrigin, probeParams)
+	local probeResult = workspace:Raycast(probeOrigin, contact.Position - probeOrigin, probeParams)
 	if not probeResult then
 		return nil
 	end
 
-	local thickness = (probeResult.Position - result.Position).Magnitude
-	self.Penetration -= thickness
-	if self.Penetration < 0 then
-		-- Ran out of power exactly on this wall -- treat as blocked, same as
-		-- the nil case above.
-		return nil
+	local thickness = (probeResult.Position - contact.Position).Magnitude
+	projectile.Penetration = math.max(projectile.Penetration - thickness, 0)
+	return probeResult.Position + direction * (projectile.Radius + PASS_CLEARANCE)
+end
+
+-- Resolves a physical cast contact. Returns the verdict and, for "destroy",
+-- the kind to Destroy() with. A bounce queues a one-shot ProjMove correction
+-- (Bounced = true) -- the ONLY streaming a non-homing bouncing projectile
+-- ever gets; it tells rendering clients to snap instead of tween and to
+-- re-baseline their local physics (see ProjectileClient).
+function Raycast.resolveHit(projectile: State, contact: Types.Contact): (Verdict, string?)
+	local instance = contact.Instance
+	local entity: Types.EntityLike? = if instance then Entity.Get(instance) else nil
+
+	if entity then
+		-- Head/Body classification is purely analytic: the raycast hits
+		-- whatever real rig geometry is physically in the way; we just check
+		-- whether that hit POINT falls within HeadRadius of the Head center
+		-- (see Entity.luau's "Head + Body hurtboxes" section).
+		local hurtbox: Types.Hurtbox = "Body"
+		local headPosition = entity:GetHeadPosition()
+		if headPosition and (contact.Position - headPosition).Magnitude <= entity.HeadRadius then
+			hurtbox = "Head"
+		end
+
+		local verdict = Raycast.resolveEntityHit(projectile, entity, contact, hurtbox)
+		if verdict == "destroy" then
+			return "destroy", "entity"
+		elseif verdict ~= "fallthrough" then
+			-- (cast: Luau widens the refined literal union back to string)
+			return verdict :: Verdict, nil
+		end
+		-- filtered out: treat like world geometry below
 	end
 
-	return probeResult.Position + direction * (self.Radius + 0.1)
+	-- Penetration is tried before bouncing; a wall thicker than the remaining
+	-- budget falls through to bounce/destroy as if Penetration were 0.
+	if projectile.Penetration > 0 then
+		local exitPosition = attemptPenetration(projectile, contact)
+		if exitPosition then
+			projectile.OnHit:Fire(Raycast.buildHitInfo(contact, entity, nil))
+			projectile.Position = exitPosition
+			return "pass", nil
+		end
+	end
+
+	if projectile.BouncesLeft > 0 then
+		projectile.BouncesLeft -= 1
+		local normal = SafeMath.direction(contact.Normal, Vector3.yAxis)
+		local velocity = projectile.Velocity
+		projectile.Velocity = (velocity - 2 * velocity:Dot(normal) * normal) * projectile.Restitution
+		projectile.Position = contact.Position + normal * (projectile.Radius + BOUNCE_CLEARANCE)
+		-- The client must SNAP on a bounce instead of tweening a straight line
+		-- from its pre-bounce position, which would visibly cut through the
+		-- surface it bounced off. The snap goes out with this frame's ProjMove
+		-- batch (see Replication.queueBounce for why it carries the end-of-frame
+		-- pose), even if a later substep this same tick destroys the
+		-- projectile; ProjHit is only flushed on a later frame, so the snap
+		-- always reaches the client first.
+		Replication.queueBounce(projectile, contact.Position, normal)
+		local onBounce = projectile.OnBounce
+		if onBounce then
+			task.spawn(onBounce, projectile, contact)
+		end
+		projectile.OnHit:Fire(Raycast.buildHitInfo(contact, entity, nil))
+		return "bounce", nil
+	end
+
+	projectile.OnHit:Fire(Raycast.buildHitInfo(contact, entity, nil))
+	return "destroy", "world"
 end
 
 return Raycast

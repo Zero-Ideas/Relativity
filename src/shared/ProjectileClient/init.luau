@@ -1,16 +1,24 @@
+--!strict
 --!optimize 2
 --[[
 	ProjectileClient (client rendering, purely cosmetic)
 	Receives the server-authoritative Projectile system's replication stream
-	(ProjSpawn/ProjMove/ProjHit/ProjSync/ProjTimeScale/ProjRay, over
-	VisualOffload -- see ServerScriptService.Server.Projectile/Replication.luau
-	for the sending side and its module doc comment for the full sync
-	protocol) and renders tracers/impacts. This module never makes a gameplay
+	(see Shared.ProjectileProtocol for the wire format, and
+	ServerScriptService.Server.Projectile/Replication.luau for the sending
+	side) and renders tracers/impacts. This module never makes a gameplay
 	decision -- no hit detection, no damage, no entity access -- it only draws
 	what the server tells it happened. All client-side simulation between
-	updates is dead-reckoning for smoothness; the server's own independent Step
-	is always authoritative, and any visual drift is corrected the instant
-	ProjHit snaps the final position.
+	updates is dead-reckoning for smoothness (see Prediction.luau); the
+	server's own independent Step is always authoritative, and any visual
+	drift is corrected the instant ProjHit snaps the final position.
+
+	Modules:
+	 init        message handlers + the bounded per-frame render scheduler
+	 Prediction  dead-reckoning physics (mirrors the server Step)
+	 VisualModel building, posing, culling and retiring the rendered Instance
+	 View        camera frustum test
+	 Impact      hit flashes (swappable via SetImpactHandler)
+	 DebugRays   ProjRay debug lines
 
 	API:
 	 ProjectileClient.EnableClientRendering()          -- call once on the client
@@ -21,26 +29,30 @@
 local RunService = game:GetService("RunService")
 local Players = game:GetService("Players")
 
-local ReplicatedStorage = game:GetService("ReplicatedStorage")
-local Shared = ReplicatedStorage:WaitForChild("Shared")
-local Heartbeat = require(Shared.Heartbeat)
-local ChunkManager = require(Shared.ChunkManager)
-local ProjectileMotion = require(Shared.ProjectileMotion)
-local VisualOffload = require(Shared.VisualOffload)
+local Shared = script.Parent
+local Heartbeat = require(Shared:WaitForChild("Heartbeat"))
+local VisualOffload = require(Shared:WaitForChild("VisualOffload"))
+local Protocol = require(Shared:WaitForChild("ProjectileProtocol"))
 
-local VisualModel = require(script.VisualModel)
-local Impact = require(script.Impact)
 local DebugRays = require(script.DebugRays)
+local Impact = require(script.Impact)
+local Prediction = require(script.Prediction)
+local Types = require(script.Types)
+local View = require(script.View)
+local VisualModel = require(script.VisualModel)
+
+type Visual = Types.Visual
+
+local Channels = Protocol.Channels
 
 local ProjectileClient = {}
 
-function ProjectileClient.SetImpactHandler(fn)
+function ProjectileClient.SetImpactHandler(fn: (Vector3, Vector3, Instance?, string?) -> ())
 	Impact.SetHandler(fn)
 end
 
--- Matches ServerScriptService.Server.Projectile's own default -- used only as
--- a fallback if a ProjSpawn payload is ever missing MaxRealLifetime, which
--- shouldn't normally happen (the server always includes it).
+-- Matches the server's own default -- used only if a spawn payload is ever
+-- missing MaxRealLifetime, which shouldn't normally happen.
 local DEFAULT_MAX_REAL_LIFETIME = 60
 
 -- Real (undilated) seconds of no ProjMove update before a SYNCED visual is
@@ -48,66 +60,31 @@ local DEFAULT_MAX_REAL_LIFETIME = 60
 -- loop below. Generous on purpose: ProjMove batches normally arrive every
 -- server tick, so anything this stale really has stopped, not just lagged.
 local SYNCED_VISUAL_STALE_TIMEOUT = 2
-local MAX_PREDICTION_SUBSTEPS = 16
-local PREDICTION_CURVE_ERROR = 0.35
-local MIN_STEP_DT = 1e-5
 -- Hard cap on visible Transform work in one client frame. Off-screen visuals
 -- still advance logically when visited but consume no transform budget. The
 -- persistent round-robin cursor is independent of dilated time, so changing
 -- GlobalTimeScale cannot collapse previously staggered cohorts onto one frame.
 local MAX_VISUAL_UPDATES_PER_FRAME = 2500
-local VIEWPORT_CULL_MARGIN = 128 -- pixels beyond each edge; avoids boundary flicker
 local SMOOTH_RADIUS = 100
 local MAX_SMOOTH_PROJECTILES = 500
 local SMOOTH_SET_REFRESH_INTERVAL = 0.1 -- real seconds; selection is presentation-only
 local DEFAULT_SMOOTH_DURATION = 1 / 60
 
 local clientRendering = false
-local visuals = {} -- [id] = { model, position, velocity, gravity, homing/bounce state, ... }
+local visuals: { [number]: Visual } = {}
 local visualCount = 0
-local visualOrder = {} -- append-only between compactions; dead ids are tombstones
+local visualOrder: { number } = {} -- append-only between compactions; dead ids are tombstones
 local visualCursor = 1
 local visualTombstones = 0
+-- Sum of global (dilated) dt since rendering began; a visual's
+-- lastSimulationTime is a reading of this clock.
 local globalSimulationClock = 0
-local smoothVisuals = {}
+local smoothVisuals: { Visual } = {}
 local nextSmoothSetRefresh = 0
 
--- Camera frustum snapshot, refreshed once per frame by refreshView. isInView
--- is then pure Luau dot products instead of one WorldToViewportPoint engine
--- call per visual, which dominated the loop at 10k visuals.
-local viewValid = false
-local viewPosition = Vector3.zero
-local viewRight, viewUp, viewLook = Vector3.xAxis, Vector3.yAxis, -Vector3.zAxis
-local viewLimitX, viewLimitY = 1, 1 -- tan(half-FOV) per axis, widened by the pixel margin
-
-local function refreshView()
-	local camera = workspace.CurrentCamera
-	local size = camera and camera.ViewportSize
-	if not size or size.X <= 0 or size.Y <= 0 then
-		viewValid = false
-		return
-	end
-	local cframe = camera.CFrame
-	local tanY = math.tan(math.rad(camera.FieldOfView) * 0.5)
-	local tanX = tanY * size.X / size.Y
-	-- A pixel margin m past an edge is 2m/size in normalized device units.
-	viewLimitX = tanX * (1 + 2 * VIEWPORT_CULL_MARGIN / size.X)
-	viewLimitY = tanY * (1 + 2 * VIEWPORT_CULL_MARGIN / size.Y)
-	viewPosition = cframe.Position
-	viewRight, viewUp, viewLook = cframe.RightVector, cframe.UpVector, cframe.LookVector
-	viewValid = true
-end
-
-local function isInView(position: Vector3): boolean
-	if not viewValid then
-		return true
-	end
-	local offset = position - viewPosition
-	local depth = offset:Dot(viewLook)
-	return depth > 0
-		and math.abs(offset:Dot(viewRight)) <= depth * viewLimitX
-		and math.abs(offset:Dot(viewUp)) <= depth * viewLimitY
-end
+--------------------------------------------------------------------------------
+-- Smooth set: the nearest visuals get per-frame interpolation
+--------------------------------------------------------------------------------
 
 local function refreshSmoothVisuals(now: number)
 	if now < nextSmoothSetRefresh then
@@ -119,48 +96,54 @@ local function refreshSmoothVisuals(now: number)
 	local character = player and player.Character
 	local root = character and (character:FindFirstChild("HumanoidRootPart") or character.PrimaryPart)
 	debug.profilebegin("ProjectileClient.RefreshSmoothSet")
-	-- Keep only the nearest K candidates in a max-heap. The previous full sort
-	-- allocated and sorted all 10k nearby stress visuals every 0.1 seconds even
-	-- though only 500 could ever be selected.
-	local heapVisuals = table.create(MAX_SMOOTH_PROJECTILES)
-	local heapDistances = table.create(MAX_SMOOTH_PROJECTILES)
+	-- Keep only the nearest K candidates in a max-heap, so this never sorts
+	-- every nearby visual when only MAX_SMOOTH_PROJECTILES can be selected.
+	local heapVisuals: { Visual } = table.create(MAX_SMOOTH_PROJECTILES)
+	local heapDistances: { number } = table.create(MAX_SMOOTH_PROJECTILES)
 	local heapSize = 0
-	local function swap(a, b)
+	local function swap(a: number, b: number)
 		heapVisuals[a], heapVisuals[b] = heapVisuals[b], heapVisuals[a]
 		heapDistances[a], heapDistances[b] = heapDistances[b], heapDistances[a]
 	end
-	local function push(visual, distanceSq)
+	local function push(visual: Visual, distanceSq: number)
 		heapSize += 1
 		local index = heapSize
 		heapVisuals[index] = visual
 		heapDistances[index] = distanceSq
 		while index > 1 do
-			local parent = math.floor(index / 2)
-			if heapDistances[parent] >= distanceSq then break end
+			local parent = index // 2
+			if heapDistances[parent] >= distanceSq then
+				break
+			end
 			swap(parent, index)
 			index = parent
 		end
 	end
-	local function replaceRoot(visual, distanceSq)
+	local function replaceRoot(visual: Visual, distanceSq: number)
 		heapVisuals[1] = visual
 		heapDistances[1] = distanceSq
 		local index = 1
 		while true do
 			local left = index * 2
-			if left > heapSize then break end
+			if left > heapSize then
+				break
+			end
 			local right = left + 1
 			local largest = if right <= heapSize and heapDistances[right] > heapDistances[left] then right else left
-			if heapDistances[index] >= heapDistances[largest] then break end
+			if heapDistances[index] >= heapDistances[largest] then
+				break
+			end
 			swap(index, largest)
 			index = largest
 		end
 	end
 	if root and root:IsA("BasePart") then
+		local rootPosition = root.Position
 		local radiusSq = SMOOTH_RADIUS * SMOOTH_RADIUS
 		for _, visual in visuals do
-			local offset = visual.position - root.Position
+			local offset = visual.position - rootPosition
 			local distanceSq = offset:Dot(offset)
-			if distanceSq <= radiusSq and isInView(visual.position) then
+			if distanceSq <= radiusSq and View.contains(visual.position) then
 				if heapSize < MAX_SMOOTH_PROJECTILES then
 					push(visual, distanceSq)
 				elseif distanceSq < heapDistances[1] then
@@ -170,8 +153,8 @@ local function refreshSmoothVisuals(now: number)
 		end
 	end
 
-	local selected = {}
-	local newSmoothVisuals = table.create(heapSize)
+	local selected: { [Visual]: boolean } = {}
+	local newSmoothVisuals: { Visual } = table.create(heapSize)
 	for index = 1, heapSize do
 		local visual = heapVisuals[index]
 		selected[visual] = true
@@ -193,144 +176,25 @@ local function refreshSmoothVisuals(now: number)
 	debug.profileend()
 end
 
-local function setSmoothTarget(visual, now: number)
+local function setSmoothTarget(visual: Visual, now: number)
 	local previousTarget = visual.lastSmoothTarget
-	local duration = if previousTarget then math.clamp(now - previousTarget, DEFAULT_SMOOTH_DURATION, 0.1)
+	local duration = if previousTarget
+		then math.clamp(now - previousTarget, DEFAULT_SMOOTH_DURATION, 0.1)
 		else DEFAULT_SMOOTH_DURATION
 	visual.lastSmoothTarget = now
 	VisualModel.SetTarget(visual, visual.position, visual.velocity, duration)
 end
 
-local function simulateVisual(visual, baseDt: number): (boolean, boolean)
-	if baseDt <= 0 then
-		return true, false
-	end
-
-	local remaining = baseDt + (visual.simulationDebt or 0)
-	visual.simulationDebt = 0
-
-	-- Fast path: with no dilation anywhere there are no boundaries to stop at,
-	-- and constant (vector/gravity) acceleration without speed clamps is
-	-- integrated exactly by one averaged-velocity step. The substep loop below
-	-- only exists for boundaries, clamps and velocity-relative acceleration.
-	if
-		ChunkManager.IsTimeUniform()
-		and visual.minSpeed <= 0
-		and visual.maxSpeed == math.huge
-		and (typeof(visual.acceleration) ~= "number" or visual.acceleration == 0)
-	then
-		local dt = math.min(remaining, visual.life)
-		local movementVelocity
-		visual.velocity, movementVelocity = ProjectileMotion.Integrate(
-			visual.velocity,
-			visual.acceleration,
-			visual.accelerationDirection,
-			visual.gravity,
-			visual.minSpeed,
-			visual.maxSpeed,
-			dt
-		)
-		visual.position += movementVelocity * dt
-		visual.life -= dt
-		return visual.life > MIN_STEP_DT, true
-	end
-
-	local moved = false
-	local guard = 0
-	while remaining > MIN_STEP_DT and guard < MAX_PREDICTION_SUBSTEPS do
-		guard += 1
-		local accelerationVector = ProjectileMotion.GetAcceleration(
-			visual.velocity,
-			visual.acceleration,
-			visual.accelerationDirection,
-			visual.gravity
-		)
-		local direction = visual.velocity
-		if direction.Magnitude < 1e-5 then
-			direction = accelerationVector.Magnitude >= 1e-5 and accelerationVector or Vector3.zAxis
-		end
-		direction = direction.Unit
-
-		local samplePosition = visual.position + direction * ProjectileMotion.PositionEpsilon
-		local chunkScale = ChunkManager.GetTimeScaleAt(samplePosition)
-		if chunkScale <= 0 then
-			remaining = 0
-			break
-		end
-
-		local availableDt = remaining * chunkScale
-		if visual.life <= MIN_STEP_DT then
-			return false, moved
-		end
-
-		local predictedVelocity = visual.velocity + accelerationVector * availableDt
-		local estimatedMovementVelocity = (visual.velocity + predictedVelocity) * 0.5
-		local speed = estimatedMovementVelocity.Magnitude
-		local stepDt = math.min(availableDt, visual.life)
-		if speed > 1e-5 then
-			local maxDistance = ProjectileMotion.GetAdaptiveMaxDistance(speed, true)
-			stepDt = math.min(stepDt, maxDistance / speed)
-			local chunkBoundaryDt = ProjectileMotion.GetTimeScaleBoundaryDt(
-				visual.position,
-				estimatedMovementVelocity,
-				ChunkManager.ChunkSize,
-				ChunkManager.UseY,
-				chunkScale,
-				stepDt,
-				ChunkManager.GetTimeScaleAt
-			)
-			local radialBoundaryDt = ChunkManager.GetRadialTimeScaleBoundaryDt(
-				visual.position,
-				estimatedMovementVelocity,
-				stepDt
-			)
-			stepDt = math.min(stepDt, chunkBoundaryDt, radialBoundaryDt)
-		end
-		stepDt = math.min(
-			stepDt,
-			ProjectileMotion.GetCurvatureStepDt(visual.velocity, accelerationVector, PREDICTION_CURVE_ERROR)
-		)
-		if stepDt <= MIN_STEP_DT then
-			visual.simulationDebt = remaining
-			break
-		end
-
-		local movementVelocity
-		visual.velocity, movementVelocity = ProjectileMotion.Integrate(
-			visual.velocity,
-			visual.acceleration,
-			visual.accelerationDirection,
-			visual.gravity,
-			visual.minSpeed,
-			visual.maxSpeed,
-			stepDt
-		)
-		visual.position += movementVelocity * stepDt
-		visual.life -= stepDt
-		remaining = math.max(remaining - stepDt / chunkScale, 0)
-		moved = true
-
-		if visual.life <= MIN_STEP_DT then
-			return false, moved
-		end
-	end
-
-	if remaining > MIN_STEP_DT and visual.simulationDebt == 0 then
-		visual.simulationDebt = remaining
-	end
-	return true, moved
-end
+--------------------------------------------------------------------------------
+-- Visual lifecycle
+--------------------------------------------------------------------------------
 
 -- Removes the flying tracer. Impact VFX is played from the ProjHit handler
--- itself (see EnableClientRendering), so this fires for real hits AND harmless
--- expiry without ever flashing in mid-air. The bullet DISAPPEARS instantly
--- (VisualModel.FadeOut hides every part and disables every
--- trail/particle/beam), but the actual :Destroy() waits out the longest
--- lifetime among the effects that were emitting -- already-spawned trail
--- segments and particles keep fading naturally during that grace window
--- instead of being cut off mid-air (or the spawn-configured DestroyDelay,
--- whichever is longer).
-local function destroyVisual(id)
+-- itself, so this fires for real hits AND harmless expiry without ever
+-- flashing in mid-air. The bullet DISAPPEARS instantly, but the actual
+-- :Destroy() waits out the longest lifetime among the effects that were
+-- emitting (or DestroyDelay, whichever is longer) -- see VisualModel.Retire.
+local function destroyVisual(id: number)
 	local visual = visuals[id]
 	if not visual then
 		return
@@ -338,7 +202,341 @@ local function destroyVisual(id)
 	visuals[id] = nil
 	visualCount -= 1
 	visualTombstones += 1
-	VisualModel.Retire(visual, visual.destroyDelay or 0)
+	VisualModel.Retire(visual, visual.destroyDelay)
+end
+
+-- Adopts an authoritative pose as of NOW. Every server pose (spawn, bounce,
+-- sync transition) is an end-of-server-frame snapshot, so the next
+-- render-loop visit must only integrate time that passes after receipt --
+-- not the backlog since this visual's previous round-robin visit, which
+-- already happened before the pose was taken.
+local function rebaseline(visual: Visual, position: Vector3, velocity: Vector3)
+	visual.position = position
+	visual.velocity = velocity
+	visual.simulationDebt = 0
+	visual.lastSimulationTime = globalSimulationClock
+end
+
+local function onSpawn(data: Protocol.SpawnPayload)
+	if visuals[data.Id] then
+		return
+	end
+	local model, rig = VisualModel.Build(data)
+	local now = os.clock()
+	local inView = View.contains(data.Position)
+	local visual: Visual = {
+		id = data.Id,
+		model = model,
+		rig = rig,
+		destroyDelay = data.DestroyDelay or 0,
+		-- See VisualModel.FadeOut -- both default true.
+		waitForParticles = data.WaitForParticles ~= false,
+		waitForTrails = data.WaitForTrails ~= false,
+
+		position = data.Position,
+		velocity = data.Velocity,
+		gravity = data.Gravity or 0,
+		acceleration = data.Acceleration or 0,
+		accelerationDirection = data.AccelerationDirection,
+		minSpeed = data.MinSpeed or 0,
+		maxSpeed = data.MaxSpeed or math.huge,
+		life = data.Lifetime,
+		simulationDebt = 0,
+		-- Combined Source.TimeScale * projectile.TimeScale; updated live via
+		-- ProjTimeScale -- see the "Local time" section of the server module.
+		timeScale = data.TimeScale or 1,
+		lastSimulationTime = globalSimulationClock,
+		synced = data.Synced == true,
+
+		-- Real (undilated) safety-net cap. spawnRealTime is THIS client's own
+		-- os.clock() at spawn -- fine, since this only needs to be a generous
+		-- backstop, not an exact match to the server's own cap.
+		spawnRealTime = now,
+		maxRealLifetime = data.MaxRealLifetime or DEFAULT_MAX_REAL_LIFETIME,
+		lastUpdate = now,
+
+		lastRenderStep = now,
+		inView = inView,
+		offscreenSince = if inView then nil else now,
+		culled = false,
+		effectCullDelay = VisualModel.GetLongestEffectLifetime(model),
+		smoothTransform = false,
+		transformElapsed = 0,
+		transformDuration = 0,
+	}
+	if data.ActivateParticlesOnCreate then
+		VisualModel.ActivateParticles(model)
+	end
+	visuals[data.Id] = visual
+	visualCount += 1
+	table.insert(visualOrder, data.Id)
+end
+
+--------------------------------------------------------------------------------
+-- Message handlers
+--------------------------------------------------------------------------------
+
+-- Fires only when the combined personal/local TimeScale actually changes --
+-- not a per-frame stream. The client just needs the number; from here it
+-- predicts locally exactly like it already does for chunk/world dilation.
+local function onTimeScale(data: Protocol.TimeScalePayload)
+	local visual = visuals[data.Id]
+	if not visual then
+		return
+	end
+	if not visual.synced then
+		-- Settle time already elapsed at the OLD scale first; otherwise the
+		-- new scale would be applied retroactively to the whole backlog
+		-- since this visual's last round-robin visit.
+		local elapsed = globalSimulationClock - visual.lastSimulationTime
+		if elapsed > 0 then
+			Prediction.simulate(visual, elapsed * visual.timeScale)
+		end
+		visual.lastSimulationTime = globalSimulationClock
+	end
+	visual.timeScale = data.TimeScale
+end
+
+-- Homing lock acquired/dropped -- rare, only on an actual transition, never
+-- per-frame. Synced switches the visual into "trust the streamed ProjMove"
+-- mode; unsynced switches it back to local physics. Either way the message
+-- carries the server's pose at the transition, which is the only correct
+-- starting point for local physics after a lock drops.
+local function onSync(data: Protocol.SyncPayload)
+	local visual = visuals[data.Id]
+	if not visual then
+		return
+	end
+	visual.synced = data.Synced
+	rebaseline(visual, data.Position, data.Velocity)
+	if visual.synced then
+		-- Reset the staleness clock right at the transition, so a lastUpdate
+		-- left over from before it can't immediately read as stale before the
+		-- first real ProjMove arrives.
+		visual.lastUpdate = os.clock()
+	end
+end
+
+-- Batched authoritative pose updates. Two kinds of entries:
+--  - Bounced = true: a one-shot bounce correction, applied whether or not
+--    the visual is synced (for a non-homing bouncer it is the ONLY update
+--    between spawn and impact). Snaps instead of tweening -- a straight
+--    tween from the old position would cut through the surface it bounced
+--    off -- plays the ricochet flash, and re-baselines local physics.
+--  - Otherwise: a continuous homing pose, only sent while the visual is
+--    synced (see Replication.isSynced on the server for why).
+local function onMove(batch: { Protocol.MovePayload })
+	local now = os.clock()
+	for _, data in batch do
+		local visual = visuals[data.Id]
+		if not visual then
+			continue
+		end
+		if data.Bounced then
+			visual.lastUpdate = now
+			rebaseline(visual, data.Position, data.Velocity)
+			VisualModel.Place(visual, data.Position, data.Velocity)
+			Impact.Play(data.Point or data.Position, data.Normal, "bounce")
+		elseif visual.synced then
+			local duration = math.clamp(now - visual.lastUpdate, 0.03, 0.2)
+			visual.lastUpdate = now
+			visual.position = data.Position
+			visual.velocity = data.Velocity
+			VisualModel.SetTarget(visual, data.Position, data.Velocity, duration)
+		end
+	end
+end
+
+local function onHit(data: Protocol.HitPayload)
+	local visual = visuals[data.Id]
+	if visual then
+		-- Snap to the server's exact position before destroying, so any
+		-- imperceptible mid-flight drift from local simulation never shows at
+		-- the one moment it would be visible.
+		VisualModel.Place(visual, data.Position, visual.velocity)
+		if data.Kind then
+			Impact.Play(data.Position, data.Normal, data.Kind)
+		end
+	end
+	destroyVisual(data.Id)
+end
+
+--------------------------------------------------------------------------------
+-- Render scheduler
+--------------------------------------------------------------------------------
+
+-- Visual came back on screen: place it without drawing a trail across the
+-- jump, restore it if it had been fully culled, and resume effects on a
+-- later update.
+local function reenterView(visual: Visual, now: number)
+	VisualModel.SuspendTrails(visual)
+	VisualModel.Place(visual, visual.position, visual.velocity)
+	if visual.culled then
+		VisualModel.SetCulled(visual, false)
+		visual.culled = false
+	end
+	visual.resumeEffectsOnNextUpdate = now
+	visual.offscreenSince = nil
+end
+
+-- Visual is off screen: once it has been gone longer than its effects take
+-- to fade, stop them and unparent it.
+local function updateOffscreen(visual: Visual, now: number)
+	local since: number = if visual.inView then now else visual.offscreenSince or now
+	visual.offscreenSince = since
+	if not visual.culled and now - since >= visual.effectCullDelay then
+		VisualModel.SuspendEffects(visual)
+		VisualModel.SetCulled(visual, true)
+		visual.culled = true
+	end
+end
+
+local function resumeEffectsIfDue(visual: Visual)
+	if visual.resumeEffectsOnNextUpdate then
+		VisualModel.ResumeEffects(visual)
+		visual.resumeEffectsOnNextUpdate = nil
+	end
+end
+
+-- A SYNCED visual (actively homing) is posed entirely by ProjMove; this only
+-- advances its tween and handles visibility. Returns whether it used
+-- transform budget, or nil if it was destroyed.
+local function updateSynced(visual: Visual, now: number): boolean?
+	local inView = View.contains(visual.position)
+	if inView then
+		if not visual.inView then
+			reenterView(visual, now)
+		elseif not visual.smoothTransform then
+			resumeEffectsIfDue(visual)
+			VisualModel.Step(visual, math.max(now - visual.lastRenderStep, 0))
+		end
+		visual.lastRenderStep = now
+	else
+		updateOffscreen(visual, now)
+	end
+	visual.inView = inView
+	-- Left-VisualRange safety net. Deliberately wall-clock, NOT a dilated
+	-- countdown: a synced visual can belong to a shooter at ANY personal time
+	-- ratio, including exactly 0, so there's no dilated schedule the client
+	-- could reconstruct. The server streams every synced projectile's pose
+	-- regardless of dt, so lastUpdate keeps refreshing while this client is
+	-- in range; once it stops, a real-time timeout cleans the visual up.
+	if now - visual.lastUpdate > SYNCED_VISUAL_STALE_TIMEOUT then
+		destroyVisual(visual.id)
+		return nil
+	end
+	return inView
+end
+
+-- An UNSYNCED visual (the common case -- including a bouncer between
+-- bounces) is dead-reckoned by Prediction over all global time accumulated
+-- since its previous visit. Returns whether it used transform budget, or nil
+-- if it was destroyed.
+local function updatePredicted(visual: Visual, elapsedGlobalDt: number, now: number): boolean?
+	local alive, moved = Prediction.simulate(visual, elapsedGlobalDt * visual.timeScale)
+	local inView = View.contains(visual.position)
+	if inView then
+		if not visual.inView then
+			reenterView(visual, now)
+		else
+			if moved and visual.smoothTransform then
+				setSmoothTarget(visual, now)
+			elseif moved then
+				VisualModel.Place(visual, visual.position, visual.velocity)
+			end
+			resumeEffectsIfDue(visual)
+		end
+		visual.lastRenderStep = now
+	else
+		updateOffscreen(visual, now)
+	end
+	visual.inView = inView
+	if not alive then
+		-- Safety net: normally ProjHit arrives first and removes this entry.
+		-- This only fires if it never does (e.g. the projectile left this
+		-- client's VisualRange).
+		destroyVisual(visual.id)
+		return nil
+	end
+	return inView
+end
+
+local function compactVisualOrder()
+	local oldOrder = visualOrder
+	local oldCount = #oldOrder
+	local compacted: { number } = table.create(math.max(oldCount - visualTombstones, 0))
+	-- Begin at the next due slot so compaction preserves round-robin fairness.
+	for offset = 0, oldCount - 1 do
+		local id = oldOrder[(visualCursor + offset - 1) % oldCount + 1]
+		if visuals[id] then
+			table.insert(compacted, id)
+		end
+	end
+	visualOrder = compacted
+	visualCursor = 1
+	visualTombstones = 0
+end
+
+-- Visits visuals round-robin until MAX_VISUAL_UPDATES_PER_FRAME on-screen
+-- transforms have been spent (or every visual was visited once).
+local function renderStep(globalDt: number)
+	globalSimulationClock += globalDt
+	local now = os.clock()
+	View.refresh()
+	refreshSmoothVisuals(now)
+
+	local slotCount = #visualOrder
+	local inspected = 0
+	local transformed = 0
+	while inspected < slotCount and transformed < MAX_VISUAL_UPDATES_PER_FRAME do
+		if visualCursor > slotCount then
+			visualCursor = 1
+		end
+		local id = visualOrder[visualCursor]
+		visualCursor += 1
+		inspected += 1
+		local visual = visuals[id]
+		if not visual then
+			continue
+		end
+		local elapsedGlobalDt = math.max(globalSimulationClock - visual.lastSimulationTime, 0)
+		visual.lastSimulationTime = globalSimulationClock
+
+		-- Real (undilated) backstop mirroring the server's MaxRealLifetime.
+		-- Normally ProjHit removes the visual first; this only matters if that
+		-- message is missed (e.g. the visual drifted outside VisualRange).
+		if now - visual.spawnRealTime >= visual.maxRealLifetime then
+			destroyVisual(id)
+			continue
+		end
+
+		local usedBudget = if visual.synced
+			then updateSynced(visual, now)
+			else updatePredicted(visual, elapsedGlobalDt, now)
+		if usedBudget then
+			transformed += 1
+		end
+	end
+
+	-- Nearby visuals receive presentation-only interpolation every real frame.
+	-- Their logical simulation and network snapshots remain in the bounded
+	-- scheduler above, so this adds at most MAX_SMOOTH_PROJECTILES transforms.
+	for _, visual in smoothVisuals do
+		if visual.inView and visuals[visual.id] == visual then
+			local resumeAt = visual.resumeEffectsOnNextUpdate
+			if resumeAt and resumeAt < now then
+				resumeEffectsIfDue(visual)
+			end
+			VisualModel.Step(visual, math.max(now - (visual.lastSmoothStep or now), 0))
+			visual.lastSmoothStep = now
+		end
+	end
+
+	-- Avoid an ever-growing sparse order array without changing which live
+	-- visual is next. This is metadata work only; it performs no transforms.
+	if visualTombstones >= 256 and visualTombstones * 4 >= #visualOrder then
+		compactVisualOrder()
+	end
 end
 
 function ProjectileClient.EnableClientRendering()
@@ -347,355 +545,27 @@ function ProjectileClient.EnableClientRendering()
 	end
 	clientRendering = true
 
-	local function onProjectileSpawn(data)
-		if visuals[data.Id] then return end
-		local model, rig = VisualModel.Build(data)
-		local now = os.clock()
-		local visual = {
-			id = data.Id,
-			model = model,
-			rig = rig,
-			destroyDelay = data.DestroyDelay or 0,
-			-- See VisualModel.FadeOut -- both default true.
-			waitForParticles = data.WaitForParticles ~= false,
-			waitForTrails = data.WaitForTrails ~= false,
-			lastUpdate = now,
-			lastRenderStep = now,
-			lastSimulationTime = globalSimulationClock,
-
-			position = data.Position,
-			velocity = data.Velocity,
-			gravity = data.Gravity or 0,
-			acceleration = data.Acceleration or 0,
-			accelerationDirection = data.AccelerationDirection,
-			minSpeed = data.MinSpeed or 0,
-			maxSpeed = data.MaxSpeed or math.huge,
-			life = data.Lifetime or 5,
-			simulationDebt = 0,
-			synced = data.Synced == true,
-			-- Combined Source.TimeScale * projectile.TimeScale at spawn time;
-			-- updated live via ProjTimeScale below, folded into the unsynced
-			-- render loop's local dead-reckoning -- see the module doc
-			-- comment's "Local time" section.
-			timeScale = data.TimeScale or 1,
-			-- Real (undilated) safety-net cap -- see MaxRealLifetime / the
-			-- render loop below. spawnRealTime is THIS client's own os.clock()
-			-- at spawn, not the server's -- fine, since this only needs to be
-			-- a generous backstop, not an exact match to the server's own cap.
-			spawnRealTime = now,
-			maxRealLifetime = data.MaxRealLifetime or DEFAULT_MAX_REAL_LIFETIME,
-			inView = isInView(data.Position),
-			effectCullDelay = VisualModel.GetLongestEffectLifetime(model),
-			culled = false,
-		}
-		if not visual.inView then
-			visual.offscreenSince = now
-		end
-		if data.ActivateParticlesOnCreate then
-			VisualModel.ActivateParticles(model)
-		end
-		visuals[data.Id] = visual
-		visualCount += 1
-		table.insert(visualOrder, data.Id)
-	end
-	-- ProjSpawn remains registered for protocol compatibility with older or
-	-- external producers. The authoritative projectile server uses the bounded
-	-- batch channel so thousands of creations become one client event per frame.
-	VisualOffload.On("ProjSpawn", onProjectileSpawn)
-	VisualOffload.On("ProjSpawnBatch", function(batch)
+	VisualOffload.On(Channels.SpawnBatch, function(batch: { Protocol.SpawnPayload })
 		debug.profilebegin("ProjectileClient.BuildSpawnBatch")
-		for _, data in batch do onProjectileSpawn(data) end
+		for _, data in batch do
+			onSpawn(data)
+		end
 		debug.profileend()
 	end)
-
-	-- Fires only when the combined personal/local TimeScale actually changes
-	-- (see Projectile:_checkTimeScaleChange) -- not a per-frame stream. The
-	-- client just needed to know the number; from here it predicts locally
-	-- exactly like it already does for chunk/world dilation.
-	VisualOffload.On("ProjTimeScale", function(data)
-		local visual = visuals[data.Id]
-		if visual then
-			visual.timeScale = data.TimeScale
-		end
-	end)
-
-	-- Sync state changed (homing lock acquired/dropped, or bounces just ran
-	-- out) -- rare, only on an actual transition, never per-frame. Synced
-	-- switches the visual into "trust the streamed ProjMove" mode; unsynced
-	-- switches it back to local physics from wherever the last authoritative
-	-- Position/Velocity left it.
-	VisualOffload.On("ProjSync", function(data)
-		local visual = visuals[data.Id]
-		if visual then
-			visual.synced = data.Synced == true
-			if visual.synced then
-				visual.simulationDebt = 0
-				-- reset the staleness clock right at the transition -- see the
-				-- synced branch of the render loop below -- so a lastUpdate
-				-- left over from before this transition (however old) can't
-				-- immediately read as stale before the first real ProjMove
-				-- arrives.
-				visual.lastUpdate = os.clock()
-			end
-		end
-	end)
-
-	-- Batched authoritative pose updates (an array covering every entry that
-	-- needs one this frame, not one event each). Two kinds of entries arrive
-	-- here, handled differently:
-	--  - Bounced = true: a one-shot bounce correction, sent regardless of
-	--    whether the visual is currently in continuous-sync mode (a
-	--    non-homing bouncer is normally fully unsynced -- see the module doc
-	--    comment -- so this is the ONLY update it ever gets between spawn and
-	--    impact). Always applied unconditionally: snap instead of tweening,
-	--    since tweening a straight line from the old position would cut
-	--    through whatever surface sits between them (exactly where the
-	--    bounce occurred), play the ricochet flash, and re-baseline
-	--    position/velocity so local physics (see the per-frame loop below)
-	--    picks up from the correct post-reflection state.
-	--  - Otherwise: a continuous homing-sync update, only meaningful (and
-	--    only sent by the server) while visual.synced is true -- see the
-	--    module doc comment for why homing can't be predicted client-side.
-	VisualOffload.On("ProjMove", function(batch)
-		local now = os.clock()
+	VisualOffload.On(Channels.TimeScale, onTimeScale)
+	VisualOffload.On(Channels.Sync, onSync)
+	VisualOffload.On(Channels.Move, onMove)
+	VisualOffload.On(Channels.HitBatch, function(batch: { Protocol.HitPayload })
 		for _, data in batch do
-			local visual = visuals[data.Id]
-			if visual and data.Bounced then
-				visual.lastUpdate = now
-				visual.position = data.Position
-				visual.velocity = data.Velocity
-				visual.simulationDebt = 0
-				VisualModel.Place(visual, data.Position, data.Velocity)
-				Impact.Play(data.Position, data.Normal, "bounce")
-			elseif visual and visual.synced then
-				local duration = math.clamp(now - visual.lastUpdate, 0.03, 0.2)
-				visual.lastUpdate = now
-				visual.position = data.Position
-				visual.velocity = data.Velocity
-				VisualModel.SetTarget(visual, data.Position, data.Velocity, duration)
-			end
+			onHit(data)
 		end
 	end)
-
-	local function onProjectileHit(data)
-		local visual = visuals[data.Id]
-		if visual then
-			-- Snap to the server's exact position before destroying, so any
-			-- imperceptible mid-flight drift from local simulation never shows
-			-- at the one moment it would be visible.
-			VisualModel.Place(visual, data.Position, visual.velocity)
-			if data.Kind then
-				Impact.Play(data.Position, data.Normal, data.Kind)
-			end
-		end
-		destroyVisual(data.Id)
-	end
-	VisualOffload.On("ProjHit", onProjectileHit)
-	VisualOffload.On("ProjHitBatch", function(batch)
-		for _, data in batch do onProjectileHit(data) end
-	end)
-
-	VisualOffload.On("ProjRay", function(data)
+	VisualOffload.On(Channels.Ray, function(data: Protocol.RayPayload)
 		DebugRays.Draw(data.From, data.To, data.LowRes)
 	end)
 
-	-- Every projectile visual gets exactly one ProjSpawn and, eventually, one
-	-- ProjHit. For an UNSYNCED visual (the common case: no active homing lock
-	-- -- this includes a bouncer between bounces, since bouncing no longer
-	-- keeps a visual continuously synced, see the module doc comment), this
-	-- loop is the entire simulation in between -- it integrates
-	-- acceleration/gravity/position on its round-robin update using all global
-	-- dt accumulated since that visual's previous update and the same chunk dt
-	-- pipeline the server's Step uses (ChunkManager.ScaleDt). No raycasting
-	-- ever happens here -- a SYNCED visual (actively homing onto a target)
-	-- skips all of that -- its Position/Velocity/pose are driven entirely by
-	-- the streamed ProjMove handler above; see the module doc comment for why
-	-- that case can't be safely predicted client-side. A bouncing visual's
-	-- position/velocity get corrected in-place by the one-shot Bounced
-	-- ProjMove entry each time it bounces (handled above, independent of
-	-- visual.synced), and this loop just keeps integrating forward from
-	-- whatever that correction left behind. All of this is purely cosmetic;
-	-- the server always runs its own independent, authoritative Step, and any
-	-- drift is corrected the instant ProjHit snaps the final position.
-	local function compactVisualOrder()
-		local oldOrder = visualOrder
-		local oldCount = #oldOrder
-		local compacted = table.create(math.max(oldCount - visualTombstones, 0))
-		-- Begin at the next due slot so compaction preserves round-robin fairness.
-		for offset = 0, oldCount - 1 do
-			local index = (visualCursor + offset - 1) % oldCount + 1
-			local id = oldOrder[index]
-			if visuals[id] then
-				table.insert(compacted, id)
-			end
-		end
-		visualOrder = compacted
-		visualCursor = 1
-		visualTombstones = 0
-	end
-
-	refreshView()
-	Heartbeat.Connect(function(globalDt)
-		globalSimulationClock += globalDt
-		local now = os.clock()
-		refreshView()
-		refreshSmoothVisuals(now)
-		local slotCount = #visualOrder
-		local inspected = 0
-		local transformed = 0
-		while inspected < slotCount and transformed < MAX_VISUAL_UPDATES_PER_FRAME do
-			if visualCursor > slotCount then
-				visualCursor = 1
-			end
-			local id = visualOrder[visualCursor]
-			visualCursor += 1
-			inspected += 1
-			local visual = visuals[id]
-			if not visual then
-				continue
-			end
-			local elapsedGlobalDt = math.max(globalSimulationClock - visual.lastSimulationTime, 0)
-			visual.lastSimulationTime = globalSimulationClock
-			-- Real (undilated) backstop, checked unconditionally before the
-			-- synced/unsynced split below -- mirrors the server's own
-			-- MaxRealLifetime check (see Step). Primarily this is redundant
-			-- with ProjHit already destroying the visual the instant the
-			-- server actually expires it; this exists purely as a client-only
-			-- fallback in case that message is ever missed (e.g. the visual
-			-- drifted outside VisualRange), so a visual can never linger
-			-- forever regardless of dt/freeze state -- same reasoning as the
-			-- server-side fix this mirrors.
-			if now - visual.spawnRealTime >= visual.maxRealLifetime then
-				destroyVisual(id)
-				continue
-			end
-
-			if visual.synced then
-				local inView = isInView(visual.position)
-				if inView then
-					transformed += 1
-					if not visual.inView then
-						-- Suppress trail history only for the re-entry teleport.
-						-- Particles kept emitting throughout the off-screen grace
-						-- period unless the visual actually reached full culling.
-						VisualModel.SuspendTrails(visual)
-						VisualModel.Place(visual, visual.position, visual.velocity)
-						if visual.culled then
-							VisualModel.SetCulled(visual, false)
-							visual.culled = false
-						end
-						visual.resumeEffectsOnNextUpdate = now
-						visual.offscreenSince = nil
-					elseif not visual.smoothTransform then
-						if visual.resumeEffectsOnNextUpdate then
-							VisualModel.ResumeEffects(visual)
-							visual.resumeEffectsOnNextUpdate = nil
-						end
-						local realDt = math.max(now - visual.lastRenderStep, 0)
-						VisualModel.Step(visual, realDt)
-					end
-					visual.lastRenderStep = now
-				else
-					if visual.inView or not visual.offscreenSince then
-						visual.offscreenSince = now
-					end
-					if not visual.culled and now - visual.offscreenSince >= visual.effectCullDelay then
-						VisualModel.SuspendEffects(visual)
-						VisualModel.SetCulled(visual, true)
-						visual.culled = true
-					end
-				end
-				visual.inView = inView
-				-- Position/velocity/pose come from ProjMove; the only thing
-				-- that runs here is a left-VisualRange safety net. This is
-				-- deliberately wall-clock (os.clock()), NOT a dilated-dt
-				-- countdown: a synced visual can belong to a shooter at ANY
-				-- personal time ratio, including exactly 0 (a legitimate
-				-- indefinite freeze the player chose), so there's no dilated
-				-- "Lifetime elapsed" schedule the client could reconstruct on
-				-- its own without knowing that live ratio (which isn't
-				-- replicated to observers -- see the module doc comment's
-				-- "Personal time" section). Instead: the server round-robins every
-				-- synced projectile through bounded ProjMove batches regardless of
-				-- dt (see the server step loop), so as long as
-				-- this client is in VisualRange, lastUpdate keeps getting
-				-- refreshed; once it stops (genuinely left range, or the
-				-- projectile is gone), a real-time timeout cleans it up.
-				if now - visual.lastUpdate > SYNCED_VISUAL_STALE_TIMEOUT then
-					destroyVisual(id)
-				end
-				continue
-			end
-
-			-- visual.timeScale is the combined Source.TimeScale *
-			-- projectile.TimeScale, kept current via the (rare, on-change
-			-- only) ProjTimeScale handler above -- see the module doc
-			-- comment's "Local time" section. simulateVisual consumes that
-			-- time across chunk boundaries using each entered chunk's own scale.
-			local alive, moved = simulateVisual(visual, elapsedGlobalDt * visual.timeScale)
-			local inView = isInView(visual.position)
-			if inView then
-				transformed += 1
-				if not visual.inView then
-					VisualModel.SuspendTrails(visual)
-					VisualModel.Place(visual, visual.position, visual.velocity)
-				elseif moved and visual.smoothTransform then
-					setSmoothTarget(visual, now)
-				elseif moved then
-					VisualModel.Place(visual, visual.position, visual.velocity)
-				end
-				if not visual.inView then
-					if visual.culled then
-						VisualModel.SetCulled(visual, false)
-						visual.culled = false
-					end
-					visual.resumeEffectsOnNextUpdate = now
-					visual.offscreenSince = nil
-				elseif visual.resumeEffectsOnNextUpdate then
-					VisualModel.ResumeEffects(visual)
-					visual.resumeEffectsOnNextUpdate = nil
-				end
-				visual.lastRenderStep = now
-			else
-				if visual.inView or not visual.offscreenSince then
-					visual.offscreenSince = now
-				end
-				if not visual.culled and now - visual.offscreenSince >= visual.effectCullDelay then
-					VisualModel.SuspendEffects(visual)
-					VisualModel.SetCulled(visual, true)
-					visual.culled = true
-				end
-			end
-			visual.inView = inView
-			if not alive then
-				-- Safety net: normally ProjHit arrives first and removes this
-				-- entry. This only fires if it never does (e.g. the
-				-- projectile left this client's VisualRange).
-				destroyVisual(id)
-			end
-		end
-
-		-- Nearby visuals receive presentation-only interpolation every real frame.
-		-- Their logical simulation and network snapshots remain in the bounded
-		-- scheduler above, so this adds at most MAX_SMOOTH_PROJECTILES transforms.
-		for _, visual in smoothVisuals do
-			if visual.inView and visuals[visual.id] == visual then
-				if visual.resumeEffectsOnNextUpdate and visual.resumeEffectsOnNextUpdate < now then
-					VisualModel.ResumeEffects(visual)
-					visual.resumeEffectsOnNextUpdate = nil
-				end
-				local lastStep = visual.lastSmoothStep or now
-				VisualModel.Step(visual, math.max(now - lastStep, 0))
-				visual.lastSmoothStep = now
-			end
-		end
-
-		-- Avoid an ever-growing sparse order array without changing which live
-		-- visual is next. This is metadata work only; it performs no transforms.
-		if visualTombstones >= 256 and visualTombstones * 4 >= #visualOrder then
-			compactVisualOrder()
-		end
-	end, { Name = "ProjectileSystem.ClientSimulate", Priority = 5 })
+	View.refresh()
+	Heartbeat.Connect(renderStep, { Name = "ProjectileSystem.ClientSimulate", Priority = 5 })
 end
 
 function ProjectileClient.GetStats()

@@ -1,22 +1,42 @@
+--!strict
 --!optimize 2
 --[[
 	Projectile/RewindHit.luau
 	Lag-compensated ("rewound") entity hit detection -- the authoritative hit
 	check for any shot fired with RewindSeconds > 0 (see Shooter.server.luau),
-	which in practice is almost every real networked shot. RewindHit.Methods
-	gets mixed onto the Projectile class by init.luau (so
-	self:_checkRewoundHit(from, to) keeps working unchanged).
+	which in practice is almost every real networked shot.
+
+	RewindHit.check only answers "which entity, if any, does this segment hit
+	from the shooter's point of view"; resolving what the hit does (pierce,
+	destroy, events) is Raycast.resolveEntityHit's job.
 ]]
 
-local ReplicatedStorage = game:GetService("ReplicatedStorage")
-local Shared = ReplicatedStorage:WaitForChild("Shared")
-local Entity = require(Shared.Entity)
-local ChunkManager = require(Shared.ChunkManager)
+local Shared = game:GetService("ReplicatedStorage"):WaitForChild("Shared")
+local Entity = require(Shared:WaitForChild("Entity"))
+local ChunkManager = require(Shared:WaitForChild("ChunkManager"))
+local SafeMath = require(Shared:WaitForChild("SafeMath"))
 
 local Math = require(script.Parent.Math)
+local Types = require(script.Parent.Types)
+
+type State = Types.State
+
+type Candidate = {
+	entity: Types.EntityLike,
+	point: Vector3,
+	distAlong: number,
+	hurtbox: Types.Hurtbox,
+}
 
 local RewindHit = {}
-RewindHit.Methods = {}
+
+-- Reused by every check (the server step is single-threaded, and each check
+-- drains it before returning) to avoid per-substep allocation churn.
+local candidates: { Candidate } = {}
+
+local function byDistance(a: Candidate, b: Candidate): boolean
+	return a.distAlong < b.distAlong
+end
 
 -- Lag-compensated entity check for one movement substep. Only meaningful while
 -- passing through a chunk that contains entities (see `highRes` in init.luau's
@@ -28,20 +48,19 @@ RewindHit.Methods = {}
 -- Two memoization/deferral choices preserve the exact "nearest in-range entity
 -- with a clear LOS to `from`" semantics while cutting redundant work:
 --  - The rewind instant (os.clock() - RewindSeconds) is pinned for the whole
---    Step (see Step's useRewind setup), and each entity's rewound position is
---    memoized in self._rewindCache. Within a frame RewindSeconds is constant
---    and os.clock() is stable, so an entity rewinds to the same place on every
---    substep -- previously this recomputed GetPositionAt per entity per
---    substep.
---  - LOS verification is deferred: in-range candidates are collected into a
---    reusable buffer, sorted ascending by distance-along-segment, then
---    LOS-checked nearest-first, returning the first whose LOS to `from` is
---    unobstructed. The survivor is exactly the nearest clear entity the old
---    hash-order loop would also have produced, but the raycast count is now the
---    rank of the nearest clear candidate (or N if all blocked) rather than up
---    to N regardless of order -- deterministically O(rank), not O(N) worst-case.
-function RewindHit.Methods:_checkRewoundHit(from: Vector3, to: Vector3)
-	local whitelist = {}
+--    Step (see init.luau), and each entity's rewound position is memoized in
+--    projectile._rewindCache, so an entity rewinds once per frame rather than
+--    once per substep.
+--  - LOS verification is deferred: in-range candidates are sorted nearest
+--    first and LOS-checked in that order, so the raycast count is the rank of
+--    the nearest clear candidate rather than every candidate.
+-- Returns entity, contact point, surface normal, hurtbox -- or nil.
+function RewindHit.check(
+	projectile: State,
+	from: Vector3,
+	to: Vector3
+): (Types.EntityLike?, Vector3?, Vector3?, Types.Hurtbox?)
+	local whitelist: { [Types.EntityLike]: boolean } = {}
 	for _, position in { from, to } do
 		local chunk = ChunkManager.GetChunk(position)
 		if chunk and ChunkManager.IsChunkActive(chunk) then
@@ -51,77 +70,74 @@ function RewindHit.Methods:_checkRewoundHit(from: Vector3, to: Vector3)
 		end
 	end
 
-	-- Collect in-range candidates (no raycasts yet) into the reusable buffer.
-	-- Each entity is tested against BOTH its rewound Head and Body spheres
-	-- (see the module doc comment's "Head + Body hurtboxes" section) --
+	-- Each entity is tested against BOTH its rewound Head and Body spheres --
 	-- Head is checked first and wins outright if in range (the two spheres
 	-- are independent, not required to nest -- see Entity.luau).
-	local candidates = self._candidateBuf
+	local filter = projectile.Filter
+	local cache = projectile._rewindCache
 	for entity in whitelist do
-		if entity ~= self.Source and not self._ignore[entity] and (not self.Filter or self.Filter(entity)) then
-			local cache = self._rewindCache[entity]
-			if not cache then
-				cache = {
-					Body = entity:GetBodyPositionAt(self._rewindTime),
-					Head = entity:GetHeadPositionAt(self._rewindTime),
+		if entity ~= projectile.Source and not projectile._ignore[entity] and (not filter or filter(entity)) then
+			local rewound = cache[entity]
+			if not rewound then
+				rewound = {
+					Body = entity:GetBodyPositionAt(projectile._rewindTime),
+					Head = entity:GetHeadPositionAt(projectile._rewindTime),
 				}
-				self._rewindCache[entity] = cache
+				cache[entity] = rewound
 			end
 
+			local head = rewound.Head
 			local matchedHead = false
-			if cache.Head then
-				local closest, distance = Math.closestPointOnSegment(cache.Head, from, to)
-				if distance <= entity.HeadRadius + self.Radius then
-					table.insert(candidates, {
+			if head then
+				local closest, distance = Math.closestPointOnSegment(head, from, to)
+				if distance <= entity.HeadRadius + projectile.Radius then
+					local candidate: Candidate = {
 						entity = entity,
 						point = closest,
 						distAlong = (closest - from).Magnitude,
 						hurtbox = "Head",
-					})
+					}
+					table.insert(candidates, candidate)
 					matchedHead = true
 				end
 			end
 			if not matchedHead then
-				local closest, distance = Math.closestPointOnSegment(cache.Body, from, to)
-				if distance <= entity.HitboxRadius + self.Radius then
-					table.insert(candidates, {
+				local closest, distance = Math.closestPointOnSegment(rewound.Body, from, to)
+				if distance <= entity.HitboxRadius + projectile.Radius then
+					local candidate: Candidate = {
 						entity = entity,
 						point = closest,
 						distAlong = (closest - from).Magnitude,
 						hurtbox = "Body",
-					})
+					}
+					table.insert(candidates, candidate)
 				end
 			end
 		end
 	end
 
-	-- Nearest-first: sort ascending by distance along the segment, then
-	-- LOS-check in order, returning the first unobstructed one. This matches
-	-- the old "bestDistAlong, clear only" survivor exactly.
-	table.sort(candidates, function(a, b)
-		return a.distAlong < b.distAlong
-	end)
+	table.sort(candidates, byDistance)
 
-	for _, c in candidates do
+	for _, candidate in candidates do
 		-- line-of-sight: real geometry must not block the shot before it would
 		-- reach this point, so stale rewound data can never be used to hit
 		-- someone through a wall. The hit instance must not belong to the
 		-- candidate itself, so a target's own body can't block hitting it.
-		local los = workspace:Raycast(from, c.point - from, self._rayParams)
+		local los = workspace:Raycast(from, candidate.point - from, projectile._rayParams)
 		local blocked = los ~= nil
-			and (los.Position - from).Magnitude < c.distAlong - 0.5
-			and Entity.Get(los.Instance) ~= c.entity
+			and (los.Position - from).Magnitude < candidate.distAlong - 0.5
+			and Entity.Get(los.Instance) ~= candidate.entity
 		if not blocked then
-			-- drain the buffer for this frame so the next substep starts clean
-			-- (Step already clears it, but this keeps the function honest if
-			-- ever called from elsewhere).
 			table.clear(candidates)
-			return c.entity, c.point, Math.safeUnit(from - c.point, Vector3.yAxis), c.hurtbox
+			return candidate.entity,
+				candidate.point,
+				SafeMath.direction(from - candidate.point, Vector3.yAxis),
+				candidate.hurtbox
 		end
 	end
 
 	table.clear(candidates)
-	return nil
+	return nil, nil, nil, nil
 end
 
 return RewindHit

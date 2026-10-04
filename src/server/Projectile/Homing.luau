@@ -1,28 +1,24 @@
+--!strict
 --!optimize 2
 --[[
 	Projectile/Homing.luau
-	Target acquisition/tracking. Homing.Methods gets mixed onto the Projectile
-	class by init.luau (so self:_updateHoming(dt) keeps working unchanged).
+	Target acquisition and steering. Homing.update(projectile, dt) runs once
+	per substep from init.luau's Step; it only ever changes the projectile's
+	HomingTarget, its homing timers, and the direction of its Velocity.
 ]]
 
-local ReplicatedStorage = game:GetService("ReplicatedStorage")
-local Shared = ReplicatedStorage:WaitForChild("Shared")
-local ChunkManager = require(Shared.ChunkManager)
-local Entity = require(Shared.Entity)
+local Shared = game:GetService("ReplicatedStorage"):WaitForChild("Shared")
+local ChunkManager = require(Shared:WaitForChild("ChunkManager"))
+local Entity = require(Shared:WaitForChild("Entity"))
 
 local Math = require(script.Parent.Math)
+local Types = require(script.Parent.Types)
+
+type State = Types.State
 
 local Homing = {}
-Homing.Methods = {}
 
--- Dilated seconds between searches while a projectile holds no target
--- (override per shot with Homing.AcquireInterval). Searching on every substep
--- made a swarm of target-less missiles run up to MAX_SUBSTEPS chunk sweeps
--- each per frame. The reset is jittered so a burst fired on one frame spreads
--- its searches across frames instead of spiking together forever.
-local DEFAULT_ACQUIRE_INTERVAL = 0.1
-
-function Homing.targetPosition(target): Vector3?
+function Homing.targetPosition(target: Types.HomingTarget?): Vector3?
 	if target == nil then
 		return nil
 	end
@@ -37,14 +33,33 @@ function Homing.targetPosition(target): Vector3?
 		end
 		return nil
 	end
-	-- assume an Entity
+	-- an Entity
 	if target.IsDestroyed then
 		return nil
 	end
-	if target.GetPosition then
-		return target:GetPosition()
+	return target:GetPosition()
+end
+
+local function isEligible(projectile: State, homing: Types.Homing, entity: Types.EntityLike): boolean
+	if entity == projectile.Source or entity.IsDestroyed then
+		return false
 	end
-	return nil
+	local filter = projectile.Filter
+	if filter and not filter(entity) then
+		return false
+	end
+	local tags = homing.TargetTags
+	if tags then
+		for _, tag in tags do
+			if entity:HasTag(tag) then
+				return true
+			end
+		end
+		return false
+	elseif homing.TargetTag then
+		return entity:HasTag(homing.TargetTag)
+	end
+	return true
 end
 
 -- Finds the nearest valid homing target: entities matching TargetTag/TargetTags
@@ -53,102 +68,82 @@ end
 -- AcquireRadius is set (the normal case -- every real spawn site sets one), so
 -- cost scales with local entity density, not total entity/projectile count; the
 -- unbounded case (rare) falls back to a full scan.
-function Homing.acquireTarget(projectile, homing, position: Vector3)
-	local source = projectile.Source
-	local filter = projectile.Filter
-
-	local function isEligible(entity): boolean
-		if entity == source or entity.IsDestroyed then
-			return false
-		end
-		if filter and not filter(entity) then
-			return false
-		end
-		if homing.TargetTags then
-			for _, tag in homing.TargetTags do
-				if entity:HasTag(tag) then
-					return true
-				end
-			end
-			return false
-		elseif homing.TargetTag then
-			return entity:HasTag(homing.TargetTag)
-		end
-		return true
+function Homing.acquireTarget(projectile: State, homing: Types.Homing, position: Vector3): Types.EntityLike?
+	local function eligible(entity: Types.EntityLike): boolean
+		return isEligible(projectile, homing, entity)
 	end
 
-	if homing.AcquireRadius then
-		local best, bestDist = nil, homing.AcquireRadius
-		local candidates = ChunkManager.GetEntitiesInRadius(position, homing.AcquireRadius, { Filter = isEligible })
-		for _, entity in candidates do
-			local distance = (entity:GetPosition() - position).Magnitude
-			if distance <= bestDist then
-				best, bestDist = entity, distance
+	local radius = homing.AcquireRadius
+	local candidates: { Types.EntityLike }
+	local bestDistance = math.huge
+	if radius then
+		candidates = ChunkManager.GetEntitiesInRadius(position, radius, { Filter = eligible })
+		bestDistance = radius
+	else
+		candidates = {}
+		local pool = if homing.TargetTag then Entity.GetTagged(homing.TargetTag) else Entity.GetAll()
+		for _, entity in pool do
+			if eligible(entity) then
+				table.insert(candidates, entity)
 			end
 		end
-		return best
 	end
 
-	local best, bestDist = nil, math.huge
-	local candidates = homing.TargetTag and Entity.GetTagged(homing.TargetTag) or Entity.GetAll()
+	local best: Types.EntityLike? = nil
 	for _, entity in candidates do
-		if isEligible(entity) then
-			local distance = (entity:GetPosition() - position).Magnitude
-			if distance <= bestDist then
-				best, bestDist = entity, distance
-			end
+		local distance = (entity:GetPosition() - position).Magnitude
+		if distance <= bestDistance then
+			best, bestDistance = entity, distance
 		end
 	end
 	return best
 end
 
-function Homing.Methods:_updateHoming(dt: number)
-	local homing = self.Homing
+function Homing.update(projectile: State, dt: number)
+	local homing = projectile.Homing
 	if not homing then
 		return
 	end
 
-	if self.HomingDelay > 0 then
-		self.HomingDelay -= dt
+	if projectile.HomingDelay > 0 then
+		projectile.HomingDelay -= dt
 		return
 	end
 
 	-- (re)acquire a target when none / auto-targeting
-	local target = self.HomingTarget
+	local target = projectile.HomingTarget
 	local targetGone = target == nil or Homing.targetPosition(target) == nil
 
 	if targetGone then
 		if homing.AcquireRadius or homing.TargetTag or homing.TargetTags then
-			self._acquireTimer -= dt
-			if self._acquireTimer <= 0 then
-				local interval = homing.AcquireInterval or DEFAULT_ACQUIRE_INTERVAL
-				self._acquireTimer = interval * (0.5 + math.random())
-				self.HomingTarget = Homing.acquireTarget(self, homing, self.Position)
-				target = self.HomingTarget
+			projectile._acquireTimer -= dt
+			if projectile._acquireTimer <= 0 then
+				-- Jittered so a burst fired on one frame spreads its searches
+				-- across frames instead of spiking together forever.
+				projectile._acquireTimer = homing.AcquireInterval * (0.5 + math.random())
+				target = Homing.acquireTarget(projectile, homing, projectile.Position)
+				projectile.HomingTarget = target
 			end
 		end
 	elseif not homing.Permalock and homing.Retarget then
-		self.ReacquireTimer -= dt
-		if self.ReacquireTimer <= 0 then
-			self.ReacquireTimer = homing.ReacquireRate or 0.3
+		projectile.ReacquireTimer -= dt
+		if projectile.ReacquireTimer <= 0 then
+			projectile.ReacquireTimer = homing.ReacquireRate
 			-- No `or target` fallback: if nothing is in range anymore, the lock
-			-- is genuinely dropped, matching "re-acquire if the target ...
-			-- leaves" above. Homing.Permalock (checked above) is the explicit
-			-- opt-in for "never drop a lock due to range."
-			self.HomingTarget = Homing.acquireTarget(self, homing, self.Position)
-			target = self.HomingTarget
+			-- is genuinely dropped. Homing.Permalock (checked above) is the
+			-- explicit opt-in for "never drop a lock due to range."
+			target = Homing.acquireTarget(projectile, homing, projectile.Position)
+			projectile.HomingTarget = target
 		end
 	end
 
-	local goal = target and Homing.targetPosition(target)
+	local goal = Homing.targetPosition(target)
 	if not goal then
 		return
 	end
-	local desired = goal - self.Position
-	local turn = (homing.TurnRate or math.rad(120)) * dt
-	local speed = self.Velocity.Magnitude
-	local newDir = Math.rotateTowards(self.Velocity, desired, turn)
-	self.Velocity = newDir * speed
+	local speed = projectile.Velocity.Magnitude
+	local newDirection = Math.rotateTowards(projectile.Velocity, goal - projectile.Position, homing.TurnRate * dt)
+	projectile.Velocity = newDirection * speed
 end
 
 return Homing

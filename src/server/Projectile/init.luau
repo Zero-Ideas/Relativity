@@ -1,3 +1,4 @@
+--!strict
 --!optimize 2
 --[[
 	Projectile (server)
@@ -17,8 +18,8 @@
 	multipliers) stays server-only and unreadable by any client, on purpose.
 	The purely cosmetic rendering half lives in ReplicatedStorage.Shared as
 	ProjectileClient -- require that from client code, this module from
-	server code. The two communicate only over VisualOffload's ProjSpawn /
-	ProjMove / ProjHit / ProjSync / ProjTimeScale / ProjRay channels (see
+	server code. The two communicate only over VisualOffload's ProjSpawnBatch /
+	ProjMove / ProjHitBatch / ProjSync / ProjTimeScale / ProjRay channels (see
 	Projectile/Replication.luau for the sending side).
 
 	Supported behaviours (mix and match): straight shots, ballistic gravity,
@@ -49,12 +50,13 @@
 	   knowledge -- the client has no replicated entity registry to check
 	   against), neither of which the client can do reliably. So rather than
 	   staying synced for the rest of its life, a bouncing projectile is only
-	   ever corrected at the instant it actually bounces: the server sends one
-	   immediate ProjMove entry (Bounced = true) with the exact post-reflection
-	   Position/Velocity, which the client snaps to and treats as its new local
-	   physics baseline. Between bounces (and before the first one, and after
-	   the last one) the client is fully unsynced and coasts on local physics,
-	   just like a non-homing, non-bouncing shot.
+	   ever corrected on the frame it actually bounces: that frame's ProjMove
+	   batch carries one entry (Bounced = true) with the contact point and the
+	   end-of-frame post-bounce Position/Velocity, which the client snaps to
+	   and treats as its new local physics baseline. Between bounces (and
+	   before the first one, and after the last one) the client is fully
+	   unsynced and coasts on local physics, just like a non-homing,
+	   non-bouncing shot.
 	 - A one-shot ProjTimeScale message every time a projectile's personal/local
 	   dilation actually CHANGES (Source.TimeScale * projectile.TimeScale --
 	   see "Local time" below), not a continuous stream: the client can't
@@ -182,7 +184,7 @@
 	   Bounces = 0              (world bounces before it dies; no upper bound is enforced)
 	   Restitution = 0.5        (velocity kept per bounce)
 	   Penetration = 0          (studs of wall material this projectile can punch
-	              through; see Raycast._attemptPenetration below. Tried BEFORE
+	              through; see attemptPenetration in Raycast.luau. Tried BEFORE
 	              bouncing on a world hit; a wall thicker than the remaining
 	              Penetration blocks it, falling through to Bounces/destroy as
 	              normal. Persistent, depleting state -- punching through
@@ -264,43 +266,65 @@
 	 diffs the combined Source.TimeScale * projectile.TimeScale against the
 	 last value it streamed for that projectile and, only on an actual change,
 	 sends a single small ProjTimeScale { Id, TimeScale } message (see
-	 Replication.spawnVisual for the initial value and Step for the on-change
-	 check). The client stores that number per visual and multiplies it
-	 straight into its existing local ChunkManager.ScaleDt dead-reckoning (see
+	 Projectile.new for the initial value and Replication.updateTimeScale for
+	 the on-change check). The client stores that number per visual and
+	 multiplies it straight into its local dead-reckoning (see
 	 ProjectileClient's render loop), the same way it already accounts for
-	 chunk/world dilation. This is unrelated to Replication.isSynced/homing,
+	 chunk/world dilation.
+
+	 Input safety: every config value goes through Config.normalize (NaN falls
+	 back to the default, +-inf and anything past SafeMath.Limit = 1e9 clamps),
+	 so a hostile or broken aim can never put a NaN into the simulation.
+	 Position/Velocity/TimeScale stay live-writable and are re-checked each
+	 Step; a projectile that leaves the +-1e9 world bound simply expires. This is unrelated to Replication.isSynced/homing,
 	 which is still the one case that genuinely needs a continuous
 	 authoritative stream (see above).
 ]]
 
-local ReplicatedStorage = game:GetService("ReplicatedStorage")
-local Shared = ReplicatedStorage:WaitForChild("Shared")
 
-local Heartbeat = require(Shared.Heartbeat)
-local ChunkManager = require(Shared.ChunkManager)
-local Entity = require(Shared.Entity)
-local ProjectileMotion = require(Shared.ProjectileMotion)
-local Signal = require(Shared.Signal)
+local Shared = game:GetService("ReplicatedStorage"):WaitForChild("Shared")
 
-local Math = require(script.Math)
+local Heartbeat = require(Shared:WaitForChild("Heartbeat"))
+local ChunkManager = require(Shared:WaitForChild("ChunkManager"))
+local Entity = require(Shared:WaitForChild("Entity"))
+local ProjectileMotion = require(Shared:WaitForChild("ProjectileMotion"))
+local Planner = require(Shared:WaitForChild("ProjectileStepPlanner"))
+local SafeMath = require(Shared:WaitForChild("SafeMath"))
+local Signal = require(Shared:WaitForChild("Signal"))
+
+local Config = require(script.Config)
 local Homing = require(script.Homing)
+local Math = require(script.Math)
 local Raycast = require(script.Raycast)
-local RewindHit = require(script.RewindHit)
 local Replication = require(script.Replication)
+local RewindHit = require(script.RewindHit)
+local Types = require(script.Types)
+
+export type Config = Types.Config
+export type HitInfo = Types.HitInfo
+export type DestroyInfo = Types.DestroyInfo
 
 local Projectile = {}
 Projectile.__index = Projectile
 
--- Mix each sub-module's instance methods onto the class so self:_resolveHit(),
--- self:_updateHoming(), self:_checkRewoundHit(), etc. keep working exactly as
--- if this were still one file.
-for _, mixin in { Homing.Methods, Raycast.Methods, RewindHit.Methods } do
-	for name, fn in mixin do
-		Projectile[name] = fn
-	end
-end
+-- The live projectile: its public/internal state plus the methods below.
+-- Declared as an intersection (not typeof(setmetatable(...))) so a projectile
+-- is directly usable anywhere a Types.State is expected.
+type Methods = {
+	Step: (self: Projectile, globalDt: number) -> boolean,
+	Destroy: (self: Projectile, result: { Position: Vector3, Normal: Vector3 }?, kind: string?) -> (),
+	SetTimeScale: (self: Projectile, scale: number) -> (),
+}
+export type Projectile = Types.State & Methods
 
-local active = {} -- server-side live projectiles
+local MIN_STEP_DT = ProjectileMotion.MinStepDt
+local MAX_SUBSTEPS = 16
+-- Homing re-aims once per substep, so cap how far one substep can turn.
+local MAX_HOMING_TURN_STEP = math.rad(5)
+-- Projectile.Burst never creates more than this many pellets in one call.
+local MAX_BURST_COUNT = 10000
+
+local active: { Projectile } = {} -- server-side live projectiles
 local nextId = 0
 
 -- When on, every movement raycast is streamed to rendering clients so the hit
@@ -311,30 +335,12 @@ local nextId = 0
 local debugRays = false
 
 function Projectile.SetDebugRays(enabled: boolean)
-	debugRays = enabled and true or false
+	debugRays = enabled == true
 end
 
 function Projectile.SetDebugSync(enabled: boolean)
-	Replication.DebugSync = enabled and true or false
+	Replication.DebugSync = enabled == true
 end
-
--- Adaptive raycast resolution. In chunks that contain entities we step finely so
--- fast bullets can't tunnel through a target; in empty chunks we take one long
--- cast per frame (walls still register, but we skip the wasted fine checks). A
--- raycast is NEVER skipped outright -- only its resolution (step size) adapts --
--- so nothing can pass through world geometry unchecked.
-local HIGH_RES_STEP = 4 -- studs per raycast near entities
-local LOW_RES_STEP = 64 -- studs per raycast in empty space
-local MAX_SUBSTEPS = 16
-local CURVE_ERROR = 0.35 -- maximum studs between a curved path and its cast chord
-local MAX_HOMING_TURN_STEP = math.rad(5)
-local MIN_STEP_DT = 1e-5
--- Pose replication is round-robined so one client event never grows without
--- bound, and its phase cannot be reset by a time-scale change.
-local MAX_SYNC_UPDATES_PER_FRAME = 2500
-local syncCursor = 1
-local MAX_VISUAL_SPAWNS_PER_FRAME = 1000
-local MAX_VISUAL_HITS_PER_FRAME = 1000
 
 -- Hard real-time (wall-clock, undilated) cap on how long any projectile can
 -- stay alive, regardless of its own dilated Lifetime/Age. A projectile whose
@@ -342,183 +348,119 @@ local MAX_VISUAL_HITS_PER_FRAME = 1000
 -- or the chunk it's sitting in all read as 0 -- see Step) never advances Age,
 -- so the normal Lifetime expiry alone would let it live in `active` forever.
 -- Checked every Step via os.clock(), independent of dt. Per-shot override via
--- config.MaxRealLifetime; change the default for every future shot with
--- Projectile.SetDefaultMaxRealLifetime.
-local DEFAULT_MAX_REAL_LIFETIME = 60 -- real seconds
+-- config.MaxRealLifetime.
+local defaultMaxRealLifetime = 60 -- real seconds
 
 function Projectile.SetDefaultMaxRealLifetime(seconds: number)
-	DEFAULT_MAX_REAL_LIFETIME = math.max(seconds, 0)
+	defaultMaxRealLifetime = SafeMath.number(seconds, defaultMaxRealLifetime, 0)
+end
+
+-- The shooter's personal ratio times this projectile's own ratio -- see the
+-- "Local time" section above. Both are live-writable from outside (an Entity
+-- or an ability can set either to anything), so both are sanitized here.
+local function combinedTimeScale(projectile: Types.State): number
+	local source = projectile.Source
+	local sourceScale = SafeMath.number(source and source.TimeScale, 1, 0)
+	return SafeMath.number(sourceScale * SafeMath.number(projectile.TimeScale, 1, 0), 0, 0)
 end
 
 --------------------------------------------------------------------------------
 -- Construction
 --------------------------------------------------------------------------------
 
-function Projectile.new(config)
+function Projectile.new(config: Config): Projectile
+	local settings = Config.normalize(config, defaultMaxRealLifetime)
+	local homing = settings.Homing
 	nextId += 1
 
-	local origin = config.Origin or Vector3.zero
-	local direction
-	if config.TargetPosition then
-		direction = Math.safeUnit(config.TargetPosition - origin, Vector3.zAxis)
-	else
-		direction = Math.safeUnit(config.Direction or Vector3.zAxis, Vector3.zAxis)
-	end
-	local speed = config.Speed or 100
-
-	local bounces = config.Bounces or 0
-
-	local self = setmetatable({
+	local state: Types.State = {
 		Id = nextId,
-		Position = origin,
-		Velocity = direction * speed,
-		Speed = speed,
-		Acceleration = config.Acceleration or 0,
-		AccelerationDirection = config.AccelerationDirection,
-		MinSpeed = config.MinSpeed or 0,
-		MaxSpeed = config.MaxSpeed or math.huge,
-		Gravity = config.Gravity or 0,
-		Radius = config.Radius or 0,
+		Position = settings.Origin,
+		Velocity = settings.Direction * settings.Speed,
+		Speed = settings.Speed,
+		Acceleration = settings.Acceleration,
+		AccelerationDirection = settings.AccelerationDirection,
+		MinSpeed = settings.MinSpeed,
+		MaxSpeed = settings.MaxSpeed,
+		Gravity = settings.Gravity,
+		Radius = settings.Radius,
 
-		Lifetime = config.Lifetime or 5,
+		Lifetime = settings.Lifetime,
 		Age = 0,
-		-- Hard real-time (wall-clock) safety cap -- see
-		-- DEFAULT_MAX_REAL_LIFETIME above. _spawnRealTime is os.clock() at
-		-- construction, checked every Step regardless of dt/freeze state.
-		MaxRealLifetime = math.max(config.MaxRealLifetime or DEFAULT_MAX_REAL_LIFETIME, 0),
-		_spawnRealTime = os.clock(),
-		-- This projectile's OWN dilation, independent of Source -- see the
-		-- module doc comment's "Local time" section. Live-mutable directly or
-		-- via :SetTimeScale(); read live every Step, never snapshotted.
-		TimeScale = math.max(config.TimeScale or 1, 0),
+		MaxRealLifetime = settings.MaxRealLifetime,
+		TimeScale = settings.TimeScale,
 
-		Damage = config.Damage or 0,
+		Damage = settings.Damage,
 		DamageMultiplier = 1,
-		Source = config.Source,
-		IgnoreInstances = config.IgnoreInstances,
-		Filter = config.Filter,
+		Source = settings.Source,
+		IgnoreInstances = settings.IgnoreInstances,
+		Filter = settings.Filter,
 
-		BouncesLeft = bounces,
-		Restitution = config.Restitution or 0.5,
-		-- Depleting budget of wall material this projectile can still punch
-		-- through -- see Raycast._attemptPenetration / the module doc
-		-- comment's config section. Tried before bouncing on a world hit.
-		Penetration = math.max(config.Penetration or 0, 0),
+		BouncesLeft = settings.Bounces,
+		Restitution = settings.Restitution,
+		Penetration = settings.Penetration,
+		PiercesLeft = settings.MaxPierces,
+		PierceFalloff = settings.PierceFalloff,
 
-		PiercesLeft = config.MaxPierces or 0,
-		PierceFalloff = config.PierceFalloff or 0,
-
-		Homing = config.Homing,
-		HomingDelay = config.Homing and (config.Homing.Delay or 0) or 0,
-		HomingTarget = config.Homing and config.Homing.Target,
+		Homing = homing,
+		HomingDelay = if homing then homing.Delay else 0,
+		HomingTarget = if homing then homing.Target else nil,
 		ReacquireTimer = 0,
+
+		Visualize = settings.Visualize,
+		VisualRange = settings.VisualRange,
+		Model = settings.Model,
+		Visual = settings.Visual,
+		VisualScale = settings.VisualScale,
+		DestroyDelay = settings.DestroyDelay,
+		WaitForParticles = settings.WaitForParticles,
+		WaitForTrails = settings.WaitForTrails,
+		ActivateParticlesOnCreate = settings.ActivateParticlesOnCreate,
+
+		-- See "Events" in the module doc comment. Fresh Signal per projectile.
+		OnHit = Signal.new() :: any,
+		OnDestroy = Signal.new() :: any,
+		OnBounce = settings.OnBounce,
+
+		RewindSeconds = settings.RewindSeconds,
+		Dead = false,
+
+		_spawnRealTime = os.clock(),
 		_acquireTimer = 0, -- throttles searches while no target is held; see Homing
-
-		Visualize = config.Visualize == true,
-		VisualRange = config.VisualRange or math.huge,
-		Model = config.Model,
-		Visual = config.Visual,
-		VisualScale = math.clamp(config.VisualScale or 1, 0.05, 20),
-		DestroyDelay = config.DestroyDelay or 0,
-		-- Client-side effect-cleanup/activation options -- see the module doc
-		-- comment's config section and VisualModel.FadeOut /
-		-- VisualModel.ActivateParticles for the actual behaviour.
-		WaitForParticles = config.WaitForParticles ~= false,
-		WaitForTrails = config.WaitForTrails ~= false,
-		ActivateParticlesOnCreate = config.ActivateParticlesOnCreate == true,
-		_spawnStreamed = false,
-
-		-- See "Events" in the module doc comment's API section. Fresh Signal
-		-- per projectile -- connect on the returned instance, not via config.
-		OnHit = Signal.new(),
-		OnDestroy = Signal.new(),
-		OnBounce = config.OnBounce,
-
-		RewindSeconds = config.RewindSeconds or 0,
-
 		_ignore = {}, -- entities already pierced
-		-- Lag-compensation working state, repopulated each Step before
-		-- _checkRewoundHit runs (see Step). rewoundPos is memoized per frame
-		-- since RewindSeconds is fixed and os.clock() is stable across one
-		-- frame's substeps; the candidate buffer is reused across substeps to
-		-- avoid per-substep allocation churn under high projectile counts.
+		-- Lag-compensation working state, reset each Step (see RewindHit).
 		_rewindTime = 0,
 		_rewindCache = {},
-		_candidateBuf = {},
-		_simulationDebt = 0, -- unprocessed personal/global dt carried across frames
-		Dead = false,
-	}, Projectile)
-	self._rayParams = Raycast.buildRayParams(self)
-	self._streamedSynced = Replication.isSynced(self)
-	-- Baseline for the ProjTimeScale on-change check in Step -- see
-	-- Replication.combinedTimeScale / the module doc comment's "Local time"
-	-- section. Computed before spawnVisual so ProjSpawn's TimeScale field
-	-- matches.
-	self._lastStreamedTimeScale = Replication.combinedTimeScale(self)
+		_simulationDebt = 0, -- personal/global seconds carried across frames
+		_rayParams = Raycast.buildRayParams(settings.Source, settings.IgnoreInstances),
+		_spawnStreamed = false,
+		_streamedSynced = false,
+		_lastStreamedTimeScale = 1,
+	}
+	state._streamedSynced = Replication.isSynced(state)
+	-- Baseline for Replication.updateTimeScale; set before spawnVisual so the
+	-- spawn snapshot's TimeScale matches.
+	state._lastStreamedTimeScale = combinedTimeScale(state)
 
+	local self: Projectile = setmetatable(state, Projectile) :: any
 	table.insert(active, self)
 	Replication.spawnVisual(self)
 	return self
 end
 
--- Tells rendering clients only when the homing-sync state actually changed --
--- not every frame (see Replication.isSynced / the module doc comment). True
--- switches the client into "trust the continuous ProjMove stream" mode; false
--- switches it back to local physics from wherever the last authoritative
--- Position/Velocity left it. Bounce corrections are separate (see
--- Raycast._resolveHit) and never touch this flag or fire ProjSync -- they're
--- one-shot regardless of sync state.
-function Projectile:_checkSyncTransition()
-	local synced = Replication.isSynced(self)
-	if synced ~= self._streamedSynced then
-		self._streamedSynced = synced
-		if Replication.DebugSync then
-			print(`[Relativity][sync] ProjSync Id={self.Id} Synced={synced} (BouncesLeft={self.BouncesLeft} Homing={self.HomingTarget ~= nil})`)
-		end
-		Replication.streamTo(self, "ProjSync", { Id = self.Id, Synced = synced })
-	end
-end
-
--- Tells rendering clients only when the combined Source.TimeScale *
--- projectile.TimeScale actually CHANGES -- not every frame. This is what
--- replaced continuously streaming Position/Velocity for the whole flight of
--- any personal/local-time-affected projectile (see the module doc comment's
--- "Local time" section): the client just needs the number, which in the
--- common case (nobody touched it after firing) never changes again after
--- ProjSpawn, so this fires zero extra times per shot instead of 60/sec.
-function Projectile:_checkTimeScaleChange(combinedScale: number)
-	if combinedScale ~= self._lastStreamedTimeScale then
-		self._lastStreamedTimeScale = combinedScale
-		if Replication.DebugSync then
-			print(`[Relativity][sync] ProjTimeScale Id={self.Id} TimeScale={combinedScale}`)
-		end
-		Replication.streamTo(self, "ProjTimeScale", { Id = self.Id, TimeScale = combinedScale })
-	end
-end
-
 -- Cone burst: `count` projectiles spread around the base direction.
-function Projectile.Burst(config, count: number)
-	local origin = config.Origin or Vector3.zero
-	local baseDir
-	if config.TargetPosition then
-		baseDir = Math.safeUnit(config.TargetPosition - origin, Vector3.zAxis)
-	else
-		baseDir = Math.safeUnit(config.Direction or Vector3.zAxis, Vector3.zAxis)
-	end
-
-	local spread = config.Spread or 0
+function Projectile.Burst(config: Config, count: number): { Projectile }
+	local origin = SafeMath.vector(config.Origin, Vector3.zero)
+	local baseDirection = Config.direction(config, origin)
+	local spread = Config.spread(config)
 	local shots = {}
-	for _ = 1, count do
-		local pelletConfig = table.clone(config)
-		-- Mutable nested configuration must never be shared by sibling shots.
-		-- This is especially important for spell bursts whose homing settings
-		-- may be extended with per-projectile state later.
-		if config.Homing then
-			pelletConfig.Homing = table.clone(config.Homing)
-		end
-		pelletConfig.TargetPosition = nil
-		pelletConfig.Direction = Math.coneDirection(baseDir, spread)
-		table.insert(shots, Projectile.new(pelletConfig))
+	for _ = 1, math.floor(SafeMath.number(count, 0, 0, MAX_BURST_COUNT)) do
+		-- Each pellet gets its own normalized Homing table from Config, so
+		-- siblings never share mutable state.
+		local pellet = table.clone(config)
+		pellet.TargetPosition = nil
+		pellet.Direction = Math.coneDirection(baseDirection, spread)
+		table.insert(shots, Projectile.new(pellet))
 	end
 	return shots
 end
@@ -526,32 +468,31 @@ end
 -- This projectile's OWN local dilation -- see the module doc comment's
 -- "Local time" section. Read live every Step, so an ability can dial this up
 -- or down over time (or reset it to 1) and the change is immediate. Setting
--- the .TimeScale field directly works identically; this just adds the same
--- clamping Entity:SetTimeScale uses.
-function Projectile:SetTimeScale(scale: number)
-	self.TimeScale = math.max(scale, 0)
+-- the .TimeScale field directly works identically.
+function Projectile.SetTimeScale(self: Projectile, scale: number)
+	self.TimeScale = SafeMath.number(scale, 1, 0)
 end
 
 --------------------------------------------------------------------------------
 -- Query (server-only in practice -- see the module doc comment's API section)
 --------------------------------------------------------------------------------
 
-function Projectile.GetAll()
+function Projectile.GetAll(): { Projectile }
 	return table.clone(active)
 end
 
 function Projectile.GetStats()
-	local queueStats = Replication.getQueueStats()
+	local stats = Replication.getQueueStats()
 	return {
 		Active = #active,
-		VisualSpawnsPerFrame = MAX_VISUAL_SPAWNS_PER_FRAME,
-		VisualHitsPerFrame = MAX_VISUAL_HITS_PER_FRAME,
-		PendingVisualSpawns = queueStats.PendingSpawns,
-		PendingVisualHits = queueStats.PendingHits,
+		VisualSpawnsPerFrame = stats.VisualSpawnsPerFrame,
+		VisualHitsPerFrame = stats.VisualHitsPerFrame,
+		PendingVisualSpawns = stats.PendingVisualSpawns,
+		PendingVisualHits = stats.PendingVisualHits,
 	}
 end
 
-function Projectile.GetBySource(source: any)
+function Projectile.GetBySource(source: Types.EntityLike): { Projectile }
 	local result = {}
 	for _, projectile in active do
 		if projectile.Source == source then
@@ -562,10 +503,10 @@ function Projectile.GetBySource(source: any)
 end
 
 export type QueryOptions = {
-	Filter: ((projectile: any) -> boolean)?,
+	Filter: ((projectile: Projectile) -> boolean)?,
 }
 
-function Projectile.GetInRadius(position: Vector3, radius: number, options: QueryOptions?)
+function Projectile.GetInRadius(position: Vector3, radius: number, options: QueryOptions?): { Projectile }
 	local filter = options and options.Filter
 	local result = {}
 	for _, projectile in active do
@@ -579,83 +520,210 @@ function Projectile.GetInRadius(position: Vector3, radius: number, options: Quer
 end
 
 --------------------------------------------------------------------------------
+-- Per-substep movement
+--------------------------------------------------------------------------------
+
+local function integrate(projectile: Types.State, velocity: Vector3, dt: number): (Vector3, Vector3)
+	return ProjectileMotion.Integrate(
+		velocity,
+		projectile.Acceleration,
+		projectile.AccelerationDirection,
+		projectile.Gravity,
+		projectile.MinSpeed,
+		projectile.MaxSpeed,
+		dt
+	)
+end
+
+-- Moves to `fraction` of this substep's chord and spends only the matching
+-- share of stepDt. The time after a contact is refunded to the caller, so a
+-- pierce/penetration/bounce keeps flying for the rest of the frame instead of
+-- silently losing it -- the client never sees pierces or penetrations and
+-- keeps coasting, so any time lost here would be pure server/client drift.
+-- Returns the dilated seconds consumed.
+local function advanceToContact(
+	projectile: Types.State,
+	from: Vector3,
+	displacement: Vector3,
+	fraction: number,
+	startVelocity: Vector3,
+	stepDt: number
+): number
+	local clamped = math.clamp(fraction, 0, 1)
+	local contactDt = stepDt * clamped
+	projectile.Velocity = if contactDt > 0 then (integrate(projectile, startVelocity, contactDt)) else startVelocity
+	projectile.Position = from + displacement * clamped
+	projectile.Age += contactDt
+	return contactDt
+end
+
+-- A pass-through contact (pierce, penetration, or a nudge past an ignored
+-- entity) teleports the projectile forward past the surface. The client
+-- flies straight through the same span in real time, so charge the time it
+-- would take to cover it. Returns the dilated seconds consumed.
+local function chargePassThrough(projectile: Types.State, contactPosition: Vector3): number
+	local speed = projectile.Velocity.Magnitude
+	if not (speed >= 1e-5) then
+		return 0
+	end
+	local skipped = (projectile.Position - contactPosition):Dot(projectile.Velocity) / speed
+	if not (skipped > 0) then
+		return 0
+	end
+	local skipDt = skipped / speed
+	projectile.Velocity = (integrate(projectile, projectile.Velocity, skipDt))
+	projectile.Age += skipDt
+	return skipDt
+end
+
+-- Applies a resolver's verdict. Returns the total dilated seconds this
+-- substep consumed, or nil once the projectile has been destroyed.
+local function settle(
+	projectile: Projectile,
+	verdict: Types.Verdict,
+	kind: string?,
+	contact: Types.Contact,
+	contactPosition: Vector3,
+	consumed: number
+): number?
+	if verdict == "destroy" then
+		projectile:Destroy(contact, kind)
+		return nil
+	elseif verdict == "pass" then
+		return consumed + chargePassThrough(projectile, contactPosition)
+	end
+	-- "bounce": the client is re-baselined by the bounce snap instead.
+	-- ("fallthrough" can't reach here: both callers resolve it first.)
+	return consumed
+end
+
+-- Moves one planned substep of `stepDt` dilated seconds, resolving the first
+-- contact along the way. Returns the dilated seconds actually consumed (less
+-- than stepDt when a contact interrupted the chord, possibly more when a
+-- pass-through skipped ahead), or nil once the projectile has been destroyed.
+local function advance(projectile: Projectile, stepDt: number, highRes: boolean): number?
+	Homing.update(projectile, stepDt)
+	local startVelocity = projectile.Velocity
+	local endVelocity, movementVelocity = integrate(projectile, startVelocity, stepDt)
+	local from = projectile.Position
+	local displacement = movementVelocity * stepDt
+	local to = from + displacement
+
+	-- Lag-compensated entity check, only while in an entity-containing chunk
+	-- and only for shots carrying a shooter's rewind offset. RewindHit already
+	-- applies Filter, so a hit here never falls through.
+	if highRes and projectile.RewindSeconds > 0 then
+		local entity, point, normal, hurtbox = RewindHit.check(projectile, from, to)
+		if entity and point and normal then
+			if debugRays then
+				Replication.streamRay(projectile, from, point, false)
+			end
+			local contact: Types.Contact = { Position = point, Normal = normal }
+			local fraction = Math.chordFraction(from, displacement, point)
+			local consumed = advanceToContact(projectile, from, displacement, fraction, startVelocity, stepDt)
+			local contactPosition = projectile.Position
+			-- (casts: the analyzer widens literal unions returned across modules)
+			local verdict = Raycast.resolveEntityHit(projectile, entity, contact, hurtbox :: Types.Hurtbox?)
+			return settle(projectile, verdict :: Types.Verdict, "entity", contact, contactPosition, consumed)
+		end
+	end
+
+	local contact = Raycast.castMovement(projectile, from, displacement)
+	if debugRays then
+		Replication.streamRay(projectile, from, if contact then contact.Position else to, not highRes)
+	end
+	if not contact then
+		projectile.Velocity = endVelocity
+		projectile.Position = to
+		projectile.Age += stepDt
+		return stepDt
+	end
+
+	-- Distance is how far the ray (or sphere center) travelled, which is exact
+	-- for Spherecast where contact.Position is the surface instead.
+	local length = displacement.Magnitude
+	local fraction = if length > 1e-5 then (contact.Distance or 0) / length else 0
+	local consumed = advanceToContact(projectile, from, displacement, fraction, startVelocity, stepDt)
+	local contactPosition = projectile.Position
+
+	local instance = contact.Instance
+	if highRes and projectile.RewindSeconds > 0 and instance and Entity.Get(instance) then
+		-- We're lag-compensating this segment and the rewound check above
+		-- found no valid hit -- from the shooter's ping-adjusted view this
+		-- entity wasn't actually there, so the live-position coincidence
+		-- doesn't count. Nudge past and keep flying.
+		Raycast.nudgePast(projectile, contact.Position)
+		return settle(projectile, "pass", nil, contact, contactPosition, consumed)
+	end
+
+	local verdict, kind = Raycast.resolveHit(projectile, contact)
+	return settle(projectile, verdict :: Types.Verdict, kind, contact, contactPosition, consumed)
+end
+
+--------------------------------------------------------------------------------
 -- Per-projectile step
 --------------------------------------------------------------------------------
 
--- Shared "died of natural causes, nothing was actually hit" path -- dilated
--- Lifetime expiry and the real-time MaxRealLifetime cap below both fizzle out
--- the same way. Deliberately does NOT fire OnHit (there was no contact to
--- report -- see the module doc comment's "Events" section); OnDestroy still
--- fires exactly once, from Destroy(), which the outer server step loop calls
--- once Step() returns false here, same as any other removal.
-function Projectile:_expire(): boolean
-	return false
-end
-
--- Advances the projectile; returns false when it should be removed.
-function Projectile:Step(globalDt: number): boolean
+-- Advances the projectile one frame; returns false when it should be
+-- removed. Returning false without hitting anything (Lifetime/MaxRealLifetime
+-- expiry, leaving the world limit) is a natural expiry: no OnHit fires, and
+-- the step loop's Destroy() fires OnDestroy with a nil Kind.
+function Projectile.Step(self: Projectile, globalDt: number): boolean
 	if self.Dead then
 		return false
 	end
 
-	-- Hard real-time cap, checked unconditionally every tick via os.clock()
-	-- BEFORE anything dt-dependent -- this is the one expiry check that MUST
-	-- run even while the projectile is completely frozen (combinedScale/chunk
-	-- dt at 0 below), since Age itself never advances in that state and the
-	-- dilated Lifetime check further down would otherwise never fire. See
-	-- MaxRealLifetime / DEFAULT_MAX_REAL_LIFETIME above.
+	-- Hard real-time cap, checked BEFORE anything dt-dependent -- this is the
+	-- one expiry check that MUST run even while the projectile is completely
+	-- frozen, since Age never advances in that state.
 	if os.clock() - self._spawnRealTime >= self.MaxRealLifetime then
-		return self:_expire()
+		return false
+	end
+
+	-- Position/Velocity are public and live-writable; a bad write from an
+	-- ability must not poison the math. Out-of-world positions expire.
+	self.Velocity = SafeMath.vector(self.Velocity, Vector3.zero)
+	if not SafeMath.isFiniteVector(self.Position) then
+		return false
 	end
 
 	-- Personal/global time is consumed below one spatial segment at a time.
 	-- Chunk scale is deliberately NOT folded in here: each segment samples the
 	-- chunk it is entering, so crossing a slow/frozen boundary takes effect at
 	-- the boundary instead of one whole frame late.
-	local combinedScale = Replication.combinedTimeScale(self)
-	-- Checked BEFORE the dt<=0 early return below, so a ratio change that
-	-- freezes the projectile entirely (combinedScale hits 0) still reaches
-	-- the client -- otherwise a frozen shot would silently keep whatever
-	-- stale TimeScale it last streamed. See ProjTimeScale / the module doc
-	-- comment's "Local time" section.
-	self:_checkTimeScaleChange(combinedScale)
-	if globalDt <= 0 or combinedScale <= 0 then
-		return true -- frozen chunk / paused / shooter or projectile frozen: keep it alive, don't move it
+	local combinedScale = combinedTimeScale(self)
+	-- Sent BEFORE the frozen early return below, so a ratio change that
+	-- freezes the projectile entirely still reaches the client.
+	Replication.updateTimeScale(self, combinedScale)
+	if not (globalDt > 0) or combinedScale <= 0 then
+		-- Frozen: keep it alive, don't move it. A lock can still be cleared
+		-- externally while frozen.
+		Replication.updateSyncState(self)
+		return true
 	end
 
-	-- Lag-compensation working state for this frame: pin rewindTime and a fresh
-	-- rewound-position cache so every substep rewinds to the SAME instant
-	-- (RewindSeconds is fixed per projectile and os.clock() is stable across
-	-- substeps; previously each substep recomputed both, doing up to N redundant
-	-- GetPositionAt lookups where one would do). The candidate buffer is
-	-- reused, never reallocated -- see RewindHit._checkRewoundHit.
+	-- Pin the rewind instant for every substep this frame; see RewindHit.
 	if self.RewindSeconds > 0 then
 		self._rewindTime = os.clock() - self.RewindSeconds
 		table.clear(self._rewindCache)
-		table.clear(self._candidateBuf)
 	end
 
 	local remaining = globalDt * combinedScale + self._simulationDebt
-	self._simulationDebt = 0
-	-- With no dilated chunk or zone anywhere, every boundary search below can
-	-- only return "none", so skip them (they dominate substep cost at scale).
+	-- With no dilated chunk or zone anywhere, every boundary search can only
+	-- return "none", so skip them (they dominate substep cost at scale).
 	local uniformTime = ChunkManager.IsTimeUniform()
+	local homing = self.Homing
 	local guard = 0
 	while remaining > MIN_STEP_DT and guard < MAX_SUBSTEPS do
 		guard += 1
+		local lifeRemaining = self.Lifetime - self.Age
+		if lifeRemaining <= MIN_STEP_DT then
+			return false
+		end
 
-		local accelerationVector = ProjectileMotion.GetAcceleration(
-			self.Velocity,
-			self.Acceleration,
-			self.AccelerationDirection,
-			self.Gravity
-		)
-		local direction = Math.safeUnit(
-			self.Velocity,
-			Math.safeUnit(accelerationVector, Vector3.zAxis)
-		)
-		local samplePosition = self.Position + direction * ProjectileMotion.PositionEpsilon
-		local chunkScale = if uniformTime then 1 else ChunkManager.GetTimeScaleAt(samplePosition)
+		local accelerationVector =
+			ProjectileMotion.GetAcceleration(self.Velocity, self.Acceleration, self.AccelerationDirection, self.Gravity)
+		local sample, chunkScale = Planner.Sample(self.Position, self.Velocity, accelerationVector, uniformTime)
 		if chunkScale <= 0 then
 			-- Real time spent in a frozen chunk is consumed without building a
 			-- catch-up burst for when the chunk is unfrozen.
@@ -663,156 +731,72 @@ function Projectile:Step(globalDt: number): boolean
 			break
 		end
 
-		local availableDt = remaining * chunkScale
-		local lifetimeRemaining = self.Lifetime - self.Age
-		if lifetimeRemaining <= MIN_STEP_DT then
-			return self:_expire()
+		-- Adaptive raycast resolution: fine steps where entities are (so fast
+		-- bullets can't tunnel through a target), long ones in empty space. A
+		-- cast is never skipped outright, only lengthened.
+		local highRes = Raycast.chunkHasEntities(sample)
+		local maxDt = math.huge
+		if homing and self.HomingTarget and homing.TurnRate > 0 then
+			maxDt = MAX_HOMING_TURN_STEP / homing.TurnRate
 		end
-
-		local predictedVelocity = self.Velocity + accelerationVector * availableDt
-		local estimatedMovementVelocity = (self.Velocity + predictedVelocity) * 0.5
-		local speed = estimatedMovementVelocity.Magnitude
-		local highRes = Raycast.chunkHasEntities(samplePosition)
-		local maxDistance = ProjectileMotion.GetAdaptiveMaxDistance(speed, highRes)
-		-- Preserve the old conservative floors near entities while allowing the
-		-- adaptive policy to grow with speed.
-		maxDistance = math.max(maxDistance, if highRes then HIGH_RES_STEP else LOW_RES_STEP)
-
-		local stepDt = math.min(availableDt, lifetimeRemaining)
-		if speed > 1e-5 then
-			stepDt = math.min(stepDt, maxDistance / speed)
-			if not uniformTime then
-				local chunkBoundaryDt = ProjectileMotion.GetTimeScaleBoundaryDt(
-					self.Position,
-					estimatedMovementVelocity,
-					ChunkManager.ChunkSize,
-					ChunkManager.UseY,
-					chunkScale,
-					stepDt,
-					ChunkManager.GetTimeScaleAt
-				)
-				local radialBoundaryDt = ChunkManager.GetRadialTimeScaleBoundaryDt(
-					self.Position,
-					estimatedMovementVelocity,
-					stepDt
-				)
-				stepDt = math.min(stepDt, chunkBoundaryDt, radialBoundaryDt)
-			end
-		end
-		stepDt = math.min(stepDt, ProjectileMotion.GetCurvatureStepDt(self.Velocity, accelerationVector, CURVE_ERROR))
-		if self.HomingTarget and self.Homing then
-			local turnRate = self.Homing.TurnRate or math.rad(120)
-			if turnRate > 0 then
-				stepDt = math.min(stepDt, MAX_HOMING_TURN_STEP / turnRate)
-			end
-		end
-		if stepDt <= MIN_STEP_DT then
-			-- Numerical boundary precision should never delete frame time.
-			self._simulationDebt = remaining
-			break
-		end
-
-		self:_updateHoming(stepDt)
-		local movementVelocity
-		self.Velocity, movementVelocity = ProjectileMotion.Integrate(
+		local stepDt = Planner.StepDt(
+			self.Position,
 			self.Velocity,
-			self.Acceleration,
-			self.AccelerationDirection,
-			self.Gravity,
-			self.MinSpeed,
-			self.MaxSpeed,
-			stepDt
+			accelerationVector,
+			chunkScale,
+			remaining,
+			lifeRemaining,
+			highRes,
+			uniformTime,
+			maxDt
 		)
-		self.Age += stepDt
-		remaining = math.max(remaining - stepDt / chunkScale, 0)
-
-		local from = self.Position
-		local displacement = movementVelocity * stepDt
-		local to = from + displacement
-
-		-- Lag-compensated entity check, only while in an entity-containing chunk
-		-- and only for shots carrying a shooter's rewind offset.
-		if highRes and self.RewindSeconds > 0 then
-			local lagEntity, lagPoint, lagNormal, lagHurtbox = self:_checkRewoundHit(from, to)
-			if lagEntity then
-				if debugRays then
-					self:_streamRay(from, lagPoint, false)
-				end
-				local verdict = self:_resolveEntityHit(lagEntity, { Position = lagPoint, Normal = lagNormal }, lagHurtbox)
-				if verdict == "destroy" then
-					return false
-				end
-				continue
-			end
+		if stepDt <= 0 then
+			break -- too little time to integrate; carried below
 		end
 
-		local result = Raycast.castMovement(self, from, displacement)
-		if debugRays then
-			self:_streamRay(from, result and result.Position or to, not highRes)
+		local consumed = advance(self, stepDt, highRes)
+		if not consumed then
+			return false -- destroyed by a hit
 		end
-
-		if not result then
-			self.Position = to
-		else
-			local instance = result.Instance
-			local liveEntity = instance and Entity.Get(instance)
-			if liveEntity and highRes and self.RewindSeconds > 0 then
-				-- We're lag-compensating this segment and the rewound check above
-				-- found no valid hit -- from the shooter's ping-adjusted view this
-				-- entity wasn't actually there, so the live-position coincidence
-				-- doesn't count. Nudge past and keep flying.
-				self.Position = result.Position + Math.safeUnit(movementVelocity, Vector3.zAxis) * (self.Radius + 0.1)
-			else
-				local velocityBeforeHit = self.Velocity
-				local verdict = self:_resolveHit(result)
-				if verdict == "destroy" then
-					return false
-				end
-				if self.Velocity ~= velocityBeforeHit then
-					-- Continue this frame along the reflected velocity instead of
-					-- the pre-bounce average used for the incoming trajectory.
-					movementVelocity = self.Velocity
-				end
-				-- pierce/bounce/penetrate/ignore already advanced self.Position past the surface
-			end
-		end
+		remaining -= consumed / chunkScale
 
 		if self.Age >= self.Lifetime - MIN_STEP_DT then
-			return self:_expire()
+			return false
 		end
 	end
 
-	if remaining > MIN_STEP_DT and self._simulationDebt == 0 then
-		-- Preserve work beyond this frame's safety budget instead of shortening
-		-- the projectile's range/lifetime by silently discarding it.
-		self._simulationDebt = remaining
-	end
+	-- Whatever wasn't simulated -- past this frame's substep budget, too small
+	-- to integrate, or overspent by a pass-through (negative) -- carries to the
+	-- next frame, so no time is ever lost or gained relative to the client.
+	self._simulationDebt = remaining
 
-	self:_checkSyncTransition()
+	if not SafeMath.isFiniteVector(self.Position) then
+		return false -- flew past SafeMath.Limit
+	end
+	Replication.updateSyncState(self)
 	return true
 end
 
-function Projectile:Destroy(result, kind: string?)
+function Projectile.Destroy(self: Projectile, result: { Position: Vector3, Normal: Vector3 }?, kind: string?)
 	if self.Dead then
 		return
 	end
 	self.Dead = true
-	local hitResult = result or { Position = self.Position, Normal = Vector3.yAxis }
-	if Replication.DebugSync then
-		print(`[Relativity][sync] ProjHit Id={self.Id} Kind={kind or "fizzle"}`)
-	end
-	Replication.queueHit(self, { Id = self.Id, Position = hitResult.Position, Normal = hitResult.Normal, Kind = kind })
+	local info: Types.DestroyInfo = {
+		Position = if result then SafeMath.vector(result.Position, self.Position) else self.Position,
+		Normal = if result then SafeMath.unit(result.Normal, Vector3.yAxis) else Vector3.yAxis,
+		Kind = kind,
+	}
+	Replication.queueHit(self, info)
 
-	-- Exactly-once -- see the module doc comment's "Events" section. Fired
-	-- here (not in Raycast._resolveEntityHit/_resolveHit/_expire) so EVERY
-	-- removal path funnels through the same single call, including natural
-	-- Lifetime/MaxRealLifetime expiry (which calls Destroy() from the outer
-	-- server step loop, not from here).
-	self.OnDestroy:Fire({ Position = hitResult.Position, Normal = hitResult.Normal, Kind = kind })
+	-- Exactly-once -- see the module doc comment's "Events" section. Every
+	-- removal path funnels through this one call, including natural expiry
+	-- (which the step loop below Destroy()s once Step returns false).
+	self.OnDestroy:Fire(info)
 
 	-- Defensive: drop heavy references so a projectile object that somehow
-	-- outlives removal from `active` (e.g. a future caller retaining the
-	-- returned handle) doesn't keep entities/closures alive through it.
+	-- outlives removal from `active` (e.g. a caller retaining the returned
+	-- handle) doesn't keep entities/closures alive through it.
 	table.clear(self._ignore)
 	self.HomingTarget = nil
 	self.OnHit:Destroy()
@@ -823,11 +807,10 @@ end
 -- Server step loop
 --------------------------------------------------------------------------------
 
-Heartbeat.Connect(function(globalDt)
-	Replication.flushHitBatch(MAX_VISUAL_HITS_PER_FRAME)
-	Replication.flushSpawnBatch(MAX_VISUAL_SPAWNS_PER_FRAME)
+Heartbeat.Connect(function(globalDt: number)
+	Replication.flushHitBatch()
+	Replication.flushSpawnBatch()
 
-	local syncCandidates = {}
 	debug.profilebegin("Projectile.StepAll")
 	-- Backwards with swap-removal: dead projectiles leave `active` the same
 	-- frame (so GetAll/GetInRadius never return them), and anything spawned by
@@ -835,75 +818,20 @@ Heartbeat.Connect(function(globalDt)
 	-- next frame.
 	for i = #active, 1, -1 do
 		local projectile = active[i]
-		-- Captured BEFORE Step() so a projectile whose homing lock drops
-		-- DURING this exact tick still gets this tick's corrected
-		-- post-drop Position/Velocity streamed -- otherwise the client is
-		-- left holding a stale pre-transition pose and resumes local
-		-- physics from the wrong place. Bounce corrections are queued
-		-- separately inside Raycast._resolveHit -- they don't depend on
-		-- isSynced at all, so a non-homing bouncer never enters this batch.
-		local wasSynced = Replication.isSynced(projectile)
-		local alive = projectile:Step(globalDt)
-		if not alive then
+		if projectile:Step(globalDt) then
+			-- Homing-locked projectiles stay continuously streamed; see
+			-- Replication.isSynced for why that is the one case that must.
+			Replication.queuePose(projectile)
+		else
 			local last = #active
 			active[i] = active[last]
 			active[last] = nil
-			projectile:Destroy({ Position = projectile.Position, Normal = Vector3.yAxis })
-		elseif
-			projectile.Visualize
-			and projectile._spawnStreamed -- clients would drop poses for visuals they haven't built
-			and (wasSynced or Replication.isSynced(projectile))
-		then
-			-- Currently (or just-formerly, see above) locked onto a homing
-			-- target (checked fresh every tick, not a static
-			-- classification) -- see the module doc comment for why this
-			-- is the one case that stays continuously streamed rather
-			-- than left to the client. Bounce snaps travel separately (see
-			-- Replication.queueBounce), so this payload is pose-only.
-			table.insert(syncCandidates, {
-				VisualRange = projectile.VisualRange,
-				Position = projectile.Position,
-				Payload = {
-					Id = projectile.Id,
-					Position = projectile.Position,
-					Velocity = projectile.Velocity,
-				},
-			})
+			projectile:Destroy(nil, nil)
 		end
 	end
 	debug.profileend()
 
-	local moveBatch = {}
-	local candidateCount = #syncCandidates
-	local updateCount = math.min(candidateCount, MAX_SYNC_UPDATES_PER_FRAME)
-	if candidateCount > 0 then
-		if syncCursor > candidateCount then
-			syncCursor = (syncCursor - 1) % candidateCount + 1
-		end
-		for offset = 0, updateCount - 1 do
-			local index = (syncCursor + offset - 1) % candidateCount + 1
-			table.insert(moveBatch, syncCandidates[index])
-		end
-		syncCursor = (syncCursor + updateCount - 1) % candidateCount + 1
-	else
-		syncCursor = 1
-	end
-	Replication.flushMoveBatch(moveBatch)
+	Replication.flushMoveBatch()
 end, { Name = "ProjectileSystem.Step", Priority = 5 })
-
--- Once-a-second ProjMove rate summary (see Replication.DebugSync above) --
--- real time, not dilated, so the reporting cadence stays steady even
--- mid-freeze.
-task.spawn(function()
-	while true do
-		task.wait(1)
-		local stats = Replication.SyncMoveStats
-		if Replication.DebugSync and (stats.batches > 0 or stats.entries > 0) then
-			print(`[Relativity][sync] ProjMove rate: {stats.batches} batches/s, {stats.entries} projectile-updates/s`)
-		end
-		stats.batches = 0
-		stats.entries = 0
-	end
-end)
 
 return Projectile

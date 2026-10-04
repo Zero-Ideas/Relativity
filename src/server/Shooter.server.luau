@@ -67,6 +67,7 @@ local Heartbeat = require(Shared.Heartbeat)
 local Entity = require(Shared.Entity)
 local Projectile = require(script.Parent.Projectile)
 local ProjectileQuota = require(script.Parent.ProjectileQuota)
+local SafeMath = require(Shared.SafeMath)
 local VisualOffload = require(Shared.VisualOffload)
 local Weapons = require(script.Parent.Weapons)
 local WeaponsShared = require(script.Parent.Weapons.Shared)
@@ -228,10 +229,13 @@ VisualOffload.On("FireBullet", function(data, player)
 		return
 	end
 
-	local targetPoint = data.TargetPoint
-	if typeof(targetPoint) ~= "Vector3" then
+	-- A NaN aim has no recoverable direction, so reject it; +-inf components
+	-- clamp to SafeMath.Limit so an absurd aim still fires the way it points.
+	local rawTarget = data.TargetPoint
+	if typeof(rawTarget) ~= "Vector3" or SafeMath.hasNaN(rawTarget) then
 		return
 	end
+	local targetPoint = SafeMath.vector(rawTarget, Vector3.zero)
 
 	local character = player.Character
 	local root = character and (character.PrimaryPart or character:FindFirstChild("HumanoidRootPart"))
@@ -255,7 +259,7 @@ VisualOffload.On("FireBullet", function(data, player)
 	if toTarget.Magnitude < 1e-3 then
 		return
 	end
-	local direction = toTarget.Unit
+	local direction = SafeMath.direction(toTarget, Vector3.zAxis)
 
 	-- rate limit: a hard per-(player, tool) cap independent of client input
 	-- (the remote is reachable directly -- see the module doc comment
