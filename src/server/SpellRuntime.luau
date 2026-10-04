@@ -7,10 +7,9 @@
 
 	Flow: every Mana Well pushes its energy along its flow wire. Transforms
 	set the element, If routes all of it one way, Divide splits it, and a
-	Vessel gives it form: Orb and Bullet fire projectiles (Projectile.luau),
-	Beam is an instant server-side ray (pierces, reflects) and Explosion an
-	instant area blast; their visuals are broadcast on the SpellBeam /
-	SpellExplosion channels (client/SpellEffects.luau). Quantity multiplies
+	Vessel gives it form: Orb, Bullet and Beam fire projectiles (Projectile.luau),
+	Explosion is an instant area blast. Sustain emits overlapping Beam packets
+	from live aim, sharing the cast's energy over its duration. Quantity multiplies
 	a vessel into a Fan, Ring or Stream of copies sharing the energy; each
 	Stream copy re-aims from the caster's live hand/cursor (see
 	CastRequest.live). Values (sensors/logic) are evaluated on demand and memoized per
@@ -43,7 +42,9 @@ local CAST_SPAWN_OFFSET = 3 -- studs in front of the caster's head
 local TRIGGER_SPAWN_OFFSET = 0.75 -- studs off the trigger point
 local PROXIMITY_CHECK_INTERVAL = 0.05 -- real seconds between proximity scans
 local VISUAL_RANGE = 800
-local BEAM_MAX_SEGMENTS = 24 -- guards the beam trace loop (bounces + pierces)
+local SUSTAIN_INTERVAL = 1 / 30 -- caster-dilated seconds between overlapping packets
+local MAX_SUSTAIN_PACKETS_PER_FRAME = 2 -- carry debt rather than catch-up spikes
+local MAX_SUSTAIN_REAL_LIFETIME = 60
 local PIERCE_FALLOFF = 0.15
 
 export type Context = {
@@ -265,6 +266,14 @@ type Watch = {
 	nextCheck: number,
 }
 local watches: { Watch } = {}
+local sustains: { any } = {}
+
+function SpellRuntime.IsSustaining(player: Player): boolean
+	for _, sustain in sustains do
+		if sustain.shot.ctx.player == player then return true end
+	end
+	return false
+end
 
 local runFlow: (compiled: any, ctx: Context, fromId: string, port: string, energy: number, element: string?) -> ()
 
@@ -313,6 +322,7 @@ local function vesselStats(compiled: any, ctx: Context, id: string): any
 		pierces = 0,
 		homing = nil :: any,
 		quantity = nil :: any,
+		sustain = nil :: number?,
 	}
 	for _, modId in compiled.vessels[id].mods do
 		local mod = compiled.runes[modId]
@@ -335,6 +345,8 @@ local function vesselStats(compiled: any, ctx: Context, id: string): any
 			if stats.range then stats.range *= tables.Range[level] end
 		elseif kind == "Quantity" then
 			stats.quantity = params
+		elseif kind == "Sustain" then
+			stats.sustain = tables.Sustain[level]
 		elseif kind == "Homing" then
 			local lock = input(compiled, ctx, modId, "entity")
 			stats.homing = {
@@ -398,7 +410,7 @@ type Shot = {
 	impact: number, -- damage per damage-energy (element x vessel)
 }
 
--- Orb / Bullet: one projectile with its triggers attached.
+-- All flying vessels use the same swept-radius simulation and trigger pipeline.
 local function launch(shot: Shot, direction: Vector3)
 	local ctx = shot.ctx
 	if not ProjectileQuota.TryAcquire(ctx.player, 1) then
@@ -437,6 +449,7 @@ local function launch(shot: Shot, direction: Vector3)
 		Visualize = true,
 		VisualRange = VISUAL_RANGE,
 		VisualScale = stats.scale,
+		Beam = if shot.vessel == "Beam" then { Length = if stats.sustain then math.max(24, stats.speed * SUSTAIN_INTERVAL * 1.05) else 24 } else nil,
 		-- Built procedurally on the client -- see VisualModel's styled visuals.
 		Visual = { Style = shot.vessel, Color = elementDef.Color, Core = elementDef.Core },
 	})
@@ -502,6 +515,17 @@ local function liveContext(ctx: Context): Context
 	return fresh
 end
 
+local function emitSustain(sustain: any)
+	local shot = table.clone(sustain.shot)
+	shot.ctx = liveContext(shot.ctx)
+	local share = math.min(SUSTAIN_INTERVAL, sustain.remaining) / shot.stats.sustain
+	shot.perCopy *= share
+	shot.damageEnergy *= share
+	local directions = spreadDirections(aimDirection(shot.compiled, shot.ctx, shot.id), shot.stats.quantity)
+	launch(shot, directions[sustain.index])
+	sustain.remaining -= math.min(SUSTAIN_INTERVAL, sustain.remaining)
+end
+
 -- Explosion: damages every living entity (never the caster) in the radius,
 -- full at the centre down to half at the edge, then broadcasts the blast for
 -- the client-side visual. Centre: the At input, else Here -- which at cast
@@ -535,95 +559,6 @@ local function explode(shot: Shot)
 	})
 end
 
--- Beam: an instant spherecast trace. Entities it passes take damage (Pierce
--- lets it continue, losing 15% each time); walls stop it unless Bounce
--- reflects it. The traced path is broadcast for the client to draw.
-local function fireBeam(shot: Shot, direction: Vector3)
-	local ctx, stats, element, compiled = shot.ctx, shot.stats, shot.element, shot.compiled
-	local elementDef = SpellRunes.Elements[element]
-	if stats.homing then
-		local target = stats.homing.lock
-			or nearestEntity(ctx.origin, stats.homing.radius, stats.homing.filter, ctx.caster)
-		if alive(target) then
-			local toTarget = target:GetPosition() - ctx.origin
-			-- Only snap onto targets in front of the aim, never behind the caster.
-			if toTarget.Magnitude > 1e-3 and toTarget.Unit:Dot(direction) > 0.2 then
-				direction = toTarget.Unit
-			end
-		end
-	end
-
-	local ignore = { ctx.character }
-	local params = RaycastParams.new()
-	params.FilterType = Enum.RaycastFilterType.Exclude
-	params.FilterDescendantsInstances = ignore
-	params.IgnoreWater = true
-
-	local position = ctx.origin + direction * math.min(ctx.spawnOffset, 1.5)
-	local points = { position }
-	local heading = direction
-	local remaining = stats.range
-	local bouncesLeft, piercesLeft = stats.bounces, stats.pierces
-	local multiplier = 1
-	local stopped, stopNormal, struck = false, nil, nil
-	local struckSet = {}
-	for _ = 1, BEAM_MAX_SEGMENTS do
-		if remaining <= 0.05 then break end
-		local result = workspace:Spherecast(position, stats.radius, heading * remaining, params)
-		if not result then
-			position += heading * remaining
-			break
-		end
-		remaining -= (result.Position - position).Magnitude
-		position = result.Position
-		local entity = Entity.Get(result.Instance)
-		if entity and (entity == ctx.caster or struckSet[entity] or not alive(entity)) then
-			-- Not a valid target: let the beam pass through it.
-			table.insert(ignore, entity.Instance or result.Instance)
-			params.FilterDescendantsInstances = ignore
-		elseif entity then
-			struckSet[entity] = true
-			strike(ctx, entity, shot.damageEnergy * shot.impact * multiplier, hurtboxAt(entity, result.Position), result.Position, element, shot.damageEnergy * multiplier)
-			if piercesLeft > 0 then
-				piercesLeft -= 1
-				multiplier *= 1 - PIERCE_FALLOFF
-				table.insert(ignore, entity.Instance or result.Instance)
-				params.FilterDescendantsInstances = ignore
-			else
-				stopped, stopNormal, struck = true, result.Normal, entity
-				break
-			end
-		elseif bouncesLeft > 0 then
-			bouncesLeft -= 1
-			table.insert(points, position)
-			heading = heading - 2 * heading:Dot(result.Normal) * result.Normal
-			position += result.Normal * 0.05
-		else
-			stopped, stopNormal = true, result.Normal
-			break
-		end
-	end
-	table.insert(points, position)
-
-	VisualOffload.Fire("SpellBeam", {
-		Points = points,
-		Width = stats.radius * 2,
-		Color = elementDef.Color,
-		Core = elementDef.Core,
-		Normal = stopNormal,
-		Kind = if struck then "entity" elseif stopped then "world" else nil,
-	})
-
-	for _, triggerId in shot.info.triggers do
-		local trigger = compiled.runes[triggerId]
-		local energy = shot.perCopy * trigger.params.Share / 100
-		if trigger.rune == "OnImpact" and stopped then
-			fireTrigger(compiled, ctx, triggerId, energy, element, position, heading, stopNormal, struck)
-		elseif trigger.rune == "OnExpire" and not stopped then
-			fireTrigger(compiled, ctx, triggerId, energy, element, position, heading, nil, nil)
-		end
-	end
-end
 
 local function fireVessel(compiled: any, ctx: Context, id: string, energy: number, element: string)
 	local info = compiled.vessels[id]
@@ -646,18 +581,34 @@ local function fireVessel(compiled: any, ctx: Context, id: string, energy: numbe
 		explode(shot)
 		return
 	end
-	local fire = if vessel == "Beam" then fireBeam else launch
 	local stream = stats.quantity and stats.quantity.Pattern == "Stream"
+	if vessel == "Beam" and stats.sustain then
+		for index = 1, info.count do
+			local sustain = {
+				shot = shot, index = index, remaining = stats.sustain,
+				nextEmit = if stream then (index - 1) * stats.quantity.Interval else 0,
+				started = os.clock(),
+			}
+			if sustain.nextEmit == 0 then
+				emitSustain(sustain)
+				sustain.nextEmit = SUSTAIN_INTERVAL
+			end
+			table.insert(sustains, sustain)
+		end
+		return
+	end
 	for index, direction in spreadDirections(aimDirection(compiled, ctx, id), stats.quantity) do
 		if stream and index > 1 then
 			task.delay((index - 1) * stats.quantity.Interval, function()
 				-- Re-aim each later copy from where the caster is pointing now.
 				local liveShot = table.clone(shot)
 				liveShot.ctx = liveContext(ctx)
-				fire(liveShot, aimDirection(compiled, liveShot.ctx, id))
+				if liveShot.ctx.character.Parent and alive(liveShot.ctx.caster) then
+					launch(liveShot, aimDirection(compiled, liveShot.ctx, id))
+				end
 			end)
 		else
-			fire(shot, direction)
+			launch(shot, direction)
 		end
 	end
 end
@@ -751,5 +702,33 @@ Heartbeat.Connect(function()
 		end
 	end
 end, { Name = "SpellRuntime.Triggers", Priority = 6 })
+
+-- One bounded centralized emitter loop, not a task/coroutine per packet.
+-- Old packets keep their physics; only newly emitted packets use live aim.
+Heartbeat.Connect(function(globalDt: number)
+	local now = os.clock()
+	for index = #sustains, 1, -1 do
+		local sustain = sustains[index]
+		local ctx = sustain.shot.ctx
+		local humanoid = ctx.character:FindFirstChildOfClass("Humanoid")
+		local tool = ctx.character:FindFirstChild("SpellAssembler")
+		if sustain.remaining <= 1e-8 or not ctx.player.Parent or ctx.player.Character ~= ctx.character
+			or not tool or not tool:IsA("Tool") or not humanoid or humanoid.Health <= 0
+			or (ctx.caster and not alive(ctx.caster)) or now - sustain.started >= MAX_SUSTAIN_REAL_LIFETIME then
+			table.remove(sustains, index)
+			continue
+		end
+		local live = liveContext(ctx)
+		local scale = ChunkManager.GetTimeScaleAt(live.origin) * (ctx.caster and ctx.caster.TimeScale or 1)
+		if scale <= 0 then continue end
+		sustain.nextEmit -= globalDt * scale
+		local emitted = 0
+		while sustain.nextEmit <= 0 and sustain.remaining > 1e-8 and emitted < MAX_SUSTAIN_PACKETS_PER_FRAME do
+			emitSustain(sustain)
+			sustain.nextEmit += SUSTAIN_INTERVAL
+			emitted += 1
+		end
+	end
+end, { Name = "SpellRuntime.Sustain", Priority = 4 })
 
 return SpellRuntime

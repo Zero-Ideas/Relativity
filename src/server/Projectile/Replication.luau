@@ -163,6 +163,9 @@ local function spawnPayload(projectile: State): Protocol.SpawnPayload
 	if Replication.isSynced(projectile) then payload.Synced = true end
 	if projectile._lastStreamedTimeScale ~= 1 then payload.TimeScale = projectile._lastStreamedTimeScale end
 	if projectile.VisualScale ~= 1 then payload.VisualScale = projectile.VisualScale end
+	if projectile.Beam then
+		payload.Beam = { Length = projectile.Beam.Length, Radius = projectile.Radius, Origin = projectile._beamOrigin or projectile.Position }
+	end
 	if projectile.DestroyDelay ~= 0 then payload.DestroyDelay = projectile.DestroyDelay end
 	if not projectile.WaitForParticles then payload.WaitForParticles = false end
 	if not projectile.WaitForTrails then payload.WaitForTrails = false end

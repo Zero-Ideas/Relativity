@@ -207,6 +207,12 @@
 	   Model = Instance?        (cloned client-side) or Visual = {Shape,Size,Color}
 	   VisualScale = 1          (0.05..20; applied once when the client clones
 	                            the visual, with no per-frame scaling cost)
+	   Beam = { Length = 24 }   (optional traveling cylinder path tail; defaults
+	                            Speed to 2000 and Radius to 0.35 when omitted.
+	                            Length clamps to 0.05..512 studs; swept-radius
+	                            head collision is unchanged. The visual tail
+	                            follows the already-swept path, including bends,
+	                            and drains after impact instead of vanishing.)
 	   DestroyDelay = 0         (client keeps the visual this long after impact)
 	   WaitForParticles = true (client-side; while true, a ParticleEmitter
 	              under the visual is only disabled on destroy -- already-
@@ -412,6 +418,8 @@ function Projectile.new(config: Config): Projectile
 		Model = settings.Model,
 		Visual = settings.Visual,
 		VisualScale = settings.VisualScale,
+		Beam = settings.Beam,
+		_beamOrigin = if settings.Beam then settings.Origin else nil,
 		DestroyDelay = settings.DestroyDelay,
 		WaitForParticles = settings.WaitForParticles,
 		WaitForTrails = settings.WaitForTrails,

@@ -61,7 +61,7 @@ export type RuneDef = {
 	Element: string?,
 	ModifierCost: number?, -- energy fraction consumed per level (Modifier runes)
 	Vessel: boolean?, -- an Output rune that gives magic its form (Orb/Bullet/Beam)
-	Instant: boolean?, -- a vessel with no flight (Beam): flight-only modifiers/triggers don't apply
+	Instant: boolean?, -- a vessel with no flight (Explosion)
 }
 
 --------------------------------------------------------------------------------
@@ -307,7 +307,7 @@ local defs: { RuneDef } = {
 	-- Modifiers -----------------------------------------------------------------
 	{
 		Id = "Speed", Name = "Speed", Category = "Modifier", Zones = { "Modifier" }, ModifierCost = 0.03,
-		Description = "Faster flight (×1.3 to ×3.2). Orb and Bullet only.",
+		Description = "Faster flight (×1.3 to ×3.2), including Beam segments.",
 		Inputs = {}, Outputs = { modOut() }, Params = { LEVEL },
 	},
 	{
@@ -317,7 +317,7 @@ local defs: { RuneDef } = {
 	},
 	{
 		Id = "Gravity", Name = "Gravity", Category = "Modifier", Zones = { "Modifier" }, ModifierCost = 0.01,
-		Description = "Arcing flight. Orb and Bullet only.",
+		Description = "Arcing flight, including Beam segments.",
 		Inputs = {}, Outputs = { modOut() }, Params = { LEVEL },
 	},
 	{
@@ -343,21 +343,26 @@ local defs: { RuneDef } = {
 	},
 	{
 		Id = "Homing", Name = "Homing", Category = "Modifier", Zones = { "Modifier" }, ModifierCost = 0.06,
-		Description = "Seeks targets. Wire an entity into Lock on to chase that one; otherwise it finds its own. A Beam snaps onto a target in range.",
+		Description = "Seeks targets. Wire an entity into Lock on to chase that one; otherwise it finds its own. Beams steer in flight too.",
 		Inputs = { { Name = "entity", Type = "entity", Label = "Lock on", Optional = true } },
 		Outputs = { modOut() },
 		Params = { LEVEL, { Name = "Filter", Label = "Seek", Type = "enum", Default = "Enemy", Options = FILTERS } },
 	},
 	{
 		Id = "Range", Name = "Range", Category = "Modifier", Zones = { "Modifier" }, ModifierCost = 0.03,
-		Description = "Longer flight time, or a longer Beam (×1.3 to ×3.5).",
+		Description = "Longer flight time (×1.3 to ×3.5).",
+		Inputs = {}, Outputs = { modOut() }, Params = { LEVEL },
+	},
+	{
+		Id = "Sustain", Name = "Sustain", Category = "Modifier", Zones = { "Modifier" }, ModifierCost = 0.04,
+		Description = "Beam only: continuously emits for 1–5 seconds, following live aim. Energy is shared across the duration; each segment keeps all flight modifiers and triggers.",
 		Inputs = {}, Outputs = { modOut() }, Params = { LEVEL },
 	},
 
 	-- Vessels (the form the magic takes) ---------------------------------------
 	vesselDef("Orb", "Orb", "A slow, heavy sphere of magic with a big hitbox. Flies at your mouse unless something is wired into Aim."),
 	vesselDef("Bullet", "Bullet", "A fast, thin tracer. Flies at your mouse unless something is wired into Aim."),
-	vesselDef("Beam", "Beam", "An instant ray that hits the first thing in its path. Pierce passes through, Bounce reflects off walls. Speed, Gravity, On Timer and On Proximity don't apply.", true),
+	vesselDef("Beam", "Beam", "A cylinder of magic traveling at 2000 studs/s. Supports all flight modifiers and triggers; Sustain emits a continuous cursor-following beam."),
 	{
 		Id = "Explosion", Name = "Explosion", Category = "Vessel", Zones = { "Output" }, Vessel = true, Instant = true,
 		Description = "Bursts on the spot, hitting everything within 8 studs (Size widens it): full damage at the centre, half at the edge. Fed by On Impact it goes off at the impact point; cast directly it goes off at At, or your mouse. Only Size applies.",
@@ -383,7 +388,7 @@ local defs: { RuneDef } = {
 	},
 	{
 		Id = "OnTimer", Name = "On Timer", Category = "Trigger", Zones = { "Trigger" },
-		Description = "After Delay seconds of flight, releases Share of the energy. Detonate ends the vessel. Not for Beams.",
+		Description = "After Delay seconds of flight, releases Share of the energy. Detonate ends the vessel.",
 		Inputs = { vesselIn() }, Outputs = { flowOut() },
 		Params = {
 			{ Name = "Delay", Label = "Delay", Type = "number", Default = 0.5, Min = 0.1, Max = 5, Step = 0.1, Suffix = "s" },
@@ -393,7 +398,7 @@ local defs: { RuneDef } = {
 	},
 	{
 		Id = "OnProximity", Name = "On Proximity", Category = "Trigger", Zones = { "Trigger" },
-		Description = "When an entity comes within Radius of the vessel, releases Share of the energy. Struck Entity is that entity; what it fires aims at it. Not for Beams.",
+		Description = "When an entity comes within Radius of the vessel, releases Share of the energy. Struck Entity is that entity; what it fires aims at it.",
 		Inputs = { vesselIn() }, Outputs = { flowOut() },
 		Params = {
 			{ Name = "Radius", Label = "Radius", Type = "number", Default = 8, Min = 2, Max = 40, Step = 1, Suffix = " st" },
@@ -421,6 +426,7 @@ SpellRunes.ModifierTables = {
 	Gravity = { 20, 40, 70, 110, 160 },
 	HomingRadius = { 30, 45, 60, 80, 100 },
 	HomingTurn = { 75, 105, 140, 180, 230 }, -- degrees/s
+	Sustain = { 1, 2, 3, 4, 5 }, -- caster-dilated seconds
 }
 
 -- Base stats per vessel. Radius is the hitbox (a Beam's is half its width),
@@ -428,7 +434,7 @@ SpellRunes.ModifierTables = {
 SpellRunes.Vessels = {
 	Orb = { Speed = 85, Radius = 0.7, Lifetime = 4, Scale = 1, Impact = 1.0 },
 	Bullet = { Speed = 300, Radius = 0.15, Lifetime = 2, Scale = 1, Impact = 0.9 },
-	Beam = { Range = 90, Radius = 0.35, Impact = 0.8 },
+	Beam = { Speed = 2000, Lifetime = 90 / 2000, Radius = 0.35, Scale = 1, Impact = 0.8 },
 	-- Radius is the blast radius; MaxCastRange keeps a cast-time blast near you.
 	Explosion = { Radius = 8, Impact = 0.9, MaxCastRange = 80 },
 }
@@ -442,24 +448,17 @@ function SpellRunes.ModifierCost(runeId: string, params: { [string]: any }): num
 	return (def and def.ModifierCost or 0) * (params.Level or 0)
 end
 
--- Which modifiers / triggers make sense on each vessel. Beams have no flight
--- time; an Explosion is a single instant blast that only Size can change.
-local FLIGHT_ONLY = { Speed = true, Gravity = true, OnTimer = true, OnProximity = true }
+-- Beams use the same flight pipeline as Orb/Bullet. Sustain is Beam-only.
 
 function SpellRunes.ModifierApplies(vesselId: string, modifierId: string): boolean
+	if modifierId == "Sustain" then return vesselId == "Beam" end
 	if vesselId == "Explosion" then
 		return modifierId == "Size"
-	end
-	if vesselId == "Beam" then
-		return not FLIGHT_ONLY[modifierId]
 	end
 	return true
 end
 
 function SpellRunes.TriggerApplies(vesselId: string, triggerId: string): boolean
-	if vesselId == "Beam" then
-		return not FLIGHT_ONLY[triggerId]
-	end
 	return vesselId ~= "Explosion"
 end
 SpellRunes.MaxModifierCost = 0.85

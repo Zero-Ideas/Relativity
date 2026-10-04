@@ -10,6 +10,7 @@ local Protocol = require(script.Parent.Parent:WaitForChild("ProjectileProtocol")
 local SafeMath = require(script.Parent.Parent:WaitForChild("SafeMath"))
 
 local Types = require(script.Parent.Types)
+local BeamVisual = require(script.Parent.BeamVisual)
 
 type Visual = Types.Visual
 type Rig = Types.Rig
@@ -221,6 +222,7 @@ local function makeCosmetic(part: BasePart)
 end
 
 function VisualModel.Build(data: Protocol.SpawnPayload): (Instance, Rig?)
+	if data.Beam then return BeamVisual.Build(data) end
 	local spec = data.Visual
 	local authored = data.Model
 	local styled = if spec and spec.Style and not authored then styledModel(spec) else nil
@@ -321,6 +323,7 @@ end
 function VisualModel.Place(visual: Visual, position: Vector3, velocity: Vector3)
 	visual.transformFrom = nil
 	visual.transformTo = nil
+	BeamVisual.Update(visual, position, velocity)
 
 	local pose = poseFrom(position, velocity)
 	local rig = visual.rig
@@ -484,6 +487,7 @@ end
 -- Hides a finished visual, then destroys it (or returns a built-in one to the
 -- pool) after max(destroyDelay, FadeOut's effect grace period).
 function VisualModel.Retire(visual: Visual, destroyDelay: number)
+	if BeamVisual.Retire(visual, destroyDelay) then return end
 	local rig = visual.rig
 	local delay = destroyDelay
 	if rig and rig.poolKey then
@@ -530,6 +534,9 @@ end
 -- loop advances it by writing Motor6D.Transform; no Tween objects are created.
 function VisualModel.SetTarget(visual: Visual, position: Vector3, velocity: Vector3, duration: number)
 	local rig = visual.rig
+	-- Cylinders use their own traveled path, never a pose tween that rotates
+	-- an entire tail across a corner. Homing still adopts every server pose.
+	if rig and rig.beam then VisualModel.Place(visual, position, velocity); return end
 	if not rig or not (duration > 0) then
 		VisualModel.Place(visual, position, velocity)
 		return

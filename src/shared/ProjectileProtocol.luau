@@ -50,6 +50,7 @@ export type SpawnPayload = {
 	Synced: boolean?, -- false
 	TimeScale: number?, -- 1
 	VisualScale: number?, -- 1
+	Beam: { Length: number, Radius: number, Origin: Vector3 }?, -- finite cylinder tail, head uses normal projectile physics
 	DestroyDelay: number?, -- 0
 	WaitForParticles: boolean?, -- true
 	WaitForTrails: boolean?, -- true

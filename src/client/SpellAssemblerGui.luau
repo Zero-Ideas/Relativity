@@ -47,7 +47,7 @@ local HANDLE = 6
 local LEFT_RANGE = Vector2.new(200, 480)
 local RIGHT_RANGE = Vector2.new(240, 520)
 local SINK_ACTION = "SpellEditorSinkMovement"
-local AIM_SEND_INTERVAL = 0.05 -- live cursor for Stream re-aiming (see SpellService)
+local AIM_SEND_INTERVAL = 0.05 -- live cursor for Stream/Sustain re-aiming
 local SINK_KEYS = {
 	Enum.KeyCode.W, Enum.KeyCode.A, Enum.KeyCode.S, Enum.KeyCode.D, Enum.KeyCode.Space,
 	Enum.KeyCode.Up, Enum.KeyCode.Down, Enum.KeyCode.Left, Enum.KeyCode.Right,
@@ -773,14 +773,16 @@ local aimConnection: RBXScriptConnection? = nil
 local function startAimStream()
 	if aimConnection then return end
 	local mouse = player:GetMouse()
-	local elapsed, last = 0, nil
+	local elapsed, last, sinceSend = 0, nil, 0
 	aimConnection = game:GetService("RunService").Heartbeat:Connect(function(dt)
 		elapsed += dt
+		sinceSend += dt
 		if elapsed < AIM_SEND_INTERVAL or visible then return end
 		elapsed = 0
 		local position = mouse.Hit.Position
-		if not last or (position - last).Magnitude > 0.1 then
+		if not last or (position - last).Magnitude > 0.1 or sinceSend >= 0.2 then
 			last = position
+			sinceSend = 0
 			aimRemote:FireServer(position)
 		end
 	end)

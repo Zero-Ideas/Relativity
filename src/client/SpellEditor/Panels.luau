@@ -474,7 +474,7 @@ function Inspector:showOverview(context: any)
 	sectionTitle(self.scroll, "How it works", self:nextOrder())
 	for _, line in {
 		"Mana is energy. Wire a Mana Well through a Transform (Fire, Arcane, Shock) into a Vessel; its damage comes from the mana that reaches it.",
-		"The Vessel is the form the magic takes: Orb (slow, heavy), Bullet (fast tracer) or Beam (instant ray). Quantity fires several.",
+		"The Vessel gives magic its form: Orb (slow, heavy), Bullet (fast tracer), Beam (traveling cylinder at 2000 studs/s), or Explosion. Sustain makes a Beam follow live aim for 1–5 seconds; Quantity fires several.",
 		"Every rune must sit inside a zone of the right kind. Pick a zone pen in the toolbox and drag on the board to draw one.",
 		"If routes all energy one way, Divide splits it. Sensors and Logic feed conditions and targeting.",
 		"Vessels aim at your mouse unless something is wired into their Aim port: put an Aim rune in a Targeting zone and wire it in (feed it Nearest Entity, Cursor, etc.).",

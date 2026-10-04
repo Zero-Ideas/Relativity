@@ -1,9 +1,9 @@
 --!optimize 2
 --[[
 	SpellEffects (client, purely cosmetic)
-	Renders spell Beams and Explosions. Both vessels resolve instantly on the
-	server (see server/SpellRuntime.luau's fireBeam / explode), which
-	broadcasts what happened here; every client draws it locally.
+	Renders instant Explosions and legacy SpellBeam flashes. New traveling
+	Beams use ProjectileClient/BeamVisual and the regular projectile protocol;
+	SpellRuntime no longer emits fixed SpellBeam rays.
 	Self-registers its listeners at require time, same as WeaponEffects.luau.
 
 	"SpellBeam" payload (server -> all clients):

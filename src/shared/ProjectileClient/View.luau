@@ -37,12 +37,17 @@ end
 
 -- Whether `position` is on screen (with margin). Everything counts as
 -- visible while no camera snapshot is available.
-function View.contains(position: Vector3): boolean
+function View.contains(position: Vector3, radius: number?): boolean
 	if not valid then
 		return true
 	end
 	local offset = position - viewPosition
 	local depth = offset:Dot(viewLook)
+	if radius and radius > 0 then
+		return depth + radius > 0
+			and math.abs(offset:Dot(viewRight)) <= depth * limitX + radius * math.sqrt(1 + limitX * limitX)
+			and math.abs(offset:Dot(viewUp)) <= depth * limitY + radius * math.sqrt(1 + limitY * limitY)
+	end
 	return depth > 0 and math.abs(offset:Dot(viewRight)) <= depth * limitX and math.abs(offset:Dot(viewUp)) <= depth * limitY
 end
 

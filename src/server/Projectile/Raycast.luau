@@ -221,6 +221,7 @@ function Raycast.resolveHit(projectile: State, contact: Types.Contact): (Verdict
 		local velocity = projectile.Velocity
 		projectile.Velocity = (velocity - 2 * velocity:Dot(normal) * normal) * projectile.Restitution
 		projectile.Position = contact.Position + normal * (projectile.Radius + BOUNCE_CLEARANCE)
+		if projectile.Beam and not projectile._spawnStreamed then projectile._beamOrigin = projectile.Position end
 		-- The client must SNAP on a bounce instead of tweening a straight line
 		-- from its pre-bounce position, which would visibly cut through the
 		-- surface it bounced off. The snap goes out with this frame's ProjMove

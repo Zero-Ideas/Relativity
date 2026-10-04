@@ -41,6 +41,12 @@ local Prediction = require(script.Prediction)
 local Types = require(script.Types)
 local View = require(script.View)
 local VisualModel = require(script.VisualModel)
+local BeamVisual = require(script.BeamVisual)
+
+local function visualInView(visual: Types.Visual, position: Vector3): boolean
+	local beam = visual.rig and visual.rig.beam
+	return View.contains(position, beam and beam.maxLength)
+end
 
 type Visual = Types.Visual
 
@@ -228,7 +234,7 @@ local function onSpawn(data: Protocol.SpawnPayload)
 	end
 	local model, rig = VisualModel.Build(data)
 	local now = os.clock()
-	local inView = View.contains(data.Position)
+	local inView = View.contains(data.Position, data.Beam and data.Beam.Length)
 	local visual: Visual = {
 		id = data.Id,
 		model = model,
@@ -343,7 +349,8 @@ local function onMove(batch: { Protocol.MovePayload })
 		if data.Bounced then
 			visual.lastUpdate = now
 			rebaseline(visual, data.Position, data.Velocity)
-			if View.contains(data.Position) then
+			BeamVisual.Correct(visual, data.Point or data.Position)
+			if visualInView(visual, data.Position) then
 				VisualModel.SuspendTrails(visual)
 				VisualModel.Place(visual, data.Position, data.Velocity)
 				visual.resumeEffectsOnNextUpdate = now
@@ -354,7 +361,7 @@ local function onMove(batch: { Protocol.MovePayload })
 			visual.lastUpdate = now
 			visual.position = data.Position
 			visual.velocity = data.Velocity
-			if visual.inView and View.contains(data.Position) then
+			if visual.inView and visualInView(visual, data.Position) then
 				VisualModel.SetTarget(visual, data.Position, data.Velocity, duration)
 			end
 		end
@@ -367,6 +374,7 @@ local function onHit(data: Protocol.HitPayload)
 		-- Snap to the server's exact position before destroying, so any
 		-- imperceptible mid-flight drift from local simulation never shows at
 		-- the one moment it would be visible.
+		BeamVisual.Correct(visual, data.Position)
 		VisualModel.Place(visual, data.Position, visual.velocity)
 		if data.Kind then
 			Impact.Play(data.Position, data.Normal, data.Kind)
@@ -384,6 +392,7 @@ end
 -- later update.
 local function reenterView(visual: Visual, now: number)
 	VisualModel.SuspendTrails(visual)
+	BeamVisual.Reset(visual)
 	VisualModel.Place(visual, visual.position, visual.velocity)
 	visual.culled = false
 	visual.resumeEffectsOnNextUpdate = now
@@ -402,7 +411,7 @@ local function recoverStalePose(visual: Visual, position: Vector3, now: number)
 		elseif model:IsA("Model") then model:GetPivot().Position
 		elseif model:IsA("BasePart") then model.Position
 		else position
-	if View.contains(renderedPosition) then
+	if visualInView(visual, renderedPosition) then
 		VisualModel.SuspendTrails(visual)
 		VisualModel.Place(visual, position, visual.velocity)
 		if not visual.culled then visual.resumeEffectsOnNextUpdate = now end
@@ -433,7 +442,7 @@ end
 -- advances its tween and handles visibility. Returns whether it used
 -- transform budget, or nil if it was destroyed.
 local function updateSynced(visual: Visual, now: number): boolean?
-	local inView = View.contains(visual.position)
+	local inView = visualInView(visual, visual.position)
 	if inView then
 		if not visual.inView then
 			reenterView(visual, now)
@@ -467,7 +476,7 @@ local function updatePredicted(visual: Visual, elapsedGlobalDt: number, now: num
 	if not visual.inView and visual.culled and Prediction.canDefer(visual) then
 		local dt = elapsedGlobalDt * visual.timeScale
 		local projectedPosition = Prediction.projectDeferred(visual, dt)
-		if dt < visual.life and not View.contains(projectedPosition) then
+		if dt < visual.life and not visualInView(visual, projectedPosition) then
 			-- Leave the baseline timestamp untouched. Re-entry consumes the whole
 			-- interval exactly once; corrections replace that baseline immediately.
 			visual.deferredPrediction = true
@@ -480,7 +489,7 @@ local function updatePredicted(visual: Visual, elapsedGlobalDt: number, now: num
 	visual.lastSimulationTime = globalSimulationClock
 	visual.deferredPrediction = false
 	deferredVisuals[visual.id] = nil
-	local inView = View.contains(visual.position)
+	local inView = visualInView(visual, visual.position)
 	if inView then
 		if not visual.inView then
 			reenterView(visual, now)
@@ -527,6 +536,7 @@ end
 -- transforms have been spent (or every visual was visited once).
 local function renderStep(globalDt: number)
 	globalSimulationClock += globalDt
+	BeamVisual.StepRetired(globalDt)
 	local now = os.clock()
 	View.refresh()
 	refreshSmoothVisuals(now)

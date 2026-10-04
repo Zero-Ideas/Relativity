@@ -45,8 +45,12 @@ local function validPoint(value: any): boolean
 end
 
 aimRemote.OnServerEvent:Connect(function(player: Player, position: any)
-	if validPoint(position) then
-		liveAim[player] = { position = position, time = os.clock() }
+	local character = player.Character
+	local tool = character and character:FindFirstChild("SpellAssembler")
+	local now = os.clock()
+	local previous = liveAim[player]
+	if tool and tool:IsA("Tool") and validPoint(position) and (not previous or now - previous.time >= 0.025) then
+		liveAim[player] = { position = position, time = now }
 	end
 end)
 
@@ -189,6 +193,9 @@ cast.OnServerEvent:Connect(function(player: Player, rawTarget: any)
 
 	local now = os.clock()
 	if lastCast[player] and now - lastCast[player] < CAST_INTERVAL then return end
+	if SpellRuntime.IsSustaining(player) then return end
+	local humanoid = character:FindFirstChildOfClass("Humanoid")
+	if not humanoid or humanoid.Health <= 0 then return end
 	local mana = player:GetAttribute("Mana")
 	if typeof(mana) ~= "number" or mana < compiled.manaCost then return end
 	lastCast[player] = now

@@ -15,6 +15,7 @@ export type Rig = {
 	model: Instance,
 	root: BasePart,
 	poolKey: string?,
+	beam: any?, -- bounded cylindrical path geometry (BeamVisual)
 }
 
 -- One rendered projectile. Physics fields mirror the server projectile and
