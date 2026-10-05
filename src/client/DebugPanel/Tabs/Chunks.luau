@@ -155,11 +155,33 @@ return function(window, ReGui)
 	me.Size = UDim2.fromOffset(9, 9)
 	me.ZIndex = 6
 	me.Parent = map
-	local facing = frame(Color3.fromRGB(255, 230, 90), 0)
-	facing.AnchorPoint = Vector2.new(0, 0.5)
-	facing.Size = UDim2.fromOffset(14, 2)
-	facing.ZIndex = 5
-	facing.Parent = map
+	-- View cone: a fan of rays across the camera's horizontal FOV. GuiObjects
+	-- rotate about their center, so each ray is twice VIEW_LENGTH long,
+	-- centered on you, with its back half faded out by a gradient.
+	local VIEW_RAYS, VIEW_LENGTH = 9, 34
+	local viewCone = Instance.new("Frame")
+	viewCone.BackgroundTransparency = 1
+	viewCone.Size = UDim2.fromOffset(0, 0)
+	viewCone.ZIndex = 5
+	viewCone.Parent = map
+	local viewRays: { Frame } = {}
+	for index = 1, VIEW_RAYS do
+		local edge = index == 1 or index == VIEW_RAYS
+		local ray = frame(Color3.fromRGB(255, 230, 90), 0)
+		ray.AnchorPoint = Vector2.new(0.5, 0.5)
+		ray.Size = UDim2.fromOffset(VIEW_LENGTH * 2, if edge then 2 else 1)
+		ray.ZIndex = 5
+		local fade = Instance.new("UIGradient")
+		fade.Transparency = NumberSequence.new({
+			NumberSequenceKeypoint.new(0, 1),
+			NumberSequenceKeypoint.new(0.5, 1),
+			NumberSequenceKeypoint.new(0.501, if edge then 0.15 else 0.55),
+			NumberSequenceKeypoint.new(1, 1),
+		})
+		fade.Parent = ray
+		ray.Parent = viewCone
+		viewRays[index] = ray
+	end
 
 	local legend = statLine(tab, "Map")
 	tab:Separator({ Text = "Selection  (left-drag paint, Shift adds, right-drag pans)" })
@@ -402,13 +424,24 @@ return function(window, ReGui)
 		playerPool.hide()
 
 		local root = localRoot()
-		me.Visible, facing.Visible = root ~= nil, root ~= nil
+		local camera = workspace.CurrentCamera
+		me.Visible, viewCone.Visible = root ~= nil, root ~= nil and camera ~= nil
 		if root then
-		local at = toMap(root.Position.X, root.Position.Z)
-		me.Position = UDim2.fromOffset(at.X, at.Y)
-		facing.Position = me.Position
-		local look = root.CFrame.LookVector
-		facing.Rotation = math.deg(math.atan2(look.Z, look.X))
+			local at = toMap(root.Position.X, root.Position.Z)
+			me.Position = UDim2.fromOffset(at.X, at.Y)
+			viewCone.Position = me.Position
+		end
+		if root and camera then
+			-- Map X is world X, map Y is world Z, so atan2(Z, X) is the on-map
+			-- heading; spread the rays across the horizontal field of view.
+			local look = camera.CFrame.LookVector
+			local heading = math.deg(math.atan2(look.Z, look.X))
+			local viewport = camera.ViewportSize
+			local aspect = if viewport.Y > 0 then viewport.X / viewport.Y else 16 / 9
+			local horizontalFov = 2 * math.deg(math.atan(math.tan(math.rad(camera.FieldOfView) / 2) * aspect))
+			for index, ray in viewRays do
+				ray.Rotation = heading + horizontalFov * ((index - 1) / (VIEW_RAYS - 1) - 0.5)
+			end
 		end
 
 		selectionPool.reset()

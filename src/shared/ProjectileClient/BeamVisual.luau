@@ -239,7 +239,11 @@ local function trim(state: any, distance: number)
 			distance = 0
 		end
 	end
-	state.length = math.max(state.length, 0)
+	-- The running length drifts from the true sum of segments (float error
+	-- per subtraction). A single point has no length, whatever the running
+	-- total says -- otherwise a drained packet stuck a hair above the release
+	-- threshold and lingered (with its channel's model) until the 60s cap.
+	state.length = if #points <= 1 then 0 else math.max(state.length, 0)
 end
 
 local function append(state: any, position: Vector3)

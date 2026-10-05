@@ -14,9 +14,9 @@
 	 - Kind: "entity" | "world" | nil -- what stopped it (nil = ran out of range)
 
 	"SpellExplosion" payload (server -> all clients):
-	 - Position: Vector3, Radius: number (blast radius), Color: Color3
-	 Drawn as a white neon core inside a larger translucent neon shell in the
-	 element colour; both swell quickly, then fade.
+	 - Position: Vector3, Radius: number (blast radius), Color: Color3,
+	   Power: number? (centre damage), Normal: Vector3? (struck surface)
+	 Rendered by ExplosionVFX, which scales size/colour/layers with Power.
 ]]
 
 local Debris = game:GetService("Debris")
@@ -26,6 +26,7 @@ local TweenService = game:GetService("TweenService")
 local Shared = ReplicatedStorage:WaitForChild("Shared")
 local VisualOffload = require(Shared.VisualOffload)
 local Impact = require(Shared.ProjectileClient.Impact)
+local ExplosionVFX = require(script.Parent.ExplosionVFX)
 
 local SpellEffects = {}
 
@@ -105,39 +106,17 @@ VisualOffload.On("SpellBeam", function(data)
 	end
 end)
 
-local EXPLOSION_GROW = TweenInfo.new(0.16, Enum.EasingStyle.Quint, Enum.EasingDirection.Out)
-local EXPLOSION_FADE = TweenInfo.new(0.4, Enum.EasingStyle.Quad, Enum.EasingDirection.In)
-
 VisualOffload.On("SpellExplosion", function(data)
 	local position = data.Position
 	if typeof(position) ~= "Vector3" then
 		return
 	end
-	local radius = math.max(data.Radius or 6, 1)
-	local color = data.Color or Color3.new(1, 1, 1)
-	local frame = CFrame.new(position)
-	local core = neon({ Shape = Enum.PartType.Ball, Size = Vector3.one * radius * 0.2, CFrame = frame, Color = Color3.new(1, 1, 1) })
-	local shell = neon({ Shape = Enum.PartType.Ball, Size = Vector3.one * radius * 0.4, CFrame = frame, Color = color, Transparency = 0.5 })
-	local glow = Instance.new("PointLight")
-	glow.Color = color
-	glow.Range = radius * 3
-	glow.Brightness = 5
-	glow.Parent = core
-	core.Parent = workspace
-	shell.Parent = workspace
-
-	-- Swell to full size (the shell's diameter is the blast diameter)...
-	TweenService:Create(core, EXPLOSION_GROW, { Size = Vector3.one * radius * 1.1 }):Play()
-	TweenService:Create(shell, EXPLOSION_GROW, { Size = Vector3.one * radius * 2 }):Play()
-	-- ...then fade away while drifting a little larger.
-	task.delay(EXPLOSION_GROW.Time, function()
-		TweenService:Create(core, EXPLOSION_FADE, { Transparency = 1, Size = Vector3.one * radius * 0.8 }):Play()
-		TweenService:Create(shell, EXPLOSION_FADE, { Transparency = 1, Size = Vector3.one * radius * 2.3 }):Play()
-		TweenService:Create(glow, EXPLOSION_FADE, { Brightness = 0 }):Play()
-	end)
-	local lifetime = EXPLOSION_GROW.Time + EXPLOSION_FADE.Time + 0.1
-	Debris:AddItem(core, lifetime)
-	Debris:AddItem(shell, lifetime)
+	ExplosionVFX.Play(position, {
+		Power = if typeof(data.Power) == "number" then data.Power else nil,
+		Radius = math.max(data.Radius or 6, 1),
+		Color = data.Color,
+		Normal = if typeof(data.Normal) == "Vector3" then data.Normal else nil,
+	})
 end)
 
 return SpellEffects

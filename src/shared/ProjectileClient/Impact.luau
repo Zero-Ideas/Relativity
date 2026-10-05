@@ -11,6 +11,11 @@ local TweenService = game:GetService("TweenService")
 
 local Impact = {}
 
+-- The built-in flash ball + ring is off by default (spell explosions and
+-- authored effects cover impacts now). Set true to bring it back; a custom
+-- handler from SetHandler always runs regardless.
+Impact.DefaultEnabled = false
+
 -- Custom impact hook: fn(position, normal, model?, kind). When set, it replaces
 -- the built-in effect below. (model is nil for impacts; kind is
 -- "entity" | "world" | "bounce" | "detonate".)
@@ -77,7 +82,7 @@ function Impact.Play(position: Vector3, normal: Vector3?, kind: string?)
 	local n = normal or Vector3.yAxis
 	if impactHandler then
 		task.spawn(impactHandler, position, n, nil, kind)
-	else
+	elseif Impact.DefaultEnabled then
 		defaultImpact(position, n, kind)
 	end
 end

@@ -1,7 +1,7 @@
 --!optimize 2
 --[[
 	DebugPanel  (client, Studio only)
-	ReGui window (toggle with F2) with six tabs:
+	ReGui window (toggle with F2) with seven tabs:
 	  Tools    -- give any Tool the server can find (see DebugService.server.luau)
 	              or clear your backpack.
 	  Time     -- your personal time ratio; drives TimeControlGui headless, so the
@@ -16,6 +16,8 @@
 	              you; pick one of yours from a dropdown to move (to the cursor
 	              or to you), delete, or clear all (replaces the old
 	              DummySpawner tool).
+	  VFX      -- local ExplosionVFX preview: power, radius, tint; spawn in front,
+	              at the cursor, or a weakest-to-strongest sweep.
 
 	One module per tab in Tabs/ (see TAB_ORDER); shared helpers in Util,
 	cross-tab state in State.
@@ -38,7 +40,7 @@ local DebugPanel = {}
 
 local TOGGLE_KEY = Enum.KeyCode.F2
 local STATS_INTERVAL = Util.STATS_INTERVAL
-local TAB_ORDER = { "Tools", "Time", "Stats", "Entities", "Chunks", "Dummies" }
+local TAB_ORDER = { "Tools", "Time", "Stats", "Entities", "Chunks", "Dummies", "VFX" }
 
 local started = false
 local localPlayer = Players.LocalPlayer

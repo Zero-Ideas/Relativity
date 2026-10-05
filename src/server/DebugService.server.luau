@@ -312,6 +312,34 @@ local actions = {
 	end,
 }
 
+-- Summary of live projectiles, for chasing leaks (who's alive past their
+-- lifetime, which channels they belong to).
+VisualOffload.On("DebugProjectileReport", function(_, player)
+	if not player then
+		return
+	end
+	local rows = {}
+	for _, p in Projectile.GetAll() do
+		if not p.Dead and #rows < 40 then
+			table.insert(rows, {
+				Id = p.Id,
+				Age = p.Age,
+				Lifetime = p.Lifetime,
+				Real = os.clock() - (p._spawnRealTime or os.clock()),
+				Joiner = p._beamJoiner == true,
+				Channel = p.Beam and p.Beam.ChannelId,
+				Previous = p.Beam and p.Beam.PreviousId,
+				Speed = p.Velocity.Magnitude,
+				TimeScale = p.TimeScale,
+				SourceScale = p.Source and p.Source.TimeScale,
+				Debt = p._simulationDebt,
+				Position = p.Position,
+			})
+		end
+	end
+	VisualOffload.FireClient(player, "DebugProjectileReport", { Total = #Projectile.GetAll(), Rows = rows })
+end)
+
 VisualOffload.On("DebugRequestEntities", function(_, player)
 	if player then
 		sendEntityList(player)
@@ -480,6 +508,25 @@ local function readStat(name: string): number?
 	return if ok and typeof(value) == "number" then value else nil
 end
 
+-- In a Studio playtest DataReceiveKbps reads 0 (the Stats.Network items that
+-- do report it are not readable from game scripts). Each subscribed client
+-- reports its own outbound -- this server's inbound -- so a 0 is filled with
+-- their sum and flagged ReceiveApprox.
+local clientOut: { [Player]: number } = {}
+
+local function inboundRate(): (number?, boolean)
+	local measured = readStat("DataReceiveKbps")
+	if measured and measured > 0 then
+		return measured, false
+	end
+	local total, any = 0, false
+	for _, rate in clientOut do
+		total += rate
+		any = true
+	end
+	return if any then total else measured, any
+end
+
 local function buildStats()
 	local projectiles = Projectile.GetStats()
 	local chunks = ChunkManager.GetStats()
@@ -491,7 +538,6 @@ local function buildStats()
 		HeartbeatMs = readStat("HeartbeatTimeMs"),
 		PhysicsMs = readStat("PhysicsStepTimeMs"),
 		SendKbps = readStat("DataSendKbps"),
-		ReceiveKbps = readStat("DataReceiveKbps"),
 		MemoryMb = Stats:GetTotalMemoryUsageMb(),
 		Instances = readStat("InstanceCount"),
 		Players = #Players:GetPlayers(),
@@ -519,6 +565,7 @@ local function onFrame(dt: number)
 	sinceSend = 0
 	if next(subscribers) then
 		local payload = buildStats()
+		payload.ReceiveKbps, payload.ReceiveApprox = inboundRate()
 		for player in subscribers do
 			-- each recipient gets its own server-measured ping
 			payload.PingMs = player:GetNetworkPing() * 1000
@@ -549,9 +596,18 @@ local function refreshTicker()
 	end
 end
 
+VisualOffload.On("DebugClientNet", function(sent, player)
+	if player and subscribers[player] and typeof(sent) == "number" and sent == sent and sent >= 0 and sent < 1e6 then
+		clientOut[player] = sent
+	end
+end)
+
 VisualOffload.On("DebugStats", function(subscribed, player)
 	if player then
 		subscribers[player] = if subscribed == true then true else nil
+		if not subscribers[player] then
+			clientOut[player] = nil
+		end
 		refreshTicker()
 	end
 end)
@@ -575,6 +631,7 @@ end)
 
 Players.PlayerRemoving:Connect(function(player)
 	subscribers[player] = nil
+	clientOut[player] = nil
 	watchers[player] = nil
 	chunkWatchers[player] = nil
 	refreshTicker()

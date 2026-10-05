@@ -61,6 +61,16 @@ export type Context = {
 	memo: { [string]: any },
 	-- Cast time only: the caster's current (origin, cursor), for Stream copies.
 	live: (() -> (Vector3?, Vector3?))?,
+	-- Fraction of its nominal energy that reached this point after Sustain
+	-- slicing and beam subdivision (1 when nothing was split). Explosions
+	-- shrink with it -- see explode().
+	energyScale: number?,
+	-- Size multiplier (Size rune) of the vessel whose trigger created this
+	-- context; an Explosion it fires scales its radius by it.
+	sizeScale: number?,
+	-- Normal of the surface whose hit fired this context's trigger (On
+	-- Impact into geometry or an entity); explosions orient their visual to it.
+	surfaceNormal: Vector3?,
 }
 
 --------------------------------------------------------------------------------
@@ -263,6 +273,9 @@ type Watch = {
 	energy: number,
 	element: string,
 	nextCheck: number,
+	nominal: number, -- energy this trigger would carry if nothing were split
+	scale: number, -- the launching shot's energyScale
+	sizeScale: number, -- the launching vessel's Size multiplier
 }
 local watches: { Watch } = {}
 
@@ -280,7 +293,14 @@ end
 -- Runs the sub-circle hanging off a trigger from eventPoint. heading is the
 -- vessel's travel direction at that moment; On Impact reflects it off the
 -- surface so what it fires ricochets unless aimed.
-local function fireTrigger(compiled: any, parent: Context, triggerId: string, energy: number, element: string, eventPoint: Vector3, heading: Vector3, normal: Vector3?, struck: any?)
+-- Share of a watch's nominal energy it actually fires with: the shot's own
+-- Sustain slice x whatever beam subdivision took from it since.
+local function triggerScale(watch: Watch, energy: number): number
+	local split = if watch.nominal > 0 then math.clamp(energy / watch.nominal, 0, 1) else 1
+	return watch.scale * split
+end
+
+local function fireTrigger(compiled: any, parent: Context, triggerId: string, energy: number, element: string, eventPoint: Vector3, heading: Vector3, normal: Vector3?, struck: any?, energyScale: number?, sizeScale: number?)
 	if normal and compiled.runes[triggerId].rune == "OnImpact" then
 		heading = heading - 2 * heading:Dot(normal) * normal
 	end
@@ -297,6 +317,9 @@ local function fireTrigger(compiled: any, parent: Context, triggerId: string, en
 		isCast = false,
 		spawnOffset = TRIGGER_SPAWN_OFFSET,
 		memo = {},
+		energyScale = energyScale or 1,
+		sizeScale = sizeScale or 1,
+		surfaceNormal = normal,
 	}
 	runFlow(compiled, ctx, triggerId, "out", energy, element)
 end
@@ -404,6 +427,7 @@ type Shot = {
 	damageEnergy: number, -- the part of it spent on hits
 	impact: number, -- damage per damage-energy (element x vessel)
 	channelId: number?,
+	energyScale: number, -- see Context.energyScale
 }
 
 -- All flying vessels use the same swept-radius simulation and trigger pipeline.
@@ -466,14 +490,18 @@ local function launch(shot: Shot, direction: Vector3)
 		local destroyTriggers = {}
 		for _, triggerId in shot.info.triggers do
 			local trigger = compiled.runes[triggerId]
+			local nominal = shot.perCopy * trigger.params.Share / 100
 			local watch: Watch = {
 				projectile = projectile,
 				compiled = compiled,
 				ctx = ctx,
 				trigger = triggerId,
-				energy = if triggerAmounts then (triggerAmounts[triggerId] or 0) else shot.perCopy * trigger.params.Share / 100,
+				energy = if triggerAmounts then (triggerAmounts[triggerId] or 0) else nominal,
 				element = element,
 				nextCheck = 0,
+				nominal = nominal,
+				scale = shot.energyScale,
+				sizeScale = shot.stats.scale or 1,
 			}
 			table.insert(boundWatches, watch)
 			if trigger.rune == "OnImpact" or trigger.rune == "OnExpire" then
@@ -492,9 +520,9 @@ local function launch(shot: Shot, direction: Vector3)
 				local kind = compiled.runes[watch.trigger].rune
 				local heading = headingOf(projectile, ctx.heading)
 				if kind == "OnImpact" and (result.Kind == "entity" or result.Kind == "world") then
-					fireTrigger(compiled, ctx, watch.trigger, watch.energy, element, result.Position, heading, result.Normal, if result.Kind == "entity" then lastStruck else nil)
+					fireTrigger(compiled, ctx, watch.trigger, watch.energy, element, result.Position, heading, result.Normal, if result.Kind == "entity" then lastStruck else nil, triggerScale(watch, watch.energy), watch.sizeScale)
 				elseif kind == "OnExpire" and result.Kind == nil then
-					fireTrigger(compiled, ctx, watch.trigger, watch.energy, element, result.Position, heading, nil, nil)
+					fireTrigger(compiled, ctx, watch.trigger, watch.energy, element, result.Position, heading, nil, nil, triggerScale(watch, watch.energy), watch.sizeScale)
 				end
 			end
 		end)
@@ -538,15 +566,23 @@ local function emitSustain(parent: Shot, index: number, share: number, channelId
 	shot.ctx = liveContext(shot.ctx)
 	shot.perCopy *= share
 	shot.damageEnergy *= share
+	shot.energyScale *= share
 	local directions = spreadDirections(aimDirection(shot.compiled, shot.ctx, shot.id), shot.stats.quantity)
 	launch(shot, directions[index])
 end
 
 -- Explosion: damages every living entity (never the caster) in the radius,
 -- full at the centre down to half at the edge, then broadcasts the blast for
--- the client-side visual. Centre: the At input, else Here -- which at cast
+-- the client-side visual. Radius = base (3) x its own Size rune x the Size of
+-- the vessel that triggered it (a big fireball makes a big blast), at full
+-- energy; a
+-- blast fed a split share of it (a Sustain packet's slice, a subdivided
+-- beamlet) shrinks with the cube root of that share, so a pulse beam's impact
+-- is a big blast while a sustained beam leaves small ones wherever it hits. Centre: the At input, else Here -- which at cast
 -- time is your hand, so a cast-time blast goes to the cursor instead
 -- (clamped to MaxCastRange).
+local MIN_EXPLOSION_SCALE = 0.2 -- smallest radius fraction a split blast keeps
+
 local function explode(shot: Shot)
 	local ctx, compiled = shot.ctx, shot.compiled
 	local base = SpellRunes.Vessels.Explosion
@@ -560,7 +596,8 @@ local function explode(shot: Shot)
 			center = ctx.origin + offset.Unit * base.MaxCastRange
 		end
 	end
-	local radius = shot.stats.radius
+	local maxRadius = shot.stats.radius * (ctx.sizeScale or 1)
+	local radius = maxRadius * math.clamp(shot.energyScale ^ (1 / 3), MIN_EXPLOSION_SCALE, 1)
 	for _, entity in ChunkManager.GetEntitiesInRadius(center, radius) do
 		if entity ~= ctx.caster and alive(entity) then
 			local position = entity:GetPosition()
@@ -572,6 +609,9 @@ local function explode(shot: Shot)
 		Position = center,
 		Radius = radius,
 		Color = SpellRunes.Elements[shot.element].Color,
+		Power = shot.damageEnergy * shot.impact, -- centre damage; drives ExplosionVFX
+		-- the struck surface, so the visual sits on walls/ceilings/slopes
+		Normal = if ctx.isCast then nil else ctx.surfaceNormal,
 	})
 end
 
@@ -592,6 +632,7 @@ local function fireVessel(compiled: any, ctx: Context, id: string, energy: numbe
 		perCopy = perCopy,
 		damageEnergy = perCopy * (1 - info.triggerShare),
 		impact = SpellRunes.Elements[element].Impact * SpellRunes.Vessels[vessel].Impact,
+		energyScale = ctx.energyScale or 1,
 	}
 	if vessel == "Explosion" then
 		explode(shot)
@@ -713,7 +754,7 @@ Heartbeat.Connect(function()
 			table.remove(watches, index)
 			local energy = watch.energy
 			watch.energy = 0 -- do not duplicate a spent trigger when later subdividing
-			fireTrigger(watch.compiled, watch.ctx, watch.trigger, energy, watch.element, projectile.Position, headingOf(projectile, watch.ctx.heading), nil, struck)
+			fireTrigger(watch.compiled, watch.ctx, watch.trigger, energy, watch.element, projectile.Position, headingOf(projectile, watch.ctx.heading), nil, struck, triggerScale(watch, energy), watch.sizeScale)
 			if trigger.params.Detonate then
 				projectile:Destroy({ Position = projectile.Position, Normal = Vector3.yAxis }, "detonate")
 			end

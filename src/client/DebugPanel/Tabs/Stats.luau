@@ -15,6 +15,14 @@ local ProjectileClient = require(Shared.ProjectileClient)
 local statLine = Util.statLine
 local fmt, readStat = Util.fmt, Util.readStat
 
+-- In a Studio playtest DataReceiveKbps reads 0 on both sides while
+-- DataSendKbps works (the Stats.Network items that do report it are not
+-- readable from game scripts). One side's inbound is the other's outbound, so
+-- a 0 inbound is filled from the server's per-player outbound and shown as ~.
+local function rate(value: number?, approx: boolean?): string
+	return (if approx then "~" else "") .. fmt("%.1f", value)
+end
+
 local localPlayer = Players.LocalPlayer
 
 return function(window)
@@ -44,6 +52,7 @@ return function(window)
 	local sChunks = statLine(tab, "Chunks (loaded / total)")
 	local sPlayers = statLine(tab, "Players / world time")
 
+	local serverOutPerPlayer: number? = nil
 	VisualOffload.On("DebugServerStats", function(s)
 		if typeof(s) ~= "table" then
 			return
@@ -52,7 +61,8 @@ return function(window)
 		sFrame(`{fmt("%.2f", s.FrameMs)} / {fmt("%.2f", s.WorstFrameMs)}`)
 		sStep(`{fmt("%.2f", s.HeartbeatMs)} / {fmt("%.2f", s.PhysicsMs)}`)
 		sPing(fmt("%.0f ms", s.PingMs))
-		sNet(`{fmt("%.1f", s.SendKbps)} / {fmt("%.1f", s.ReceiveKbps)} KB/s`)
+		serverOutPerPlayer = if s.SendKbps then s.SendKbps / math.max(s.Players or 1, 1) else nil
+		sNet(`{rate(s.SendKbps)} / {rate(s.ReceiveKbps, s.ReceiveApprox)} KB/s`)
 		sMemory(fmt("%.0f MB", s.MemoryMb))
 		sInstances(fmt("%d", s.Instances))
 		sProjectiles(fmt("%d", s.Projectiles))
@@ -90,7 +100,11 @@ return function(window)
 		cFrame(`{fmt("%.2f", averageMs)} / {fmt("%.2f", worstFrame * 1000)}`)
 		frames, frameTime, worstFrame = 0, 0, 0
 		cPing(fmt("%.0f ms", localPlayer:GetNetworkPing() * 1000))
-		cNet(`{fmt("%.1f", readStat("DataReceiveKbps"))} / {fmt("%.1f", readStat("DataSendKbps"))} KB/s`)
+		local received, sent = readStat("DataReceiveKbps"), readStat("DataSendKbps")
+		local approx = (received or 0) <= 0 and serverOutPerPlayer ~= nil
+		cNet(`{rate(if approx then serverOutPerPlayer else received, approx)} / {rate(sent)} KB/s`)
+		-- lets the server fill its own 0 inbound (see DebugService)
+		VisualOffload.Fire("DebugClientNet", sent)
 		cMemory(fmt("%.0f MB", Stats:GetTotalMemoryUsageMb()))
 		cInstances(fmt("%d", readStat("InstanceCount")))
 		cVisuals(fmt("%d", ProjectileClient.GetStats().Visuals))

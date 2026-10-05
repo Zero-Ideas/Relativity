@@ -13,6 +13,11 @@ local Handler = {}
 Handler.Interval = 1 / 30
 Handler.MaxJoinersPerBeam = 512
 Handler.MaxNewJoinersPerFrame = 128
+-- No new joiners once BOTH real (launched, non-joiner) packets a link spans
+-- are older than this many real seconds. Measured from launch, so it keeps
+-- counting after a packet dies -- a front that stopped young can't keep
+-- anchoring fresh joiners forever.
+Handler.MaxJoinerSourceAge = 3
 function Handler.GetInterval(speed: number): number
 	return math.max(1 / 60, math.min(Handler.Interval, (BeamPath.MaxStretch - 2) / math.max(speed, 1)))
 end
@@ -26,7 +31,19 @@ local streams: { [number]: any } = {}
 local streamOrder: { number } = {}
 local streamCursor = 1
 local lastJoinerStats = { Created = 0, Updated = 0, BudgetSplits = 0 }
-local breakReasons = { Geometry = 0, ChannelBudget = 0, FrameBudget = 0, Quota = 0 }
+local breakReasons = { Geometry = 0, ChannelBudget = 0, FrameBudget = 0, Quota = 0, SourceAge = 0 }
+
+-- The real packet a beamlet ultimately descends from on each side: itself
+-- for a launched packet, the recorded endpoint for a joiner.
+local function realBehind(p: any): any
+	return if p._beamJoiner then p._beamRealBehind or p else p
+end
+local function realAhead(p: any): any
+	return if p._beamJoiner then p._beamRealAhead or p else p
+end
+local function realAge(p: any): number
+	return os.clock() - (p._spawnRealTime or os.clock())
+end
 
 local function nodeFor(p: any, previous: any): any
 	p._beamPrevious = previous and previous.projectile
@@ -142,8 +159,11 @@ Projectile.SetBeamSpanStep(function(globalDt: number)
 			end
 			if not previous then resolve(node, initialPath(node), globalDt); continue end
 			local front = previous.projectile
+			local behindReal, aheadReal = realBehind(p), realAhead(front)
 			local corners, needed = BeamPath.Plan(p.Position, front.Position, p._beamTurns, front._beamTurns)
 			local reason = if not corners then "Geometry"
+				elseif needed > 0 and realAge(behindReal) > Handler.MaxJoinerSourceAge
+					and realAge(aheadReal) > Handler.MaxJoinerSourceAge then "SourceAge"
 				elseif stream.joinerCount + needed > Handler.MaxJoinersPerBeam then "ChannelBudget"
 				elseif created + needed > Handler.MaxNewJoinersPerFrame then "FrameBudget"
 				elseif needed > 0 and p._beamReserveChildren and not p._beamReserveChildren(needed) then "Quota"
@@ -174,7 +194,12 @@ Projectile.SetBeamSpanStep(function(globalDt: number)
 					local turns = {}
 					for turn = 1, phase do turns[turn] = ahead[turn] end
 					local child = Projectile.CreateBeamSample(prototype, from:Lerp(to,t), velocity, turns)
-					child.Age = p.Age + (front.Age-p.Age)*t
+					child._beamRealBehind, child._beamRealAhead = behindReal, aheadReal
+					-- Toward a dead (world-stopped) front, never inherit its frozen
+					-- age: the last joiner re-links to that front every frame, so a
+					-- blended age kept seeding young joiners and the chain rebuilt
+					-- itself until the 60s real-time cap. Ages must only increase.
+					child.Age = if front.Dead then p.Age else p.Age + (front.Age-p.Age)*t
 					-- Spell callbacks are bound synchronously, before any hit.
 					child.Damage = p.Damage / (needed+1)
 					if p._beamBindChild then p._beamBindChild(child, 1/(needed+1)) end
