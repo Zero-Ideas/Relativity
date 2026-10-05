@@ -374,6 +374,22 @@ local function chunkKey(value: any): Vector3?
 	return if key.Magnitude < 1e6 then key else nil
 end
 
+-- Keys from data.Keys (a mass selection, capped) or a single data.Key.
+local function chunkKeys(data): { Vector3 }
+	local keys = {}
+	local source = if typeof(data.Keys) == "table" then data.Keys else { data.Key }
+	for index, value in source do
+		if index > MAX_CHUNKS_SENT then
+			break
+		end
+		local key = chunkKey(value)
+		if key then
+			table.insert(keys, key)
+		end
+	end
+	return keys
+end
+
 local function timeScale(value: any): number?
 	local scale = finite(value)
 	return if scale then math.clamp(scale, 0, MAX_TIME_SCALE) else nil
@@ -386,9 +402,11 @@ end
 
 local chunkActions = {
 	SetScale = function(data)
-		local key, scale = chunkKey(data.Key), timeScale(data.Scale)
-		if key and scale then
-			ChunkManager.SetTimeScaleForKey(key, scale, scale ~= 1)
+		local scale = timeScale(data.Scale)
+		if scale then
+			for _, key in chunkKeys(data) do
+				ChunkManager.SetTimeScaleForKey(key, scale, scale ~= 1)
+			end
 		end
 	end,
 	SetScaleRadius = function(data)
@@ -400,9 +418,10 @@ local chunkActions = {
 		end
 	end,
 	SetLoaded = function(data)
-		local key = chunkKey(data.Key)
-		if key and typeof(data.Loaded) == "boolean" then
-			ChunkManager.SetLoadedAt(chunkCenter(key), data.Loaded)
+		if typeof(data.Loaded) == "boolean" then
+			for _, key in chunkKeys(data) do
+				ChunkManager.SetLoadedAt(chunkCenter(key), data.Loaded)
+			end
 		end
 	end,
 	ResetAll = function()

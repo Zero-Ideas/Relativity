@@ -1,5 +1,7 @@
 --!optimize 2
 -- Authored Entity test dummies with a coalesced, server-owned damage display.
+-- Driven by the Studio debug panel's Dummies tab (src/client/DebugPanel.luau)
+-- over the "DummySpawner" channel; Studio only, like the rest of the panel.
 local Players = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local RunService = game:GetService("RunService")
@@ -89,19 +91,36 @@ local function clear(player)
 	end
 end
 
-local function resolveTemplate(tool)
-	-- ObjectValue selects an arbitrary replicated Model; the attribute selects
-	-- a direct child by name. Both choices are configured on the server Tool.
-	local selection = tool:FindFirstChild("DummyModel")
-	local template = if selection and selection:IsA("ObjectValue") then selection.Value
-		else ReplicatedStorage:FindFirstChild(tool:GetAttribute("DummyModel") or "Dummy")
-	if template and template:IsA("Model") and template:IsDescendantOf(ReplicatedStorage) then return template end
-	warn("[DummySpawner] DummyModel must select a Model under ReplicatedStorage")
+local DEFAULT_MODEL = "Dummy"
+local DEFAULT_HEALTH = 1000
+
+-- Spawnable templates: rigged (Humanoid) Models directly under
+-- ReplicatedStorage or inside a ReplicatedStorage folder named "Dummies".
+local function templates(): { [string]: Model }
+	local found = {}
+	local function consider(instance: Instance)
+		if instance:IsA("Model") and instance:FindFirstChildOfClass("Humanoid") and not found[instance.Name] then
+			found[instance.Name] = instance
+		end
+	end
+	for _, child in ReplicatedStorage:GetChildren() do
+		consider(child)
+		if child:IsA("Folder") and child.Name == "Dummies" then
+			for _, nested in child:GetChildren() do consider(nested) end
+		end
+	end
+	return found
+end
+
+local function resolveTemplate(name: any): Model?
+	local template = templates()[if typeof(name) == "string" then name else DEFAULT_MODEL]
+	if template then return template end
+	warn("[DummySpawner] no rigged Model named", name, "under ReplicatedStorage")
 	return nil
 end
 
-local function spawn(player, tool, playerRoot, target)
-	local template = resolveTemplate(tool)
+local function spawn(player, data, playerRoot, target)
+	local template = resolveTemplate(data.Model)
 	if not template then return end
 	local model = template:Clone()
 	local humanoid = model:FindFirstChildOfClass("Humanoid")
@@ -120,7 +139,7 @@ local function spawn(player, tool, playerRoot, target)
 	model.PrimaryPart = root
 	humanoid.WalkSpeed = 0
 	humanoid.DisplayDistanceType = Enum.HumanoidDisplayDistanceType.None
-	local health = SafeMath.number(tool:GetAttribute("DummyHealth"), humanoid.MaxHealth, 1, 1000000)
+	local health = SafeMath.number(data.Health, DEFAULT_HEALTH, 1, 1000000)
 	humanoid.MaxHealth, humanoid.Health = health, health
 	local params = RaycastParams.new()
 	params.FilterType = Enum.RaycastFilterType.Exclude
@@ -170,7 +189,7 @@ local function spawn(player, tool, playerRoot, target)
 end
 
 local function moveDummy(player, model, target)
-	-- Only this tool's server-owned dummies belonging to the requester can move.
+	-- Only server-owned dummies belonging to the requester can move.
 	if typeof(model) ~= "Instance" or not model:IsA("Model") or model.Parent ~= folder then return end
 	local state = counters[model]
 	if not state or model:GetAttribute("SpawnedBy") ~= player.UserId then return end
@@ -194,13 +213,22 @@ local function moveDummy(player, model, target)
 	state.Move = { From = from, To = CFrame.new(position) * from.Rotation, Elapsed = 0, WasAnchored = wasAnchored }
 end
 
+local MAX_PLACE_DISTANCE = 500
+
 VisualOffload.On("DummySpawner", function(data, player)
-	if not player or typeof(data) ~= "table" then return end
+	-- Debug-panel feature: never accept spawn requests from a live server.
+	if not RunService:IsStudio() or not player or typeof(data) ~= "table" then return end
+	if data.Action == "Models" then
+		local names = {}
+		for name in templates() do table.insert(names, name) end
+		table.sort(names)
+		VisualOffload.FireClient(player, "DummyModels", { Models = names, Default = DEFAULT_MODEL, Health = DEFAULT_HEALTH })
+		return
+	end
 	local character = player.Character
-	local tool = character and character:FindFirstChild("DummySpawner")
 	local root = character and character:FindFirstChild("HumanoidRootPart")
 	local humanoid = character and character:FindFirstChildOfClass("Humanoid")
-	if not tool or not tool:IsA("Tool") or not root or not humanoid or humanoid.Health <= 0 then return end
+	if not root or not humanoid or humanoid.Health <= 0 then return end
 	if data.Action ~= "Spawn" and data.Action ~= "Clear" and data.Action ~= "Move" and data.Action ~= "Delete" then return end
 	local now = os.clock()
 	if lastCommand[player] and now - lastCommand[player] < 0.25 then return end
@@ -218,9 +246,9 @@ VisualOffload.On("DummySpawner", function(data, player)
 	end
 	local target = data.Position
 	if typeof(target) ~= "Vector3" or not SafeMath.isFiniteVector(target) then return end
-	if (target - root.Position).Magnitude > 200 then return end
+	if (target - root.Position).Magnitude > MAX_PLACE_DISTANCE then return end
 	if data.Action == "Move" then moveDummy(player, data.Dummy, target)
-	else spawn(player, tool, root, target) end
+	else spawn(player, data, root, target) end
 end)
 
 local elapsed = 0

@@ -25,15 +25,6 @@
 
 	"StarterPack": {
 	  "$ignoreUnknownInstances": true,
-	  "DummySpawner": {
-		"$className": "Tool",
-		"$properties": {
-		  "CanBeDropped": false,
-		  "RequiresHandle": false,
-		  "ToolTip": "Click to spawn; E selects/deselects; click to move; R removes selected or clears all"
-		},
-		"$attributes": { "DummyHealth": 1000, "DummyModel": "Dummy" }
-	  },
 	  "SpellAssembler": {
 		"$className": "Tool",
 		"$properties": {
