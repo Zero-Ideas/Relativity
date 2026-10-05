@@ -51,7 +51,6 @@ local ok,problem=xpcall(function()
 	end
 	assert(vertical==0,"clipped link resurrected a trajectory tail")
 	Beam.AdoptPath(visuals[4],nil)
-	Beam.AdoptLinks(visuals[4],nil,true)
 	checkNoTails()
 	Beam.Retire(visuals[4],0)
 	assert(#visuals[4].rig.beam.points==1,"retirement fell back to old packet history")

@@ -81,8 +81,9 @@
 	and any visual drift is corrected the instant ProjHit snaps the final
 	position.
 
-	Beams always use the bounded authoritative pose stream, including their
-	linked, wall-clipped centerline. A body contact never teleports a distant
+	Beams predict their linked centerline from timestamped motion seeds, with
+	sparse safety/steering snapshots and immediate topology/clipping corrections.
+	A body contact never teleports a distant
 	back endpoint onto the leading endpoint's wall; each moving head owns its
 	wall bounce/penetration timing. Client beam sections are tessellated after
 	union and capped to 12 studs without limiting the beam's total reach.
@@ -165,7 +166,7 @@
 	              decelerates. Vector3: arbitrary world-space acceleration)
 	   AccelerationDirection = nil (optional direction for numeric Acceleration)
 	   MinSpeed = 0, MaxSpeed = math.huge   (clamp after acceleration + gravity)
-	   Lifetime = 5             (dilated seconds; no upper bound is enforced)
+	   Lifetime = 5             (3 for beams; dilated seconds; no upper bound is enforced)
 	   MaxRealLifetime = 60     (real, undilated seconds -- a hard safety cap
 	              independent of Lifetime/TimeScale/chunk dilation; see
 	              DEFAULT_MAX_REAL_LIFETIME below. Fires even if this
@@ -548,6 +549,10 @@ function Projectile.GetStats()
 		VisualHitsPerFrame = stats.VisualHitsPerFrame,
 		PendingVisualSpawns = stats.PendingVisualSpawns,
 		PendingVisualHits = stats.PendingVisualHits,
+		BeamPoseCandidates = stats.BeamPoseCandidates,
+		BeamPoseUpdates = stats.BeamPoseUpdates,
+		BeamRefreshInterval = stats.BeamRefreshInterval,
+		BeamHomingRefreshInterval = stats.BeamHomingRefreshInterval,
 	}
 end
 
@@ -958,7 +963,6 @@ end
 
 Heartbeat.Connect(function(globalDt: number)
 	Replication.flushHitBatch()
-	Replication.flushSpawnBatch()
 
 	debug.profilebegin("Projectile.StepAll")
 	-- Backwards with swap-removal: dead projectiles leave `active` the same
@@ -968,8 +972,8 @@ Heartbeat.Connect(function(globalDt: number)
 	for i = #active, 1, -1 do
 		local projectile = active[i]
 		if projectile:Step(globalDt) then
-			-- Homing-locked projectiles and beams stay continuously streamed; see
-			-- Replication.isSynced for why that is the one case that must.
+			-- Ordinary homing streams continuously; beams are filtered into sparse
+			-- refreshes and immediate topology corrections after link refinement.
 			Replication.queuePose(projectile)
 		else
 			local last = #active
@@ -981,6 +985,11 @@ Heartbeat.Connect(function(globalDt: number)
 	debug.profileend()
 	if beamSpanStep then beamSpanStep(globalDt) end
 
+	-- Publish only completed end-of-frame snapshots. Beam refinement can
+	-- insert colliding children above: sending their parent before those
+	-- children existed exposed an incomplete newest section for one frame.
+	-- Keep spawn-before-move ordering and the existing bounded spawn queue.
+	Replication.flushSpawnBatch()
 	Replication.flushMoveBatch()
 end, { Name = "ProjectileSystem.Step", Priority = 5 })
 

@@ -6,9 +6,10 @@
 	ProjectileClient (receiving). Channel names and payload shapes live here
 	so both sides are type-checked against one definition.
 
-	Every server pose (spawn, bounce snap, sync transition, homing stream) is
-	an end-of-server-frame snapshot; the client adopts each as "now" -- see
-	the Projectile module doc comment (init.luau) for the full protocol.
+	Beam snapshots carry a synchronized real-time epoch and global scale.
+	Clients catch up from that epoch, predict endpoints together and tessellate
+	locally. Topology/clipping and hits remain server-authoritative. Ordinary
+	projectile snapshots retain their existing receipt-time baseline.
 ]]
 
 local Protocol = {}
@@ -51,8 +52,10 @@ export type SpawnPayload = {
 	Synced: boolean?, -- false
 	TimeScale: number?, -- 1
 	VisualScale: number?, -- 1
+	ServerTime: number?, -- synchronized real-time epoch for predicted beams
+	GlobalScale: number?,
 	Beam: { Length: number, Radius: number, Origin: Vector3, ChannelId: number?, PreviousId: number?,
-		PreviousPosition: Vector3?, PreviousTurns: { Vector3 }?, Turns: { Vector3 }?, Path: { Vector3 }?, Clipped: boolean? }?, -- linked stream centerline
+		Path: { Vector3 }?, Clipped: boolean? }?, -- linked stream centerline
 	DestroyDelay: number?, -- 0
 	WaitForParticles: boolean?, -- true
 	WaitForTrails: boolean?, -- true
@@ -66,8 +69,10 @@ export type MovePayload = {
 	Velocity: Vector3,
 	Bounced: boolean?,
 	Corrected: boolean?, -- authoritative beam-body contact, not a ricochet flash
-	BeamTurns: { Vector3 }?,
-	BeamUnlinked: boolean?,
+	BeamPreviousId: number?, -- 0 explicitly unlinks; nil means not a beam
+	ServerTime: number?,
+	GlobalScale: number?,
+	TimeScale: number?,
 	BeamPath: { Vector3 }?, -- authoritative linked body, clipped at obstructions
 	BeamClipped: boolean?, -- true only when the body stops before its PreviousId
 	Lifetime: number?,
@@ -80,7 +85,6 @@ export type HitPayload = {
 	Position: Vector3,
 	Normal: Vector3,
 	Kind: string?, -- nil: expired without hitting anything
-	BeamTurns: { Vector3 }?,
 	BeamBody: boolean?,
 	BeamPath: { Vector3 }?,
 	BeamClipped: boolean?,

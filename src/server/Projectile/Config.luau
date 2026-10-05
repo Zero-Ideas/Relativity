@@ -152,7 +152,7 @@ function Config.normalize(raw: Types.Config, defaultMaxRealLifetime: number): Se
 		MaxSpeed = SafeMath.cap(raw.MaxSpeed, minSpeed),
 		Gravity = acceleration(raw.Gravity),
 		Radius = SafeMath.number(raw.Radius, if typeof(raw.Beam) == "table" then 0.35 else 0, 0),
-		Lifetime = SafeMath.number(raw.Lifetime, DEFAULT_LIFETIME, 0),
+		Lifetime = SafeMath.number(raw.Lifetime, if typeof(raw.Beam) == "table" then 3 else DEFAULT_LIFETIME, 0),
 		MaxRealLifetime = SafeMath.number(raw.MaxRealLifetime, defaultMaxRealLifetime, 0),
 		TimeScale = SafeMath.number(raw.TimeScale, 1, 0),
 		Damage = SafeMath.number(raw.Damage, 0),

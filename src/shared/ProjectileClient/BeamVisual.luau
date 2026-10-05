@@ -10,6 +10,9 @@ local Geometry = require(script.Parent.BeamGeometry)
 local View = require(script.Parent.View)
 local RunService = game:GetService("RunService")
 local Planner = require(script.Parent.Parent.ProjectileStepPlanner)
+local Prediction = require(script.Parent.Prediction)
+local Heartbeat = require(script.Parent.Parent.Heartbeat)
+local BeamPath = require(script.Parent.Parent.BeamPath)
 
 local BeamVisual = {}
 local MAX_SEGMENTS = 8
@@ -21,6 +24,67 @@ local ROTATION = CFrame.Angles(0, math.pi / 2, 0) -- cylinder's X axis -> path Z
 local groups: { [number]: any } = {}
 local pending: { [any]: any } = {}
 local applyConnection: RBXScriptConnection? = nil
+local predicting: { [any]: boolean } = {}
+
+-- Advance all channel endpoints to ONE presentation epoch before joining any
+-- of them. The ordinary round-robin renderer must not mix endpoint ages.
+function BeamVisual.PredictGroups(now: number, simulationClock: number)
+	for state in predicting do
+		local visual = state.visual
+		if not visual or not state.predictedAt then continue end
+		if now < state.predictedAt then visual.lastSimulationTime = simulationClock; continue end
+		local elapsed = math.max(now - state.predictedAt, 0)
+		local _, moved = Prediction.simulate(visual, elapsed * state.globalScale * visual.timeScale)
+		state.predictedAt = now
+		visual.lastSimulationTime = simulationClock
+		if state.group then state.group.dirty = true
+		elseif moved then BeamVisual.Update(visual, visual.position, visual.velocity) end
+	end
+end
+
+local function predictedPath(state: any): { Vector3 }?
+	local source = state.authoritativePath
+	if not source or not state.visual or not state.predictedAt then return source end
+	local result = table.clone(source)
+	if #result == 0 then return result end
+	local position = state.visual.position
+	result[1] = position
+	if #result > 1 and not state.pathClipped then
+		local front = state.group.byId[state.previousId]
+		if front and front.visual and not front.retired then
+			result[#result] = front.visual.position
+		elseif state.previousId == 0 then
+			-- A detached fragment translates; world bend vertices remain fixed.
+			result[#result] += position - source[1]
+		else
+			-- The front is gone/pending; never pin a moving packet to an old
+			-- spawn/impact location. Translate the last approved finite fragment
+			-- until the server supplies a replacement link or a clipped anchor.
+			if #result == 2 then result[2] += position - source[1]
+			else return { position } end
+		end
+	end
+	-- Prediction cannot authorize a giant collision body. Physical refinement
+	-- seeds replacement nodes on the next server frame; until those arrive,
+	-- don't draw a shortcut from a moving head to a stale bend/impact anchor.
+	for index = 1, #result - 1 do
+		if (result[index+1]-result[index]).Magnitude > BeamPath.MaxStretch * 2 then
+			return { position }
+		end
+	end
+	return result
+end
+
+function BeamVisual.AdoptMotion(visual: Types.Visual, serverTime: number?, globalScale: number?, previousId: number?)
+	local state = visual.rig and visual.rig.beam
+	if not state then return end
+	if previousId ~= nil then state.previousId = previousId end
+	if serverTime then
+		state.predictedAt = serverTime
+		state.globalScale = globalScale or Heartbeat.GetGlobalTimeScale()
+	end
+	if state.group then state.group.dirty = true end
+end
 
 local function part(parent: Instance, name: string, color: Color3, transparency: number, initialPose: CFrame?): Part
 	local p = Instance.new("Part")
@@ -97,9 +161,10 @@ end
 function BeamVisual.GetBounds(visual: Types.Visual, position: Vector3, simulationClock: number): (Vector3, number)
 	local state = visual.rig and visual.rig.beam
 	if not state then return position, 0 end
-	if state.authoritativePath and #state.authoritativePath > 1 then
+	local path = if state.group then predictedPath(state) else state.authoritativePath
+	if path and #path > 1 then
 		local low, high = position, position
-		for _, point in state.authoritativePath do low, high = low:Min(point), high:Max(point) end
+		for _, point in path do low, high = low:Min(point), high:Max(point) end
 		return (low+high)*.5, (high-low).Magnitude*.5+state.maxLength
 	end
 	return position, state.maxLength
@@ -128,7 +193,7 @@ function BeamVisual.FlushGroups(simulationClock: number?)
 			-- A sustained sample renders exactly ONE server-approved path.
 			-- Its old travel history is never a second tail, even after a split,
 			-- clipping, interest loss, delayed pose, or missing predecessor.
-			state.linkPoints = state.authoritativePath
+			state.linkPoints = predictedPath(state)
 			if state.linkPoints and #state.linkPoints > 0 then table.insert(paths, state.linkPoints) end
 		end
 		if #paths > 0 then
@@ -145,6 +210,7 @@ end
 
 local function releaseState(visual: Types.Visual)
 	local state = (visual.rig :: Types.Rig).beam
+	predicting[state] = nil
 	pending[state] = nil
 	local group = state.group
 	if group then
@@ -234,14 +300,15 @@ function BeamVisual.Build(data: Protocol.SpawnPayload): (Instance, Types.Rig)
 		placeholder.Name = "BeamPacket_" .. data.Id
 		placeholder.Parent = group.model
 		local state = { points = { data.Position }, length = 0, maxLength = beam.Length,
-			radius = group.radius, speed = data.Velocity.Magnitude, group = group, id = data.Id,
-			previousId = beam.PreviousId, previousPosition = beam.PreviousPosition,
-			previousTurns = beam.PreviousTurns, turns = beam.Turns or {} }
+			radius = group.radius, speed = data.Velocity.Magnitude, group = group,
+			id = data.Id, previousId = beam.PreviousId or 0,
+			predictedAt = data.ServerTime, globalScale = data.GlobalScale or Heartbeat.GetGlobalTimeScale(),
+		}
 		state.authoritativePath = beam.Path
 		state.pathClipped = beam.Clipped
 		group.members[state] = true
-		group.dirty = true
 		group.byId[data.Id] = state
+		group.dirty = true
 		return placeholder, { model = placeholder, driver = group.driver, root = group.root,
 			motor = group.motor, rootOffset = CFrame.identity, beam = state }
 	end
@@ -256,6 +323,7 @@ function BeamVisual.Build(data: Protocol.SpawnPayload): (Instance, Types.Rig)
 		driver = driver, root = root, motor = motor(driver, root), model = model,
 		rootOffset = CFrame.identity,
 		beam = { points = { beam.Origin }, segments = {}, length = 0,
+			predictedAt = data.ServerTime, globalScale = data.GlobalScale or Heartbeat.GetGlobalTimeScale(),
 			maxLength = beam.Length, radius = math.max(beam.Radius, 0.025),
 			color = color, core = spec and spec.Core or Color3.new(1, 1, 1), speed = data.Velocity.Magnitude },
 	}
@@ -267,14 +335,18 @@ end
 
 function BeamVisual.Attach(visual: Types.Visual)
 	local rig = visual.rig
-	if rig and rig.beam then rig.beam.visual = visual end
+	if rig and rig.beam then
+		rig.beam.visual = visual
+		predicting[rig.beam] = true
+	end
 end
 
-function BeamVisual.AdoptPath(visual: Types.Visual, points: { Vector3 }?, clipped: boolean?)
+function BeamVisual.AdoptPath(visual: Types.Visual, points: { Vector3 }?, clipped: boolean?, final: boolean?)
 	local state = visual.rig and visual.rig.beam
 	if not state then return end
 	state.authoritativePath = points
 	state.pathClipped = clipped
+	state.finalPath = final == true
 	if state.group then state.group.dirty = true end
 end
 
@@ -304,31 +376,15 @@ function BeamVisual.Update(visual: Types.Visual, position: Vector3, velocity: Ve
 	if rig.beam.group then
 		rig.beam.group.dirty = true
 		rig.beam.points, rig.beam.length = {position}, 0
-		rig.beam.pendingTurns = nil
 		rig.beam.speed = velocity.Magnitude
 		return
 	end
-	for _, point in rig.beam.pendingTurns or {} do append(rig.beam, point) end
-	rig.beam.pendingTurns = nil
 	append(rig.beam, position)
 	rig.beam.speed = velocity.Magnitude
 	draw(rig)
 end
 
-function BeamVisual.AdoptLinks(visual: Types.Visual, turns: { Vector3 }?, unlinked: boolean?)
-	local state = visual.rig and visual.rig.beam
-	if not state or not state.group then return end
-	state.group.dirty = true
-	if turns then
-		local added = {}
-		for index = #state.turns + 1, #turns do table.insert(added, turns[index]) end
-		if #added > 0 then state.pendingTurns = added end
-		state.turns = turns
-	end
-	if unlinked then state.previousId, state.previousPosition, state.previousTurns = nil, nil, nil end
-end
-
-function BeamVisual.StopBody(visual: Types.Visual, contact: Vector3, turns: { Vector3 }?)
+function BeamVisual.StopBody(visual: Types.Visual, contact: Vector3)
 	local state = visual.rig and visual.rig.beam
 	if not state or not state.group then return end
 	state.group.dirty = true
@@ -351,7 +407,6 @@ function BeamVisual.StopBody(visual: Types.Visual, contact: Vector3, turns: { Ve
 	stop[#stop] = contact
 	state.stopPath = stop
 	state.pathClipped = true
-	if turns then state.turns = turns end
 end
 
 -- Remove predicted overshoot before an authoritative bounce/impact. Retain
@@ -395,9 +450,10 @@ function BeamVisual.Retire(visual: Types.Visual, delay: number): boolean
 	if not rig or not rig.beam then return false end
 	if rig.beam.retired then return true end
 	local state = rig.beam
+	predicting[state] = nil
 	if state.group then
 		state.group.dirty = true
-		local points = state.stopPath or state.authoritativePath
+		local points = state.stopPath or (if state.finalPath then state.authoritativePath else predictedPath(state))
 		state.points = if points and #points > 0 then table.clone(points) else { visual.position }
 		state.length = 0
 		for index = 1, #state.points - 1 do state.length += (state.points[index+1]-state.points[index]).Magnitude end

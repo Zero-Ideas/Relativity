@@ -339,8 +339,8 @@ end
 --    between spawn and impact). Snaps instead of tweening -- a straight
 --    tween from the old position would cut through the surface it bounced
 --    off -- plays the ricochet flash, and re-baselines local physics.
---  - Otherwise: a continuous homing pose, only sent while the visual is
---    synced (see Replication.isSynced on the server for why).
+--  - Otherwise: ordinary continuous homing, or a timestamped beam correction.
+--    Beams predict between snapshots regardless of the ordinary Synced flag.
 local function onMove(batch: { Protocol.MovePayload })
 	local now = os.clock()
 	for _, data in batch do
@@ -350,13 +350,13 @@ local function onMove(batch: { Protocol.MovePayload })
 		end
 		if visual.rig and visual.rig.beam then
 			BeamVisual.AdoptPath(visual, data.BeamPath, data.BeamClipped)
-			BeamVisual.AdoptLinks(visual, data.BeamTurns, data.BeamUnlinked)
+			BeamVisual.AdoptMotion(visual, data.ServerTime, data.GlobalScale, data.BeamPreviousId)
+			if data.TimeScale ~= nil then visual.timeScale = data.TimeScale end
 			if data.Lifetime then visual.life = data.Lifetime end
 		end
 		if data.Bounced or data.Corrected then
 			visual.lastUpdate = now
 			rebaseline(visual, data.Position, data.Velocity)
-			BeamVisual.AdoptLinks(visual, data.BeamTurns, data.BeamUnlinked)
 			BeamVisual.Correct(visual, data.Point or data.Position)
 			if visual.rig and visual.rig.beam and visual.rig.beam.group then
 				BeamVisual.Update(visual, data.Position, data.Velocity)
@@ -369,7 +369,7 @@ local function onMove(batch: { Protocol.MovePayload })
 					Impact.Play(data.Point or data.Position, data.Normal, "bounce")
 				end
 			end
-		elseif visual.synced then
+		elseif visual.synced or (visual.rig and visual.rig.beam) then
 			local duration = math.clamp(now - visual.lastUpdate, 0.03, 0.2)
 			visual.lastUpdate = now
 			rebaseline(visual, data.Position, data.Velocity)
@@ -388,13 +388,13 @@ end
 local function onHit(data: Protocol.HitPayload)
 	local visual = visuals[data.Id]
 	if visual then
-		BeamVisual.AdoptPath(visual, data.BeamPath, data.BeamClipped)
+		BeamVisual.AdoptPath(visual, data.BeamPath, data.BeamClipped, true)
+		rebaseline(visual, data.Position, visual.velocity)
 		-- Snap to the server's exact position before destroying, so any
 		-- imperceptible mid-flight drift from local simulation never shows at
 		-- the one moment it would be visible.
-		BeamVisual.AdoptLinks(visual, data.BeamTurns)
 		if data.BeamBody then
-			BeamVisual.StopBody(visual, data.Position, data.BeamTurns)
+			BeamVisual.StopBody(visual, data.Position)
 		else
 			BeamVisual.Correct(visual, data.Position)
 			VisualModel.Place(visual, data.Position, visual.velocity)
@@ -550,6 +550,7 @@ end
 -- transforms have been spent (or every visual was visited once).
 local function renderStep(globalDt: number)
 	globalSimulationClock += globalDt
+	BeamVisual.PredictGroups(workspace:GetServerTimeNow(), globalSimulationClock)
 	BeamVisual.StepRetired(globalDt)
 	local now = os.clock()
 	View.refresh()
@@ -579,7 +580,7 @@ local function renderStep(globalDt: number)
 			continue
 		end
 
-		local usedBudget = if visual.synced
+		local usedBudget = if visual.synced or (visual.rig and visual.rig.beam and visual.rig.beam.predictedAt)
 			then updateSynced(visual, now)
 			else updatePredicted(visual, elapsedGlobalDt, now)
 		if usedBudget then
@@ -615,6 +616,7 @@ function ProjectileClient.EnableClientRendering()
 	end
 	clientRendering = true
 	ChunkManager.BeforeTimeScaleChange:Connect(function()
+		BeamVisual.PredictGroups(workspace:GetServerTimeNow(), globalSimulationClock)
 		for _, visual in deferredVisuals do
 				Prediction.settleDeferred(visual,
 					math.max(globalSimulationClock - visual.lastSimulationTime, 0) * visual.timeScale)

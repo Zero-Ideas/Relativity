@@ -434,7 +434,7 @@ SpellRunes.ModifierTables = {
 SpellRunes.Vessels = {
 	Orb = { Speed = 85, Radius = 0.7, Lifetime = 4, Scale = 1, Impact = 1.0 },
 	Bullet = { Speed = 300, Radius = 0.15, Lifetime = 2, Scale = 1, Impact = 0.9 },
-	Beam = { Speed = 2000, Lifetime = 5, Radius = 0.35, Scale = 1, Impact = 0.8 },
+	Beam = { Speed = 2000, Lifetime = 3, Radius = 0.35, Scale = 1, Impact = 0.8 },
 	-- Radius is the blast radius; MaxCastRange keeps a cast-time blast near you.
 	Explosion = { Radius = 8, Impact = 0.9, MaxCastRange = 80 },
 }

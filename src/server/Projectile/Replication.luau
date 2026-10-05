@@ -9,9 +9,10 @@
 	top-level Projectile doc comment (init.luau) for the protocol's design.
 
 	Per frame, init.luau's step loop calls, in order:
-	 flushHitBatch / flushSpawnBatch  (start of frame, bounded)
+	 flushHitBatch                   (start of frame, bounded)
 	 Step -> updateTimeScale / updateSyncState / queueBounce / queueHit
-	 queuePose for every projectile that is homing-synced
+	 queuePose -> refine/collide beam links
+	 flushSpawnBatch                 (completed snapshots, bounded)
 	 flushMoveBatch                   (end of frame, bounded round-robin)
 ]]
 
@@ -20,6 +21,7 @@ local Players = game:GetService("Players")
 local Shared = game:GetService("ReplicatedStorage"):WaitForChild("Shared")
 local VisualOffload = require(Shared:WaitForChild("VisualOffload"))
 local Protocol = require(Shared:WaitForChild("ProjectileProtocol"))
+local Heartbeat = require(Shared:WaitForChild("Heartbeat"))
 
 local Types = require(script.Parent.Types)
 
@@ -36,6 +38,37 @@ local MAX_HITS_PER_FRAME = 1000
 -- order and is never reset by dilation, so changing GlobalTimeScale cannot
 -- merge staggered cohorts into one spike.
 local MAX_POSES_PER_FRAME = 2500
+-- Beam geometry is reconstructed locally. Ballistic safety snapshots are
+-- sparse; homing and topology/clipping/time changes are never rate-throttled.
+local BEAM_REFRESH = 0.5
+local beamSnapshots: { [number]: any } = {}
+
+local function rememberBeam(projectile: State, now: number)
+	if not projectile.Beam then return end
+	beamSnapshots[projectile.Id] = {
+		Time = now, PreviousId = projectile.Beam.PreviousId or 0,
+		Clipped = projectile._beamSpanClipped == true,
+		Path = table.clone(projectile._beamSpan or {}),
+		Scale = Heartbeat.GetGlobalTimeScale(), PersonalScale = projectile._lastStreamedTimeScale,
+	}
+end
+
+local function beamDue(projectile: State, now: number): boolean
+	if projectile.HomingTarget then return true end
+	local previous = beamSnapshots[projectile.Id]
+	if not previous then return true end
+	if previous.PreviousId ~= (projectile.Beam.PreviousId or 0)
+		or previous.Clipped ~= (projectile._beamSpanClipped == true)
+		or previous.Scale ~= Heartbeat.GetGlobalTimeScale()
+		or previous.PersonalScale ~= projectile._lastStreamedTimeScale then return true end
+	local path = projectile._beamSpan or {}
+	if #path ~= #previous.Path then return true end
+	-- Bend vertices and clipped endpoints are world anchors, not predictions.
+	for index = 2, #path - (if projectile._beamSpanClipped then 0 else 1) do
+		if (path[index] - previous.Path[index]).Magnitude > 0.05 then return true end
+	end
+	return now - previous.Time >= BEAM_REFRESH
+end
 
 -- When on, prints every ProjSpawn/ProjSync/ProjTimeScale/ProjHit as it is
 -- streamed (individually rare enough to log one line each), plus a
@@ -63,9 +96,10 @@ local hitQueue: { Entry } = {}
 local hitQueueHead = 1
 local pendingBounces: { BounceSnap } = {} -- flushed with this frame's ProjMove
 local pendingBounceHead = 1
-local poseCandidates: { State } = {} -- homing-synced this frame
+local poseCandidates: { State } = {} -- homing and beam correction candidates
 local poseCursor = 1
 local moveStats = { batches = 0, entries = 0 }
+local beamStats = { Candidates = 0, Updates = 0 }
 
 -- Only finite-range visuals need interest bookkeeping. Unlimited-range
 -- stress tests retain the broadcast fast path. The persistent cursor limits
@@ -152,12 +186,11 @@ local function streamTo(projectile: State, channel: string, payload: any)
 	end
 end
 
--- Homing needs authoritative steering. Beams also need authoritative linked
--- endpoints/body clipping: predicting each end on a different client visit
--- creates stretched or broken geometry at collisions/time-field boundaries.
--- Ordinary non-homing projectiles retain sparse one-shot corrections.
+-- Ordinary homing retains its pose stream. Beam endpoints are predicted at
+-- one common client epoch, with sparse ballistic snapshots and immediate
+-- authoritative steering/topology/clipping/bounce corrections.
 function Replication.isSynced(projectile: State): boolean
-	return projectile.HomingTarget ~= nil or projectile.Beam ~= nil
+	return projectile.HomingTarget ~= nil and projectile.Beam == nil
 end
 
 -- Fields equal to ProjectileClient's defaults are omitted: remote events
@@ -182,11 +215,12 @@ local function spawnPayload(projectile: State): Protocol.SpawnPayload
 	if projectile._lastStreamedTimeScale ~= 1 then payload.TimeScale = projectile._lastStreamedTimeScale end
 	if projectile.VisualScale ~= 1 then payload.VisualScale = projectile.VisualScale end
 	if projectile.Beam then
-		local previous = projectile._beamPrevious
-		payload.Beam = { Length = projectile.Beam.Length, Radius = projectile.Radius, Origin = projectile.Position,
+		payload.ServerTime = workspace:GetServerTimeNow()
+		payload.GlobalScale = Heartbeat.GetGlobalTimeScale()
+		payload.Beam = { Length = projectile.Beam.Length, Radius = projectile.Radius,
+			Origin = if projectile.Beam.ChannelId then projectile.Position else projectile._beamOrigin or projectile.Position,
 			ChannelId = projectile.Beam.ChannelId, PreviousId = projectile.Beam.PreviousId,
-			PreviousPosition = previous and previous.Position, PreviousTurns = previous and previous._beamTurns,
-			Turns = projectile._beamTurns, Path = projectile._beamSpan, Clipped = projectile._beamSpanClipped }
+			Path = projectile._beamSpan, Clipped = projectile._beamSpanClipped }
 	end
 	if projectile.DestroyDelay ~= 0 then payload.DestroyDelay = projectile.DestroyDelay end
 	if not projectile.WaitForParticles then payload.WaitForParticles = false end
@@ -215,6 +249,7 @@ end
 -- invocations in one frame. A projectile that dies before its queued spawn
 -- was streamed needs no hit message because no client visual exists yet.
 function Replication.queueHit(projectile: State, info: Types.DestroyInfo)
+	beamSnapshots[projectile.Id] = nil
 	if Replication.DebugSync then
 		print(`[Relativity][sync] ProjHit Id={projectile.Id} Kind={info.Kind or "fizzle"}`)
 	end
@@ -226,7 +261,6 @@ function Replication.queueHit(projectile: State, info: Types.DestroyInfo)
 		Position = info.Position,
 		Normal = info.Normal,
 		Kind = info.Kind,
-		BeamTurns = projectile._beamTurns,
 		BeamBody = projectile._beamBodyHit,
 		BeamPath = projectile._beamSpan,
 		BeamClipped = projectile._beamSpanClipped,
@@ -275,6 +309,7 @@ function Replication.flushSpawnBatch()
 		projectile._spawnStreamed = true
 		local payload = spawnPayload(projectile)
 		projectile._streamedSynced = payload.Synced == true
+		rememberBeam(projectile, workspace:GetServerTimeNow())
 		local recipients
 		if projectile.VisualRange < math.huge then
 			recipients = {}
@@ -337,6 +372,10 @@ function Replication.getQueueStats()
 		VisualHitsPerFrame = MAX_HITS_PER_FRAME,
 		PendingVisualSpawns = math.max(#spawnQueue - spawnQueueHead + 1, 0),
 		PendingVisualHits = math.max(#hitQueue - hitQueueHead + 1, 0),
+		BeamPoseCandidates = beamStats.Candidates,
+		BeamPoseUpdates = beamStats.Updates,
+		BeamRefreshInterval = BEAM_REFRESH,
+		BeamHomingRefreshInterval = 0,
 	}
 end
 
@@ -414,10 +453,10 @@ function Replication.queueCorrection(projectile: State, point: Vector3, normal: 
 	table.insert(pendingBounces, { Projectile = projectile, Point = point, Normal = normal, Corrected = true })
 end
 
--- Marks a homing/beam-synced projectile as due a pose (see isSynced).
--- Payloads are only built for the round-robin slice actually sent.
+-- Collects homing/beam candidates. Beam cadence and topology are checked AFTER
+-- link refinement; payloads are built only for the bounded slice actually sent.
 function Replication.queuePose(projectile: State)
-	if projectile.Visualize and projectile._spawnStreamed and projectile._streamedSynced then
+	if projectile.Visualize and projectile._spawnStreamed and (projectile._streamedSynced or projectile.Beam ~= nil) then
 		table.insert(poseCandidates, projectile)
 	end
 end
@@ -429,9 +468,11 @@ local function poseEntry(projectile: State): Entry
 		Velocity = projectile.Velocity,
 		BeamPath = projectile._beamSpan,
 		BeamClipped = projectile._beamSpanClipped,
-		BeamTurns = projectile._beamTurns,
+		BeamPreviousId = if projectile.Beam then projectile.Beam.PreviousId or 0 else nil,
+		ServerTime = if projectile.Beam then workspace:GetServerTimeNow() else nil,
+		GlobalScale = if projectile.Beam then Heartbeat.GetGlobalTimeScale() else nil,
+		TimeScale = if projectile.Beam then projectile._lastStreamedTimeScale else nil,
 		Lifetime = if projectile.Beam then math.max(projectile.Lifetime-projectile.Age, 0) else nil,
-		BeamUnlinked = if projectile.Beam and not projectile.Beam.PreviousId then true else nil,
 	}
 	local interest = interests[projectile.Id]
 	return { Range = projectile.VisualRange, Position = projectile.Position, Payload = payload,
@@ -442,6 +483,8 @@ end
 -- queued homing poses, as one ProjMove event per recipient.
 function Replication.flushMoveBatch()
 	local batch: { Entry } = {}
+	local now = workspace:GetServerTimeNow()
+	local sent: { [number]: boolean } = {}
 	local lastBounce = math.min(#pendingBounces, pendingBounceHead+MAX_POSES_PER_FRAME-1)
 	for index = pendingBounceHead, lastBounce do
 		local bounce = pendingBounces[index]
@@ -452,8 +495,10 @@ function Replication.flushMoveBatch()
 			Velocity = projectile.Velocity,
 			Bounced = if bounce.Corrected then nil else true,
 			Corrected = bounce.Corrected,
-			BeamTurns = projectile._beamTurns,
-			BeamUnlinked = if projectile.Beam and not projectile.Beam.PreviousId then true else nil,
+			BeamPreviousId = if projectile.Beam then projectile.Beam.PreviousId or 0 else nil,
+			ServerTime = if projectile.Beam then now else nil,
+			GlobalScale = if projectile.Beam then Heartbeat.GetGlobalTimeScale() else nil,
+			TimeScale = if projectile.Beam then projectile._lastStreamedTimeScale else nil,
 			BeamPath = projectile._beamSpan,
 			BeamClipped = projectile._beamSpanClipped,
 			Lifetime = if projectile.Beam then math.max(projectile.Lifetime-projectile.Age, 0) else nil,
@@ -461,22 +506,34 @@ function Replication.flushMoveBatch()
 			Normal = bounce.Normal,
 		}
 		local interest = interests[projectile.Id]
+		sent[projectile.Id] = true
+		if projectile.Beam then beamStats.Updates += 1 end
+		if not projectile.Dead then rememberBeam(projectile, now) end
 		table.insert(batch, { Range = projectile.VisualRange, Position = projectile.Position, Payload = payload,
 			Recipients = if projectile.VisualRange < math.huge then interest and interest.Observers or {} else nil })
 	end
 	pendingBounces, pendingBounceHead = compact(pendingBounces, lastBounce+1)
 
-	local candidateCount = #poseCandidates
+	local due = {}
+	for _, projectile in poseCandidates do
+		if projectile.Beam then beamStats.Candidates += 1 end
+		if not projectile.Dead and not sent[projectile.Id]
+			and (not projectile.Beam or beamDue(projectile, now)) then table.insert(due, projectile) end
+	end
+	table.clear(poseCandidates)
+	local candidateCount = #due
 	if candidateCount > 0 then
 		local updateCount = math.min(candidateCount, math.max(MAX_POSES_PER_FRAME-#batch, 0))
 		if poseCursor > candidateCount then
 			poseCursor = (poseCursor - 1) % candidateCount + 1
 		end
 		for offset = 0, updateCount - 1 do
-			table.insert(batch, poseEntry(poseCandidates[(poseCursor + offset - 1) % candidateCount + 1]))
+			local projectile = due[(poseCursor + offset - 1) % candidateCount + 1]
+			table.insert(batch, poseEntry(projectile))
+			if projectile.Beam then beamStats.Updates += 1 end
+			rememberBeam(projectile, now)
 		end
 		poseCursor = (poseCursor + updateCount - 1) % candidateCount + 1
-		table.clear(poseCandidates)
 	else
 		poseCursor = 1
 	end
