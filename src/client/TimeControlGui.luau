@@ -32,27 +32,38 @@ local PRESETS = { 0, 0.25, 0.5, 1, 2 }
 local started = false
 local dragging = false
 local currentRatio = 1
+-- os.clock() of the last locally-initiated change; server echoes of older
+-- throttled sends are ignored for a moment after it (both sides clamp to the
+-- same range, so the echo never carries new information mid-drag)
+local lastLocalChange = 0
+local ECHO_GRACE = 0.3
+local listeners: { (number) -> () } = {}
 
 -- throttle network sends during a drag (local apply stays instant)
 local SEND_INTERVAL = 0.05
 local lastSent = 0
 local pendingSend: number? = nil
 
--- built lazily in start()
-local track: Frame
-local fill: Frame
-local handle: Frame
-local valueLabel: TextLabel
+-- built lazily in start(); nil when started headless (see DebugPanel.luau)
+local track: Frame?
+local fill: Frame?
+local handle: Frame?
+local valueLabel: TextLabel?
 
 local function ratioToAlpha(ratio: number): number
 	return math.clamp((ratio - MIN_RATIO) / (MAX_RATIO - MIN_RATIO), 0, 1)
 end
 
 local function render(ratio: number)
-	local alpha = ratioToAlpha(ratio)
-	fill.Size = UDim2.new(alpha, 0, 1, 0)
-	handle.Position = UDim2.new(alpha, 0, 0.5, 0)
-	valueLabel.Text = string.format("Your Time  x%.2f", ratio)
+	if fill and handle and valueLabel then
+		local alpha = ratioToAlpha(ratio)
+		fill.Size = UDim2.new(alpha, 0, 1, 0)
+		handle.Position = UDim2.new(alpha, 0, 0.5, 0)
+		valueLabel.Text = string.format("Your Time  x%.2f", ratio)
+	end
+	for _, listener in listeners do
+		task.spawn(listener, ratio)
+	end
 end
 
 -- Throttled request to the authoritative server. Coalesces rapid drag updates
@@ -75,12 +86,14 @@ local function applyRatio(ratio: number, fromNetwork: boolean?)
 	currentRatio = ratio
 	render(ratio)
 	if not fromNetwork then
+		lastLocalChange = os.clock()
 		MovementController.SetPersonalTimeScale(ratio) -- instant local feedback
 		requestServer(ratio)
 	end
 end
 
 local function alphaFromInput(inputX: number): number
+	assert(track)
 	local left = track.AbsolutePosition.X
 	local width = track.AbsoluteSize.X
 	if width <= 0 then
@@ -226,13 +239,36 @@ local function build()
 	end)
 end
 
-function TimeControlGui.start()
+TimeControlGui.MinRatio = MIN_RATIO
+TimeControlGui.MaxRatio = MAX_RATIO
+TimeControlGui.Presets = PRESETS
+
+-- Same path as dragging the built-in slider: applies locally and requests it
+-- from the server (throttled).
+function TimeControlGui.SetRatio(ratio: number)
+	applyRatio(ratio)
+end
+
+function TimeControlGui.GetRatio(): number
+	return currentRatio
+end
+
+-- fn(ratio) after every change, local or server-confirmed.
+function TimeControlGui.OnChanged(fn: (number) -> ())
+	table.insert(listeners, fn)
+end
+
+-- options.Headless skips the built-in on-screen panel; another UI drives it
+-- through SetRatio/OnChanged instead.
+function TimeControlGui.start(options: { Headless: boolean? }?)
 	if started then
 		return
 	end
 	started = true
 
-	build()
+	if not (options and options.Headless) then
+		build()
+	end
 	applyRatio(MovementController.GetPersonalTimeScale(), true)
 
 	-- flush any coalesced send shortly after the last drag update
@@ -252,7 +288,7 @@ function TimeControlGui.start()
 	-- this only ever targets this player (see example/init.server.luau), never
 	-- broadcast, since it's personal
 	VisualOffload.On("PersonalTimeScale", function(scale)
-		if not dragging and typeof(scale) == "number" then
+		if not dragging and typeof(scale) == "number" and os.clock() - lastLocalChange > ECHO_GRACE then
 			applyRatio(scale, true)
 		end
 	end)

@@ -47,6 +47,9 @@ export type Visual = {
 	spawnRealTime: number,
 	maxRealLifetime: number,
 	lastUpdate: number, -- os.clock() of the last authoritative pose
+	-- beams: real seconds between ServerTime and receipt of the spawn; every
+	-- later ServerTime for this packet is shifted by it (see onSpawn)
+	beamTimeOffset: number?,
 
 	-- presentation
 	lastRenderStep: number,

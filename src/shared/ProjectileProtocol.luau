@@ -7,8 +7,9 @@
 	so both sides are type-checked against one definition.
 
 	Beam snapshots carry a synchronized real-time epoch and global scale.
-	Clients catch up from that epoch, predict endpoints together and tessellate
-	locally. Topology/clipping and hits remain server-authoritative. Ordinary
+	Clients shift each packet's epoch by its spawn transit time (so it starts
+	at the received pose, like other projectiles), predict endpoints together
+	and tessellate locally. Topology/clipping and hits remain server-authoritative. Ordinary
 	projectile snapshots retain their existing receipt-time baseline.
 ]]
 

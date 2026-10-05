@@ -9,6 +9,7 @@
 ]]
 
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local RunService = game:GetService("RunService")
 local Shared = ReplicatedStorage:WaitForChild("Shared")
 
 local ChunkManager = require(Shared.ChunkManager)
@@ -20,6 +21,7 @@ local MovementController = require(script.MovementController)
 local ChunkVisualizer = require(script.ChunkVisualizer)
 local TimeControlGui = require(script.TimeControlGui)
 local ToolManager = require(script.ToolManager)
+local DebugPanel = require(script.DebugPanel) -- Studio-only ReGui panel (F2)
 -- These two self-register their VisualOffload listeners at require time
 -- (no .start()) -- see AmmoState.luau (ammo cache for a future HUD) and
 -- WeaponEffects.luau (server-broadcast one-shot weapon VFX like the
@@ -36,7 +38,13 @@ Entity.EnableHurtboxHistoryRendering() -- draws the history trail when Entity.Sh
 
 MovementController.start()
 ChunkVisualizer.start()
-TimeControlGui.start()
+if RunService:IsStudio() then
+	-- the time slider lives in the debug panel (F2) instead of its own HUD
+	TimeControlGui.start({ Headless = true })
+	DebugPanel.start()
+else
+	TimeControlGui.start()
+end
 ToolManager.start()
 
 -- Optional: custom impact VFX for offloaded projectiles.

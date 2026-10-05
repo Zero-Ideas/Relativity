@@ -19,6 +19,7 @@
 
 	API:
 	 StatusEffectSys.Register(name, definition: EffectDefinition)
+	 StatusEffectSys.GetRegisteredNames() -> { string }
 	 StatusEffectSys:ApplyEffect(entity, name, duration, potency?) -> ActiveEffect?
 	 StatusEffectSys:RemoveEffect(entity, name, duration?, potency?)
 	   -- duration/potency each: a number subtracts that much from the
@@ -70,6 +71,16 @@ local hasDriver: { [any]: boolean } = {} -- [entity] = true once its OnUpdate dr
 
 function StatusEffectSys.Register(name: string, definition: EffectDefinition)
 	definitions[name] = definition
+end
+
+-- Sorted names of every registered effect (e.g. for debug tooling).
+function StatusEffectSys.GetRegisteredNames(): { string }
+	local names = {}
+	for name in definitions do
+		table.insert(names, name)
+	end
+	table.sort(names)
+	return names
 end
 
 --------------------------------------------------------------------------------

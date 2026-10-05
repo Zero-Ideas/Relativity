@@ -233,6 +233,16 @@ local function onSpawn(data: Protocol.SpawnPayload)
 	if visuals[data.Id] then
 		return
 	end
+	-- Beams are timestamped, but catching up the transit time on arrival put
+	-- a fast packet tens of studs downrange on its first frame. Like every
+	-- other projectile, start from the received pose: shift this packet's
+	-- epoch by its own transit time, and every later correction by the same
+	-- amount so they don't snap it forward again.
+	local beamTimeOffset = nil
+	if data.Beam and data.ServerTime then
+		beamTimeOffset = math.max(workspace:GetServerTimeNow() - data.ServerTime, 0)
+		data.ServerTime += beamTimeOffset
+	end
 	local model, rig = VisualModel.Build(data)
 	local now = os.clock()
 	local inView = View.contains(data.Position, data.Beam and data.Beam.Length)
@@ -267,6 +277,7 @@ local function onSpawn(data: Protocol.SpawnPayload)
 		spawnRealTime = now,
 		maxRealLifetime = data.MaxRealLifetime or DEFAULT_MAX_REAL_LIFETIME,
 		lastUpdate = now,
+		beamTimeOffset = beamTimeOffset,
 
 		lastRenderStep = now,
 		inView = inView,
@@ -350,7 +361,11 @@ local function onMove(batch: { Protocol.MovePayload })
 		end
 		if visual.rig and visual.rig.beam then
 			BeamVisual.AdoptPath(visual, data.BeamPath, data.BeamClipped)
-			BeamVisual.AdoptMotion(visual, data.ServerTime, data.GlobalScale, data.BeamPreviousId)
+			local serverTime = data.ServerTime
+			if serverTime then
+				serverTime += visual.beamTimeOffset or 0
+			end
+			BeamVisual.AdoptMotion(visual, serverTime, data.GlobalScale, data.BeamPreviousId)
 			if data.TimeScale ~= nil then visual.timeScale = data.TimeScale end
 			if data.Lifetime then visual.life = data.Lifetime end
 		end
