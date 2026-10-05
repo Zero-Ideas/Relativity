@@ -7,6 +7,7 @@ local Shared = game:GetService("ReplicatedStorage").Shared
 local Heartbeat = require(Shared.Heartbeat)
 local ChunkManager = require(Shared.ChunkManager)
 local Projectile = require(script.Parent.Projectile)
+local BeamPath = require(Shared.BeamPath)
 
 local Handler = {}
 Handler.Interval = 1 / 30
@@ -16,14 +17,58 @@ local MAX_CHANNELS_PER_PLAYER = 32
 local channels: { any } = {}
 local lastInput: { [Player]: number } = {}
 local nextChannelId = 0
+local streams: { [number]: any } = {}
 
 function Handler.Launch(config: any): any
 	local beamConfig = table.clone(config)
-	beamConfig.Beam = config.Beam or {}
+	beamConfig.Beam = table.clone(config.Beam or {})
+	local id = beamConfig.Beam.ChannelId
+	local stream = id and streams[id]
+	if id and not stream then stream = { nodes = {}, last = nil }; streams[id] = stream end
+	local previous = stream and stream.last
+	if previous then beamConfig.Beam.PreviousId = previous.projectile.Id end
 	-- No vessel-imposed range: normal lifetime/real-lifetime safety bounds
 	-- apply, as they do for every other flying projectile.
-	return Projectile.new(beamConfig)
+	local p = Projectile.new(beamConfig)
+	if stream then
+		p._beamPrevious = previous and previous.projectile
+		local node = { projectile = p, previous = previous, position = p.Position }
+		table.insert(stream.nodes, node)
+		stream.last = node
+		p.OnDestroy:Connect(function(info)
+			-- Keep the exact stopped front as the end of the next linked span.
+			-- It must not join to a predicted point behind/through the surface.
+			node.position = info.Position
+			p.Position = info.Position
+		end)
+	end
+	return p
 end
+
+Projectile.SetBeamSpanStep(function(globalDt: number)
+	for id, stream in streams do
+		local living = false
+		for _, node in stream.nodes do
+			local p = node.projectile
+			if p.Dead then continue end
+			living = true
+			node.position = p.Position
+		end
+		if not living then streams[id] = nil; continue end
+		if globalDt <= 0 then continue end
+		-- Front to back: contact/bounce corrections are available before a
+		-- younger section queries its older front. Work touches beam nodes only,
+		-- never scans the 10k ordinary projectile stress-test population.
+		for _, node in stream.nodes do
+			local p, previous = node.projectile, node.previous
+			if p.Dead or not previous then continue end
+			local front = previous.projectile
+			local points = BeamPath.Connect(p.Position, previous.position, p._beamTurns, front._beamTurns)
+			if points then p:ResolveBeamSpan(points) end
+			node.position = p.Position
+		end
+	end
+end)
 
 function Handler.IsActive(player: Player): boolean
 	for _, channel in channels do if channel.Player == player then return true end end

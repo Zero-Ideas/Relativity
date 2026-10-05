@@ -209,6 +209,7 @@ function Replication.queueHit(projectile: State, info: Types.DestroyInfo)
 		Position = info.Position,
 		Normal = info.Normal,
 		Kind = info.Kind,
+		BeamTurns = projectile._beamTurns,
 	}
 	table.insert(hitQueue, { Range = projectile.VisualRange, Position = info.Position, Payload = payload })
 end

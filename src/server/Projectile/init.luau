@@ -320,6 +320,7 @@ type Methods = {
 	Step: (self: Projectile, globalDt: number) -> boolean,
 	Destroy: (self: Projectile, result: { Position: Vector3, Normal: Vector3 }?, kind: string?) -> (),
 	SetTimeScale: (self: Projectile, scale: number) -> (),
+	ResolveBeamSpan: (self: Projectile, points: { Vector3 }) -> (),
 }
 export type Projectile = Types.State & Methods
 
@@ -332,6 +333,14 @@ local MAX_BURST_COUNT = 10000
 
 local active: { Projectile } = {} -- server-side live projectiles
 local nextId = 0
+local beamSpanStep: ((number) -> ())? = nil
+
+-- Dedicated beam work runs after ALL heads are stepped, but before pose
+-- replication. Never mix an old front pose with an already-stepped back.
+function Projectile.SetBeamSpanStep(callback: (number) -> ())
+	assert(not beamSpanStep, "Beam span handler already installed")
+	beamSpanStep = callback
+end
 
 -- When on, every movement raycast is streamed to rendering clients so the hit
 -- detection can be seen as lines (see ProjRay in ProjectileClient). Off by
@@ -420,6 +429,7 @@ function Projectile.new(config: Config): Projectile
 		VisualScale = settings.VisualScale,
 		Beam = settings.Beam,
 		_beamOrigin = if settings.Beam then settings.Origin else nil,
+		_beamTurns = if settings.Beam and settings.Beam.ChannelId then {} else nil,
 		DestroyDelay = settings.DestroyDelay,
 		WaitForParticles = settings.WaitForParticles,
 		WaitForTrails = settings.WaitForTrails,
@@ -785,6 +795,65 @@ function Projectile.Step(self: Projectile, globalDt: number): boolean
 	return true
 end
 
+-- A linked section's body lies between *two* moving endpoints. Casting only
+-- each endpoint's velocity misses the tilted cylinder between them. Route
+-- these contacts through the same entity/pierce/bounce/penetration resolvers
+-- as ordinary movement, without spawning another projectile or ray worker.
+function Projectile.ResolveBeamSpan(self: Projectile, points: { Vector3 })
+	if self.Dead or combinedTimeScale(self) <= 0 or ChunkManager.GetTimeScaleAt(self.Position) <= 0 then return end
+	local function params(): RaycastParams
+		if next(self._ignore) == nil then return self._rayParams end
+		local filtered = RaycastParams.new()
+		filtered.FilterType = Enum.RaycastFilterType.Exclude
+		filtered.IgnoreWater = self._rayParams.IgnoreWater
+		filtered.CollisionGroup = self._rayParams.CollisionGroup
+		local ignore = self._rayParams.FilterDescendantsInstances
+		for entity in self._ignore do if entity.Instance then table.insert(ignore, entity.Instance) end end
+		filtered.FilterDescendantsInstances = ignore
+		return filtered
+	end
+	for index = 1, #points - 1 do
+		local from, to = points[index], points[index + 1]
+		local offset = to - from
+		local length = offset.Magnitude
+		if length < 1e-4 then continue end
+		local heading = offset / length
+		local traveled = 0
+		local contacts = 0
+		while traveled < length - 1e-4 do
+			-- Roblox's shape sweep has a 1024-stud travel limit; splitting
+			-- a long connector preserves its full reach rather than capping it.
+			local distance = math.min(length - traveled, 1024)
+			local contact = Raycast.castMovement(self, from + heading * traveled, heading * distance, params())
+			if not contact then traveled += distance; continue end
+			local originalPosition, originalVelocity = self.Position, self.Velocity
+			self.Velocity = heading * originalVelocity.Magnitude
+			local verdict, kind = Raycast.resolveHit(self, contact)
+			if verdict == "destroy" then
+				self.Position = contact.Position
+				self:Destroy(contact, kind)
+				return
+			elseif verdict == "bounce" then
+				return -- reflection + exact contact already queued by resolver
+			end
+			local entity = contact.Instance and Entity.Get(contact.Instance)
+			if entity and self._ignore[entity] then
+				-- Piercing consumes this packet's normal budget once. Leave its
+				-- back at the existing pose; the next span cast excludes the entity.
+				self.Position, self.Velocity = originalPosition, originalVelocity
+				contacts += 1
+				if contacts >= 16 then return end
+			else
+				-- Successful wall penetration advances to the real exit, so normal
+				-- head movement cannot spend that penetration budget a second time.
+				self.Velocity = originalVelocity
+				Replication.queueCorrection(self, contact.Position, contact.Normal)
+				return
+			end
+		end
+	end
+end
+
 function Projectile.Destroy(self: Projectile, result: { Position: Vector3, Normal: Vector3 }?, kind: string?)
 	if self.Dead then
 		return
@@ -807,6 +876,7 @@ function Projectile.Destroy(self: Projectile, result: { Position: Vector3, Norma
 	-- handle) doesn't keep entities/closures alive through it.
 	table.clear(self._ignore)
 	self.HomingTarget = nil
+	self._beamPrevious = nil
 	self.OnHit:Destroy()
 	self.OnDestroy:Destroy()
 end
@@ -838,6 +908,7 @@ Heartbeat.Connect(function(globalDt: number)
 		end
 	end
 	debug.profileend()
+	if beamSpanStep then beamSpanStep(globalDt) end
 
 	Replication.flushMoveBatch()
 end, { Name = "ProjectileSystem.Step", Priority = 5 })
