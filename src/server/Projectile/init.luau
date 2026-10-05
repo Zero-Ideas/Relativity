@@ -309,7 +309,7 @@ local ProjectileMotion = require(Shared:WaitForChild("ProjectileMotion"))
 local Planner = require(Shared:WaitForChild("ProjectileStepPlanner"))
 local SafeMath = require(Shared:WaitForChild("SafeMath"))
 local Signal = require(Shared:WaitForChild("Signal"))
-local BeamPath = require(Shared:WaitForChild("BeamPath"))
+local BeamPath = require(Shared:WaitForChild("Projectile"):WaitForChild("BeamPath"))
 
 local Config = require(script.Config)
 local Homing = require(script.Homing)

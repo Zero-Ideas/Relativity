@@ -1,8 +1,8 @@
 -- Fresh-module Studio harness; validates adaptive joiners and bounded work.
 local shared=game.ReplicatedStorage._BeamStretchShared
 local server=game.ServerScriptService._BeamStretchServer
-local Path=require(shared.BeamPath)
-local Handler=require(server.BeamProjectileHandler)
+local Path=require(shared.Projectile.BeamPath)
+local Handler=require(server.Projectile.BeamProjectileHandler)
 local Projectile=require(server.Projectile)
 local function liveCount()
 	local count=0

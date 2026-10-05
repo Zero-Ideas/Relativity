@@ -4,8 +4,8 @@ assert(RunService:IsStudio())
 local shared = game.ReplicatedStorage.Shared
 local server = game.ServerScriptService.Server
 local Entity = require(shared.Entity)
-local Path = require(shared.BeamPath)
-local Handler = require(server.BeamProjectileHandler)
+local Path = require(shared.Projectile.BeamPath)
+local Handler = require(server.Projectile.BeamProjectileHandler)
 local viewer = game.Players:GetPlayers()[1]
 assert(viewer and viewer.Character)
 local origin = viewer.Character:GetPivot().Position + Vector3.new(0,180,0)

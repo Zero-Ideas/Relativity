@@ -1,7 +1,7 @@
 -- Studio-only regression: a steady sustain must pass the former 150 ceiling.
 local server=game.ServerScriptService._BeamStretchServer
 local P=require(server.Projectile)
-local H=require(server.BeamProjectileHandler)
+local H=require(server.Projectile.BeamProjectileHandler)
 local Runtime=require(server.SpellRuntime)
 local Q=require(server.ProjectileQuota)
 local Entity=require(game.ReplicatedStorage.Shared.Entity)

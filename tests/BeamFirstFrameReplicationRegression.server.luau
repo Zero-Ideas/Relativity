@@ -3,11 +3,11 @@
 local shared=game.ReplicatedStorage._BeamWireAfterShared
 local server=game.ServerScriptService._BeamWireAfterServer
 local P=require(server.Projectile)
-local H=require(server.BeamProjectileHandler)
+local H=require(server.Projectile.BeamProjectileHandler)
 local HB=require(shared.Heartbeat)
 local V=require(shared.VisualOffload)
 local Protocol=require(shared.ProjectileProtocol)
-local limit=require(shared.BeamPath).MaxStretch
+local limit=require(shared.Projectile.BeamPath).MaxStretch
 local origin=Vector3.new(0,6000,0)
 local channel=987654101
 local known,paths,spawns={},{},{}

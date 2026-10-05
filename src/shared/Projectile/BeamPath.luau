@@ -2,7 +2,8 @@
 -- Shared *physical* centerline of a continuous stream. A newer sample is the
 -- back of its section; the preceding sample is its front. Turning the input
 -- therefore bends the stream instead of emitting unrelated parallel bars.
--- Both server collision and client cylinders use these exact endpoints.
+-- Shared projectile geometry: both server collision and client cylinders use
+-- these exact endpoints. Kept replicated because the client needs the same math.
 local BeamPath = {}
 BeamPath.MaxStretch = 32
 BeamPath.MaxJoinersPerLink = 32

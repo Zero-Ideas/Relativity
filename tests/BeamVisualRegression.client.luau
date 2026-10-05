@@ -123,7 +123,7 @@ Beam.StepRetired(.5)
 assert(linkedGroup.model.Parent == nil, "steered stream leaked shared geometry")
 local splitVisuals={}
 local splitGroup
-local Path=require(modules.Parent.BeamPath)
+local Path=require(modules.Parent.Projectile.BeamPath)
 for index=1,2 do
 	local back=origin+Vector3.xAxis*((index-1)*Path.MaxStretch*3)
 	local position=back+Vector3.xAxis*10

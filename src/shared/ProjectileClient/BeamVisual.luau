@@ -12,7 +12,7 @@ local RunService = game:GetService("RunService")
 local Planner = require(script.Parent.Parent.ProjectileStepPlanner)
 local Prediction = require(script.Parent.Prediction)
 local Heartbeat = require(script.Parent.Parent.Heartbeat)
-local BeamPath = require(script.Parent.Parent.BeamPath)
+local BeamPath = require(script.Parent.Parent:WaitForChild("Projectile"):WaitForChild("BeamPath"))
 
 local BeamVisual = {}
 local MAX_SEGMENTS = 8

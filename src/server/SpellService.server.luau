@@ -12,7 +12,7 @@ local SafeMath = require(Shared:WaitForChild("SafeMath"))
 local SpellCompiler = require(Shared:WaitForChild("SpellCompiler"))
 local SpellStore = require(script.Parent:WaitForChild("SpellStore"))
 local SpellRuntime = require(script.Parent:WaitForChild("SpellRuntime"))
-local BeamHandler = require(script.Parent:WaitForChild("BeamProjectileHandler"))
+local BeamHandler = require(script.Parent:WaitForChild("Projectile"):WaitForChild("BeamProjectileHandler"))
 local RunService = game:GetService("RunService")
 
 local MANA = 10_000_000_000_000

@@ -6,8 +6,8 @@ local Players = game:GetService("Players")
 local Shared = game:GetService("ReplicatedStorage").Shared
 local Heartbeat = require(Shared.Heartbeat)
 local ChunkManager = require(Shared.ChunkManager)
-local Projectile = require(script.Parent.Projectile)
-local BeamPath = require(Shared.BeamPath)
+local Projectile = require(script.Parent)
+local BeamPath = require(Shared:WaitForChild("Projectile"):WaitForChild("BeamPath"))
 
 local Handler = {}
 Handler.Interval = 1 / 30

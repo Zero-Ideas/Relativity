@@ -1,7 +1,7 @@
 -- Normal Script in the isolated Studio harness; never ships with the game.
 local shared = game.ReplicatedStorage._BeamStretchShared
 local server = game.ServerScriptService._BeamStretchServer
-local Handler = require(server.BeamProjectileHandler)
+local Handler = require(server.Projectile.BeamProjectileHandler)
 local Projectile = require(server.Projectile)
 local function root(p)
 	local seen={}
@@ -62,7 +62,7 @@ local ok,problem=xpcall(function()
 	-- A frozen back gets additional joiners as its moving front gets farther
 	-- away; neither endpoint teleports or prematurely consumes a bounce.
 	Chunks.AddTimeScaleZone(zoneId,origin,15,0)
-	local spacing=require(shared.BeamPath).MaxStretch
+	local spacing=require(shared.Projectile.BeamPath).MaxStretch
 	wall.Position=origin+Vector3.xAxis*(spacing*5)
 	local moving=launch(origin+Vector3.xAxis*(spacing*.9),920000003)
 	local frozen=launch(origin,920000003)

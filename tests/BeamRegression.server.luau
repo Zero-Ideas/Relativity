@@ -12,7 +12,7 @@ local Projectile = require(server.Projectile)
 local Config = require(server.Projectile.Config)
 local Quota = require(server.ProjectileQuota)
 local Entity = require(shared.Entity)
-local BeamHandler = require(server.BeamProjectileHandler)
+local BeamHandler = require(server.Projectile.BeamProjectileHandler)
 
 local function plan(modifiers, vessel)
 	local graph = Compiler.CreateDefaultGraph()

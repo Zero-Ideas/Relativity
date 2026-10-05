@@ -886,7 +886,7 @@ local ProjectileMotion = require(Shared:WaitForChild("ProjectileMotion"))
 local Planner = require(Shared:WaitForChild("ProjectileStepPlanner"))
 local SafeMath = require(Shared:WaitForChild("SafeMath"))
 local Signal = require(Shared:WaitForChild("Signal"))
-local BeamPath = require(Shared:WaitForChild("BeamPath"))
+local BeamPath = require(Shared:WaitForChild("Projectile"):WaitForChild("BeamPath"))
 
 local Config = require(script.Config)
 local Homing = require(script.Homing)
@@ -5071,7 +5071,7 @@ local RunService = game:GetService("RunService")
 local Planner = require(script.Parent.Parent.ProjectileStepPlanner)
 local Prediction = require(script.Parent.Prediction)
 local Heartbeat = require(script.Parent.Parent.Heartbeat)
-local BeamPath = require(script.Parent.Parent.BeamPath)
+local BeamPath = require(script.Parent.Parent:WaitForChild("Projectile"):WaitForChild("BeamPath"))
 
 local BeamVisual = {}
 local MAX_SEGMENTS = 8
@@ -5577,7 +5577,7 @@ return BeamVisual
 -- =============================================================================
 
 -- =============================================================================
--- BEGIN FILE: src/server/BeamProjectileHandler.luau
+-- BEGIN FILE: src/server/Projectile/BeamProjectileHandler.luau
 -- =============================================================================
 --!strict
 -- Continuous beams are ordered chains of REAL projectile beamlets. Every
@@ -5587,8 +5587,8 @@ local Players = game:GetService("Players")
 local Shared = game:GetService("ReplicatedStorage").Shared
 local Heartbeat = require(Shared.Heartbeat)
 local ChunkManager = require(Shared.ChunkManager)
-local Projectile = require(script.Parent.Projectile)
-local BeamPath = require(Shared.BeamPath)
+local Projectile = require(script.Parent)
+local BeamPath = require(Shared:WaitForChild("Projectile"):WaitForChild("BeamPath"))
 
 local Handler = {}
 Handler.Interval = 1 / 30
@@ -5892,17 +5892,18 @@ end, { Name = "BeamProjectileHandler.Channel", Priority = 4 })
 
 Players.PlayerRemoving:Connect(Handler.Stop)
 return Handler
--- END FILE: src/server/BeamProjectileHandler.luau
+-- END FILE: src/server/Projectile/BeamProjectileHandler.luau
 -- =============================================================================
 
 -- =============================================================================
--- BEGIN FILE: src/shared/BeamPath.luau
+-- BEGIN FILE: src/shared/Projectile/BeamPath.luau
 -- =============================================================================
 --!strict
 -- Shared *physical* centerline of a continuous stream. A newer sample is the
 -- back of its section; the preceding sample is its front. Turning the input
 -- therefore bends the stream instead of emitting unrelated parallel bars.
--- Both server collision and client cylinders use these exact endpoints.
+-- Shared projectile geometry: both server collision and client cylinders use
+-- these exact endpoints. Kept replicated because the client needs the same math.
 local BeamPath = {}
 BeamPath.MaxStretch = 32
 BeamPath.MaxJoinersPerLink = 32
@@ -5979,6 +5980,6 @@ function BeamPath.Connect(back: Vector3, front: Vector3, backTurns: { Vector3 }?
 end
 
 return BeamPath
--- END FILE: src/shared/BeamPath.luau
+-- END FILE: src/shared/Projectile/BeamPath.luau
 -- =============================================================================
 

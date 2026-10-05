@@ -1,10 +1,10 @@
 -- Normal Studio Script in fresh isolated modules; never shipped by Rojo.
 local shared=game.ReplicatedStorage._BeamStretchShared
 local server=game.ServerScriptService._BeamStretchServer
-local Handler=require(server.BeamProjectileHandler)
+local Handler=require(server.Projectile.BeamProjectileHandler)
 local Projectile=require(server.Projectile)
 local Chunks=require(shared.ChunkManager)
-local Path=require(shared.BeamPath)
+local Path=require(shared.Projectile.BeamPath)
 local viewer=game.Players:GetPlayers()[1]
 local origin=Vector3.new(0,5000,0)
 local spawned,samples={},{}

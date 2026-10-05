@@ -35,7 +35,7 @@ local SpellRunes = require(Shared:WaitForChild("SpellRunes"))
 local StatusEffectSys = require(Shared:WaitForChild("StatusEffectSys"))
 local Projectile = require(script.Parent:WaitForChild("Projectile"))
 local ProjectileQuota = require(script.Parent:WaitForChild("ProjectileQuota"))
-local BeamHandler = require(script.Parent:WaitForChild("BeamProjectileHandler"))
+local BeamHandler = require(script.Parent:WaitForChild("Projectile"):WaitForChild("BeamProjectileHandler"))
 
 local SpellRuntime = {}
 
