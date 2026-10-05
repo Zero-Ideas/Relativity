@@ -62,6 +62,8 @@ local function edge(model: Model, offset: Vector3, size: Vector3)
 end
 
 -- Builds the outline around the origin; refresh() PivotTo()s it into place.
+ChunkVisualizer.ColorForScale = colorForScale -- shared with the debug panel's minimap
+
 local function makeOutline(key: Vector3): Model
 	local size = ChunkManager.ChunkSize
 	local half = size / 2

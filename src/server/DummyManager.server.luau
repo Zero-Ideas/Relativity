@@ -63,9 +63,10 @@ function spawnDummy()
 	registerDummy(model)
 end
 
+-- Optional: places without a Workspace "Dummy" rig simply don't get one
+-- (test dummies come from the debug panel's Dummies tab instead).
 local existing = workspace:WaitForChild("Dummy", 10)
 if not existing or not existing:IsA("Model") then
-	warn("[Relativity] DummyManager: no Dummy rig found in Workspace")
 	return
 end
 

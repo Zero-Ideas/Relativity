@@ -89,7 +89,6 @@ if not toggleDebugEvent then
 	toggleDebugEvent.Parent = ReplicatedStorage
 end
 
--- was expecting game:GetService("ServerScriptService")
 
 task.spawn(function()
 	local result = MapGen.visualizeAnimated(CONFIG)

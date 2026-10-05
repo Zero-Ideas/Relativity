@@ -4276,7 +4276,6 @@ ReGui:DefineElement("InputText", {
 
 		local function Callback(...)
 			local Func = Config.Callback
-			warn(Config, Config.Callback == EmptyFunction)
 			Func(Class, ...)
 		end
 
@@ -7074,7 +7073,6 @@ ReGui:DefineElement("Window", {
 		--// Create default title bar
 		if not NoTitleButtons then
 			if NoClose then
-				print("DOESNT CLOSE")
 				Class:AddDefaultTitleButtons(true)
 			else
 				Class:AddDefaultTitleButtons(false)
