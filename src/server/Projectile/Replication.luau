@@ -47,6 +47,7 @@ type Entry = {
 	Range: number,
 	Position: Vector3,
 	Payload: any,
+	Recipients: { [Player]: boolean }?,
 }
 
 type BounceSnap = {
@@ -61,9 +62,19 @@ local spawnQueueHead = 1
 local hitQueue: { Entry } = {}
 local hitQueueHead = 1
 local pendingBounces: { BounceSnap } = {} -- flushed with this frame's ProjMove
+local pendingBounceHead = 1
 local poseCandidates: { State } = {} -- homing-synced this frame
 local poseCursor = 1
 local moveStats = { batches = 0, entries = 0 }
+
+-- Only finite-range visuals need interest bookkeeping. Unlimited-range
+-- stress tests retain the broadcast fast path. The persistent cursor limits
+-- re-entry checks independently of simulation/dilation and spawn cohorts.
+local interests: { [number]: { Projectile: State, Observers: { [Player]: boolean } } } = {}
+local interestOrder: { number } = {}
+local interestCursor = 1
+local interestCount = 0
+local frameRoots: { [Player]: BasePart }? = nil
 
 local function playerRoots(): { [Player]: BasePart }
 	local roots: { [Player]: BasePart } = {}
@@ -87,7 +98,14 @@ local function fanOut(channel: string, entries: { Entry })
 	local perPlayer: { [Player]: { any } } = {}
 	local roots: { [Player]: BasePart }? = nil
 	for _, entry in entries do
-		if entry.Range >= math.huge then
+		if entry.Recipients then
+			for player in entry.Recipients do
+				if not player.Parent then continue end
+				local list = perPlayer[player] or {}
+				perPlayer[player] = list
+				table.insert(list, entry.Payload)
+			end
+		elseif entry.Range >= math.huge then
 			table.insert(broadcast, entry.Payload)
 		else
 			roots = roots or playerRoots()
@@ -126,21 +144,20 @@ local function streamTo(projectile: State, channel: string, payload: any)
 		VisualOffload.Fire(channel, payload)
 		return
 	end
-	for player, root in playerRoots() do
-		if (root.Position - projectile.Position).Magnitude <= projectile.VisualRange then
+	local interest = interests[projectile.Id]
+	for player in interest and interest.Observers or {} do
+		if player.Parent then
 			VisualOffload.FireClient(player, channel, payload)
 		end
 	end
 end
 
--- Whether the client can't safely predict this projectile's CONTINUOUS motion
--- on its own right now -- see the module doc comment in init.luau. Only an
--- active homing lock qualifies: a target's position is seen through each
--- observer's own replication lag, so local steering would diverge per client.
--- Bounces are corrected one-shot (queueBounce) and personal/local time scales
--- are replicated as a number (updateTimeScale), so neither forces a stream.
+-- Homing needs authoritative steering. Beams also need authoritative linked
+-- endpoints/body clipping: predicting each end on a different client visit
+-- creates stretched or broken geometry at collisions/time-field boundaries.
+-- Ordinary non-homing projectiles retain sparse one-shot corrections.
 function Replication.isSynced(projectile: State): boolean
-	return projectile.HomingTarget ~= nil
+	return projectile.HomingTarget ~= nil or projectile.Beam ~= nil
 end
 
 -- Fields equal to ProjectileClient's defaults are omitted: remote events
@@ -166,10 +183,10 @@ local function spawnPayload(projectile: State): Protocol.SpawnPayload
 	if projectile.VisualScale ~= 1 then payload.VisualScale = projectile.VisualScale end
 	if projectile.Beam then
 		local previous = projectile._beamPrevious
-		payload.Beam = { Length = projectile.Beam.Length, Radius = projectile.Radius, Origin = projectile._beamOrigin or projectile.Position,
+		payload.Beam = { Length = projectile.Beam.Length, Radius = projectile.Radius, Origin = projectile.Position,
 			ChannelId = projectile.Beam.ChannelId, PreviousId = projectile.Beam.PreviousId,
 			PreviousPosition = previous and previous.Position, PreviousTurns = previous and previous._beamTurns,
-			Turns = projectile._beamTurns }
+			Turns = projectile._beamTurns, Path = projectile._beamSpan, Clipped = projectile._beamSpanClipped }
 	end
 	if projectile.DestroyDelay ~= 0 then payload.DestroyDelay = projectile.DestroyDelay end
 	if not projectile.WaitForParticles then payload.WaitForParticles = false end
@@ -210,8 +227,15 @@ function Replication.queueHit(projectile: State, info: Types.DestroyInfo)
 		Normal = info.Normal,
 		Kind = info.Kind,
 		BeamTurns = projectile._beamTurns,
+		BeamBody = projectile._beamBodyHit,
+		BeamPath = projectile._beamSpan,
+		BeamClipped = projectile._beamSpanClipped,
 	}
-	table.insert(hitQueue, { Range = projectile.VisualRange, Position = info.Position, Payload = payload })
+	local interest = interests[projectile.Id]
+	table.insert(hitQueue, { Range = projectile.VisualRange, Position = info.Position, Payload = payload,
+		Recipients = interest and table.clone(interest.Observers) })
+	interests[projectile.Id] = nil
+	if interest then interestCount -= 1 end
 end
 
 -- Compacts a head-indexed queue once its consumed prefix dominates it.
@@ -240,23 +264,73 @@ end
 -- queued visuals spawn from their latest authoritative pose, so batching never
 -- rewinds or slows gameplay.
 function Replication.flushSpawnBatch()
+	frameRoots = playerRoots()
 	local batch: { Entry } = {}
-	local last = math.min(#spawnQueue, spawnQueueHead + MAX_SPAWNS_PER_FRAME - 1)
+	local exits: { [Player]: { number } } = {}
+	local remaining = MAX_SPAWNS_PER_FRAME
+	local last = math.min(#spawnQueue, spawnQueueHead + remaining - 1)
 	for index = spawnQueueHead, last do
 		local projectile = spawnQueue[index]
-		if not projectile.Dead then
-			projectile._spawnStreamed = true
-			local payload = spawnPayload(projectile)
-			-- The snapshot is the client's sync baseline; keep the transition
-			-- check diffing against exactly what was sent.
-			projectile._streamedSynced = payload.Synced == true
-			table.insert(batch, { Range = projectile.VisualRange, Position = projectile.Position, Payload = payload })
+		if projectile.Dead then continue end
+		projectile._spawnStreamed = true
+		local payload = spawnPayload(projectile)
+		projectile._streamedSynced = payload.Synced == true
+		local recipients
+		if projectile.VisualRange < math.huge then
+			recipients = {}
+			for player, root in frameRoots :: { [Player]: BasePart } do
+				if (root.Position-projectile.Position).Magnitude <= projectile.VisualRange then recipients[player] = true end
+			end
+			interests[projectile.Id] = { Projectile = projectile, Observers = recipients }
+			interestCount += 1
+			table.insert(interestOrder, projectile.Id)
 		end
+		table.insert(batch, { Range = projectile.VisualRange, Position = projectile.Position, Payload = payload, Recipients = recipients })
+		remaining -= 1
 	end
 	spawnQueue, spawnQueueHead = compact(spawnQueue, last + 1)
+	-- At most 2500 checks and 1000 creation/re-entry snapshots in a frame.
+	-- Hysteresis prevents churn when the player sits on the range boundary.
+	for _ = 1, math.min(#interestOrder, MAX_POSES_PER_FRAME) do
+		if interestCursor > #interestOrder then interestCursor = 1 end
+		local id = interestOrder[interestCursor]
+		interestCursor += 1
+		local interest = interests[id]
+		if not interest then continue end
+		local projectile, observers = interest.Projectile, interest.Observers
+		local entering: { [Player]: boolean } = {}
+		for player in observers do
+			local root = (frameRoots :: { [Player]: BasePart })[player]
+			if not root or (root.Position-projectile.Position).Magnitude > projectile.VisualRange*1.1+8 then
+				observers[player] = nil
+				if player.Parent then
+					local list = exits[player] or {}; exits[player] = list
+					table.insert(list, id)
+				end
+			end
+		end
+		for player, root in frameRoots :: { [Player]: BasePart } do
+			if not observers[player] and remaining > 0 and (root.Position-projectile.Position).Magnitude <= projectile.VisualRange then
+				entering[player], observers[player] = true, true
+			end
+		end
+		if next(entering) then
+			table.insert(batch, { Range = projectile.VisualRange, Position = projectile.Position,
+				Payload = spawnPayload(projectile), Recipients = entering })
+			remaining -= 1
+		end
+	end
+	for player, ids in exits do VisualOffload.FireClient(player, Channels.RangeExit, ids) end
 	fanOut(Channels.SpawnBatch, batch)
+	if #interestOrder > 4096 and #interestOrder > 2*interestCount then
+		local ordered = {}
+		for offset = 0, #interestOrder-1 do
+			local id = interestOrder[(interestCursor+offset-1)%#interestOrder+1]
+			if interests[id] then table.insert(ordered,id) end
+		end
+		interestOrder, interestCursor = ordered, 1
+	end
 end
-
 function Replication.getQueueStats()
 	return {
 		VisualSpawnsPerFrame = MAX_SPAWNS_PER_FRAME,
@@ -340,7 +414,7 @@ function Replication.queueCorrection(projectile: State, point: Vector3, normal: 
 	table.insert(pendingBounces, { Projectile = projectile, Point = point, Normal = normal, Corrected = true })
 end
 
--- Marks a homing-synced projectile as due a pose this frame (see isSynced).
+-- Marks a homing/beam-synced projectile as due a pose (see isSynced).
 -- Payloads are only built for the round-robin slice actually sent.
 function Replication.queuePose(projectile: State)
 	if projectile.Visualize and projectile._spawnStreamed and projectile._streamedSynced then
@@ -353,15 +427,24 @@ local function poseEntry(projectile: State): Entry
 		Id = projectile.Id,
 		Position = projectile.Position,
 		Velocity = projectile.Velocity,
+		BeamPath = projectile._beamSpan,
+		BeamClipped = projectile._beamSpanClipped,
+		BeamTurns = projectile._beamTurns,
+		Lifetime = if projectile.Beam then math.max(projectile.Lifetime-projectile.Age, 0) else nil,
+		BeamUnlinked = if projectile.Beam and not projectile.Beam.PreviousId then true else nil,
 	}
-	return { Range = projectile.VisualRange, Position = projectile.Position, Payload = payload }
+	local interest = interests[projectile.Id]
+	return { Range = projectile.VisualRange, Position = projectile.Position, Payload = payload,
+		Recipients = if projectile.VisualRange < math.huge then interest and interest.Observers or {} else nil }
 end
 
 -- Sends this frame's bounce snaps plus a bounded round-robin slice of the
 -- queued homing poses, as one ProjMove event per recipient.
 function Replication.flushMoveBatch()
 	local batch: { Entry } = {}
-	for _, bounce in pendingBounces do
+	local lastBounce = math.min(#pendingBounces, pendingBounceHead+MAX_POSES_PER_FRAME-1)
+	for index = pendingBounceHead, lastBounce do
+		local bounce = pendingBounces[index]
 		local projectile = bounce.Projectile
 		local payload: Protocol.MovePayload = {
 			Id = projectile.Id,
@@ -370,16 +453,22 @@ function Replication.flushMoveBatch()
 			Bounced = if bounce.Corrected then nil else true,
 			Corrected = bounce.Corrected,
 			BeamTurns = projectile._beamTurns,
+			BeamUnlinked = if projectile.Beam and not projectile.Beam.PreviousId then true else nil,
+			BeamPath = projectile._beamSpan,
+			BeamClipped = projectile._beamSpanClipped,
+			Lifetime = if projectile.Beam then math.max(projectile.Lifetime-projectile.Age, 0) else nil,
 			Point = bounce.Point,
 			Normal = bounce.Normal,
 		}
-		table.insert(batch, { Range = projectile.VisualRange, Position = projectile.Position, Payload = payload })
+		local interest = interests[projectile.Id]
+		table.insert(batch, { Range = projectile.VisualRange, Position = projectile.Position, Payload = payload,
+			Recipients = if projectile.VisualRange < math.huge then interest and interest.Observers or {} else nil })
 	end
-	table.clear(pendingBounces)
+	pendingBounces, pendingBounceHead = compact(pendingBounces, lastBounce+1)
 
 	local candidateCount = #poseCandidates
 	if candidateCount > 0 then
-		local updateCount = math.min(candidateCount, MAX_POSES_PER_FRAME)
+		local updateCount = math.min(candidateCount, math.max(MAX_POSES_PER_FRAME-#batch, 0))
 		if poseCursor > candidateCount then
 			poseCursor = (poseCursor - 1) % candidateCount + 1
 		end

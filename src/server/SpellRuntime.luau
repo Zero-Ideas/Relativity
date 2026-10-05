@@ -450,48 +450,69 @@ local function launch(shot: Shot, direction: Vector3)
 		Visual = { Style = shot.vessel, Color = elementDef.Color, Core = elementDef.Core },
 	})
 
-	local lastStruck = nil
-	projectile.OnHit:Connect(function(hit)
-		if hit.Entity then
-			lastStruck = hit.Entity
-			local multiplier = projectile.DamageMultiplier
-			strike(ctx, hit.Entity, projectile.Damage * multiplier, hit.Hurtbox, hit.CFrame.Position, element, shot.damageEnergy * multiplier)
-		end
-	end)
-	local destroyTriggers = {}
-	for _, triggerId in shot.info.triggers do
-		local trigger = compiled.runes[triggerId]
-		local watch: Watch = {
-			projectile = projectile,
-			compiled = compiled,
-			ctx = ctx,
-			trigger = triggerId,
-			energy = shot.perCopy * trigger.params.Share / 100,
-			element = element,
-			nextCheck = 0,
-		}
-		if trigger.rune == "OnImpact" or trigger.rune == "OnExpire" then
-			table.insert(destroyTriggers, watch)
-		else
-			table.insert(watches, watch)
-		end
-	end
-	local released = false
-	projectile.OnDestroy:Connect(function(result)
-		if not released then
-			released = true
-			ProjectileQuota.Release(ctx.player, 1)
-		end
-		for _, watch in destroyTriggers do
-			local kind = compiled.runes[watch.trigger].rune
-			local heading = headingOf(projectile, ctx.heading)
-			if kind == "OnImpact" and (result.Kind == "entity" or result.Kind == "world") then
-				fireTrigger(compiled, ctx, watch.trigger, watch.energy, element, result.Position, heading, result.Normal, if result.Kind == "entity" then lastStruck else nil)
-			elseif kind == "OnExpire" and result.Kind == nil then
-				fireTrigger(compiled, ctx, watch.trigger, watch.energy, element, result.Position, heading, nil, nil)
+	-- Reusable synchronous binding for both emitted packets and subdivisions.
+	-- Each fork receives a fraction of the UNFIRED trigger/damage energy.
+	local bind: (any, number, any?) -> ()
+	bind = function(projectile, damageEnergy, triggerAmounts)
+		local lastStruck = nil
+		local boundWatches = {}
+		projectile.OnHit:Connect(function(hit)
+			if hit.Entity then
+				lastStruck = hit.Entity
+				local multiplier = projectile.DamageMultiplier
+				strike(ctx, hit.Entity, projectile.Damage * multiplier, hit.Hurtbox, hit.CFrame.Position, element, damageEnergy * multiplier)
+			end
+		end)
+		local destroyTriggers = {}
+		for _, triggerId in shot.info.triggers do
+			local trigger = compiled.runes[triggerId]
+			local watch: Watch = {
+				projectile = projectile,
+				compiled = compiled,
+				ctx = ctx,
+				trigger = triggerId,
+				energy = if triggerAmounts then (triggerAmounts[triggerId] or 0) else shot.perCopy * trigger.params.Share / 100,
+				element = element,
+				nextCheck = 0,
+			}
+			table.insert(boundWatches, watch)
+			if trigger.rune == "OnImpact" or trigger.rune == "OnExpire" then
+				table.insert(destroyTriggers, watch)
+			else
+				table.insert(watches, watch)
 			end
 		end
-	end)
+		local released = false
+		projectile.OnDestroy:Connect(function(result)
+			if not released then
+				released = true
+				ProjectileQuota.Release(ctx.player, 1)
+			end
+			for _, watch in destroyTriggers do
+				local kind = compiled.runes[watch.trigger].rune
+				local heading = headingOf(projectile, ctx.heading)
+				if kind == "OnImpact" and (result.Kind == "entity" or result.Kind == "world") then
+					fireTrigger(compiled, ctx, watch.trigger, watch.energy, element, result.Position, heading, result.Normal, if result.Kind == "entity" then lastStruck else nil)
+				elseif kind == "OnExpire" and result.Kind == nil then
+					fireTrigger(compiled, ctx, watch.trigger, watch.energy, element, result.Position, heading, nil, nil)
+				end
+			end
+		end)
+		projectile._beamReserveChildren = function(count)
+			return ProjectileQuota.TryAcquire(ctx.player, count)
+		end
+		projectile._beamBindChild = function(child, share)
+			local amounts = {}
+			for _, watch in boundWatches do amounts[watch.trigger] = watch.energy * share end
+			bind(child, damageEnergy * share, amounts)
+		end
+		projectile._beamScaleEnergy = function(share)
+			damageEnergy *= share
+			projectile.Damage *= share
+			for _, watch in boundWatches do watch.energy *= share end
+		end
+	end
+	bind(projectile, shot.damageEnergy, nil)
 end
 
 -- A fresh cast-time context from the caster's live hand and cursor, so each
@@ -582,6 +603,7 @@ local function fireVessel(compiled: any, ctx: Context, id: string, energy: numbe
 			BeamHandler.Start({
 				Player = ctx.player, Character = ctx.character, Caster = ctx.caster,
 				Duration = stats.sustain,
+				Speed = stats.speed,
 				Delay = if stream then (index - 1) * stats.quantity.Interval else 0,
 				Origin = function() return liveContext(ctx).origin end,
 				Emit = function(share, channelId) emitSustain(shot, index, share, channelId) end,
@@ -674,6 +696,7 @@ Heartbeat.Connect(function()
 		local watch = watches[index]
 		local projectile = watch.projectile
 		local trigger = watch.compiled.runes[watch.trigger]
+		if watch.energy <= 0 then table.remove(watches, index); continue end
 		local fired, struck = false, nil
 		if projectile.Dead then
 			table.remove(watches, index)
@@ -688,7 +711,9 @@ Heartbeat.Connect(function()
 		end
 		if fired then
 			table.remove(watches, index)
-			fireTrigger(watch.compiled, watch.ctx, watch.trigger, watch.energy, watch.element, projectile.Position, headingOf(projectile, watch.ctx.heading), nil, struck)
+			local energy = watch.energy
+			watch.energy = 0 -- do not duplicate a spent trigger when later subdividing
+			fireTrigger(watch.compiled, watch.ctx, watch.trigger, energy, watch.element, projectile.Position, headingOf(projectile, watch.ctx.heading), nil, struck)
 			if trigger.params.Detonate then
 				projectile:Destroy({ Position = projectile.Position, Normal = Vector3.yAxis }, "detonate")
 			end

@@ -26,9 +26,11 @@
 	acceleration/deceleration, bouncing (restitution), homing (explicit target or
 	auto-acquire by tag(s), with optional Permalock), piercing with falloff, and
 	cone bursts. Rendering can be offloaded to clients (Visualize = true): the
-	server keeps only the logic. Every projectile gets exactly two replication
-	events over its life -- ProjSpawn (once, with its full trajectory-determining
-	config) and ProjHit (once, on destroy). On top of that there are three
+	server keeps only the logic. Visuals receive ProjSpawn with their current
+	trajectory config and ProjHit on destruction. Finite-range observers also
+	receive ProjRangeExit and a fresh authoritative spawn on re-entry; sparse
+	corrections must never be lost permanently outside that range.
+	On top of that there are three
 	independent, orthogonal streaming mechanisms, each covering a different case
 	the client can't safely reproduce on its own:
 	 - Continuous sync while actively homing (self.HomingTarget ~= nil, checked
@@ -78,6 +80,12 @@
 	cosmetic; the server always runs its own independent, authoritative Step,
 	and any visual drift is corrected the instant ProjHit snaps the final
 	position.
+
+	Beams always use the bounded authoritative pose stream, including their
+	linked, wall-clipped centerline. A body contact never teleports a distant
+	back endpoint onto the leading endpoint's wall; each moving head owns its
+	wall bounce/penetration timing. Client beam sections are tessellated after
+	union and capped to 12 studs without limiting the beam's total reach.
 
 	API:
 	 Projectile.new(config) -> projectile
@@ -212,7 +220,10 @@
 	                            Length clamps to 0.05..512 studs; swept-radius
 	                            head collision is unchanged. The visual tail
 	                            follows the already-swept path, including bends,
-	                            and drains after impact instead of vanishing.)
+	                            and drains after impact instead of vanishing.
+	                            Sustained spells launch through BeamProjectileHandler:
+	                            ChannelId/PreviousId join moving endpoints; tilted
+	                            section-body collision runs through this same resolver.)
 	   DestroyDelay = 0         (client keeps the visual this long after impact)
 	   WaitForParticles = true (client-side; while true, a ParticleEmitter
 	              under the visual is only disabled on destroy -- already-
@@ -297,6 +308,7 @@ local ProjectileMotion = require(Shared:WaitForChild("ProjectileMotion"))
 local Planner = require(Shared:WaitForChild("ProjectileStepPlanner"))
 local SafeMath = require(Shared:WaitForChild("SafeMath"))
 local Signal = require(Shared:WaitForChild("Signal"))
+local BeamPath = require(Shared:WaitForChild("BeamPath"))
 
 local Config = require(script.Config)
 local Homing = require(script.Homing)
@@ -320,7 +332,8 @@ type Methods = {
 	Step: (self: Projectile, globalDt: number) -> boolean,
 	Destroy: (self: Projectile, result: { Position: Vector3, Normal: Vector3 }?, kind: string?) -> (),
 	SetTimeScale: (self: Projectile, scale: number) -> (),
-	ResolveBeamSpan: (self: Projectile, points: { Vector3 }) -> (),
+	ResolveBeamSpan: (self: Projectile, points: { Vector3 }, allowHits: boolean?, cornerIndices: { number }?) -> { Vector3 },
+	ClearBeamPrevious: (self: Projectile) -> (),
 }
 export type Projectile = Types.State & Methods
 
@@ -464,6 +477,34 @@ function Projectile.new(config: Config): Projectile
 	table.insert(active, self)
 	Replication.spawnVisual(self)
 	return self
+end
+
+-- A real beamlet: unique identity, ordinary simulation, replication and
+-- collision events. The handler binds spell energy/quota before its first step.
+function Projectile.CreateBeamSample(template: Projectile, position: Vector3, velocity: Vector3, turns: { Vector3 }): Projectile
+	local state = table.clone(template)
+	nextId += 1
+	state.Id = nextId
+	state.Position, state.Velocity, state.Speed = position, velocity, velocity.Magnitude
+	state.RewindSeconds = 0
+	state._beamJoiner, state._beamJoinerWorldStop = true, nil
+	state.Beam = template.Beam and table.clone(template.Beam)
+	state.Homing = template.Homing and table.clone(template.Homing)
+	state._beamTurns = table.clone(turns)
+	state._beamPrevious, state._beamSpan, state._beamSpanClipped = nil, nil, nil
+	state._spawnStreamed, state._streamedSynced = false, Replication.isSynced(state)
+	state._ignore, state._rewindCache, state._simulationDebt = table.clone(template._ignore), {}, 0
+	state._rayParams = Raycast.buildRayParams(state.Source, state.IgnoreInstances)
+	state.Dead, state._beamBodyHit = false, nil
+	state._beamReserveChildren, state._beamBindChild, state._beamScaleEnergy = nil, nil, nil
+	state.OnHit, state.OnDestroy = Signal.new() :: any, Signal.new() :: any
+	local self = setmetatable(state, Projectile) :: any
+	table.insert(active, self)
+	return self
+end
+
+function Projectile.PublishBeamSample(self: Projectile)
+	Replication.spawnVisual(self)
 end
 
 -- Cone burst: `count` projectiles spread around the base direction.
@@ -795,63 +836,87 @@ function Projectile.Step(self: Projectile, globalDt: number): boolean
 	return true
 end
 
--- A linked section's body lies between *two* moving endpoints. Casting only
--- each endpoint's velocity misses the tilted cylinder between them. Route
--- these contacts through the same entity/pierce/bounce/penetration resolvers
--- as ordinary movement, without spawning another projectile or ray worker.
-function Projectile.ResolveBeamSpan(self: Projectile, points: { Vector3 })
-	if self.Dead or combinedTimeScale(self) <= 0 or ChunkManager.GetTimeScaleAt(self.Position) <= 0 then return end
-	local function params(): RaycastParams
-		if next(self._ignore) == nil then return self._rayParams end
-		local filtered = RaycastParams.new()
-		filtered.FilterType = Enum.RaycastFilterType.Exclude
-		filtered.IgnoreWater = self._rayParams.IgnoreWater
-		filtered.CollisionGroup = self._rayParams.CollisionGroup
-		local ignore = self._rayParams.FilterDescendantsInstances
-		for entity in self._ignore do if entity.Instance then table.insert(ignore, entity.Instance) end end
-		filtered.FilterDescendantsInstances = ignore
-		return filtered
-	end
+-- Linked-body tests must never advance/reflect the distant back endpoint.
+-- Movement Step owns wall bounces/penetration and their triggers. Here a world
+-- obstruction clips the body; entity contacts still use the normal damage and
+-- pierce pipeline once per packet. This prevents a leading ricochet from
+-- instantly pulling every trailing sample onto the same wall.
+function Projectile.ResolveBeamSpan(self: Projectile, points: { Vector3 }, allowHits: boolean?, cornerIndices: { number }?): { Vector3 }
+	local clipped = { points[1] }
+	self._beamSpanClipped = nil
+	if self.Dead then return clipped end
+	local ignore = self._rayParams.FilterDescendantsInstances
+	for entity in self._ignore do if entity.Instance then table.insert(ignore, entity.Instance) end end
+	local filtered = RaycastParams.new()
+	filtered.FilterType = Enum.RaycastFilterType.Exclude
+	filtered.IgnoreWater = self._rayParams.IgnoreWater
+	filtered.CollisionGroup = self._rayParams.CollisionGroup
+	filtered.FilterDescendantsInstances = ignore
+	local contacts = 0
 	for index = 1, #points - 1 do
 		local from, to = points[index], points[index + 1]
 		local offset = to - from
 		local length = offset.Magnitude
 		if length < 1e-4 then continue end
-		local heading = offset / length
-		local traveled = 0
-		local contacts = 0
+		local heading, traveled = offset / length, 0
 		while traveled < length - 1e-4 do
-			-- Roblox's shape sweep has a 1024-stud travel limit; splitting
-			-- a long connector preserves its full reach rather than capping it.
-			local distance = math.min(length - traveled, 1024)
-			local contact = Raycast.castMovement(self, from + heading * traveled, heading * distance, params())
+			local distance = math.min(length - traveled, 1000)
+			local contact = Raycast.castMovement(self, from + heading * traveled, heading * distance, filtered)
 			if not contact then traveled += distance; continue end
-			local originalPosition, originalVelocity = self.Position, self.Velocity
-			self.Velocity = heading * originalVelocity.Magnitude
-			local verdict, kind = Raycast.resolveHit(self, contact)
-			if verdict == "destroy" then
-				self.Position = contact.Position
-				self:Destroy(contact, kind)
-				return
-			elseif verdict == "bounce" then
-				return -- reflection + exact contact already queued by resolver
-			end
 			local entity = contact.Instance and Entity.Get(contact.Instance)
-			if entity and self._ignore[entity] then
-				-- Piercing consumes this packet's normal budget once. Leave its
-				-- back at the existing pose; the next span cast excludes the entity.
-				self.Position, self.Velocity = originalPosition, originalVelocity
-				contacts += 1
-				if contacts >= 16 then return end
-			else
-				-- Successful wall penetration advances to the real exit, so normal
-				-- head movement cannot spend that penetration budget a second time.
-				self.Velocity = originalVelocity
-				Replication.queueCorrection(self, contact.Position, contact.Normal)
-				return
+			if not entity then
+				-- Surface contact is not the sphere center. Keep the rendered
+				-- endpoint on the swept centerline, including its radius clearance.
+				table.insert(clipped, from + heading * (traveled + contact.Distance))
+				self._beamSpanClipped = true
+				-- Each inserted beamlet owns its contact/trigger, not the whole
+				-- original gap. Bounce still belongs to its moving tip; do not
+				-- reflect an endpoint from a distant body contact.
+				if self._beamJoiner and self.BouncesLeft <= 0 and self.Penetration <= 0
+					and allowHits ~= false and combinedTimeScale(self) > 0
+					and ChunkManager.GetTimeScaleAt(contact.Position) > 0 then
+					self._beamSpan, self._beamBodyHit = clipped, true
+					self.OnHit:Fire(Raycast.buildHitInfo(contact, nil, nil))
+					self:Destroy(contact, "world")
+				end
+				return clipped
 			end
+			-- Frozen portions do not deliver repeated body-trigger hits. Still
+			-- calculate clipping so geometry stays coherent across time bubbles.
+			if allowHits == false or combinedTimeScale(self) <= 0 or ChunkManager.GetTimeScaleAt(contact.Position) <= 0 then
+				table.insert(ignore, entity.Instance)
+				filtered.FilterDescendantsInstances = ignore
+			else
+				local position, velocity = self.Position, self.Velocity
+				self.Velocity = heading * velocity.Magnitude
+				local headPosition = entity:GetHeadPosition()
+				local hurtbox: Types.Hurtbox = if headPosition and (contact.Position-headPosition).Magnitude <= entity.HeadRadius then "Head" else "Body"
+				local verdict = Raycast.resolveEntityHit(self, entity, contact, hurtbox)
+				self.Position, self.Velocity = position, velocity
+				if verdict == "destroy" then
+					table.insert(clipped, from + heading * (traveled + contact.Distance))
+					self._beamSpan = BeamPath.Compact(clipped, cornerIndices)
+					self._beamSpanClipped = true
+					self._beamBodyHit = true
+					self:Destroy(contact, "entity")
+					return clipped
+				end
+				-- A rejected entity must not fall through into world reflection.
+				table.insert(ignore, entity.Instance)
+				filtered.FilterDescendantsInstances = ignore
+			end
+			contacts += 1
+			if contacts >= 16 then self._beamSpanClipped = true; return clipped end
 		end
+		table.insert(clipped, to)
 	end
+	return clipped
+end
+function Projectile.ClearBeamPrevious(self: Projectile)
+	if not self.Beam or not self.Beam.PreviousId then return end
+	self.Beam.PreviousId, self._beamPrevious = nil, nil
+	self._beamSpanClipped = nil
+	Replication.queueCorrection(self, self.Position, Vector3.yAxis)
 end
 
 function Projectile.Destroy(self: Projectile, result: { Position: Vector3, Normal: Vector3 }?, kind: string?)
@@ -859,11 +924,17 @@ function Projectile.Destroy(self: Projectile, result: { Position: Vector3, Norma
 		return
 	end
 	self.Dead = true
+	self._beamJoinerWorldStop = kind == "world" and not self._beamBodyHit
 	local info: Types.DestroyInfo = {
 		Position = if result then SafeMath.vector(result.Position, self.Position) else self.Position,
 		Normal = if result then SafeMath.unit(result.Normal, Vector3.yAxis) else Vector3.yAxis,
 		Kind = kind,
 	}
+	if self.Beam and kind == "world" and not self._beamBodyHit then
+		-- Followers may finish at this stopped tip. Store its cleared center,
+		-- not the pre-cast position or a point inside the wall.
+		self.Position = info.Position + info.Normal * self.Radius
+	end
 	Replication.queueHit(self, info)
 
 	-- Exactly-once -- see the module doc comment's "Events" section. Every
@@ -897,7 +968,7 @@ Heartbeat.Connect(function(globalDt: number)
 	for i = #active, 1, -1 do
 		local projectile = active[i]
 		if projectile:Step(globalDt) then
-			-- Homing-locked projectiles stay continuously streamed; see
+			-- Homing-locked projectiles and beams stay continuously streamed; see
 			-- Replication.isSynced for why that is the one case that must.
 			Replication.queuePose(projectile)
 		else

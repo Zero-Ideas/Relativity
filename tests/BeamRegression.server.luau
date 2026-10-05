@@ -83,7 +83,8 @@ aim = origin + Vector3.new(500, 0, 0)
 task.wait(1.1)
 capture:Disconnect()
 assert(changed, "sustain didn't follow live aim")
-assert(count == 30, "expected 30 packets, got " .. count)
+local expectedPackets = math.ceil(1 / BeamHandler.GetInterval(2000) - 1e-6)
+assert(count == expectedPackets, "expected " .. expectedPackets .. " packets, got " .. count)
 -- Range V consumes 15%, Sustain I consumes 4%; Fire impact .8 x Beam .8.
 local expected = 30 * (1 - .15 - .04) * .8 * .8
 assert(math.abs(energy - expected) < .001, "sustain multiplied/lost cast energy")

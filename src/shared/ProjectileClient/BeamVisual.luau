@@ -1,15 +1,15 @@
 --!strict
 -- Finite, traveling cylinders along a bounded path, not an instantaneous ray
--- from the muzzle to the cursor. Only the existing projectile head drives this
--- cosmetic tail. Collision/damage/bounce/pierce/homing stay server-owned.
+-- from the muzzle to the cursor. Sustained channels share a linked centerline
+-- with server collision; individual beams retain their traveled path tail.
+-- Collision/damage/bounce/pierce/homing stay server-owned.
 local ChunkManager = require(script.Parent.Parent.ChunkManager)
 local Types = require(script.Parent.Types)
 local Protocol = require(script.Parent.Parent.ProjectileProtocol)
 local Geometry = require(script.Parent.BeamGeometry)
 local View = require(script.Parent.View)
 local RunService = game:GetService("RunService")
-local Prediction = require(script.Parent.Prediction)
-local Motion = require(script.Parent.Parent.ProjectileMotion)
+local Planner = require(script.Parent.Parent.ProjectileStepPlanner)
 
 local BeamVisual = {}
 local MAX_SEGMENTS = 8
@@ -81,7 +81,7 @@ function BeamVisual.ApplyGroups()
 			local length = (b - a).Magnitude
 			local up = if math.abs((b - a).Y / length) > .99 then Vector3.xAxis else Vector3.yAxis
 			shape(group, group.segments, index, CFrame.lookAt((a + b) * .5, b, up) * ROTATION,
-				Vector3.new(length, group.radius * 2, group.radius * 2), false)
+				Vector3.new(math.min(length, Geometry.MaxSegmentLength), group.radius * 2, group.radius * 2), false)
 		end
 		hideAfter(group.segments, #geometry.segments)
 		for index, point in geometry.joints do
@@ -94,14 +94,42 @@ end
 -- One aggregation per channel per frame, never one visible bar per packet.
 -- Only already-simulated paths enter the union. Offscreen packets retain the
 -- normal prediction timestamp/correction rules and resume through Reset.
-function BeamVisual.FlushGroups()
+function BeamVisual.GetBounds(visual: Types.Visual, position: Vector3, simulationClock: number): (Vector3, number)
+	local state = visual.rig and visual.rig.beam
+	if not state then return position, 0 end
+	if state.authoritativePath and #state.authoritativePath > 1 then
+		local low, high = position, position
+		for _, point in state.authoritativePath do low, high = low:Min(point), high:Max(point) end
+		return (low+high)*.5, (high-low).Magnitude*.5+state.maxLength
+	end
+	return position, state.maxLength
+end
+
+function BeamVisual.FlushGroups(simulationClock: number?)
 	for _, group in groups do
+		for state in group.members do
+			local visual = state.visual
+			local visible = if state.retired then View.contains((state.points[1]+state.points[#state.points])*.5, state.length*.5+state.radius)
+				else visual and visual.inView or false
+			if visible ~= state.wasVisible then state.wasVisible = visible; group.dirty = true end
+		end
+		if not group.dirty then continue end
+		group.dirty = false
 		local paths = {}
 		for state in group.members do
 			local visual = state.visual
-			local inView = if state.retired then View.contains(state.points[#state.points], state.maxLength)
+			local inView = if state.retired then View.contains((state.points[1]+state.points[#state.points])*.5, state.length*.5+state.radius)
 				else visual and visual.inView
-			if inView and state.length > 1e-4 then table.insert(paths, state.points) end
+			if not inView then continue end
+			if state.retired then
+				if state.length > 1e-4 then table.insert(paths, state.points) end
+				continue
+			end
+			-- A sustained sample renders exactly ONE server-approved path.
+			-- Its old travel history is never a second tail, even after a split,
+			-- clipping, interest loss, delayed pose, or missing predecessor.
+			state.linkPoints = state.authoritativePath
+			if state.linkPoints and #state.linkPoints > 0 then table.insert(paths, state.linkPoints) end
 		end
 		if #paths > 0 then
 			local segments, joints = Geometry.Merge(paths, group.radius)
@@ -117,9 +145,12 @@ end
 
 local function releaseState(visual: Types.Visual)
 	local state = (visual.rig :: Types.Rig).beam
+	pending[state] = nil
 	local group = state.group
 	if group then
+		group.dirty = true
 		group.members[state] = nil
+		group.byId[state.id] = nil
 		if next(group.members) == nil then
 			groups[group.id], pending[group] = nil, nil
 			group.model:Destroy()
@@ -170,35 +201,13 @@ end
 local function draw(rig: Types.Rig)
 	local state = rig.beam
 	if state.group then return end
-	for index = 1, #state.points - 1 do
-		local a, b = state.points[index], state.points[index + 1]
-		local length = (b - a).Magnitude
-		local up = if length > 1e-4 and math.abs((b - a).Y / length) > .99 then Vector3.xAxis else Vector3.yAxis
-		local pose = if length > 1e-4 then CFrame.lookAt((a + b) * 0.5, b, up) * ROTATION else CFrame.new(a)
-		local segment = state.segments[index]
-		if not segment then
-			local core = part(rig.model, "BeamCore", state.core, 0, pose)
-			local glow = part(rig.model, "BeamGlow", state.color, 0.5, pose)
-			segment = { core = core, glow = glow, coreMotor = motor(rig.driver, core, pose), glowMotor = motor(rig.driver, glow, pose) }
-			state.segments[index] = segment
-		end
-		if length > 1e-4 then
-			local transform = rig.driver.CFrame:ToObjectSpace(pose)
-			segment.core.Size = Vector3.new(length + state.radius * 0.1, state.radius * 1.1, state.radius * 1.1)
-			segment.glow.Size = Vector3.new(length + state.radius * 0.1, state.radius * 2, state.radius * 2)
-			segment.coreMotor.Transform = segment.coreMotor.C0:Inverse() * transform
-			segment.glowMotor.Transform = segment.glowMotor.C0:Inverse() * transform
-			segment.core.Transparency, segment.glow.Transparency = 0, 0.5
-		else
-			segment.core.Transparency, segment.glow.Transparency = 1, 1
-		end
-	end
-	for index = #state.points, #state.segments do
-		state.segments[index].core.Transparency = 1
-		state.segments[index].glow.Transparency = 1
-	end
+	state.model, state.driver = rig.model, rig.driver
+	state.joints = state.joints or {}
+	local spans = {}
+	for index = 1, #state.points-1 do table.insert(spans, { state.points[index], state.points[index+1] }) end
+	pending[state] = { segments = Geometry.Split(spans), joints = {} }
+	if not applyConnection then applyConnection = RunService.PreSimulation:Connect(BeamVisual.ApplyGroups) end
 end
-
 function BeamVisual.Build(data: Protocol.SpawnPayload): (Instance, Types.Rig)
 	local beam = assert(data.Beam)
 	local spec = data.Visual
@@ -214,7 +223,7 @@ function BeamVisual.Build(data: Protocol.SpawnPayload): (Instance, Types.Rig)
 			local root = part(model, "BeamHead", color, 1)
 			group = { id = beam.ChannelId, model = model, driver = driver, root = root,
 				motor = motor(driver, root), color = color, core = spec and spec.Core or Color3.new(1, 1, 1),
-				radius = math.max(beam.Radius, .025), segments = {}, joints = {}, members = {}, visible = false }
+				radius = math.max(beam.Radius, .025), segments = {}, joints = {}, members = {}, byId = {}, visible = false, dirty = true }
 			groups[beam.ChannelId] = group
 			model.Parent = workspace
 			if not applyConnection then applyConnection = RunService.PreSimulation:Connect(BeamVisual.ApplyGroups) end
@@ -224,10 +233,15 @@ function BeamVisual.Build(data: Protocol.SpawnPayload): (Instance, Types.Rig)
 		local placeholder = Instance.new("Folder")
 		placeholder.Name = "BeamPacket_" .. data.Id
 		placeholder.Parent = group.model
-		local state = { points = { beam.Origin }, length = 0, maxLength = beam.Length,
-			radius = group.radius, speed = data.Velocity.Magnitude, group = group }
+		local state = { points = { data.Position }, length = 0, maxLength = beam.Length,
+			radius = group.radius, speed = data.Velocity.Magnitude, group = group, id = data.Id,
+			previousId = beam.PreviousId, previousPosition = beam.PreviousPosition,
+			previousTurns = beam.PreviousTurns, turns = beam.Turns or {} }
+		state.authoritativePath = beam.Path
+		state.pathClipped = beam.Clipped
 		group.members[state] = true
-		append(state, data.Position)
+		group.dirty = true
+		group.byId[data.Id] = state
 		return placeholder, { model = placeholder, driver = group.driver, root = group.root,
 			motor = group.motor, rootOffset = CFrame.identity, beam = state }
 	end
@@ -256,6 +270,22 @@ function BeamVisual.Attach(visual: Types.Visual)
 	if rig and rig.beam then rig.beam.visual = visual end
 end
 
+function BeamVisual.AdoptPath(visual: Types.Visual, points: { Vector3 }?, clipped: boolean?)
+	local state = visual.rig and visual.rig.beam
+	if not state then return end
+	state.authoritativePath = points
+	state.pathClipped = clipped
+	if state.group then state.group.dirty = true end
+end
+
+-- Interest loss is not an impact: do not leave a retired copy with the same
+-- id in a channel when the authoritative re-entry snapshot rebuilds it.
+function BeamVisual.Discard(visual: Types.Visual): boolean
+	if not visual.rig or not visual.rig.beam then return false end
+	releaseState(visual)
+	return true
+end
+
 function BeamVisual.ShouldPlayImpact(visual: Types.Visual, point: Vector3): boolean
 	local rig = visual.rig
 	local group = rig and rig.beam and rig.beam.group
@@ -270,9 +300,58 @@ end
 function BeamVisual.Update(visual: Types.Visual, position: Vector3, velocity: Vector3)
 	local rig = visual.rig
 	if not rig or not rig.beam then return end
+	rig.beam.linkPoints = nil
+	if rig.beam.group then
+		rig.beam.group.dirty = true
+		rig.beam.points, rig.beam.length = {position}, 0
+		rig.beam.pendingTurns = nil
+		rig.beam.speed = velocity.Magnitude
+		return
+	end
+	for _, point in rig.beam.pendingTurns or {} do append(rig.beam, point) end
+	rig.beam.pendingTurns = nil
 	append(rig.beam, position)
 	rig.beam.speed = velocity.Magnitude
 	draw(rig)
+end
+
+function BeamVisual.AdoptLinks(visual: Types.Visual, turns: { Vector3 }?, unlinked: boolean?)
+	local state = visual.rig and visual.rig.beam
+	if not state or not state.group then return end
+	state.group.dirty = true
+	if turns then
+		local added = {}
+		for index = #state.turns + 1, #turns do table.insert(added, turns[index]) end
+		if #added > 0 then state.pendingTurns = added end
+		state.turns = turns
+	end
+	if unlinked then state.previousId, state.previousPosition, state.previousTurns = nil, nil, nil end
+end
+
+function BeamVisual.StopBody(visual: Types.Visual, contact: Vector3, turns: { Vector3 }?)
+	local state = visual.rig and visual.rig.beam
+	if not state or not state.group then return end
+	state.group.dirty = true
+	local stop = table.clone(state.authoritativePath or { contact })
+	if #stop == 1 then
+		state.stopPath, state.pathClipped = { contact }, true
+		return
+	end
+	-- The actual stop can precede a predecessor's next bounce. Retain only
+	-- the contacts up to the segment containing this impact, never overshoot.
+	local best, distance = 1, math.huge
+	for index = 1, #stop - 1 do
+		local a, b = stop[index], stop[index+1]
+		local offset = b-a
+		local t = math.clamp((contact-a):Dot(offset)/math.max(offset:Dot(offset),1e-8),0,1)
+		local d = (a+offset*t-contact).Magnitude
+		if d < distance then best, distance = index, d end
+	end
+	while #stop > best + 1 do table.remove(stop) end
+	stop[#stop] = contact
+	state.stopPath = stop
+	state.pathClipped = true
+	if turns then state.turns = turns end
 end
 
 -- Remove predicted overshoot before an authoritative bounce/impact. Retain
@@ -281,6 +360,7 @@ function BeamVisual.Correct(visual: Types.Visual, contact: Vector3)
 	local rig = visual.rig
 	if not rig or not rig.beam then return end
 	local state, bestIndex, bestDistance = rig.beam, 1, math.huge
+	if state.group then state.group.dirty = true; return end
 	for index = 1, #state.points - 1 do
 		local a, b = state.points[index], state.points[index + 1]
 		local offset = b - a
@@ -300,22 +380,8 @@ function BeamVisual.Reset(visual: Types.Visual)
 	if rig and rig.beam then
 		local state = rig.beam
 		if state.group then
-			local delta = (visual.position - state.points[#state.points]).Magnitude
-			if not visual.synced and delta > state.maxLength and Prediction.canDefer(visual) then
-				-- Rebuild only the recent tail after a long offscreen interval.
-				-- The settled velocity/position already include elapsed time; this
-				-- is a cosmetic backwards sample, never a second simulation step.
-				local acceleration = Motion.GetAcceleration(visual.velocity, visual.acceleration, visual.accelerationDirection, visual.gravity)
-				local duration = math.min(state.maxLength / math.max(visual.velocity.Magnitude, 1), 1)
-				state.points, state.length = {}, 0
-				for index = 0, MAX_SEGMENTS do
-					local t = duration * (1 - index / MAX_SEGMENTS)
-					local point = visual.position - visual.velocity * t + acceleration * (.5 * t * t)
-					if index == 0 then table.insert(state.points, point) else append(state, point) end
-				end
-			else
-				append(state, visual.position)
-			end
+			state.group.dirty = true
+			state.points, state.length = {visual.position}, 0
 			return
 		end
 		rig.beam.points = { visual.position }
@@ -328,7 +394,16 @@ function BeamVisual.Retire(visual: Types.Visual, delay: number): boolean
 	local rig = visual.rig
 	if not rig or not rig.beam then return false end
 	if rig.beam.retired then return true end
-	rig.beam.retired = true
+	local state = rig.beam
+	if state.group then
+		state.group.dirty = true
+		local points = state.stopPath or state.authoritativePath
+		state.points = if points and #points > 0 then table.clone(points) else { visual.position }
+		state.length = 0
+		for index = 1, #state.points - 1 do state.length += (state.points[index+1]-state.points[index]).Magnitude end
+	end
+	if state.speed <= 1e-4 then state.points = { state.points[#state.points] }; state.length = 0 end
+	state.retired = true
 	-- Drain already-traveled geometry from the tail. Hiding the whole packet
 	-- on impact would leave a frame-sized hole in a sustained beam.
 	table.insert(retired, { visual = visual, lastClock = clock, started = os.clock(), delay = delay })
@@ -345,9 +420,32 @@ function BeamVisual.StepRetired(globalDt: number)
 		local visual = item.visual
 		local rig = visual.rig :: Types.Rig
 		local state = rig.beam
-		local elapsed = (clock - item.lastClock) * visual.timeScale * ChunkManager.GetTimeScaleAt(visual.position)
+		local elapsed = (clock - item.lastClock) * visual.timeScale
 		item.lastClock = clock
-		trim(state, math.max(elapsed, 0) * state.speed)
+		local remaining = math.max(elapsed, 0) + (state.retireDebt or 0)
+		local beforeLength = state.length
+		if elapsed <= 0 then
+			-- Like server Step, frozen time does not spend carried simulation debt.
+		elseif ChunkManager.IsTimeUniform() then
+			trim(state, remaining * state.speed)
+			remaining = 0
+		else
+			local guard = 0
+			while remaining > 1e-6 and #state.points > 1 and state.speed > 1e-4 and guard < 16 do
+				guard += 1
+				local origin, offset = state.points[1], state.points[2]-state.points[1]
+				if offset.Magnitude < 1e-4 then trim(state,.0001); continue end
+				local scale = ChunkManager.GetTimeScaleAt(origin)
+				if scale <= 0 then remaining = 0; break end
+				local dt = Planner.StepDt(origin, offset.Unit*state.speed, Vector3.zero, scale, remaining,
+					math.huge, true, false, offset.Magnitude/state.speed)
+				if dt <= 0 then break end
+				trim(state, dt*state.speed)
+				remaining -= dt/scale
+			end
+		end
+		state.retireDebt = remaining
+		if state.group and state.length ~= beforeLength then state.group.dirty = true end
 		draw(rig)
 		visited += 1
 		if (state.length <= 1e-4 and os.clock() - item.started >= item.delay) or os.clock() - item.started >= 60 then

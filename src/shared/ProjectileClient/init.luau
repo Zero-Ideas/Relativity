@@ -43,11 +43,6 @@ local View = require(script.View)
 local VisualModel = require(script.VisualModel)
 local BeamVisual = require(script.BeamVisual)
 
-local function visualInView(visual: Types.Visual, position: Vector3): boolean
-	local beam = visual.rig and visual.rig.beam
-	return View.contains(position, beam and beam.maxLength)
-end
-
 type Visual = Types.Visual
 
 local Channels = Protocol.Channels
@@ -62,11 +57,9 @@ end
 -- missing MaxRealLifetime, which shouldn't normally happen.
 local DEFAULT_MAX_REAL_LIFETIME = 60
 
--- Real (undilated) seconds of no ProjMove update before a SYNCED visual is
--- assumed to have left VisualRange and gets cleaned up -- see the render
--- loop below. Generous on purpose: ProjMove batches normally arrive every
--- server tick, so anything this stale really has stopped, not just lagged.
-local SYNCED_VISUAL_STALE_TIMEOUT = 2
+-- Range loss is now explicit, not inferred from missing homing updates.
+-- Under heavy load a bounded pose stream can legitimately pause for seconds;
+-- only server death/range exit or the real-lifetime backstop removes it.
 -- Hard cap on visible Transform work in one client frame. Exact off-screen
 -- trajectories defer prediction until needed; complex ones retain simulation. The
 -- persistent round-robin cursor is independent of dilated time, so changing
@@ -89,6 +82,14 @@ local visualTombstones = 0
 local globalSimulationClock = 0
 local smoothVisuals: { Visual } = {}
 local nextSmoothSetRefresh = 0
+
+local function visualInView(visual: Types.Visual, position: Vector3): boolean
+	if visual.rig and visual.rig.beam then
+		local center, radius = BeamVisual.GetBounds(visual, position, globalSimulationClock)
+		return View.contains(center, radius)
+	end
+	return View.contains(position)
+end
 
 --------------------------------------------------------------------------------
 -- Smooth set: the nearest visuals get per-frame interpolation
@@ -347,9 +348,15 @@ local function onMove(batch: { Protocol.MovePayload })
 		if not visual then
 			continue
 		end
-		if data.Bounced then
+		if visual.rig and visual.rig.beam then
+			BeamVisual.AdoptPath(visual, data.BeamPath, data.BeamClipped)
+			BeamVisual.AdoptLinks(visual, data.BeamTurns, data.BeamUnlinked)
+			if data.Lifetime then visual.life = data.Lifetime end
+		end
+		if data.Bounced or data.Corrected then
 			visual.lastUpdate = now
 			rebaseline(visual, data.Position, data.Velocity)
+			BeamVisual.AdoptLinks(visual, data.BeamTurns, data.BeamUnlinked)
 			BeamVisual.Correct(visual, data.Point or data.Position)
 			if visual.rig and visual.rig.beam and visual.rig.beam.group then
 				BeamVisual.Update(visual, data.Position, data.Velocity)
@@ -358,15 +365,14 @@ local function onMove(batch: { Protocol.MovePayload })
 				VisualModel.SuspendTrails(visual)
 				VisualModel.Place(visual, data.Position, data.Velocity)
 				visual.resumeEffectsOnNextUpdate = now
-				if BeamVisual.ShouldPlayImpact(visual, data.Point or data.Position) then
+				if data.Bounced and BeamVisual.ShouldPlayImpact(visual, data.Point or data.Position) then
 					Impact.Play(data.Point or data.Position, data.Normal, "bounce")
 				end
 			end
 		elseif visual.synced then
 			local duration = math.clamp(now - visual.lastUpdate, 0.03, 0.2)
 			visual.lastUpdate = now
-			visual.position = data.Position
-			visual.velocity = data.Velocity
+			rebaseline(visual, data.Position, data.Velocity)
 			if visual.rig and visual.rig.beam and visual.rig.beam.group then
 				-- Retain authoritative curvature while offscreen; no Instances
 				-- are moved here. Re-entry must not invent a homing shortcut.
@@ -382,11 +388,17 @@ end
 local function onHit(data: Protocol.HitPayload)
 	local visual = visuals[data.Id]
 	if visual then
+		BeamVisual.AdoptPath(visual, data.BeamPath, data.BeamClipped)
 		-- Snap to the server's exact position before destroying, so any
 		-- imperceptible mid-flight drift from local simulation never shows at
 		-- the one moment it would be visible.
-		BeamVisual.Correct(visual, data.Position)
-		VisualModel.Place(visual, data.Position, visual.velocity)
+		BeamVisual.AdoptLinks(visual, data.BeamTurns)
+		if data.BeamBody then
+			BeamVisual.StopBody(visual, data.Position, data.BeamTurns)
+		else
+			BeamVisual.Correct(visual, data.Position)
+			VisualModel.Place(visual, data.Position, visual.velocity)
+		end
 		if data.Kind and BeamVisual.ShouldPlayImpact(visual, data.Position) then
 			Impact.Play(data.Position, data.Normal, data.Kind)
 		end
@@ -467,16 +479,6 @@ local function updateSynced(visual: Visual, now: number): boolean?
 		updateOffscreen(visual, now)
 	end
 	visual.inView = inView
-	-- Left-VisualRange safety net. Deliberately wall-clock, NOT a dilated
-	-- countdown: a synced visual can belong to a shooter at ANY personal time
-	-- ratio, including exactly 0, so there's no dilated schedule the client
-	-- could reconstruct. The server streams every synced projectile's pose
-	-- regardless of dt, so lastUpdate keeps refreshing while this client is
-	-- in range; once it stops, a real-time timeout cleans the visual up.
-	if now - visual.lastUpdate > SYNCED_VISUAL_STALE_TIMEOUT then
-		destroyVisual(visual.id)
-		return nil
-	end
 	return inView
 end
 
@@ -604,7 +606,7 @@ local function renderStep(globalDt: number)
 	if visualTombstones >= 256 and visualTombstones * 4 >= #visualOrder then
 		compactVisualOrder()
 	end
-	BeamVisual.FlushGroups()
+	BeamVisual.FlushGroups(globalSimulationClock)
 end
 
 function ProjectileClient.EnableClientRendering()
@@ -632,6 +634,17 @@ function ProjectileClient.EnableClientRendering()
 	VisualOffload.On(Channels.TimeScale, onTimeScale)
 	VisualOffload.On(Channels.Sync, onSync)
 	VisualOffload.On(Channels.Move, onMove)
+	VisualOffload.On(Channels.RangeExit, function(ids: { number })
+		for _, id in ids do
+			local visual = visuals[id]
+			if not visual then continue end
+			if BeamVisual.Discard(visual) then
+				visuals[id], deferredVisuals[id] = nil, nil
+				visualCount -= 1
+				visualTombstones += 1
+			else destroyVisual(id) end
+		end
+	end)
 	VisualOffload.On(Channels.HitBatch, function(batch: { Protocol.HitPayload })
 		for _, data in batch do
 			onHit(data)

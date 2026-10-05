@@ -4,7 +4,11 @@
 local Players = game:GetService("Players")
 
 local ProjectileQuota = {}
-ProjectileQuota.Maximum = 150
+-- Head packets AND independently hitting beamlets share this budget. The
+-- old 150 ceiling could admit a head but reject its required joiners during
+-- ordinary sustain, leaving real gaps. Allow the requested 10k-scale loads;
+-- spawn/render/network per-frame caps remain separate and unchanged.
+ProjectileQuota.Maximum = 15000
 
 local active: { [Player]: number } = {}
 

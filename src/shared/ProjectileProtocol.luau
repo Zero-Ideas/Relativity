@@ -17,6 +17,7 @@ Protocol.Channels = {
 	SpawnBatch = "ProjSpawnBatch", -- { SpawnPayload }
 	Move = "ProjMove", -- { MovePayload }
 	HitBatch = "ProjHitBatch", -- { HitPayload }
+	RangeExit = "ProjRangeExit", -- { number }; not projectile death
 	Sync = "ProjSync", -- SyncPayload
 	TimeScale = "ProjTimeScale", -- TimeScalePayload
 	Ray = "ProjRay", -- RayPayload
@@ -51,7 +52,7 @@ export type SpawnPayload = {
 	TimeScale: number?, -- 1
 	VisualScale: number?, -- 1
 	Beam: { Length: number, Radius: number, Origin: Vector3, ChannelId: number?, PreviousId: number?,
-		PreviousPosition: Vector3?, PreviousTurns: { Vector3 }?, Turns: { Vector3 }? }?, -- linked stream centerline
+		PreviousPosition: Vector3?, PreviousTurns: { Vector3 }?, Turns: { Vector3 }?, Path: { Vector3 }?, Clipped: boolean? }?, -- linked stream centerline
 	DestroyDelay: number?, -- 0
 	WaitForParticles: boolean?, -- true
 	WaitForTrails: boolean?, -- true
@@ -66,6 +67,10 @@ export type MovePayload = {
 	Bounced: boolean?,
 	Corrected: boolean?, -- authoritative beam-body contact, not a ricochet flash
 	BeamTurns: { Vector3 }?,
+	BeamUnlinked: boolean?,
+	BeamPath: { Vector3 }?, -- authoritative linked body, clipped at obstructions
+	BeamClipped: boolean?, -- true only when the body stops before its PreviousId
+	Lifetime: number?,
 	Point: Vector3?, -- bounce contact point
 	Normal: Vector3?, -- bounce surface normal
 }
@@ -76,6 +81,9 @@ export type HitPayload = {
 	Normal: Vector3,
 	Kind: string?, -- nil: expired without hitting anything
 	BeamTurns: { Vector3 }?,
+	BeamBody: boolean?,
+	BeamPath: { Vector3 }?,
+	BeamClipped: boolean?,
 }
 
 export type SyncPayload = {

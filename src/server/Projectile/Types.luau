@@ -205,6 +205,14 @@ export type State = {
 	_beamOrigin: Vector3?,
 	_beamTurns: { Vector3 }?,
 	_beamPrevious: any?,
+	_beamBodyHit: boolean?,
+	_beamSpan: { Vector3 }?,
+	_beamSpanClipped: boolean?,
+	_beamJoiner: boolean?, -- independently simulated/colliding subdivision
+	_beamJoinerWorldStop: boolean?,
+	_beamReserveChildren: ((number) -> boolean)?,
+	_beamBindChild: ((any, number) -> ())?,
+	_beamScaleEnergy: ((number) -> ())?,
 }
 
 -- What a hit resolver decided:

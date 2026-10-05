@@ -3,6 +3,21 @@
 -- tails become one cylinder, not stacked bars/glow. Distinct paths stay
 -- distinct: never invent a connecting chord through untraveled geometry.
 local Geometry = {}
+Geometry.MaxSegmentLength = 12
+
+-- Tessellate after union, so overlaps are removed but no pooled cylinder can
+-- grow into an enormous bar on a flick or a stretched time-field boundary.
+function Geometry.Split(segments: { any }): { any }
+	local result = {}
+	for _, span in segments do
+		local a, b = span[1], span[2]
+		local count = math.max(1, math.ceil((b-a).Magnitude/(Geometry.MaxSegmentLength-.01)))
+		for index = 1, count do
+			table.insert(result, { a:Lerp(b,(index-1)/count), a:Lerp(b,index/count) })
+		end
+	end
+	return result
+end
 
 function Geometry.Merge(paths: { any }, radius: number): ({ any }, { Vector3 })
 	local families: { [string]: any } = {}
@@ -10,6 +25,9 @@ function Geometry.Merge(paths: { any }, radius: number): ({ any }, { Vector3 })
 	local tolerance = math.max(radius * .15, .005)
 	local function quant(value: number, scale: number): number return math.floor(value / scale + .5) end
 	for _, points in paths do
+		-- A point is a control endpoint, not a beam body. Rounded caps are
+		-- generated only for nonzero segments below; singleton snapshots must
+		-- not leave floating glow dots (especially after retirement/freeze).
 		for index = 1, #points - 1 do
 			local a, b = points[index], points[index + 1]
 			local offset = b - a
@@ -69,13 +87,16 @@ function Geometry.Merge(paths: { any }, radius: number): ({ any }, { Vector3 })
 	end
 	table.sort(order, function(a, b) return a.key < b.key end)
 	local segments, joints, seenJoints = {}, {}, {}
+	local function addJoint(point: Vector3)
+		local key = `{quant(point.X,tolerance)}:{quant(point.Y,tolerance)}:{quant(point.Z,tolerance)}`
+		if not seenJoints[key] then seenJoints[key] = true; table.insert(joints, point) end
+	end
 	local function add(bucket, from, to)
 		local a = bucket.origin + bucket.direction * from
 		local b = bucket.origin + bucket.direction * to
 		table.insert(segments, { a, b })
 		for _, point in { a, b } do
-			local key = `{quant(point.X,tolerance)}:{quant(point.Y,tolerance)}:{quant(point.Z,tolerance)}`
-			if not seenJoints[key] then seenJoints[key] = true; table.insert(joints, point) end
+			addJoint(point)
 		end
 	end
 	for _, bucket in order do
@@ -88,7 +109,7 @@ function Geometry.Merge(paths: { any }, radius: number): ({ any }, { Vector3 })
 		end
 		add(bucket, from, to)
 	end
-	return segments, joints
+	return Geometry.Split(segments), joints
 end
 
 return Geometry
