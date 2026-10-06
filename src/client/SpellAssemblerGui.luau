@@ -674,6 +674,15 @@ local function buildGui()
 			SpellAssemblerGui.Toggle()
 			return
 		end
+		if not processed and not visible and equippedTool then
+			if input.KeyCode == Enum.KeyCode.R then
+				SpellAssemblerGui.Freeze()
+				return
+			elseif input.KeyCode == Enum.KeyCode.T then
+				SpellAssemblerGui.FireFrozen()
+				return
+			end
+		end
 		if not visible then return end
 		if input.UserInputType ~= Enum.UserInputType.Keyboard then
 			if not placing and not resizing then board:inputBegan(input) end
@@ -933,6 +942,33 @@ function SpellAssemblerGui.Cast()
 	if character and activeCache.spec then
 		SpellCircleVFX.Cast(character, activeCache.spec, 1, mouse.Hit.Position, true, true)
 	end
+end
+
+-- R while charging: the charge is paid for now and the spell hangs where its
+-- circle is. Freezing one past SpellRunes.Freeze.MaxQueued fires the oldest
+-- first (the server mirrors both).
+function SpellAssemblerGui.Freeze()
+	local character = player.Character
+	local compiled = activeCache.compiled
+	if not charging or not character or not compiled then return end
+	local charge = SpellRunes.ChargeFromHold(os.clock() - chargeStarted)
+	local mana = player:GetAttribute("Mana")
+	if typeof(mana) ~= "number" or mana < compiled.manaCost * SpellRunes.ChargeEnergyMultiplier(charge) then return end
+	stopChargeBar()
+	if SpellCircleVFX.FrozenCount(character) >= SpellRunes.Freeze.MaxQueued then
+		SpellCircleVFX.FireFrozen(character, player:GetMouse().Hit.Position)
+	end
+	local position = SpellCircleVFX.Freeze(character)
+	channelRemote:FireServer("Freeze", position)
+end
+
+-- T: the oldest frozen spell fires toward the cursor.
+function SpellAssemblerGui.FireFrozen()
+	local character = player.Character
+	if not character then return end
+	local target = player:GetMouse().Hit.Position
+	channelRemote:FireServer("FireFrozen", target)
+	SpellCircleVFX.FireFrozen(character, target)
 end
 
 function SpellAssemblerGui.StopCast()

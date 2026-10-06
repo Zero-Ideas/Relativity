@@ -242,7 +242,148 @@ local function circleClose(player: Player, phase: string)
 	end
 end
 
-channel.OnServerEvent:Connect(function(player: Player, action: any)
+-- Frozen spells (R while charging / T to fire): paid for at freeze time and
+-- launched later from where their circle hung, oldest first. One frozen
+-- before full charge keeps charging while it hangs, up to 1x (never into
+-- overcharge); the extra is paid for when it fires, if the mana is there.
+type FrozenSpell = { compiled: any, charge: number, started: number, origin: Vector3 }
+local frozenSpells: { [Player]: { FrozenSpell } } = {}
+local FROZEN_FALLBACK_RANGE = 100 -- auto-fire target when there's no fresh cursor
+
+local function freshAim(player: Player): Vector3?
+	local aim = liveAim[player]
+	return if aim and os.clock() - aim.time <= LIVE_AIM_MAX_AGE then aim.position else nil
+end
+
+local function livingCharacter(player: Player): (Model?, BasePart?)
+	local character = player.Character
+	local humanoid = character and character:FindFirstChildOfClass("Humanoid")
+	local head = character and (character:FindFirstChild("Head") or character.PrimaryPart)
+	if not humanoid or humanoid.Health <= 0 or not head or not head:IsA("BasePart") then
+		return nil, nil
+	end
+	return character, head
+end
+
+local function fireFrozen(player: Player, target: Vector3): boolean
+	local queue = frozenSpells[player]
+	local entry = queue and table.remove(queue, 1)
+	local character = livingCharacter(player)
+	if not entry or not character then
+		return false
+	end
+	local charge = entry.charge
+	if charge < 1 then
+		local grown = math.min(SpellRunes.ChargeFromHold(os.clock() - entry.started), 1)
+		local extra = entry.compiled.manaCost * (SpellRunes.ChargeEnergyMultiplier(grown) - SpellRunes.ChargeEnergyMultiplier(charge))
+		local mana = player:GetAttribute("Mana")
+		if grown > charge and typeof(mana) == "number" and mana >= extra then
+			player:SetAttribute("Mana", mana - extra)
+			charge = grown
+		end
+	end
+	VisualOffload.Fire("SpellCircle", { Phase = "FireFrozen", Caster = character, Target = target })
+	local origin = entry.origin
+	local ok, err = pcall(SpellRuntime.Cast, entry.compiled, {
+		player = player,
+		caster = Entity.Get(character),
+		character = character,
+		origin = origin,
+		cursorPoint = target,
+		cursorEntity = aimedEntity(character, origin, target),
+		charge = charge,
+		live = function()
+			return origin, target -- a frozen spell keeps its spot and its T aim
+		end,
+	})
+	if not ok then
+		warn(`[SpellService] frozen cast failed: {tostring(err)}`)
+	end
+	return true
+end
+
+local function freezeSpell(player: Player, rawPosition: any)
+	local started = chargeStart[player]
+	local character, head = livingCharacter(player)
+	if not started or not character or not head or not equippedAssembler(player) then
+		return
+	end
+	local record = SpellStore.GetActive(player)
+	local compiled = record and compiledFor(record)
+	if not record or not compiled or SpellRunes.HasSustain(compiled) then
+		return
+	end
+	local held = os.clock() - started
+	if held > SpellRunes.Charge.StaleAfter then
+		return
+	end
+	local charge = SpellRunes.ChargeFromHold(held)
+	local manaCost = compiled.manaCost * SpellRunes.ChargeEnergyMultiplier(charge)
+	local mana = player:GetAttribute("Mana")
+	if typeof(mana) ~= "number" or mana < manaCost then
+		return
+	end
+	player:SetAttribute("Mana", mana - manaCost)
+	chargeStart[player] = nil
+	circleOpen[player] = nil
+
+	-- where the circle hangs: the client's claim if it's near the head,
+	-- otherwise where the circle would be (3 studs out along the aim)
+	local eye = head.Position - Vector3.new(0, 0.3, 0)
+	local aim = freshAim(player)
+	local facing = if aim and (aim - eye).Magnitude > 1e-3 then (aim - eye).Unit else character:GetPivot().LookVector
+	local origin = eye + facing * 3
+	if validPoint(rawPosition) and (rawPosition - head.Position).Magnitude <= SpellRunes.Freeze.MaxDistance then
+		origin = rawPosition
+	end
+
+	local queue = frozenSpells[player]
+	if not queue then
+		queue = {}
+		frozenSpells[player] = queue
+	end
+	if #queue >= SpellRunes.Freeze.MaxQueued then
+		fireFrozen(player, aim or origin + facing * FROZEN_FALLBACK_RANGE)
+	end
+	table.insert(queue, { compiled = compiled, charge = charge, started = started, origin = origin })
+	VisualOffload.Fire("SpellCircle", {
+		Phase = "Freeze",
+		Caster = character,
+		Position = origin,
+		Direction = facing,
+		Spec = circleSpecFor(record),
+		Charge = charge,
+	})
+end
+
+local function clearFrozen(player: Player, character: Model?)
+	if frozenSpells[player] == nil then
+		return
+	end
+	frozenSpells[player] = nil
+	if character then
+		VisualOffload.Fire("SpellCircle", { Phase = "ClearFrozen", Caster = character })
+	end
+end
+
+-- Frozen spells die with their caster.
+local function watchCharacters(player: Player)
+	player.CharacterAdded:Connect(function(character)
+		local humanoid = character:WaitForChild("Humanoid", 10)
+		if humanoid and humanoid:IsA("Humanoid") then
+			humanoid.Died:Connect(function()
+				clearFrozen(player, character)
+			end)
+		end
+	end)
+	player.CharacterRemoving:Connect(function(character)
+		clearFrozen(player, character)
+	end)
+end
+for _, player in Players:GetPlayers() do watchCharacters(player) end
+Players.PlayerAdded:Connect(watchCharacters)
+
+channel.OnServerEvent:Connect(function(player: Player, action: any, payload: any)
 	if action == "Stop" then
 		BeamHandler.Stop(player)
 		circleClose(player, "End")
@@ -256,6 +397,12 @@ channel.OnServerEvent:Connect(function(player: Player, action: any)
 		if circleOpen[player] then
 			circleOpen[player] = nil
 			circleClose(player, "Cancel")
+		end
+	elseif action == "Freeze" then
+		freezeSpell(player, payload)
+	elseif action == "FireFrozen" then
+		if typeof(payload) == "Vector3" and not SafeMath.hasNaN(payload) and equippedAssembler(player) then
+			fireFrozen(player, SafeMath.vector(payload, Vector3.zero))
 		end
 	end
 end)
@@ -351,6 +498,7 @@ Players.PlayerRemoving:Connect(function(player)
 	lastCommand[player] = nil
 	circleOpen[player] = nil
 	lastCircleBegin[player] = nil
+	frozenSpells[player] = nil
 end)
 
 print("[Relativity] spell service online")

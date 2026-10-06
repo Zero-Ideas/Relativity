@@ -13,8 +13,12 @@
 	The caster's own client calls these directly (SpellAssemblerGui) with a
 	locally built spec; everyone else gets the server's "SpellCircle"
 	VisualOffload messages:
-	 { Phase = "Begin" | "Cast" | "Cancel" | "End", Caster = Model,
-	   Spec = Spec?, Target = Vector3?, Charge = number?, Sustain = boolean? }
+	 { Phase = "Begin" | "Cast" | "Cancel" | "End" | "Freeze" | "FireFrozen"
+	   | "ClearFrozen", Caster = Model, Spec = Spec?, Target = Vector3?,
+	   Charge = number?, Sustain = boolean?, Position = Vector3?, Direction = Vector3? }
+	Freeze (R while charging) pins the charging circle in world space;
+	FireFrozen (T) turns the caster's oldest frozen circle to the target and
+	releases it.
 
 	Each circle is one transparent Part carrying a fixed-size SurfaceGui;
 	everything inside is laid out in 0..1 canvas coordinates so satellites
@@ -101,7 +105,7 @@ type CastState = {
 	Circles: { Circle },
 	Items: { Item },
 	Layers: { Layer },
-	State: string, -- "charge" | "sustain" | "release" | "cancel"
+	State: string, -- "charge" | "frozen" | "sustain" | "release" | "cancel"
 	Began: number, -- os.clock at Begin (charge is held in real time)
 	Charge: number, -- current draw progress 0..Charge.Max
 	Age: number, -- dilated seconds
@@ -110,6 +114,12 @@ type CastState = {
 	SustainLeft: number,
 	Target: Vector3?,
 	IsLocal: boolean,
+	-- set while frozen (and for its release): the circle hangs in world space
+	-- at FrozenOrigin + FrozenDirection * HAND_DISTANCE instead of following
+	-- the caster
+	FrozenOrigin: Vector3?,
+	FrozenDirection: Vector3?,
+	ChargeCap: number?, -- frozen before full charge: keeps drawing up to 1x, never overcharges
 	LastP: number,
 	LastO: number,
 	LastV: number,
@@ -117,6 +127,9 @@ type CastState = {
 
 local casts: { CastState } = {}
 local current: { [Model]: CastState } = {}
+-- Frozen (R) spells per caster, oldest first; FireFrozen (T) releases the head.
+local frozen: { [Model]: { CastState } } = {}
+local MAX_FROZEN_SAFETY = 6 -- the gameplay cap (3) lives in SpellRunes.Freeze; this only bounds a desync
 local folder: Folder? = nil
 local connection: RBXScriptConnection? = nil
 
@@ -612,7 +625,7 @@ local function step(dt: number)
 			table.remove(casts, index)
 			continue
 		end
-		local origin = head.Position - Vector3.new(0, 0.3, 0)
+		local origin = cast.FrozenOrigin or head.Position - Vector3.new(0, 0.3, 0)
 		local dilation = Heartbeat.GetGlobalTimeScale() * ChunkManager.GetTimeScaleAt(origin)
 		local ddt = dt * dilation
 		cast.Age += ddt
@@ -630,6 +643,17 @@ local function step(dt: number)
 			progress = math.min(cast.Charge, 1)
 			over = math.clamp((cast.Charge - 1) / (SpellRunes.Charge.Max - 1), 0, 1)
 			spinBoost = 1 + over * 2
+		elseif cast.State == "frozen" then
+			-- held in place, idling and pulsing; one frozen mid-draw finishes
+			-- drawing (its charge keeps growing to 1x, like the server's)
+			local cap = cast.ChargeCap or cast.Charge
+			if cast.Charge < cap then
+				cast.Charge = math.min(cap, math.max(cast.Charge, (os.clock() - cast.Began) / SpellRunes.Charge.FullTime))
+			end
+			progress = math.min(cast.Charge, 1)
+			over = math.clamp((cast.Charge - 1) / (SpellRunes.Charge.Max - 1), 0, 1)
+			spinBoost = 0.6 + over
+			flash = 0.4 + math.sin(cast.Age * 4) * 0.4
 		elseif cast.State == "sustain" then
 			over = math.clamp((cast.Charge - 1) / (SpellRunes.Charge.Max - 1), 0, 1)
 			spinBoost = 2.5
@@ -666,9 +690,12 @@ local function step(dt: number)
 		end
 		applyItems(cast, progress, over, visible)
 
-		local aim = aimPoint(cast, origin)
-		local direction = aim - origin
-		direction = if direction.Magnitude > 1e-3 then direction.Unit else caster:GetPivot().LookVector
+		local direction = cast.FrozenDirection
+		if not direction then
+			local aim = aimPoint(cast, origin) - origin
+			direction = if aim.Magnitude > 1e-3 then aim.Unit else caster:GetPivot().LookVector
+		end
+		assert(direction)
 		local brightness = 2.5 + over * 1.5 + math.sin(cast.Age * 10) * over * 0.8 + flash
 		local basis = CFrame.lookAt(origin, origin + direction)
 		for _, circle in cast.Circles do
@@ -769,12 +796,87 @@ function SpellCircleVFX.End(caster: Model)
 	end
 end
 
+-- Freezes the caster's charging circle where it is (R). `position` is the
+-- main circle's centre and `direction` its facing; omitted, the circle's
+-- current placement is used (the caster's own client). A client that missed
+-- Begin builds it from `spec` at `charge`. Returns where the main circle
+-- now hangs.
+function SpellCircleVFX.Freeze(caster: Model, position: Vector3?, direction: Vector3?, spec: any?, charge: number?): Vector3?
+	local cast = current[caster]
+	if not cast then
+		cast = createCast(caster, spec, nil, false)
+		if not cast then
+			return nil
+		end
+		ensureRunning()
+	end
+	current[caster] = nil
+	if charge then
+		cast.Charge = charge
+		cast.Began = os.clock() - charge * SpellRunes.Charge.FullTime -- so it keeps growing from there
+	end
+	cast.ChargeCap = if cast.Charge < 1 then 1 else cast.Charge
+	local main = cast.Circles[1].Part
+	local facing = direction or main.CFrame.LookVector
+	local centre = position or main.Position
+	cast.FrozenDirection = facing
+	cast.FrozenOrigin = centre - facing * HAND_DISTANCE
+	cast.State, cast.StateAge = "frozen", 0
+	local queue = frozen[caster]
+	if not queue then
+		queue = {}
+		frozen[caster] = queue
+	end
+	table.insert(queue, cast)
+	while #queue > MAX_FROZEN_SAFETY do
+		local oldest = table.remove(queue, 1) :: CastState
+		oldest.State, oldest.StateAge = "cancel", 0
+	end
+	return centre
+end
+
+-- Fires the caster's oldest frozen circle (T): it turns from where it hangs
+-- to face `target`, then releases.
+function SpellCircleVFX.FireFrozen(caster: Model, target: Vector3)
+	local queue = frozen[caster]
+	local cast = queue and table.remove(queue, 1)
+	if not cast then
+		return
+	end
+	local origin, facing = cast.FrozenOrigin, cast.FrozenDirection
+	if origin and facing then
+		local centre = origin + facing * HAND_DISTANCE
+		local aim = target - centre
+		local direction = if aim.Magnitude > 1e-3 then aim.Unit else facing
+		cast.FrozenDirection = direction
+		cast.FrozenOrigin = centre - direction * HAND_DISTANCE
+	end
+	cast.State, cast.StateAge = "release", 0
+end
+
+-- Drops every frozen circle of the caster (death, respawn, leaving).
+function SpellCircleVFX.ClearFrozen(caster: Model)
+	for _, cast in frozen[caster] or {} do
+		cast.State, cast.StateAge = "cancel", 0
+	end
+	frozen[caster] = nil
+end
+
+function SpellCircleVFX.FrozenCount(caster: Model): number
+	local queue = frozen[caster]
+	return if queue then #queue else 0
+end
+
 VisualOffload.On("SpellCircle", function(data)
 	if typeof(data) ~= "table" then
 		return
 	end
 	local caster = data.Caster
 	if typeof(caster) ~= "Instance" or not caster:IsA("Model") then
+		return
+	end
+	if data.Phase == "ClearFrozen" then
+		SpellCircleVFX.ClearFrozen(caster) -- also for our own character: the server decides when
 		return
 	end
 	-- the caster's own client already drew it locally
@@ -790,6 +892,12 @@ VisualOffload.On("SpellCircle", function(data)
 		SpellCircleVFX.Cancel(caster)
 	elseif data.Phase == "End" then
 		SpellCircleVFX.End(caster)
+	elseif data.Phase == "Freeze" then
+		local position = if typeof(data.Position) == "Vector3" then data.Position else nil
+		local direction = if typeof(data.Direction) == "Vector3" and data.Direction.Magnitude > 1e-3 then data.Direction.Unit else nil
+		SpellCircleVFX.Freeze(caster, position, direction, data.Spec, if typeof(data.Charge) == "number" then data.Charge else nil)
+	elseif data.Phase == "FireFrozen" and target then
+		SpellCircleVFX.FireFrozen(caster, target)
 	end
 end)
 

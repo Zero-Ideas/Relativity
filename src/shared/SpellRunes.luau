@@ -482,6 +482,15 @@ SpellRunes.Charge = {
 	StaleAfter = 30, -- a ChargeBegin older than this is ignored (counts as a click)
 }
 
+-- Freezing (R while charging): the charged spell is paid for and hangs where
+-- its circle was; T launches the oldest toward the cursor. Freezing one more
+-- than MaxQueued fires the oldest first. MaxDistance bounds how far from the
+-- caster's head a client may claim its frozen circle sits.
+SpellRunes.Freeze = {
+	MaxQueued = 3,
+	MaxDistance = 8,
+}
+
 function SpellRunes.ChargeFromHold(seconds: number): number
 	local charge = SpellRunes.Charge
 	return math.clamp(seconds / charge.FullTime, charge.Min, charge.Max)
