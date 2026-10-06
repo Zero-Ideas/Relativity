@@ -27,6 +27,8 @@
 	 entity:DealDamage(target, amount, info?) -> finalAmount
 	 entity:Heal(amount)
 	 entity:IsActive() -> boolean            (false when chunk-frozen or destroyed)
+	 Entity.RespawnDelay / Entity.SetRespawnHandler(fn)  -- forced respawn after
+	                                         death; see "Forced respawn" below
 	 entity:GetChunk() -> Chunk?
 	 entity:Destroy()
 
@@ -82,6 +84,7 @@
 ]]
 
 local RunService = game:GetService("RunService")
+local Players = game:GetService("Players")
 
 local Heartbeat = require(script.Parent.Heartbeat)
 local ChunkManager = require(script.Parent.ChunkManager)
@@ -120,6 +123,24 @@ Entity.HurtboxValidWindow = 0.3
 -- per-entity without touching these globals.
 Entity.HeadRadius = 1.5 -- studs; independent of HitboxRadius, no nesting requirement
 Entity.HeadshotMultiplier = 2 -- damage multiplier applied by Shooter.server.luau on a Head hit
+
+-- Forced respawn (server only): every entity that dies is respawned this many
+-- REAL seconds later -- real, not dilated, so a frozen chunk can't keep anyone
+-- dead -- by the first of:
+--   1. the handler from Entity.SetRespawnHandler(fn(entity) -> boolean?),
+--      if it returns true;
+--   2. player characters: player:LoadCharacter(), unless the player has
+--      already respawned (their Character is no longer the dead one);
+--   3. an entity with a Respawn function prop: entity:Respawn();
+--   4. data-only entities (no Humanoid): revived in place at MaxHealth.
+-- Humanoid NPCs need 1 or 3 (a dead Humanoid can't be revived in place).
+-- Set Entity.RespawnDelay = nil to turn forced respawn off.
+Entity.RespawnDelay = 5 :: number?
+local respawnHandler: ((any) -> boolean?)? = nil
+
+function Entity.SetRespawnHandler(fn: ((any) -> boolean?)?)
+	respawnHandler = fn
+end
 
 local entities = {} -- flat array for fast iteration
 local entityIndex = {} -- [entity] = array index (O(1) swap-remove)
@@ -228,6 +249,13 @@ function Entity.new(instance: Instance?, props: { [string]: any }?)
 					self._instanceConnections,
 					humanoid.HealthChanged:Connect(function(health)
 						self.Health = health
+						-- Some deaths (e.g. Health set to 0 server-side on a
+						-- client-owned character) never fire Died here; a
+						-- health of 0 is a death either way. _handleDeath is
+						-- idempotent.
+						if health <= 0 then
+							self:_handleDeath(nil)
+						end
 					end)
 				)
 				table.insert(
@@ -583,13 +611,49 @@ function Entity:Heal(amount: number)
 	end
 end
 
+local function respawn(entity)
+	local instance = entity.Instance
+	print(`[Entity][respawn-debug] timer fired for {instance and instance:GetFullName() or "data entity"} #{entity.Id}`) -- TEMP
+	if respawnHandler and respawnHandler(entity) == true then
+		return
+	end
+	-- Resolves only while this is still the player's current character, so a
+	-- player who already respawned (Roblox's own timer, a reset) is skipped.
+	local player = instance and Players:GetPlayerFromCharacter(instance)
+	print(`[Entity][respawn-debug] player={player} currentCharacterIsDead={player and player.Character == instance}`) -- TEMP
+	if player then
+		if player.Parent then
+			player:LoadCharacter()
+			print(`[Entity][respawn-debug] LoadCharacter called for {player.Name}`) -- TEMP
+		end
+		return
+	end
+	local custom = entity.Respawn
+	if typeof(custom) == "function" then
+		custom(entity)
+		return
+	end
+	-- A dead Humanoid can't be revived in place: an old (already replaced)
+	-- player character or an NPC without a Respawn prop is left alone.
+	if not entity.Humanoid and not entity.IsDestroyed then
+		entity.Health = entity.MaxHealth
+		entity._dead = false
+	end
+end
+
 function Entity:_handleDeath(info: any?)
 	if self._dead then
 		return
 	end
 	self._dead = true
 	self.Died:Fire(info)
-	
+	print(`[Entity][respawn-debug] death detected: {self.Instance and self.Instance:GetFullName() or "data entity"} #{self.Id} server={RunService:IsServer()} delay={Entity.RespawnDelay}`) -- TEMP
+
+	local delay = Entity.RespawnDelay
+	if delay and RunService:IsServer() then
+		task.delay(delay, respawn, self)
+	end
+
 	if self.DestroyOnDeath then
 		self:Destroy()
 	end

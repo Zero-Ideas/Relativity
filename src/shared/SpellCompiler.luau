@@ -215,11 +215,49 @@ local function zoneContains(zone: any, x: number, y: number): boolean
 	return x >= zone.x and y >= zone.y and x <= zone.x + zone.w and y <= zone.y + zone.h
 end
 
+-- A name describing what a spell does, for cards saved without one: its
+-- element(s), vessels left to right, and "Sustained" if any vessel channels,
+-- e.g. "Fire Orb + Explosion", "Sustained Shock Beam".
+function SpellCompiler.SuggestName(graph: any): string
+	local runes = if typeof(graph) == "table" and typeof(graph.runes) == "table" then table.clone(graph.runes) else {}
+	table.sort(runes, function(a, b)
+		return (tonumber(a.x) or 0) < (tonumber(b.x) or 0)
+	end)
+	local elements, vessels, seen = {}, {}, {}
+	local sustained = false
+	for _, rune in runes do
+		local id = rune.rune
+		if typeof(id) ~= "string" or seen[id] then
+			continue
+		end
+		if SpellRunes.Elements[id] then
+			seen[id] = true
+			table.insert(elements, id)
+		elseif SpellRunes.Vessels[id] then
+			seen[id] = true
+			table.insert(vessels, id)
+		elseif id == "Sustain" then
+			sustained = true
+		end
+	end
+	if #vessels == 0 then
+		return "Untitled Spell"
+	end
+	local name = table.concat(vessels, " + ")
+	if #elements > 0 then
+		name = table.concat(elements, "/") .. " " .. name
+	end
+	if sustained then
+		name = "Sustained " .. name
+	end
+	return string.sub(name, 1, 24)
+end
+
 -- A starter circle: Mana -> Fire -> Orb with a Speed modifier.
 function SpellCompiler.CreateDefaultGraph()
 	return {
 		version = SpellCompiler.GraphVersion,
-		name = "Fireball",
+		name = "", -- unnamed: saving without a name uses SuggestName
 		zones = {
 			{ id = "zone_input", kind = "Input", x = 0, y = 0, w = 260, h = 200 },
 			{ id = "zone_transform", kind = "Transform", x = 320, y = 0, w = 260, h = 200 },

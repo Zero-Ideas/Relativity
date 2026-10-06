@@ -27,6 +27,7 @@ local Shared = ReplicatedStorage:WaitForChild("Shared")
 local VisualOffload = require(Shared.VisualOffload)
 local Impact = require(Shared.ProjectileClient.Impact)
 local ExplosionVFX = require(script.Parent.ExplosionVFX)
+local _SpellCircleVFX = require(script.Parent.SpellCircleVFX) -- self-registers "SpellCircle"
 
 local SpellEffects = {}
 

@@ -49,6 +49,15 @@ local function getParts(character: Model): { BasePart }
 	return parts
 end
 
+-- Server simulates every unanchored part of the character.
+local function takeOwnership(character: Model)
+	for _, part in getParts(character) do
+		if part:CanSetNetworkOwnership() then
+			part:SetNetworkOwner(nil)
+		end
+	end
+end
+
 local function getGravityForce(part: BasePart): VectorForce
 	local existing = part:FindFirstChild("RagdollTimeGravity")
 	if existing and existing:IsA("VectorForce") then
@@ -350,10 +359,11 @@ function RagdollModule.SetRagdoll(character: Model, value: boolean, applyPushOnR
 			humanoid:SetStateEnabled(Enum.HumanoidStateType.GettingUp, false)
 			
 		elseif RunService:IsServer() then
-			local root = getRoot(character)
-			if root and root:CanSetNetworkOwnership() then
-				root:SetNetworkOwner(nil)
-			end
+			-- Every limb, not just the root: ragdolling splits the rig into one
+			-- assembly per part, and any limb a client still owns ignores the
+			-- server's physics (pushes, launches). Unragdolling re-joins the
+			-- rig, so handing the root back to the player restores all of it.
+			takeOwnership(character)
 			
 			humanoid:ChangeState(Enum.HumanoidStateType.Ragdoll)
 			humanoid:SetStateEnabled(Enum.HumanoidStateType.GettingUp, false)
@@ -383,6 +393,37 @@ function RagdollModule.SetRagdoll(character: Model, value: boolean, applyPushOnR
 				root:SetNetworkOwner(player)
 			end
 		end
+	end
+end
+
+-- Launches a (ragdolled) character: server takes every limb, then each gets
+-- `linearVelocity` in world-time units (scaled by local time like
+-- SetRootVelocity), so the whole body flies together. `angularVelocity`
+-- (rad/s) spins the body as one rigid piece about its centre of mass: every
+-- limb gets the same spin plus the tangential velocity w x r for its offset,
+-- so the joints don't fight it.
+function RagdollModule.Launch(character: Model, linearVelocity: Vector3, angularVelocity: Vector3?)
+	takeOwnership(character)
+	local state = trackedRagdolls[character]
+	local scale = if state then state.Scale else getScale(character)
+	local parts = getParts(character)
+	local spin = angularVelocity or Vector3.zero
+	local center = Vector3.zero
+	if spin ~= Vector3.zero then
+		local totalMass = 0
+		for _, part in parts do
+			center += part.Position * part.Mass
+			totalMass += part.Mass
+		end
+		center = if totalMass > 0 then center / totalMass else Vector3.zero
+	end
+	for _, part in parts do
+		local linear = linearVelocity
+		if spin ~= Vector3.zero then
+			linear += spin:Cross(part.AssemblyCenterOfMass - center)
+			part.AssemblyAngularVelocity = spin * scale
+		end
+		part.AssemblyLinearVelocity = linear * scale
 	end
 end
 

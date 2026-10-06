@@ -51,6 +51,7 @@ export type ParamDef = {
 export type RuneDef = {
 	Id: string,
 	Name: string,
+	Glyph: string?, -- the rune's symbol, shown beside its name in the editor
 	Category: string,
 	Zones: { string },
 	Description: string,
@@ -74,7 +75,7 @@ SpellRunes.Zones = {
 	Input = { Color = Color3.fromRGB(80, 170, 255), Description = "Where mana enters the circle." },
 	Targeting = { Color = Color3.fromRGB(90, 220, 150), Description = "Decides where the spell aims. Leave it out to aim at the mouse." },
 	Conditional = { Color = Color3.fromRGB(255, 205, 80), Description = "Sensors and logic that compute conditions." },
-	Branch = { Color = Color3.fromRGB(255, 150, 70), Description = "Routes or splits the flow of mana." },
+	Branch = { Color = Color3.fromRGB(255, 150, 70), Glyph = "Δ", Description = "Routes or splits the flow of mana." },
 	Transform = { Color = Color3.fromRGB(255, 95, 80), Description = "Converts raw mana into an element." },
 	Modifier = { Color = Color3.fromRGB(170, 130, 255), Description = "Shapes how a vessel flies, how many there are, and what it passes through." },
 	Output = { Color = Color3.fromRGB(255, 90, 140), Description = "Where energy leaves the circle: Vessels (Orb, Bullet, Beam) give the magic its form." },
@@ -127,9 +128,9 @@ end
 local function vesselIn(): PortDef
 	return { Name = "vessel", Type = "vessel", Label = "Vessel" }
 end
-local function vesselDef(id: string, name: string, description: string, instant: boolean?): RuneDef
+local function vesselDef(id: string, name: string, glyph: string, description: string, instant: boolean?): RuneDef
 	return {
-		Id = id, Name = name, Category = "Vessel", Zones = { "Output" }, Vessel = true, Instant = instant,
+		Id = id, Name = name, Glyph = glyph, Category = "Vessel", Zones = { "Output" }, Vessel = true, Instant = instant,
 		Description = description,
 		Inputs = {
 			flowIn(),
@@ -148,7 +149,7 @@ end
 local defs: { RuneDef } = {
 	-- Input ---------------------------------------------------------------------
 	{
-		Id = "Mana", Name = "Mana Well", Category = "Input", Zones = { "Input" },
+		Id = "Mana", Name = "Mana Well", Glyph = "⊙", Category = "Input", Zones = { "Input" },
 		Description = "Draws Amount mana each cast and pushes it into the circle as energy.",
 		Inputs = {}, Outputs = { flowOut() },
 		Params = { { Name = "Amount", Label = "Mana", Type = "number", Default = 30, Min = 1, Max = 1000, Step = 1, Suffix = " mana" } },
@@ -156,7 +157,7 @@ local defs: { RuneDef } = {
 
 	-- Targeting -----------------------------------------------------------------
 	{
-		Id = "Target", Name = "Aim", Category = "Targeting", Zones = { "Targeting" },
+		Id = "Target", Name = "Aim", Glyph = "⊣", Category = "Targeting", Zones = { "Targeting" },
 		Description = "Where a vessel points: wire Aim into a vessel's Aim port. With nothing in Aim at it aims at your mouse; feed it a point or entity (e.g. Nearest Entity) to aim there instead, falling back to the mouse when that's empty.",
 		Inputs = { { Name = "point", Type = "point", Label = "Aim at", Optional = true } },
 		Outputs = { { Name = "point", Type = "point", Label = "Aim" } },
@@ -165,29 +166,29 @@ local defs: { RuneDef } = {
 
 	-- Sensors -------------------------------------------------------------------
 	{
-		Id = "Caster", Name = "Caster", Category = "Sensor", Zones = VALUE_ZONES,
+		Id = "Caster", Name = "Caster", Glyph = "α", Category = "Sensor", Zones = VALUE_ZONES,
 		Description = "You.",
 		Inputs = {}, Outputs = { { Name = "entity", Type = "entity", Label = "Caster" } }, Params = {},
 	},
 	{
-		Id = "Cursor", Name = "Cursor", Category = "Sensor", Zones = VALUE_ZONES,
+		Id = "Cursor", Name = "Cursor", Glyph = "χ", Category = "Sensor", Zones = VALUE_ZONES,
 		Description = "Where you aimed when casting, and the entity under the crosshair (if any).",
 		Inputs = {},
 		Outputs = { { Name = "point", Type = "point", Label = "Point" }, { Name = "entity", Type = "entity", Label = "Entity" } },
 		Params = {},
 	},
 	{
-		Id = "Here", Name = "Here", Category = "Sensor", Zones = VALUE_ZONES,
+		Id = "Here", Name = "Here", Glyph = "ξ", Category = "Sensor", Zones = VALUE_ZONES,
 		Description = "Where this part of the circle is running: your hand at cast time, or the bolt's position when a trigger fires.",
 		Inputs = {}, Outputs = { { Name = "point", Type = "point", Label = "Point" } }, Params = {},
 	},
 	{
-		Id = "Struck", Name = "Struck Entity", Category = "Sensor", Zones = VALUE_ZONES,
+		Id = "Struck", Name = "Struck Entity", Glyph = "∩", Category = "Sensor", Zones = VALUE_ZONES,
 		Description = "The entity that set off the current trigger (the one hit, or the one that came close). Empty at cast time.",
 		Inputs = {}, Outputs = { { Name = "entity", Type = "entity", Label = "Entity" } }, Params = {},
 	},
 	{
-		Id = "Nearest", Name = "Nearest Entity", Category = "Sensor", Zones = VALUE_ZONES,
+		Id = "Nearest", Name = "Nearest Entity", Glyph = "Π", Category = "Sensor", Zones = VALUE_ZONES,
 		Description = "Closest living entity (never you) within Radius of From. From defaults to Here.",
 		Inputs = { { Name = "from", Type = "point", Label = "From", Optional = true } },
 		Outputs = { { Name = "entity", Type = "entity", Label = "Entity" } },
@@ -197,26 +198,26 @@ local defs: { RuneDef } = {
 		},
 	},
 	{
-		Id = "Distance", Name = "Distance", Category = "Sensor", Zones = VALUE_ZONES,
+		Id = "Distance", Name = "Distance", Glyph = "ρ", Category = "Sensor", Zones = VALUE_ZONES,
 		Description = "Studs between two points. Huge if either is empty.",
 		Inputs = { { Name = "a", Type = "point", Label = "A" }, { Name = "b", Type = "point", Label = "B" } },
 		Outputs = { { Name = "value", Type = "number", Label = "Studs" } }, Params = {},
 	},
 	{
-		Id = "Health", Name = "Health", Category = "Sensor", Zones = VALUE_ZONES,
+		Id = "Health", Name = "Health", Glyph = "ζ", Category = "Sensor", Zones = VALUE_ZONES,
 		Description = "An entity's health (0 if empty).",
 		Inputs = { { Name = "entity", Type = "entity", Label = "Entity" } },
 		Outputs = { { Name = "value", Type = "number", Label = "Health" } },
 		Params = { { Name = "Mode", Label = "As", Type = "enum", Default = "Points", Options = { "Points", "Percent" } } },
 	},
 	{
-		Id = "Exists", Name = "Exists", Category = "Sensor", Zones = VALUE_ZONES,
+		Id = "Exists", Name = "Exists", Glyph = "∃", Category = "Sensor", Zones = VALUE_ZONES,
 		Description = "True when the entity is present and alive.",
 		Inputs = { { Name = "entity", Type = "entity", Label = "Entity" } },
 		Outputs = { { Name = "value", Type = "bool", Label = "Yes" } }, Params = {},
 	},
 	{
-		Id = "IsPlayer", Name = "Is Player", Category = "Sensor", Zones = VALUE_ZONES,
+		Id = "IsPlayer", Name = "Is Player", Glyph = "∈", Category = "Sensor", Zones = VALUE_ZONES,
 		Description = "True when the entity is a player character.",
 		Inputs = { { Name = "entity", Type = "entity", Label = "Entity" } },
 		Outputs = { { Name = "value", Type = "bool", Label = "Yes" } }, Params = {},
@@ -224,45 +225,45 @@ local defs: { RuneDef } = {
 
 	-- Logic ---------------------------------------------------------------------
 	{
-		Id = "Number", Name = "Number", Category = "Logic", Zones = VALUE_ZONES,
+		Id = "Number", Name = "Number", Glyph = "κ", Category = "Logic", Zones = VALUE_ZONES,
 		Description = "A constant.",
 		Inputs = {}, Outputs = { { Name = "value", Type = "number", Label = "Value" } },
 		Params = { { Name = "Value", Label = "Value", Type = "number", Default = 30, Min = -10000, Max = 10000, Step = 1 } },
 	},
 	{
-		Id = "Math", Name = "Math", Category = "Logic", Zones = VALUE_ZONES,
+		Id = "Math", Name = "Math", Glyph = "*", Category = "Logic", Zones = VALUE_ZONES,
 		Description = "A op B. Division by zero gives 0.",
 		Inputs = { { Name = "a", Type = "number", Label = "A" }, { Name = "b", Type = "number", Label = "B" } },
 		Outputs = { { Name = "value", Type = "number", Label = "Result" } },
 		Params = { { Name = "Op", Label = "Op", Type = "enum", Default = "+", Options = { "+", "-", "×", "÷", "min", "max" } } },
 	},
 	{
-		Id = "Compare", Name = "Compare", Category = "Logic", Zones = VALUE_ZONES,
+		Id = "Compare", Name = "Compare", Glyph = "≶", Category = "Logic", Zones = VALUE_ZONES,
 		Description = "True when A op B.",
 		Inputs = { { Name = "a", Type = "number", Label = "A" }, { Name = "b", Type = "number", Label = "B" } },
 		Outputs = { { Name = "value", Type = "bool", Label = "Result" } },
 		Params = { { Name = "Op", Label = "Op", Type = "enum", Default = "<", Options = { "<", "≤", "=", "≠", "≥", ">" } } },
 	},
 	{
-		Id = "And", Name = "And", Category = "Logic", Zones = VALUE_ZONES,
+		Id = "And", Name = "And", Glyph = "∧", Category = "Logic", Zones = VALUE_ZONES,
 		Description = "True when both are true.",
 		Inputs = { { Name = "a", Type = "bool", Label = "A" }, { Name = "b", Type = "bool", Label = "B" } },
 		Outputs = { { Name = "value", Type = "bool", Label = "Result" } }, Params = {},
 	},
 	{
-		Id = "Or", Name = "Or", Category = "Logic", Zones = VALUE_ZONES,
+		Id = "Or", Name = "Or", Glyph = "∨", Category = "Logic", Zones = VALUE_ZONES,
 		Description = "True when either is true.",
 		Inputs = { { Name = "a", Type = "bool", Label = "A" }, { Name = "b", Type = "bool", Label = "B" } },
 		Outputs = { { Name = "value", Type = "bool", Label = "Result" } }, Params = {},
 	},
 	{
-		Id = "Not", Name = "Not", Category = "Logic", Zones = VALUE_ZONES,
+		Id = "Not", Name = "Not", Glyph = "¬", Category = "Logic", Zones = VALUE_ZONES,
 		Description = "Flips true and false.",
 		Inputs = { { Name = "a", Type = "bool", Label = "In" } },
 		Outputs = { { Name = "value", Type = "bool", Label = "Result" } }, Params = {},
 	},
 	{
-		Id = "Select", Name = "Choose Point", Category = "Logic", Zones = VALUE_ZONES,
+		Id = "Select", Name = "Choose Point", Glyph = "⌖", Category = "Logic", Zones = VALUE_ZONES,
 		Description = "Then if the condition holds, otherwise Else. Handy for targeting fallbacks.",
 		Inputs = {
 			{ Name = "cond", Type = "bool", Label = "If" },
@@ -274,13 +275,13 @@ local defs: { RuneDef } = {
 
 	-- Branch --------------------------------------------------------------------
 	{
-		Id = "If", Name = "If", Category = "Branch", Zones = { "Branch" },
+		Id = "If", Name = "If", Glyph = "⇒", Category = "Branch", Zones = { "Branch" },
 		Description = "Sends all energy down True or False depending on the condition. An unwired side fizzles.",
 		Inputs = { flowIn(), { Name = "cond", Type = "bool", Label = "Condition" } },
 		Outputs = { flowOut("yes", "True"), flowOut("no", "False") }, Params = {},
 	},
 	{
-		Id = "Divide", Name = "Divide", Category = "Branch", Zones = { "Branch" },
+		Id = "Divide", Name = "Divide", Glyph = "÷", Category = "Branch", Zones = { "Branch" },
 		Description = "Splits energy between two paths; both run.",
 		Inputs = { flowIn() },
 		Outputs = { flowOut("a", "A"), flowOut("b", "B") },
@@ -289,49 +290,49 @@ local defs: { RuneDef } = {
 
 	-- Transform -----------------------------------------------------------------
 	{
-		Id = "Fire", Name = "Fire", Category = "Transform", Zones = { "Transform" }, Element = "Fire",
+		Id = "Fire", Name = "Fire", Glyph = "☲", Category = "Transform", Zones = { "Transform" }, Element = "Fire",
 		Description = "80% of energy on impact, plus a burn worth 35% over 3s.",
 		Inputs = { flowIn() }, Outputs = { flowOut() }, Params = {},
 	},
 	{
-		Id = "Arcane", Name = "Arcane", Category = "Transform", Zones = { "Transform" }, Element = "Arcane",
+		Id = "Arcane", Name = "Arcane", Glyph = "★", Category = "Transform", Zones = { "Transform" }, Element = "Arcane",
 		Description = "All energy lands as impact damage.",
 		Inputs = { flowIn() }, Outputs = { flowOut() }, Params = {},
 	},
 	{
-		Id = "Shock", Name = "Shock", Category = "Transform", Zones = { "Transform" }, Element = "Shock",
+		Id = "Shock", Name = "Shock", Glyph = "☇", Category = "Transform", Zones = { "Transform" }, Element = "Shock",
 		Description = "70% of energy on impact, and stuns 0.01s per energy (max 1s).",
 		Inputs = { flowIn() }, Outputs = { flowOut() }, Params = {},
 	},
 
 	-- Modifiers -----------------------------------------------------------------
 	{
-		Id = "Speed", Name = "Speed", Category = "Modifier", Zones = { "Modifier" }, ModifierCost = 0.03,
+		Id = "Speed", Name = "Speed", Glyph = "v", Category = "Modifier", Zones = { "Modifier" }, ModifierCost = 0.03,
 		Description = "Faster flight (×1.3 to ×3.2), including Beam segments.",
 		Inputs = {}, Outputs = { modOut() }, Params = { LEVEL },
 	},
 	{
-		Id = "Size", Name = "Size", Category = "Modifier", Zones = { "Modifier" }, ModifierCost = 0.04,
+		Id = "Size", Name = "Size", Glyph = "λ", Category = "Modifier", Zones = { "Modifier" }, ModifierCost = 0.04,
 		Description = "Bigger hitbox and visual (×1.4 to ×3.6); a wider Beam.",
 		Inputs = {}, Outputs = { modOut() }, Params = { LEVEL },
 	},
 	{
-		Id = "Gravity", Name = "Gravity", Category = "Modifier", Zones = { "Modifier" }, ModifierCost = 0.01,
+		Id = "Gravity", Name = "Gravity", Glyph = "g", Category = "Modifier", Zones = { "Modifier" }, ModifierCost = 0.01,
 		Description = "Arcing flight, including Beam segments.",
 		Inputs = {}, Outputs = { modOut() }, Params = { LEVEL },
 	},
 	{
-		Id = "Bounce", Name = "Bounce", Category = "Modifier", Zones = { "Modifier" }, ModifierCost = 0.05,
+		Id = "Bounce", Name = "Bounce", Glyph = "ꓘ", Category = "Modifier", Zones = { "Modifier" }, ModifierCost = 0.05,
 		Description = "Ricochets off walls Level times. Beams reflect too.",
 		Inputs = {}, Outputs = { modOut() }, Params = { LEVEL },
 	},
 	{
-		Id = "Pierce", Name = "Pierce", Category = "Modifier", Zones = { "Modifier" }, ModifierCost = 0.06,
+		Id = "Pierce", Name = "Pierce", Glyph = "↦", Category = "Modifier", Zones = { "Modifier" }, ModifierCost = 0.06,
 		Description = "Passes through Level enemies (15% less damage each).",
 		Inputs = {}, Outputs = { modOut() }, Params = { LEVEL },
 	},
 	{
-		Id = "Quantity", Name = "Quantity", Category = "Modifier", Zones = { "Modifier" },
+		Id = "Quantity", Name = "Quantity", Glyph = "Σ", Category = "Modifier", Zones = { "Modifier" },
 		Description = "Fires Count copies that share the energy: a Fan across Spread degrees, a Ring around the aim, or a Stream one after another.",
 		Inputs = {}, Outputs = { modOut() },
 		Params = {
@@ -342,29 +343,29 @@ local defs: { RuneDef } = {
 		},
 	},
 	{
-		Id = "Homing", Name = "Homing", Category = "Modifier", Zones = { "Modifier" }, ModifierCost = 0.06,
+		Id = "Homing", Name = "Homing", Glyph = "◎", Category = "Modifier", Zones = { "Modifier" }, ModifierCost = 0.06,
 		Description = "Seeks targets. Wire an entity into Lock on to chase that one; otherwise it finds its own. Beams steer in flight too.",
 		Inputs = { { Name = "entity", Type = "entity", Label = "Lock on", Optional = true } },
 		Outputs = { modOut() },
 		Params = { LEVEL, { Name = "Filter", Label = "Seek", Type = "enum", Default = "Enemy", Options = FILTERS } },
 	},
 	{
-		Id = "Range", Name = "Range", Category = "Modifier", Zones = { "Modifier" }, ModifierCost = 0.03,
+		Id = "Range", Name = "Range", Glyph = "↔", Category = "Modifier", Zones = { "Modifier" }, ModifierCost = 0.03,
 		Description = "Longer flight time (×1.3 to ×3.5).",
 		Inputs = {}, Outputs = { modOut() }, Params = { LEVEL },
 	},
 	{
-		Id = "Sustain", Name = "Sustain", Category = "Modifier", Zones = { "Modifier" }, ModifierCost = 0.04,
+		Id = "Sustain", Name = "Sustain", Glyph = "τ", Category = "Modifier", Zones = { "Modifier" }, ModifierCost = 0.04,
 		Description = "Beam only: hold to channel for up to 1–5 seconds; release to stop. Follows live aim. Energy is shared across the maximum duration; segments keep all flight modifiers and triggers.",
 		Inputs = {}, Outputs = { modOut() }, Params = { LEVEL },
 	},
 
 	-- Vessels (the form the magic takes) ---------------------------------------
-	vesselDef("Orb", "Orb", "A slow, heavy sphere of magic with a big hitbox. Flies at your mouse unless something is wired into Aim."),
-	vesselDef("Bullet", "Bullet", "A fast, thin tracer. Flies at your mouse unless something is wired into Aim."),
-	vesselDef("Beam", "Beam", "A cylinder of magic traveling at 2000 studs/s. Supports all flight modifiers and triggers; Sustain emits a continuous cursor-following beam."),
+	vesselDef("Orb", "Orb", "◯", "A slow, heavy sphere of magic with a big hitbox. Flies at your mouse unless something is wired into Aim."),
+	vesselDef("Bullet", "Bullet", "➤", "A fast, thin tracer. Flies at your mouse unless something is wired into Aim."),
+	vesselDef("Beam", "Beam", "═", "A cylinder of magic traveling at 2000 studs/s. Supports all flight modifiers and triggers; Sustain emits a continuous cursor-following beam."),
 	{
-		Id = "Explosion", Name = "Explosion", Category = "Vessel", Zones = { "Output" }, Vessel = true, Instant = true,
+		Id = "Explosion", Name = "Explosion", Glyph = "✸", Category = "Vessel", Zones = { "Output" }, Vessel = true, Instant = true,
 		Description = "Bursts on the spot, hitting everything within 8 studs (Size widens it): full damage at the centre, half at the edge. Fed by On Impact it goes off at the impact point; cast directly it goes off at At, or your mouse. Only Size applies.",
 		Inputs = {
 			flowIn(),
@@ -377,17 +378,17 @@ local defs: { RuneDef } = {
 
 	-- Triggers ------------------------------------------------------------------
 	{
-		Id = "OnImpact", Name = "On Impact", Category = "Trigger", Zones = { "Trigger" },
+		Id = "OnImpact", Name = "On Impact", Glyph = "⊗", Category = "Trigger", Zones = { "Trigger" },
 		Description = "When the vessel stops on a wall or enemy, releases Share of its energy from the impact point. What it fires ricochets unless aimed.",
 		Inputs = { vesselIn() }, Outputs = { flowOut() }, Params = { SHARE },
 	},
 	{
-		Id = "OnExpire", Name = "On Expire", Category = "Trigger", Zones = { "Trigger" },
+		Id = "OnExpire", Name = "On Expire", Glyph = "⊘", Category = "Trigger", Zones = { "Trigger" },
 		Description = "When the vessel runs out of range without hitting anything, releases Share of its energy there.",
 		Inputs = { vesselIn() }, Outputs = { flowOut() }, Params = { SHARE },
 	},
 	{
-		Id = "OnTimer", Name = "On Timer", Category = "Trigger", Zones = { "Trigger" },
+		Id = "OnTimer", Name = "On Timer", Glyph = "⧗", Category = "Trigger", Zones = { "Trigger" },
 		Description = "After Delay seconds of flight, releases Share of the energy. Detonate ends the vessel.",
 		Inputs = { vesselIn() }, Outputs = { flowOut() },
 		Params = {
@@ -397,7 +398,7 @@ local defs: { RuneDef } = {
 		},
 	},
 	{
-		Id = "OnProximity", Name = "On Proximity", Category = "Trigger", Zones = { "Trigger" },
+		Id = "OnProximity", Name = "On Proximity", Glyph = "⊚", Category = "Trigger", Zones = { "Trigger" },
 		Description = "When an entity comes within Radius of the vessel, releases Share of the energy. Struck Entity is that entity; what it fires aims at it.",
 		Inputs = { vesselIn() }, Outputs = { flowOut() },
 		Params = {
@@ -408,6 +409,11 @@ local defs: { RuneDef } = {
 		},
 	},
 }
+
+-- "⊙ Mana Well" -- the rune's name prefixed with its glyph, when it has one.
+function SpellRunes.DisplayName(def: RuneDef): string
+	return if def.Glyph then def.Glyph .. "  " .. def.Name else def.Name
+end
 
 SpellRunes.Categories = { "Input", "Targeting", "Sensor", "Logic", "Branch", "Transform", "Modifier", "Vessel", "Trigger" }
 SpellRunes.Order = {} :: { string }
@@ -461,6 +467,56 @@ end
 function SpellRunes.TriggerApplies(vesselId: string, triggerId: string): boolean
 	return vesselId ~= "Explosion"
 end
+-- Hold-to-charge casting (spells without Sustain; Sustain keeps press-to-cast,
+-- hold-to-channel). Charge grows 1 per FullTime seconds held, from Min (a
+-- quick click) to Max. Up to 1 it scales the energy -- and mana -- spent; past
+-- 1 it adds copies, up to MaxCopyMultiplier x at Max, with energy scaled up by
+-- the same factor so the extra copies are full strength. The server measures
+-- the hold itself (SpellChannel "ChargeBegin" -> SpellCast).
+SpellRunes.Charge = {
+	FullTime = 1, -- seconds held to reach charge 1
+	Min = 0.25, -- charge of an instant click
+	Max = 2,
+	MaxCopyMultiplier = 1.5,
+	OverchargeSpread = 12, -- degrees: fan for extra copies of a Quantity-less vessel
+	StaleAfter = 30, -- a ChargeBegin older than this is ignored (counts as a click)
+}
+
+function SpellRunes.ChargeFromHold(seconds: number): number
+	local charge = SpellRunes.Charge
+	return math.clamp(seconds / charge.FullTime, charge.Min, charge.Max)
+end
+
+-- Copy multiplier: 1 up to charge 1, then linear to MaxCopyMultiplier at Max.
+function SpellRunes.ChargeCopyMultiplier(chargeLevel: number): number
+	local charge = SpellRunes.Charge
+	local over = math.clamp((chargeLevel - 1) / (charge.Max - 1), 0, 1)
+	return 1 + (charge.MaxCopyMultiplier - 1) * over
+end
+
+-- Energy (and mana) multiplier: the charge itself up to 1, then the copy
+-- multiplier, so each copy keeps its full energy.
+function SpellRunes.ChargeEnergyMultiplier(chargeLevel: number): number
+	if chargeLevel <= 1 then
+		return math.clamp(chargeLevel, 0, 1)
+	end
+	return SpellRunes.ChargeCopyMultiplier(chargeLevel)
+end
+
+-- Whether a compiled spell channels (any vessel with a Sustain modifier);
+-- those keep press-to-cast so holding can sustain them.
+function SpellRunes.HasSustain(compiled: any): boolean
+	for _, info in compiled.vessels or {} do
+		for _, modId in info.mods or {} do
+			local mod = compiled.runes[modId]
+			if mod and mod.rune == "Sustain" then
+				return true
+			end
+		end
+	end
+	return false
+end
+
 SpellRunes.MaxModifierCost = 0.85
 SpellRunes.MaxTriggerShare = 0.9
 

@@ -27,6 +27,8 @@ local player = Players.LocalPlayer
 local Shared = ReplicatedStorage:WaitForChild("Shared")
 local SpellCompiler = require(Shared:WaitForChild("SpellCompiler"))
 local SpellRunes = require(Shared:WaitForChild("SpellRunes"))
+local SpellCircleLayout = require(Shared:WaitForChild("SpellCircleLayout"))
+local SpellCircleVFX = require(script.Parent:WaitForChild("SpellCircleVFX"))
 local remotes = ReplicatedStorage:WaitForChild("SpellRemotes")
 local command = remotes:WaitForChild("SpellCommand") :: RemoteFunction
 local castRemote = remotes:WaitForChild("SpellCast") :: RemoteEvent
@@ -104,7 +106,12 @@ local function slotRecord(slot: number): any?
 end
 
 local function currentName(): string
-	return if nameBox and nameBox.Text ~= "" then nameBox.Text else doc.graph.name
+	local typed = if nameBox then string.gsub(nameBox.Text, "^%s*(.-)%s*$", "%1") else ""
+	if typed ~= "" then
+		return typed
+	end
+	-- unnamed card: describe it instead of saving a generic placeholder
+	return if doc.graph.name ~= "" then doc.graph.name else SpellCompiler.SuggestName(doc.graph)
 end
 
 local function signature(): string
@@ -591,7 +598,7 @@ local function buildGui()
 		onArmZone = armZone,
 		onRunePress = function(runeId: string)
 			placing = { runeId = runeId, start = Board.pointer(), moved = false }
-			if ghost then ghost.Text = "＋ " .. SpellRunes.Runes[runeId].Name end
+			if ghost then ghost.Text = "＋ " .. SpellRunes.DisplayName(SpellRunes.Runes[runeId]) end
 		end,
 	})
 	inspector = Panels.Inspector.new(inspectorFrame :: Frame, {
@@ -783,8 +790,119 @@ function SpellAssemblerGui.Toggle()
 	if visible then SpellAssemblerGui.Close() else SpellAssemblerGui.Open() end
 end
 
+--------------------------------------------------------------------------------
+-- Hold-to-charge (spells without Sustain): press starts charging, release
+-- casts. The server times the hold itself; this only mirrors it for the bar.
+--------------------------------------------------------------------------------
+
+local charging = false
+local chargeStarted = 0
+local chargeGui: ScreenGui? = nil
+local chargeFill: Frame? = nil
+local chargeText: TextLabel? = nil
+local chargeConnection: RBXScriptConnection? = nil
+-- The active card compiled once, with its circle spec: the same
+-- SpellCircleLayout.Build the server broadcasts, so the caster's own circle
+-- draws instantly and matches what everyone else sees.
+local activeCache: { record: any, compiled: any, spec: any, sustain: boolean } = { record = nil, compiled = nil, spec = nil, sustain = false }
+
+local function refreshActive()
+	local record = serverState.activeSlot and slotRecord(serverState.activeSlot)
+	if not record or not record.graph then
+		activeCache.record, activeCache.compiled, activeCache.spec, activeCache.sustain = nil, nil, nil, false
+		return
+	end
+	if activeCache.record ~= record then
+		local compiled = SpellCompiler.Compile(record.graph)
+		activeCache.record = record
+		activeCache.compiled = compiled
+		activeCache.spec = if compiled then SpellCircleLayout.Build(compiled) else nil
+		activeCache.sustain = compiled ~= nil and SpellRunes.HasSustain(compiled)
+	end
+end
+
+local function activeHasSustain(): boolean
+	refreshActive()
+	return activeCache.sustain
+end
+
+local function buildChargeBar()
+	if chargeGui then
+		return
+	end
+	local screen = Instance.new("ScreenGui")
+	screen.Name = "SpellCharge"
+	screen.ResetOnSpawn = false
+	screen.Enabled = false
+	local frame = Instance.new("Frame")
+	frame.AnchorPoint = Vector2.new(0.5, 1)
+	frame.Position = UDim2.new(0.5, 0, 1, -130)
+	frame.Size = UDim2.fromOffset(240, 10)
+	frame.BackgroundColor3 = Color3.fromRGB(20, 22, 30)
+	frame.BackgroundTransparency = 0.2
+	frame.BorderSizePixel = 0
+	frame.Parent = screen
+	local fill = Instance.new("Frame")
+	fill.Size = UDim2.fromScale(0, 1)
+	fill.BorderSizePixel = 0
+	fill.Parent = frame
+	-- tick at charge 1: everything right of it is overcharge
+	local tick = Instance.new("Frame")
+	tick.AnchorPoint = Vector2.new(0.5, 0)
+	tick.Position = UDim2.fromScale(1 / SpellRunes.Charge.Max, 0)
+	tick.Size = UDim2.new(0, 2, 1, 0)
+	tick.BackgroundColor3 = Color3.new(1, 1, 1)
+	tick.BorderSizePixel = 0
+	tick.ZIndex = 2
+	tick.Parent = frame
+	local text = Instance.new("TextLabel")
+	text.BackgroundTransparency = 1
+	text.AnchorPoint = Vector2.new(0.5, 1)
+	text.Position = UDim2.new(0.5, 0, 0, -2)
+	text.Size = UDim2.fromOffset(240, 16)
+	text.Font = Enum.Font.GothamBold
+	text.TextSize = 13
+	text.TextColor3 = Color3.new(1, 1, 1)
+	text.TextStrokeTransparency = 0.5
+	text.Parent = frame
+	screen.Parent = player:WaitForChild("PlayerGui")
+	chargeGui, chargeFill, chargeText = screen, fill, text
+end
+
+local function stopChargeBar()
+	charging = false
+	if chargeConnection then
+		chargeConnection:Disconnect()
+		chargeConnection = nil
+	end
+	if chargeGui then
+		chargeGui.Enabled = false
+	end
+end
+
+local function startChargeBar()
+	buildChargeBar()
+	local screen = chargeGui :: ScreenGui
+	screen.Enabled = true
+	if chargeConnection then
+		chargeConnection:Disconnect()
+	end
+	chargeConnection = game:GetService("RunService").RenderStepped:Connect(function()
+		local level = SpellRunes.ChargeFromHold(os.clock() - chargeStarted)
+		local fill = chargeFill :: Frame
+		local text = chargeText :: TextLabel
+		fill.Size = UDim2.fromScale(level / SpellRunes.Charge.Max, 1)
+		fill.BackgroundColor3 = if level < 1 then Color3.fromRGB(110, 170, 255) else Color3.fromRGB(255, 170, 60)
+		if level < 1 then
+			text.Text = string.format("%d%% power", math.floor(level * 100))
+		else
+			text.Text = string.format("OVERCHARGE  %.2fx copies", SpellRunes.ChargeCopyMultiplier(level))
+		end
+	end)
+end
+
 function SpellAssemblerGui.Cast()
-	if not equippedTool or visible or holdingCast then return end
+	if not equippedTool or visible or holdingCast or charging then return end
 	if not serverState.activeSlot then
 		if activeLabel then
 			activeLabel.Text = "No spell equipped: press E, then Save"
@@ -796,15 +914,53 @@ function SpellAssemblerGui.Cast()
 		end
 		return
 	end
+	if not activeHasSustain() then
+		-- charge while held; released in StopCast
+		charging = true
+		chargeStarted = os.clock()
+		channelRemote:FireServer("ChargeBegin")
+		startChargeBar()
+		local character = player.Character
+		if character and activeCache.spec then
+			SpellCircleVFX.Begin(character, activeCache.spec, player:GetMouse().Hit.Position, true)
+		end
+		return
+	end
 	local mouse = player:GetMouse()
 	holdingCast = true
 	castRemote:FireServer(mouse.Hit.Position)
+	local character = player.Character
+	if character and activeCache.spec then
+		SpellCircleVFX.Cast(character, activeCache.spec, 1, mouse.Hit.Position, true, true)
+	end
 end
 
 function SpellAssemblerGui.StopCast()
+	if charging then
+		stopChargeBar()
+		local target = player:GetMouse().Hit.Position
+		castRemote:FireServer(target)
+		local character = player.Character
+		if character then
+			-- predict the server's mana check so a cast it will refuse fizzles
+			local charge = SpellRunes.ChargeFromHold(os.clock() - chargeStarted)
+			local mana = player:GetAttribute("Mana")
+			local compiled = activeCache.compiled
+			local cost = if compiled then compiled.manaCost * SpellRunes.ChargeEnergyMultiplier(charge) else math.huge
+			if typeof(mana) == "number" and mana >= cost then
+				SpellCircleVFX.Cast(character, activeCache.spec, charge, target, false, true)
+			else
+				SpellCircleVFX.Cancel(character)
+			end
+		end
+		return
+	end
 	if not holdingCast then return end
 	holdingCast = false
 	channelRemote:FireServer("Stop")
+	if player.Character then
+		SpellCircleVFX.End(player.Character)
+	end
 end
 
 local aimConnection: RBXScriptConnection? = nil
@@ -861,6 +1017,14 @@ end
 
 function SpellAssemblerGui.Unequip(tool: Tool)
 	if equippedTool ~= tool then return end
+	if charging then
+		-- switching away abandons the charge instead of releasing it
+		stopChargeBar()
+		channelRemote:FireServer("ChargeCancel")
+		if player.Character then
+			SpellCircleVFX.Cancel(player.Character)
+		end
+	end
 	SpellAssemblerGui.StopCast()
 	equippedTool = nil
 	stopAimStream()

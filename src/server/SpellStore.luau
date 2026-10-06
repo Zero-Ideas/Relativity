@@ -3,13 +3,17 @@
 	Dedicated persistence/cache for assembled spell cards. This intentionally
 	does not share the legacy Player DataStore, so neither system can overwrite
 	the other's schema.
+
+	Every environment -- live servers, Studio Play and Team Test -- reads and
+	writes the same DataStore, so a spell book follows the player everywhere.
+	In Studio this needs Game Settings > Security > "Enable Studio Access to
+	API Services".
 ]]
 
 local DataStoreService = game:GetService("DataStoreService")
 local Players = game:GetService("Players")
 local RunService = game:GetService("RunService")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
-local ServerStorage = game:GetService("ServerStorage")
 local HttpService = game:GetService("HttpService")
 
 local SpellCompiler = require(ReplicatedStorage:WaitForChild("Shared"):WaitForChild("SpellCompiler"))
@@ -96,13 +100,6 @@ local function sanitizeLoaded(raw: any)
 	return data
 end
 
-local function studioBridge(): BindableFunction
-	local bridge = ServerStorage:WaitForChild("RelativityStudioSpellStore", 3)
-	assert(bridge and bridge:IsA("BindableFunction") and bridge:GetAttribute("Ready"),
-		"Local Studio spell plugin is not loaded. Reopen Studio after installing RelativitySpellCards.rbxm.")
-	return bridge :: BindableFunction
-end
-
 local function keyFor(player: Player): string
 	return `player_{player.UserId}`
 end
@@ -131,7 +128,7 @@ local function publicState(entry: Entry)
 		slots = copy(entry.data.slots),
 		dirty = entry.dirty,
 		saving = entry.saving,
-		storageMode = if RunService:IsStudio() then "StudioLocal" else "DataStore",
+		storageMode = "DataStore",
 	}
 end
 
@@ -152,11 +149,7 @@ function SpellStore.Load(player: Player)
 	}
 	entries[player] = entry
 	local ok, result
-	if RunService:IsStudio() then
-		ok, result = pcall(function() return studioBridge():Invoke("Load", player.UserId) end)
-	else
-		ok, result = withRetries(function() return store:GetAsync(keyFor(player)) end)
-	end
+	ok, result = withRetries(function() return store:GetAsync(keyFor(player)) end)
 	if entries[player] ~= entry then
 		return
 	end
@@ -209,15 +202,6 @@ end
 function SpellStore.GetState(player: Player)
 	SpellStore.WaitForLoad(player, 15)
 	local entry = entries[player]
-	-- A newly loaded local plugin may become available after this player's
-	-- startup load. Retry only the failed Studio load, never replace a live
-	-- in-session book or silently retry production failures on every request.
-	local bridge = RunService:IsStudio() and ServerStorage:FindFirstChild("RelativityStudioSpellStore")
-	if entry and entry.loaded and not entry.available and not entry.dirty and bridge and bridge:GetAttribute("Ready") then
-		entries[player] = nil
-		SpellStore.Load(player)
-		entry = entries[player]
-	end
 	if not entry then
 		return { available = false, sessionOnly = false, error = "Spell state is unavailable.", slots = {} }
 	end
@@ -247,23 +231,18 @@ function SpellStore.Save(player: Player): (boolean, string?)
 	local expectedRevision = entry.persistedRevision
 	snapshot.revision = expectedRevision + 1
 	snapshot.saveId = HttpService:GenerateGUID(false)
-	local ok, result
-	if RunService:IsStudio() then
-		ok, result = pcall(function() return studioBridge():Invoke("Save", player.UserId, snapshot, expectedRevision) end)
-	else
-		ok, result = withRetries(function()
-			return store:UpdateAsync(keyFor(player), function(old)
-				if old ~= nil and typeof(old) ~= "table" then return nil end
-				-- Idempotent retry if the first write succeeded but its response
-				-- failed. Otherwise reject an older server overwriting a new one.
-				if typeof(old) == "table" and old.saveId == snapshot.saveId then return old end
-				if typeof(old) == "table" and typeof(old.schemaVersion) == "number" and old.schemaVersion > SCHEMA_VERSION then return nil end
-				local revision = typeof(old) == "table" and old.revision or 0
-				if revision ~= expectedRevision then return nil end
-				return snapshot
-			end)
+	local ok, result = withRetries(function()
+		return store:UpdateAsync(keyFor(player), function(old)
+			if old ~= nil and typeof(old) ~= "table" then return nil end
+			-- Idempotent retry if the first write succeeded but its response
+			-- failed. Otherwise reject an older server overwriting a new one.
+			if typeof(old) == "table" and old.saveId == snapshot.saveId then return old end
+			if typeof(old) == "table" and typeof(old.schemaVersion) == "number" and old.schemaVersion > SCHEMA_VERSION then return nil end
+			local revision = typeof(old) == "table" and old.revision or 0
+			if revision ~= expectedRevision then return nil end
+			return snapshot
 		end)
-	end
+	end)
 	entry.saving = false
 	if ok and typeof(result) == "table" then
 		entry.persistedRevision = snapshot.revision

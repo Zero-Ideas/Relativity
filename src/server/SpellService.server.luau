@@ -10,10 +10,12 @@ local Shared = ReplicatedStorage:WaitForChild("Shared")
 local Entity = require(Shared:WaitForChild("Entity"))
 local SafeMath = require(Shared:WaitForChild("SafeMath"))
 local SpellCompiler = require(Shared:WaitForChild("SpellCompiler"))
+local SpellRunes = require(Shared:WaitForChild("SpellRunes"))
+local SpellCircleLayout = require(Shared:WaitForChild("SpellCircleLayout"))
+local VisualOffload = require(Shared:WaitForChild("VisualOffload"))
 local SpellStore = require(script.Parent:WaitForChild("SpellStore"))
 local SpellRuntime = require(script.Parent:WaitForChild("SpellRuntime"))
 local BeamHandler = require(script.Parent:WaitForChild("Projectile"):WaitForChild("BeamProjectileHandler"))
-local RunService = game:GetService("RunService")
 
 local MANA = 10_000_000_000_000
 local CAST_INTERVAL = 0.25
@@ -34,10 +36,9 @@ cast.Parent = remoteFolder
 local channel = remoteFolder:FindFirstChild("SpellChannel") or Instance.new("RemoteEvent")
 channel.Name = "SpellChannel"
 channel.Parent = remoteFolder
-channel.OnServerEvent:Connect(function(player: Player, action: any)
-	if action == "Stop" then BeamHandler.Stop(player)
-	elseif action == "KeepAlive" then BeamHandler.KeepAlive(player) end
-end)
+-- Hold-to-charge: the server times the hold itself, from ChargeBegin to the
+-- SpellCast that ends it, so a client can't claim a charge it never held.
+local chargeStart: { [Player]: number } = {}
 
 -- While the tool is held the client streams its cursor here (unreliable,
 -- ~20 Hz) so Stream copies can re-aim mid-cast. Only positions newer than
@@ -101,9 +102,8 @@ local function filterName(player: Player, raw: any): (string?, string?)
 	name = string.gsub(name, "%s+$", "")
 	name = truncateCharacters(name, 24)
 	if name == "" then name = "Untitled Spell" end
-	-- Local Studio test cards never reach production/player-visible storage.
-	-- Authentication failure must not prevent offline editor testing.
-	if RunService:IsStudio() then return name, nil end
+	-- Studio and Team Test save to the same live store, so names are always
+	-- filtered.
 	local ok, filtered = pcall(function()
 		local result = TextService:FilterStringAsync(name, player.UserId)
 		return result:GetNonChatStringForUserAsync(player.UserId)
@@ -200,33 +200,107 @@ local function compiledFor(record: any): any?
 	return cached or nil
 end
 
-cast.OnServerEvent:Connect(function(player: Player, rawTarget: any)
+-- Spell circle VFX (client/SpellCircleVFX): the spec is built once per saved
+-- record. circleOpen marks a player whose charging circle was broadcast, so
+-- a cast that then fails (no mana, cooldown, ...) cancels it.
+local circleSpecs: { [any]: any } = setmetatable({}, { __mode = "k" }) :: any
+local circleOpen: { [Player]: boolean } = {}
+local lastCircleBegin: { [Player]: number } = {}
+local CIRCLE_BEGIN_INTERVAL = 0.15
+
+local function circleSpecFor(record: any): any?
+	local cached = circleSpecs[record]
+	if cached == nil then
+		local compiled = compiledFor(record)
+		cached = if compiled then SpellCircleLayout.Build(compiled) else false
+		circleSpecs[record] = cached
+	end
+	return cached or nil
+end
+
+local function circleBegin(player: Player)
+	local now = os.clock()
+	if lastCircleBegin[player] and now - lastCircleBegin[player] < CIRCLE_BEGIN_INTERVAL then
+		return
+	end
+	local character = player.Character
+	local record = SpellStore.GetActive(player)
+	local spec = record and circleSpecFor(record)
+	if not character or not spec or not equippedAssembler(player) then
+		return
+	end
+	lastCircleBegin[player] = now
+	circleOpen[player] = true
+	local aim = liveAim[player]
+	VisualOffload.Fire("SpellCircle", { Phase = "Begin", Caster = character, Spec = spec, Target = aim and aim.position })
+end
+
+local function circleClose(player: Player, phase: string)
+	local character = player.Character
+	if character then
+		VisualOffload.Fire("SpellCircle", { Phase = phase, Caster = character })
+	end
+end
+
+channel.OnServerEvent:Connect(function(player: Player, action: any)
+	if action == "Stop" then
+		BeamHandler.Stop(player)
+		circleClose(player, "End")
+	elseif action == "KeepAlive" then
+		BeamHandler.KeepAlive(player)
+	elseif action == "ChargeBegin" then
+		chargeStart[player] = os.clock()
+		circleBegin(player)
+	elseif action == "ChargeCancel" then
+		chargeStart[player] = nil
+		if circleOpen[player] then
+			circleOpen[player] = nil
+			circleClose(player, "Cancel")
+		end
+	end
+end)
+
+-- Runs one cast request; true when the spell went off (for the circle VFX).
+local function castSpell(player: Player, rawTarget: any): boolean
 	-- A NaN aim has no recoverable direction, so reject it; +-inf components
 	-- clamp to SafeMath.Limit so an absurd aim still fires the way it points.
 	if typeof(rawTarget) ~= "Vector3" or SafeMath.hasNaN(rawTarget) then
-		return
+		return false
 	end
 	local targetPoint = SafeMath.vector(rawTarget, Vector3.zero)
 	local tool = equippedAssembler(player)
 	local character = player.Character
 	local root = character and (character.PrimaryPart or character:FindFirstChild("HumanoidRootPart"))
 	if not tool or not character or not root or not root:IsA("BasePart") then
-		return
+		return false
 	end
 	local record = SpellStore.GetActive(player)
-	if not record then return end
+	if not record then return false end
 	local compiled = compiledFor(record)
-	if not compiled then return end
+	if not compiled then return false end
 
 	local now = os.clock()
-	if lastCast[player] and now - lastCast[player] < CAST_INTERVAL then return end
-	if SpellRuntime.IsSustaining(player) then return end
+	if lastCast[player] and now - lastCast[player] < CAST_INTERVAL then return false end
+	if SpellRuntime.IsSustaining(player) then return false end
 	local humanoid = character:FindFirstChildOfClass("Humanoid")
-	if not humanoid or humanoid.Health <= 0 then return end
+	if not humanoid or humanoid.Health <= 0 then return false end
+	-- Sustain spells cast on press at full charge (holding channels them);
+	-- everything else uses the timed hold, and a cast with no (or a stale)
+	-- ChargeBegin counts as an instant click.
+	local charge = 1
+	if not SpellRunes.HasSustain(compiled) then
+		local started = chargeStart[player]
+		local held = if started then now - started else 0
+		charge = if held > 0 and held <= SpellRunes.Charge.StaleAfter
+			then SpellRunes.ChargeFromHold(held)
+			else SpellRunes.Charge.Min
+	end
+	chargeStart[player] = nil
+	local manaCost = compiled.manaCost * SpellRunes.ChargeEnergyMultiplier(charge)
 	local mana = player:GetAttribute("Mana")
-	if typeof(mana) ~= "number" or mana < compiled.manaCost then return end
+	if typeof(mana) ~= "number" or mana < manaCost then return false end
 	lastCast[player] = now
-	player:SetAttribute("Mana", mana - compiled.manaCost)
+	player:SetAttribute("Mana", mana - manaCost)
 
 	local head = character:FindFirstChild("Head")
 	local origin = if head and head:IsA("BasePart") then head.Position else root.Position
@@ -238,6 +312,7 @@ cast.OnServerEvent:Connect(function(player: Player, rawTarget: any)
 		origin = origin,
 		cursorPoint = targetPoint,
 		cursorEntity = aimedEntity(character, origin, targetPoint),
+		charge = charge,
 		live = function()
 			local headNow = character:FindFirstChild("Head")
 			local aim = liveAim[player]
@@ -249,13 +324,33 @@ cast.OnServerEvent:Connect(function(player: Player, rawTarget: any)
 	if not ok then
 		warn(`[SpellService] cast failed: {tostring(err)}`)
 	end
+	circleOpen[player] = nil
+	VisualOffload.Fire("SpellCircle", {
+		Phase = "Cast",
+		Caster = character,
+		Spec = circleSpecFor(record), -- lets a client that missed Begin still draw it
+		Target = targetPoint,
+		Charge = charge,
+		Sustain = SpellRunes.HasSustain(compiled),
+	})
+	return true
+end
+
+cast.OnServerEvent:Connect(function(player: Player, rawTarget: any)
+	if not castSpell(player, rawTarget) and circleOpen[player] then
+		circleOpen[player] = nil
+		circleClose(player, "Cancel")
+	end
 end)
 
 Players.PlayerRemoving:Connect(function(player)
 	commandBusy[player] = nil
 	liveAim[player] = nil
 	lastCast[player] = nil
+	chargeStart[player] = nil
 	lastCommand[player] = nil
+	circleOpen[player] = nil
+	lastCircleBegin[player] = nil
 end)
 
 print("[Relativity] spell service online")

@@ -373,7 +373,8 @@ function Board:buildZone(zone: any)
 		BorderSizePixel = 0,
 	}, frame)
 	Theme.corner(header, 12)
-	local title = (if zone.locked then "🔒 " else "") .. string.upper(zone.kind)
+	local zoneGlyph = (SpellRunes.Zones[zone.kind] :: any).Glyph
+	local title = (if zone.locked then "🔒 " else "") .. (if zoneGlyph then zoneGlyph .. "  " else "") .. string.upper(zone.kind)
 		.. if zone.label and zone.label ~= "" then `  ·  {zone.label}` else ""
 	Theme.label(header, title, 14, {
 		Font = Theme.FontBold,
@@ -460,7 +461,7 @@ function Board:buildRune(rune: any)
 		BackgroundColor3 = header.BackgroundColor3,
 		BorderSizePixel = 0,
 	}, header)
-	Theme.label(header, (if rune.locked then "🔒 " else "") .. def.Name, 14, { Font = Theme.FontBold, Position = UDim2.fromOffset(10, 0), Size = UDim2.new(1, -86, 1, 0), ZIndex = 2 })
+	Theme.label(header, (if rune.locked then "🔒 " else "") .. SpellRunes.DisplayName(def), 14, { Font = Theme.FontBold, Position = UDim2.fromOffset(10, 0), Size = UDim2.new(1, -86, 1, 0), ZIndex = 2 })
 	Theme.label(header, self:estimateText(rune), 12, {
 		Font = Theme.FontMedium,
 		Position = UDim2.new(1, -80, 0, 0),

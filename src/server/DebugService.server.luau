@@ -34,12 +34,21 @@ local ServerStorage = game:GetService("ServerStorage")
 local StarterPack = game:GetService("StarterPack")
 local Stats = game:GetService("Stats")
 
-if not RunService:IsStudio() then
-	return
-end
+-- Gated per player (see DebugAccess), not per environment: Team Test's
+-- cloud server isn't "Studio", but its testers still need the panel.
+local DebugAccess = require(script.Parent.DebugAccess)
 
 local Shared = ReplicatedStorage:WaitForChild("Shared")
 local VisualOffload = require(Shared.VisualOffload)
+
+-- Every request is dropped unless the sender may use the debug panel.
+local function onAllowed(channel: string, handler: (any, Player) -> ())
+	VisualOffload.On(channel, function(data, player)
+		if player and DebugAccess.IsAllowed(player) then
+			handler(data, player)
+		end
+	end)
+end
 local ChunkManager = require(Shared.ChunkManager)
 local Heartbeat = require(Shared.Heartbeat)
 local Entity = require(Shared.Entity)
@@ -90,7 +99,7 @@ local function ownsTool(player: Player, name: string): boolean
 	return (backpack ~= nil and backpack:FindFirstChild(name) ~= nil) or (held ~= nil and held:IsA("Tool"))
 end
 
-VisualOffload.On("DebugRequestTools", function(_, player)
+onAllowed("DebugRequestTools", function(_, player)
 	if player then
 		sendToolList(player)
 	end
@@ -116,13 +125,13 @@ local function clearTools(containers: { Instance? })
 	end
 end
 
-VisualOffload.On("DebugGiveTool", function(name, player)
+onAllowed("DebugGiveTool", function(name, player)
 	if player and typeof(name) == "string" then
 		giveToPlayer(player, name)
 	end
 end)
 
-VisualOffload.On("DebugClearTools", function(_, player)
+onAllowed("DebugClearTools", function(_, player)
 	if player then
 		clearTools({ player:FindFirstChildOfClass("Backpack"), player.Character })
 	end
@@ -314,7 +323,7 @@ local actions = {
 
 -- Summary of live projectiles, for chasing leaks (who's alive past their
 -- lifetime, which channels they belong to).
-VisualOffload.On("DebugProjectileReport", function(_, player)
+onAllowed("DebugProjectileReport", function(_, player)
 	if not player then
 		return
 	end
@@ -340,13 +349,13 @@ VisualOffload.On("DebugProjectileReport", function(_, player)
 	VisualOffload.FireClient(player, "DebugProjectileReport", { Total = #Projectile.GetAll(), Rows = rows })
 end)
 
-VisualOffload.On("DebugRequestEntities", function(_, player)
+onAllowed("DebugRequestEntities", function(_, player)
 	if player then
 		sendEntityList(player)
 	end
 end)
 
-VisualOffload.On("DebugEntityAction", function(data, player)
+onAllowed("DebugEntityAction", function(data, player)
 	if not player or typeof(data) ~= "table" then
 		return
 	end
@@ -473,13 +482,13 @@ local chunkActions = {
 	end,
 }
 
-VisualOffload.On("DebugRequestChunks", function(_, player)
+onAllowed("DebugRequestChunks", function(_, player)
 	if player then
 		VisualOffload.FireClient(player, "DebugChunks", chunkSnapshot())
 	end
 end)
 
-VisualOffload.On("DebugChunkAction", function(data, player)
+onAllowed("DebugChunkAction", function(data, player)
 	if not player or typeof(data) ~= "table" then
 		return
 	end
@@ -596,13 +605,13 @@ local function refreshTicker()
 	end
 end
 
-VisualOffload.On("DebugClientNet", function(sent, player)
+onAllowed("DebugClientNet", function(sent, player)
 	if player and subscribers[player] and typeof(sent) == "number" and sent == sent and sent >= 0 and sent < 1e6 then
 		clientOut[player] = sent
 	end
 end)
 
-VisualOffload.On("DebugStats", function(subscribed, player)
+onAllowed("DebugStats", function(subscribed, player)
 	if player then
 		subscribers[player] = if subscribed == true then true else nil
 		if not subscribers[player] then
@@ -612,7 +621,7 @@ VisualOffload.On("DebugStats", function(subscribed, player)
 	end
 end)
 
-VisualOffload.On("DebugEntityWatch", function(id, player)
+onAllowed("DebugEntityWatch", function(id, player)
 	if player then
 		watchers[player] = if typeof(id) == "number" then id else nil
 		refreshTicker()
@@ -622,7 +631,7 @@ VisualOffload.On("DebugEntityWatch", function(id, player)
 	end
 end)
 
-VisualOffload.On("DebugChunkWatch", function(watching, player)
+onAllowed("DebugChunkWatch", function(watching, player)
 	if player then
 		chunkWatchers[player] = if watching == true then true else nil
 		refreshTicker()

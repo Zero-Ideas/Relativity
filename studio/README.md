@@ -1,4 +1,8 @@
-# Studio spell-card persistence
+# Studio spell-card persistence (retired)
+
+> No longer used: SpellStore now saves to the live `RelativitySpellCards_v1`
+> DataStore in every environment, Studio and Team Test included. You can
+> uninstall `RelativitySpellCards.rbxm`.
 
 This local plugin stores test spell books in Studio plugin settings, isolated
 by place and player ID. It never accesses the production DataStore. Names in

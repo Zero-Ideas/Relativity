@@ -33,6 +33,7 @@ local VisualOffload = require(Shared:WaitForChild("VisualOffload"))
 local Heartbeat = require(Shared:WaitForChild("Heartbeat"))
 local SpellRunes = require(Shared:WaitForChild("SpellRunes"))
 local StatusEffectSys = require(Shared:WaitForChild("StatusEffectSys"))
+local Ragdoll = require(script.Parent:WaitForChild("Ragdoll"))
 local Projectile = require(script.Parent:WaitForChild("Projectile"))
 local ProjectileQuota = require(script.Parent:WaitForChild("ProjectileQuota"))
 local BeamHandler = require(script.Parent:WaitForChild("Projectile"):WaitForChild("BeamProjectileHandler"))
@@ -71,6 +72,9 @@ export type Context = {
 	-- Normal of the surface whose hit fired this context's trigger (On
 	-- Impact into geometry or an entity); explosions orient their visual to it.
 	surfaceNormal: Vector3?,
+	-- Cast-time only: hold-to-charge copy multiplier (>= 1) for the vessels
+	-- the cast fires directly; see SpellRunes.Charge.
+	copyMultiplier: number?,
 }
 
 --------------------------------------------------------------------------------
@@ -583,6 +587,103 @@ end
 -- (clamped to MaxCastRange).
 local MIN_EXPLOSION_SCALE = 0.2 -- smallest radius fraction a split blast keeps
 
+-- Fling: a blast whose power at a target (centre damage x falloff) reaches
+-- FLING_MIN_POWER ragdolls it (the Stun effect) and launches it away from the
+-- centre with an upward bias; speed and ragdoll time grow with the power.
+local FLING_MIN_POWER = 40
+local FLING_SPEED_PER_POWER = 1.6 -- studs/s per point of power at the target
+local FLING_MIN_SPEED, FLING_MAX_SPEED = 80, 180
+local FLING_UPWARD = 0.75 -- upward share mixed into the launch direction
+local FLING_RAGDOLL_MIN, FLING_RAGDOLL_MAX = 0.8, 3 -- seconds of Stun
+local FLING_RAGDOLL_PER_POWER = 1 / 150
+local FLING_SPIN_MIN, FLING_SPIN_MAX = 4, 14 -- rad/s of random tumble; grows with power
+local FLING_SPIN_PER_POWER = 0.05
+local FLING_TRAIL_LIFETIME = 0.5
+
+local flingRandom = Random.new()
+local flingTrailTokens: { [Instance]: number } = {}
+
+-- White trail on the torso while flung: tapers to nothing and fades over its
+-- lifetime. A fresh fling reuses the trail and pushes back its end; when the
+-- ragdoll time is up it stops emitting, then is removed once the tail fades.
+local function flingTrail(character: Instance, duration: number)
+	local part = character:FindFirstChild("UpperTorso") or character:FindFirstChild("Torso")
+		or character:FindFirstChild("HumanoidRootPart")
+	if not part or not part:IsA("BasePart") then
+		return
+	end
+	local trail = part:FindFirstChild("FlingTrail") :: Trail?
+	if not trail then
+		local a0 = Instance.new("Attachment")
+		a0.Name = "FlingTrailTop"
+		a0.Position = Vector3.new(0, 0.6, 0)
+		a0.Parent = part
+		local a1 = Instance.new("Attachment")
+		a1.Name = "FlingTrailBottom"
+		a1.Position = Vector3.new(0, -0.6, 0)
+		a1.Parent = part
+		local newTrail = Instance.new("Trail")
+		newTrail.Name = "FlingTrail"
+		newTrail.Attachment0 = a0
+		newTrail.Attachment1 = a1
+		newTrail.Color = ColorSequence.new(Color3.new(1, 1, 1))
+		newTrail.Transparency = NumberSequence.new(0.1, 1)
+		newTrail.WidthScale = NumberSequence.new(1, 0)
+		newTrail.Lifetime = FLING_TRAIL_LIFETIME
+		newTrail.MinLength = 0.05
+		newTrail.FaceCamera = true
+		newTrail.LightEmission = 0.4
+		newTrail.Parent = part
+		trail = newTrail
+	end
+	local active = trail :: Trail
+	active.Enabled = true
+	local token = (flingTrailTokens[character] or 0) + 1
+	flingTrailTokens[character] = token
+	task.delay(duration, function()
+		if flingTrailTokens[character] ~= token then
+			return
+		end
+		if not active.Parent then
+			flingTrailTokens[character] = nil
+			return
+		end
+		active.Enabled = false
+		task.delay(FLING_TRAIL_LIFETIME, function()
+			if flingTrailTokens[character] ~= token then
+				return
+			end
+			flingTrailTokens[character] = nil
+			local top, bottom = active.Attachment0, active.Attachment1
+			active:Destroy()
+			if top then top:Destroy() end
+			if bottom then bottom:Destroy() end
+		end)
+	end)
+end
+
+local function fling(entity: any, center: Vector3, power: number)
+	local character = entity.Instance
+	if not character or not character:IsA("Model") or not entity.Humanoid then
+		return
+	end
+	local ragdollTime = math.clamp(FLING_RAGDOLL_MIN + power * FLING_RAGDOLL_PER_POWER, FLING_RAGDOLL_MIN, FLING_RAGDOLL_MAX)
+	-- Stun first: it ragdolls (server takes ownership of every limb); the
+	-- launch then re-asserts ownership so a client can't overwrite it.
+	if alive(entity) then
+		StatusEffectSys:ApplyEffect(entity, "Stun", ragdollTime)
+	end
+	local away = entity:GetPosition() - center
+	away = Vector3.new(away.X, 0, away.Z)
+	local direction = (if away.Magnitude > 1e-3 then away.Unit else Vector3.zero) + Vector3.new(0, FLING_UPWARD, 0)
+	local velocity = direction.Unit * math.clamp(power * FLING_SPEED_PER_POWER, FLING_MIN_SPEED, FLING_MAX_SPEED)
+	-- random tumble axis; up to +-30% jitter on the power-scaled spin rate
+	local spinRate = math.clamp(power * FLING_SPIN_PER_POWER, FLING_SPIN_MIN, FLING_SPIN_MAX)
+		* flingRandom:NextNumber(0.7, 1.3)
+	Ragdoll.Launch(character, velocity, flingRandom:NextUnitVector() * spinRate)
+	flingTrail(character, ragdollTime)
+end
+
 local function explode(shot: Shot)
 	local ctx, compiled = shot.ctx, shot.compiled
 	local base = SpellRunes.Vessels.Explosion
@@ -602,7 +703,11 @@ local function explode(shot: Shot)
 		if entity ~= ctx.caster and alive(entity) then
 			local position = entity:GetPosition()
 			local falloff = 1 - 0.5 * math.clamp((position - center).Magnitude / radius, 0, 1)
-			strike(ctx, entity, shot.damageEnergy * shot.impact * falloff, "Body", position, shot.element, shot.damageEnergy * falloff)
+			local power = shot.damageEnergy * shot.impact * falloff
+			strike(ctx, entity, power, "Body", position, shot.element, shot.damageEnergy * falloff)
+			if power >= FLING_MIN_POWER then
+				fling(entity, center, power)
+			end
 		end
 	end
 	VisualOffload.Fire("SpellExplosion", {
@@ -620,7 +725,22 @@ local function fireVessel(compiled: any, ctx: Context, id: string, energy: numbe
 	local info = compiled.vessels[id]
 	local vessel = compiled.runes[id].rune
 	local stats = vesselStats(compiled, ctx, id)
-	local perCopy = energy * (1 - info.modCost) / info.count
+	-- Overcharge adds copies (energy already scaled to match). A vessel with
+	-- Quantity grows its own pattern; one without fans the extras out.
+	local count = info.count
+	local copies = ctx.copyMultiplier or 1
+	if copies > 1 and vessel ~= "Explosion" then
+		count = math.max(info.count, math.floor(info.count * copies + 0.5))
+		if count ~= info.count then
+			local quantity = if stats.quantity then table.clone(stats.quantity) else {
+				Pattern = "Fan",
+				Spread = SpellRunes.Charge.OverchargeSpread,
+			}
+			quantity.Count = count
+			stats.quantity = quantity
+		end
+	end
+	local perCopy = energy * (1 - info.modCost) / count
 	local shot: Shot = {
 		compiled = compiled,
 		ctx = ctx,
@@ -640,7 +760,7 @@ local function fireVessel(compiled: any, ctx: Context, id: string, energy: numbe
 	end
 	local stream = stats.quantity and stats.quantity.Pattern == "Stream"
 	if vessel == "Beam" and stats.sustain then
-		for index = 1, info.count do
+		for index = 1, count do
 			BeamHandler.Start({
 				Player = ctx.player, Character = ctx.character, Caster = ctx.caster,
 				Duration = stats.sustain,
@@ -703,6 +823,7 @@ export type CastRequest = {
 	cursorPoint: Vector3,
 	cursorEntity: any?,
 	live: (() -> (Vector3?, Vector3?))?, -- current (origin, cursor); see liveContext
+	charge: number?, -- hold-to-charge level (SpellRunes.Charge); 1 = a normal cast
 }
 
 -- Runs every Mana Well's flow. Mana is charged by the caller.
@@ -723,9 +844,13 @@ function SpellRuntime.Cast(compiled: any, request: CastRequest)
 		spawnOffset = CAST_SPAWN_OFFSET,
 		memo = {},
 		live = request.live,
+		copyMultiplier = SpellRunes.ChargeCopyMultiplier(request.charge or 1),
 	}
+	-- Partial charge spends that fraction of every well's energy; overcharge
+	-- spends more, matching the extra copies (the caller already took mana).
+	local energyMultiplier = SpellRunes.ChargeEnergyMultiplier(request.charge or 1)
 	for _, rootId in compiled.manaRoots do
-		runFlow(compiled, ctx, rootId, "out", compiled.runes[rootId].params.Amount, nil)
+		runFlow(compiled, ctx, rootId, "out", compiled.runes[rootId].params.Amount * energyMultiplier, nil)
 	end
 end
 

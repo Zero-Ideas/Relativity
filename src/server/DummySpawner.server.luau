@@ -9,6 +9,7 @@ local Shared = ReplicatedStorage:WaitForChild("Shared")
 local Entity = require(Shared.Entity)
 local SafeMath = require(Shared.SafeMath)
 local VisualOffload = require(Shared.VisualOffload)
+local DebugAccess = require(script.Parent.DebugAccess)
 
 -- Duplicate Studio Script instances must never install a second handler.
 if Shared:GetAttribute("DummySpawnerRunning") then return end
@@ -216,8 +217,9 @@ end
 local MAX_PLACE_DISTANCE = 500
 
 VisualOffload.On("DummySpawner", function(data, player)
-	-- Debug-panel feature: never accept spawn requests from a live server.
-	if not RunService:IsStudio() or not player or typeof(data) ~= "table" then return end
+	-- Debug-panel feature: only for players DebugAccess allows (anyone in a
+	-- Studio-hosted server; owner/allow-listed testers on Team Test or live).
+	if not DebugAccess.IsAllowed(player) or typeof(data) ~= "table" then return end
 	if data.Action == "Models" then
 		local names = {}
 		for name in templates() do table.insert(names, name) end

@@ -125,14 +125,14 @@ function Toolbox.new(parent: Frame, hooks: any)
 					AutoButtonColor = true,
 				})
 				Theme.make("Frame", { Size = UDim2.new(0, 4, 1, -12), Position = UDim2.fromOffset(6, 6), BackgroundColor3 = color, BorderSizePixel = 0 }, item)
-				Theme.label(item, def.Name, 13, { Font = Theme.FontBold, Position = UDim2.fromOffset(18, 5), Size = UDim2.new(1, -26, 0, 18) })
+				Theme.label(item, SpellRunes.DisplayName(def), 13, { Font = Theme.FontBold, Position = UDim2.fromOffset(18, 5), Size = UDim2.new(1, -26, 0, 18) })
 				Theme.label(item, def.Description, 11, { Position = UDim2.fromOffset(18, 23), Size = UDim2.new(1, -26, 0, 16), TextColor3 = Colors.muted })
 				item.InputBegan:Connect(function(input)
 					if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
 						hooks.onRunePress(runeId)
 					end
 				end)
-				table.insert(self.items, { frame = item, text = string.lower(def.Name .. " " .. def.Category .. " " .. def.Description), category = category })
+				table.insert(self.items, { frame = item, text = string.lower(SpellRunes.DisplayName(def) .. " " .. def.Category .. " " .. def.Description), category = category })
 			end
 		end
 	end
@@ -350,7 +350,7 @@ end
 function Inspector:showRune(rune: any, context: any)
 	local def = SpellRunes.Runes[rune.rune]
 	local color = Board.categoryColor(def)
-	self:text(def.Name, 18, color:Lerp(Color3.new(1, 1, 1), 0.35), true)
+	self:text(SpellRunes.DisplayName(def), 18, color:Lerp(Color3.new(1, 1, 1), 0.35), true)
 	self:text(`{def.Category} rune · goes in a {table.concat(def.Zones, " or ")} zone`, 12, Colors.muted)
 	self:text(def.Description, 13)
 	for _, problem in context.errors do
@@ -394,7 +394,7 @@ end
 
 function Inspector:showZone(zone: any)
 	local kind = SpellRunes.Zones[zone.kind]
-	self:text(`{zone.kind} zone`, 18, kind.Color:Lerp(Color3.new(1, 1, 1), 0.35), true)
+	self:text((if (kind :: any).Glyph then (kind :: any).Glyph .. "  " else "") .. `{zone.kind} zone`, 18, kind.Color:Lerp(Color3.new(1, 1, 1), 0.35), true)
 	self:text(kind.Description, 13)
 	local inside = #self.hooks.doc():runesInZone(zone)
 	self:text(`{inside} rune{if inside == 1 then "" else "s"} inside · {zone.w} × {zone.h}`, 12, Colors.muted)
