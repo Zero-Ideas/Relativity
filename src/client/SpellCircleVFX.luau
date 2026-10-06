@@ -60,6 +60,12 @@ local SAT_GAP = 0.7 -- studs each satellite level sits in front of its parent
 local SAT_SPREAD = 0.6 -- sibling satellites circle the parent's axis at this fraction of its radius
 local SAT_ORBIT = 0.5 -- radians per (dilated, spin-boosted) second siblings circle that axis
 local MAX_SAT_DEPTH = 3
+local CLOUD_DISPERSE = 0.6 -- seconds for a frozen circle to come apart into its cloud
+local CLOUD_DRIFT_MIN, CLOUD_DRIFT_MAX = 0.15, 0.6 -- radians per second each piece circles the cloud centre
+-- Cloud placement is random per cast (not from the spell's seed), so no two
+-- frozen clouds move alike.
+local cloudRng = Random.new()
+local PIECE_GAP = 0.02 -- studs between a circle's stacked pieces (avoids z-fighting)
 
 local BASE_RADIUS = 3 -- studs, for a full-share first circle
 local HAND_DISTANCE = 5
@@ -84,9 +90,28 @@ type Item = {
 
 type Layer = { Frame: Frame, Speed: number, Phase: number }
 
-type Circle = {
+-- One flat canvas of a circle. A main circle is several stacked pieces (outer
+-- ring, overcharge rings, band, star, core) so a frozen spell can come apart
+-- into a tumbling cloud of rings and glyphs; Drift/Axis/Rate/Tilt are that
+-- piece's place and spin in the cloud.
+type Piece = {
 	Part: Part,
 	Gui: SurfaceGui,
+	Drift: Vector3,
+	DriftAxis: Vector3,
+	DriftRate: number, -- radians per second around the cloud centre (signed)
+	Bob: number, -- how far it swings in and out from the centre, studs
+	BobRate: number,
+	BobPhase: number,
+	Axis: Vector3,
+	Rate: number,
+	Tilt: CFrame,
+}
+
+type Circle = {
+	Part: Part, -- the first piece's part (where the circle sits when assembled)
+	Gui: SurfaceGui,
+	Pieces: { Piece },
 	Size: number, -- part side in studs
 	Distance: number,
 	Ghost: boolean?,
@@ -105,7 +130,7 @@ type CastState = {
 	Circles: { Circle },
 	Items: { Item },
 	Layers: { Layer },
-	State: string, -- "charge" | "frozen" | "sustain" | "release" | "cancel"
+	State: string, -- "charge" | "frozen" | "assemble" | "sustain" | "release" | "cancel"
 	Began: number, -- os.clock at Begin (charge is held in real time)
 	Charge: number, -- current draw progress 0..Charge.Max
 	Age: number, -- dilated seconds
@@ -120,6 +145,7 @@ type CastState = {
 	FrozenOrigin: Vector3?,
 	FrozenDirection: Vector3?,
 	ChargeCap: number?, -- frozen before full charge: keeps drawing up to 1x, never overcharges
+	AssembleStart: number?, -- os.clock when a frozen cloud began reassembling (T)
 	LastP: number,
 	LastO: number,
 	LastV: number,
@@ -370,20 +396,22 @@ local function buildSatellite(builder: Builder, frame: Frame, sat: any, color: C
 	glyph(builder, frame, sat.Glyph, 0.5, 0.5, 0.36, if child then child.Core else color, 0, start + span * 0.5, finish)
 end
 
-local function buildCircle(builder: Builder, root: Frame, cs: any, numeral: string)
+-- `canvas()` returns a fresh piece (its own part) for the next layer group.
+local function buildCircle(builder: Builder, canvas: () -> Frame, cs: any, numeral: string)
 	local rng = Random.new(cs.Seed)
 	local color, core = cs.Color, cs.Core
 	local dir = if rng:NextNumber() < 0.5 then -1 else 1
 
 	-- 0 - 0.25: outer ring traces around, numerals written behind it
-	local outerLayer = layer(builder, root, dir * 6, rng:NextNumber(0, 360))
+	local outerRoot = canvas()
+	local outerLayer = layer(builder, outerRoot, dir * 6, rng:NextNumber(0, 360))
 	sweepRing(builder, outerLayer, OUTER, 3, color, 0, 0.25)
 	ring(builder, outerLayer, OUTER_INNER, 2, color, 0.12, 0.25)
 	local numeralSlots = math.floor(2 * math.pi * NUMERAL_R / 0.032)
 	textRing(builder, outerLayer, fillTokens(chars(numeral), "·", numeralSlots), NUMERAL_R, 0.034, core, 0, 0.25, NUMERAL_FONT)
 
 	-- overcharge rings (driven by charge past 1, not by draw progress)
-	local overLayer = layer(builder, root, -dir * 14, rng:NextNumber(0, 360))
+	local overLayer = layer(builder, canvas(), -dir * 14, rng:NextNumber(0, 360))
 	for k = 1, OVER_RINGS do
 		local radius = 0.395 + 0.022 * k
 		ring(builder, overLayer, radius, 2, core, (k - 1) / OVER_RINGS, k / OVER_RINGS, true, 0.85)
@@ -396,10 +424,10 @@ local function buildCircle(builder: Builder, root: Frame, cs: any, numeral: stri
 	end
 
 	-- 0.25 - 0.5: script band rings and the vessel's star
-	local bandLayer = layer(builder, root, -dir * 10, rng:NextNumber(0, 360))
+	local bandLayer = layer(builder, canvas(), -dir * 10, rng:NextNumber(0, 360))
 	ring(builder, bandLayer, BAND_OUT, 2, color, 0.25, 0.38)
 	ring(builder, bandLayer, BAND_IN, 2, color, 0.27, 0.4)
-	local polyLayer = layer(builder, root, dir * 4, rng:NextNumber(0, 360))
+	local polyLayer = layer(builder, canvas(), dir * 4, rng:NextNumber(0, 360))
 	polygonFor(builder, polyLayer, cs, POLY_R, 2, 0.25, 0.5)
 
 	-- 0.5 - 0.75: modifier nodes and band glyphs pop in
@@ -419,8 +447,9 @@ local function buildCircle(builder: Builder, root: Frame, cs: any, numeral: stri
 	textRing(builder, bandLayer, fillTokens(cs.Band, nil, bandSlots), BAND_R, 0.042, core, 0.5, 0.75)
 
 	-- 0.75 - 1: core and quantity marks (satellites are their own canvases)
-	ring(builder, root, CORE_R, 2, color, 0.75, 0.85)
-	glyph(builder, root, cs.ElementGlyph, 0.5, 0.5, 0.14, core, 0, 0.78, 0.95)
+	local coreRoot = canvas()
+	ring(builder, coreRoot, CORE_R, 2, color, 0.75, 0.85)
+	glyph(builder, coreRoot, cs.ElementGlyph, 0.5, 0.5, 0.14, core, 0, 0.78, 0.95)
 	local quantity = cs.Quantity
 	if quantity and quantity.Count > 1 then
 		local count = quantity.Count
@@ -434,7 +463,7 @@ local function buildCircle(builder: Builder, root: Frame, cs: any, numeral: stri
 			for k = 1, count do
 				local angle = -math.pi / 2 + (if count > 1 then ((k - 1) / (count - 1) - 0.5) * spread else 0)
 				local x, y = polar(MARK_R, angle)
-				glyph(builder, root, "▲", x, y, 0.026, core, math.deg(angle) + 90, 0.75 + 0.2 * k / count, 0.8 + 0.2 * k / count)
+				glyph(builder, outerRoot, "▲", x, y, 0.026, core, math.deg(angle) + 90, 0.75 + 0.2 * k / count, 0.8 + 0.2 * k / count)
 			end
 		end
 	end
@@ -472,13 +501,36 @@ local function newCanvas(sizeStuds: number): (Part, SurfaceGui, Frame)
 	return part, gui, root
 end
 
+-- A piece's random place in the frozen cloud: up to `reach` studs from the
+-- centre, circling it on its own axis at its own speed, swinging in and out,
+-- and tumbling. Random per cast.
+local function newPiece(part: Part, gui: SurfaceGui, reach: number): Piece
+	local rng = cloudRng
+	local distance = reach * rng:NextNumber(0.35, 1)
+	return {
+		Part = part,
+		Gui = gui,
+		Drift = rng:NextUnitVector() * distance,
+		DriftAxis = rng:NextUnitVector(),
+		DriftRate = rng:NextNumber(CLOUD_DRIFT_MIN, CLOUD_DRIFT_MAX) * (if rng:NextNumber() < 0.5 then -1 else 1),
+		Bob = distance * rng:NextNumber(0.1, 0.35),
+		BobRate = rng:NextNumber(0.6, 1.6),
+		BobPhase = rng:NextNumber(0, math.pi * 2),
+		Axis = rng:NextUnitVector(),
+		Rate = rng:NextNumber(0.3, 0.9) * (if rng:NextNumber() < 0.5 then -1 else 1),
+		Tilt = CFrame.fromAxisAngle(rng:NextUnitVector(), rng:NextNumber(0, math.pi)),
+	}
+end
+
 --------------------------------------------------------------------------------
 -- Cast lifecycle
 --------------------------------------------------------------------------------
 
 local function destroyCast(cast: CastState)
 	for _, circle in cast.Circles do
-		circle.Part:Destroy()
+		for _, piece in circle.Pieces do
+			piece.Part:Destroy()
+		end
 	end
 	table.clear(cast.Circles)
 	if current[cast.Caster] == cast then
@@ -514,6 +566,7 @@ local function createCast(caster: Model, spec: any, target: Vector3?, isLocal: b
 			local circle: Circle = {
 				Part = part,
 				Gui = gui,
+				Pieces = { newPiece(part, gui, BASE_RADIUS * (1 + 0.4 * depth)) },
 				Size = side,
 				Distance = anchor.Distance + SAT_GAP,
 				Anchor = anchor,
@@ -547,11 +600,15 @@ local function createCast(caster: Model, spec: any, target: Vector3?, isLocal: b
 		end
 		local radius = BASE_RADIUS * cs.Scale * scale
 		local side = radius / OUTER
-		local part, gui, root = newCanvas(side)
-		buildCircle(builder, root, cs, spec.Numeral or "")
-		local circle: Circle = { Part = part, Gui = gui, Size = side, Distance = distance }
+		local pieces: { Piece } = {}
+		buildCircle(builder, function()
+			local part, gui, root = newCanvas(side)
+			part.Parent = parent
+			table.insert(pieces, newPiece(part, gui, radius * (0.6 + 0.3 * index)))
+			return root
+		end, cs, spec.Numeral or "")
+		local circle: Circle = { Part = pieces[1].Part, Gui = pieces[1].Gui, Pieces = pieces, Size = side, Distance = distance }
 		table.insert(circles, circle)
-		part.Parent = parent
 		addSatellites(cs, circle, radius, 1)
 		-- the next vessel's circle stacks past this one's satellites
 		distance += STACK_GAP + SAT_GAP * satelliteDepth(cs)
@@ -560,7 +617,14 @@ local function createCast(caster: Model, spec: any, target: Vector3?, isLocal: b
 			for k = 1, math.min(quantity.Count - 1, 4) do
 				local ghostPart, ghostGui, ghostRoot = newCanvas(side * (1 - 0.06 * k))
 				buildGhost(builder, ghostRoot, cs, 0.75 + 0.05 * k, 0.85 + 0.05 * k)
-				table.insert(circles, { Part = ghostPart, Gui = ghostGui, Size = side * (1 - 0.06 * k), Distance = HAND_DISTANCE - 0.4 * k, Ghost = true })
+				table.insert(circles, {
+					Part = ghostPart,
+					Gui = ghostGui,
+					Pieces = { newPiece(ghostPart, ghostGui, radius * 1.2) },
+					Size = side * (1 - 0.06 * k),
+					Distance = HAND_DISTANCE - 0.4 * k,
+					Ghost = true,
+				})
 				ghostPart.Parent = parent
 			end
 		end
@@ -654,6 +718,15 @@ local function step(dt: number)
 			over = math.clamp((cast.Charge - 1) / (SpellRunes.Charge.Max - 1), 0, 1)
 			spinBoost = 0.6 + over
 			flash = 0.4 + math.sin(cast.Age * 4) * 0.4
+		elseif cast.State == "assemble" then
+			-- the cloud flies back together facing the target, then releases
+			local f = math.clamp((os.clock() - (cast.AssembleStart or 0)) / SpellRunes.Freeze.AssembleTime, 0, 1)
+			over = math.clamp((cast.Charge - 1) / (SpellRunes.Charge.Max - 1), 0, 1)
+			spinBoost = 3 + 5 * f
+			flash = 1.5 * f
+			if f >= 1 then
+				cast.State, cast.StateAge = "release", 0
+			end
 		elseif cast.State == "sustain" then
 			over = math.clamp((cast.Charge - 1) / (SpellRunes.Charge.Max - 1), 0, 1)
 			spinBoost = 2.5
@@ -698,6 +771,15 @@ local function step(dt: number)
 		assert(direction)
 		local brightness = 2.5 + over * 1.5 + math.sin(cast.Age * 10) * over * 0.8 + flash
 		local basis = CFrame.lookAt(origin, origin + direction)
+		-- how far apart the pieces are: 0 = assembled circle(s), 1 = frozen cloud
+		local cloud = 0
+		if cast.State == "frozen" then
+			cloud = math.min(1, cast.StateAge / CLOUD_DISPERSE)
+		elseif cast.State == "assemble" then
+			cloud = 1 - math.clamp((os.clock() - (cast.AssembleStart or 0)) / SpellRunes.Freeze.AssembleTime, 0, 1)
+		end
+		cloud = cloud * cloud * (3 - 2 * cloud) -- smoothstep
+		local cloudCentre = origin + direction * HAND_DISTANCE
 		for _, circle in cast.Circles do
 			local anchor = circle.Anchor
 			if anchor then
@@ -710,17 +792,28 @@ local function step(dt: number)
 			local distance = circle.Distance + push
 			local position = (basis * CFrame.new(offset.X, offset.Y, -distance)).Position
 			local frame = CFrame.lookAt(position, position + direction)
-			circle.Part.CFrame = frame
-			local side = circle.Size * sizeMul
-			if circle.Part.Size.X ~= side then
-				circle.Part.Size = Vector3.new(side, side, 0.05)
+			local side = circle.Size * sizeMul * (1 - 0.25 * cloud)
+			local pieceBrightness = if circle.Ghost then brightness * 0.6 else brightness
+			for index, piece in circle.Pieces do
+				local placed = frame * CFrame.new(0, 0, -PIECE_GAP * (index - 1))
+				if cloud > 0 then
+					local swing = 1 + piece.Bob / math.max(piece.Drift.Magnitude, 1e-3) * math.sin(cast.Age * piece.BobRate + piece.BobPhase)
+					local drift = CFrame.fromAxisAngle(piece.DriftAxis, cast.Age * piece.DriftRate) * (piece.Drift * swing)
+					local tumble = CFrame.fromAxisAngle(piece.Axis, cast.Age * piece.Rate) * piece.Tilt
+					placed = placed:Lerp(CFrame.new(cloudCentre + drift) * tumble, cloud)
+				end
+				local part = piece.Part
+				part.CFrame = placed
+				if part.Size.X ~= side then
+					part.Size = Vector3.new(side, side, 0.05)
+				end
+				-- SurfaceGuis only draw on one side: show whichever faces the camera
+				local face = if (cameraPosition - placed.Position):Dot(placed.LookVector) > 0 then Enum.NormalId.Front else Enum.NormalId.Back
+				if piece.Gui.Face ~= face then
+					piece.Gui.Face = face
+				end
+				piece.Gui.Brightness = pieceBrightness
 			end
-			-- SurfaceGuis only draw on one side: show whichever faces the camera
-			local face = if (cameraPosition - position):Dot(direction) > 0 then Enum.NormalId.Front else Enum.NormalId.Back
-			if circle.Gui.Face ~= face then
-				circle.Gui.Face = face
-			end
-			circle.Gui.Brightness = if circle.Ghost then brightness * 0.6 else brightness
 		end
 	end
 	if #casts == 0 and connection then
@@ -835,8 +928,9 @@ function SpellCircleVFX.Freeze(caster: Model, position: Vector3?, direction: Vec
 	return centre
 end
 
--- Fires the caster's oldest frozen circle (T): it turns from where it hangs
--- to face `target`, then releases.
+-- Fires the caster's oldest frozen circle (T): its cloud reassembles into the
+-- circle(s) facing `target` over SpellRunes.Freeze.AssembleTime (the server
+-- launches the spell then), and releases.
 function SpellCircleVFX.FireFrozen(caster: Model, target: Vector3)
 	local queue = frozen[caster]
 	local cast = queue and table.remove(queue, 1)
@@ -851,7 +945,8 @@ function SpellCircleVFX.FireFrozen(caster: Model, target: Vector3)
 		cast.FrozenDirection = direction
 		cast.FrozenOrigin = centre - direction * HAND_DISTANCE
 	end
-	cast.State, cast.StateAge = "release", 0
+	cast.State, cast.StateAge = "assemble", 0
+	cast.AssembleStart = os.clock()
 end
 
 -- Drops every frozen circle of the caster (death, respawn, leaving).

@@ -489,6 +489,7 @@ SpellRunes.Charge = {
 SpellRunes.Freeze = {
 	MaxQueued = 3,
 	MaxDistance = 8,
+	AssembleTime = 0.45, -- seconds a frozen spell's cloud takes to reassemble before it launches
 }
 
 function SpellRunes.ChargeFromHold(seconds: number): number

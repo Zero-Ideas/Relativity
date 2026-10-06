@@ -283,22 +283,29 @@ local function fireFrozen(player: Player, target: Vector3): boolean
 		end
 	end
 	VisualOffload.Fire("SpellCircle", { Phase = "FireFrozen", Caster = character, Target = target })
+	-- launch once the circle has reassembled on clients (SpellCircleVFX)
 	local origin = entry.origin
-	local ok, err = pcall(SpellRuntime.Cast, entry.compiled, {
-		player = player,
-		caster = Entity.Get(character),
-		character = character,
-		origin = origin,
-		cursorPoint = target,
-		cursorEntity = aimedEntity(character, origin, target),
-		charge = charge,
-		live = function()
-			return origin, target -- a frozen spell keeps its spot and its T aim
-		end,
-	})
-	if not ok then
-		warn(`[SpellService] frozen cast failed: {tostring(err)}`)
-	end
+	task.delay(SpellRunes.Freeze.AssembleTime, function()
+		local living = livingCharacter(player)
+		if living ~= character then
+			return
+		end
+		local ok, err = pcall(SpellRuntime.Cast, entry.compiled, {
+			player = player,
+			caster = Entity.Get(character),
+			character = character,
+			origin = origin,
+			cursorPoint = target,
+			cursorEntity = aimedEntity(character, origin, target),
+			charge = charge,
+			live = function()
+				return origin, target -- a frozen spell keeps its spot and its T aim
+			end,
+		})
+		if not ok then
+			warn(`[SpellService] frozen cast failed: {tostring(err)}`)
+		end
+	end)
 	return true
 end
 
