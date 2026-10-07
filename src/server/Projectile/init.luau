@@ -348,8 +348,19 @@ local MAX_HOMING_TURN_STEP = math.rad(5)
 local MAX_BURST_COUNT = 10000
 
 local active: { Projectile } = {} -- server-side live projectiles
--- Time spent in the step loop, for the debug panel (TakeStepTiming).
-local stepTime, stepFrames, stepWorst = 0, 0, 0
+-- Time per frame spent in each phase of the server loop, for the debug
+-- panel (TakeStepTiming): projectile movement, beam body refinement, and
+-- replication flushing.
+local PHASES = { "Step", "Beam", "Replication" }
+local phaseTotal: { [string]: number } = { Step = 0, Beam = 0, Replication = 0 }
+local phaseWorst: { [string]: number } = { Step = 0, Beam = 0, Replication = 0 }
+local phaseFrames = 0
+local function recordPhase(name: string, elapsed: number)
+	phaseTotal[name] += elapsed
+	if elapsed > phaseWorst[name] then
+		phaseWorst[name] = elapsed
+	end
+end
 local nextId = 0
 local beamSpanStep: ((number) -> ())? = nil
 
@@ -566,13 +577,18 @@ function Projectile.TakeOccupancyStats()
 	return Occupancy.TakeStats()
 end
 
--- Average and worst step-loop time (ms per frame) since the last call, then
--- resets -- DebugService's Stats tab reads this.
-function Projectile.TakeStepTiming(): (number, number)
-	local average = if stepFrames > 0 then stepTime / stepFrames * 1000 else 0
-	local worst = stepWorst * 1000
-	stepTime, stepFrames, stepWorst = 0, 0, 0
-	return average, worst
+-- Average and worst ms per frame of each phase (Step / Beam / Replication)
+-- since the last call, then resets -- DebugService's Stats tab reads this.
+-- e.g. { StepMs = 12.1, StepWorstMs = 18.0, BeamMs = ..., ReplicationMs = ... }
+function Projectile.TakeStepTiming(): { [string]: number }
+	local result = {}
+	for _, name in PHASES do
+		result[name .. "Ms"] = if phaseFrames > 0 then phaseTotal[name] / phaseFrames * 1000 else 0
+		result[name .. "WorstMs"] = phaseWorst[name] * 1000
+		phaseTotal[name], phaseWorst[name] = 0, 0
+	end
+	phaseFrames = 0
+	return result
 end
 
 function Projectile.GetBySource(source: Types.EntityLike): { Projectile }
@@ -865,17 +881,51 @@ end
 -- obstruction clips the body; entity contacts still use the normal damage and
 -- pierce pipeline once per packet. This prevents a leading ricochet from
 -- instantly pulling every trailing sample onto the same wall.
+-- Body-cast params for this packet: its movement filter plus every entity it
+-- already pierced. Built once and reused across frames; rebuilt only when the
+-- pierced set grows (ResolveBeamSpan runs for every beam packet every frame,
+-- and rebuilding them each call was thousands of allocations per frame).
+local function spanParams(self: Projectile): RaycastParams
+	local pierced = 0
+	for _ in self._ignore do
+		pierced += 1
+	end
+	local cached = self._spanParams
+	if cached and self._spanPierced == pierced then
+		return cached
+	end
+	local ignore = self._rayParams.FilterDescendantsInstances
+	for entity in self._ignore do if entity.Instance then table.insert(ignore, entity.Instance) end end
+	local params = RaycastParams.new()
+	params.FilterType = Enum.RaycastFilterType.Exclude
+	params.IgnoreWater = self._rayParams.IgnoreWater
+	params.CollisionGroup = self._rayParams.CollisionGroup
+	params.FilterDescendantsInstances = ignore
+	self._spanParams, self._spanPierced = params, pierced
+	return params
+end
+
 function Projectile.ResolveBeamSpan(self: Projectile, points: { Vector3 }, allowHits: boolean?, cornerIndices: { number }?): { Vector3 }
 	local clipped = { points[1] }
 	self._beamSpanClipped = nil
 	if self.Dead then return clipped end
-	local ignore = self._rayParams.FilterDescendantsInstances
-	for entity in self._ignore do if entity.Instance then table.insert(ignore, entity.Instance) end end
-	local filtered = RaycastParams.new()
-	filtered.FilterType = Enum.RaycastFilterType.Exclude
-	filtered.IgnoreWater = self._rayParams.IgnoreWater
-	filtered.CollisionGroup = self._rayParams.CollisionGroup
-	filtered.FilterDescendantsInstances = ignore
+	local filtered = spanParams(self)
+	-- Entities skipped for the rest of THIS call only (frozen portions,
+	-- rejected targets) go on a private copy, never the cached params.
+	local ignore: { Instance }? = nil
+	local function exclude(instance: Instance)
+		if not ignore then
+			ignore = filtered.FilterDescendantsInstances
+			local private = RaycastParams.new()
+			private.FilterType = filtered.FilterType
+			private.IgnoreWater = filtered.IgnoreWater
+			private.CollisionGroup = filtered.CollisionGroup
+			filtered = private
+		end
+		local list = ignore :: { Instance }
+		table.insert(list, instance)
+		filtered.FilterDescendantsInstances = list
+	end
 	local contacts = 0
 	for index = 1, #points - 1 do
 		local from, to = points[index], points[index + 1]
@@ -908,8 +958,7 @@ function Projectile.ResolveBeamSpan(self: Projectile, points: { Vector3 }, allow
 			-- Frozen portions do not deliver repeated body-trigger hits. Still
 			-- calculate clipping so geometry stays coherent across time bubbles.
 			if allowHits == false or combinedTimeScale(self) <= 0 or ChunkManager.GetTimeScaleAt(contact.Position) <= 0 then
-				table.insert(ignore, entity.Instance)
-				filtered.FilterDescendantsInstances = ignore
+				exclude(entity.Instance)
 			else
 				local position, velocity = self.Position, self.Velocity
 				self.Velocity = heading * velocity.Magnitude
@@ -926,8 +975,7 @@ function Projectile.ResolveBeamSpan(self: Projectile, points: { Vector3 }, allow
 					return clipped
 				end
 				-- A rejected entity must not fall through into world reflection.
-				table.insert(ignore, entity.Instance)
-				filtered.FilterDescendantsInstances = ignore
+				exclude(entity.Instance)
 			end
 			contacts += 1
 			if contacts >= 16 then self._beamSpanClipped = true; return clipped end
@@ -981,7 +1029,10 @@ end
 --------------------------------------------------------------------------------
 
 Heartbeat.Connect(function(globalDt: number)
+	phaseFrames += 1
+	local replicationStarted = os.clock()
 	Replication.flushHitBatch()
+	local replicationElapsed = os.clock() - replicationStarted
 
 	debug.profilebegin("Projectile.StepAll")
 	local stepStarted = os.clock()
@@ -1002,19 +1053,24 @@ Heartbeat.Connect(function(globalDt: number)
 			projectile:Destroy(nil, nil)
 		end
 	end
-	local stepElapsed = os.clock() - stepStarted
-	stepTime += stepElapsed
-	stepFrames += 1
-	if stepElapsed > stepWorst then stepWorst = stepElapsed end
+	recordPhase("Step", os.clock() - stepStarted)
 	debug.profileend()
-	if beamSpanStep then beamSpanStep(globalDt) end
+	if beamSpanStep then
+		debug.profilebegin("Projectile.BeamSpans")
+		local beamStarted = os.clock()
+		beamSpanStep(globalDt)
+		recordPhase("Beam", os.clock() - beamStarted)
+		debug.profileend()
+	end
 
 	-- Publish only completed end-of-frame snapshots. Beam refinement can
 	-- insert colliding children above: sending their parent before those
 	-- children existed exposed an incomplete newest section for one frame.
 	-- Keep spawn-before-move ordering and the existing bounded spawn queue.
+	local flushStarted = os.clock()
 	Replication.flushSpawnBatch()
 	Replication.flushMoveBatch()
+	recordPhase("Replication", replicationElapsed + os.clock() - flushStarted)
 end, { Name = "ProjectileSystem.Step", Priority = 5 })
 
 return Projectile

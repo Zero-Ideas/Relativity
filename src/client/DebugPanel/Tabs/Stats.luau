@@ -46,7 +46,10 @@ return function(window)
 	local sMemory = statLine(tab, "Memory")
 	local sInstances = statLine(tab, "Instances")
 	local sProjectiles = statLine(tab, "Projectiles")
-	local sProjectileStep = statLine(tab, "Projectile step ms (avg / worst)")
+	local sProjectileStep = statLine(tab, "Projectile movement ms (avg / worst)")
+	local sBeamStep = statLine(tab, "Beam bodies ms (avg / worst)")
+	local sReplication = statLine(tab, "Projectile replication ms (avg / worst)")
+	local sProjectileTotal = statLine(tab, "Projectile total ms")
 	local sSkipped = statLine(tab, "Raycasts skipped (empty space)")
 	local sQueues = statLine(tab, "Visual queue (spawn / hit)")
 	local sBeams = statLine(tab, "Beam pose updates (total)")
@@ -68,11 +71,17 @@ return function(window)
 		sMemory(fmt("%.0f MB", s.MemoryMb))
 		sInstances(fmt("%d", s.Instances))
 		sProjectiles(fmt("%d", s.Projectiles))
-		-- share of the whole server frame the projectile step takes
-		local share = if typeof(s.FrameMs) == "number" and s.FrameMs > 0 and typeof(s.StepMs) == "number"
-			then string.format("  (%d%% of frame)", math.floor(s.StepMs / s.FrameMs * 100 + 0.5))
-			else ""
-		sProjectileStep(`{fmt("%.2f", s.StepMs)} / {fmt("%.2f", s.StepWorstMs)}{share}`)
+		-- each phase, and how much of the whole server frame they add up to
+		local function share(ms: any): string
+			return if typeof(s.FrameMs) == "number" and s.FrameMs > 0 and typeof(ms) == "number"
+				then string.format("  (%d%%)", math.floor(ms / s.FrameMs * 100 + 0.5))
+				else ""
+		end
+		sProjectileStep(`{fmt("%.2f", s.StepMs)} / {fmt("%.2f", s.StepWorstMs)}{share(s.StepMs)}`)
+		sBeamStep(`{fmt("%.2f", s.BeamMs)} / {fmt("%.2f", s.BeamWorstMs)}{share(s.BeamMs)}`)
+		sReplication(`{fmt("%.2f", s.ReplicationMs)} / {fmt("%.2f", s.ReplicationWorstMs)}{share(s.ReplicationMs)}`)
+		local total = (tonumber(s.StepMs) or 0) + (tonumber(s.BeamMs) or 0) + (tonumber(s.ReplicationMs) or 0)
+		sProjectileTotal(`{fmt("%.2f", total)}{share(total)} of a {fmt("%.1f", s.FrameMs)} ms frame`)
 		if s.OccupancyReady == false then
 			sSkipped("baking map...")
 		elseif typeof(s.RaycastChecks) == "number" and s.RaycastChecks > 0 then

@@ -602,7 +602,7 @@ end
 
 local function buildStats()
 	local projectiles = Projectile.GetStats()
-	local stepMs, stepWorstMs = Projectile.TakeStepTiming()
+	local timing = Projectile.TakeStepTiming()
 	local occupancy = Projectile.TakeOccupancyStats()
 	local chunks = ChunkManager.GetStats()
 	local averageFrame = if frames > 0 then frameTime / frames else 0
@@ -618,8 +618,12 @@ local function buildStats()
 		Players = #Players:GetPlayers(),
 		GlobalTimeScale = Heartbeat.GetGlobalTimeScale(),
 		Projectiles = projectiles.Active,
-		StepMs = stepMs,
-		StepWorstMs = stepWorstMs,
+		StepMs = timing.StepMs,
+		StepWorstMs = timing.StepWorstMs,
+		BeamMs = timing.BeamMs,
+		BeamWorstMs = timing.BeamWorstMs,
+		ReplicationMs = timing.ReplicationMs,
+		ReplicationWorstMs = timing.ReplicationWorstMs,
 		RaycastChecks = occupancy.Checks,
 		RaycastsSkipped = occupancy.Skipped,
 		OccupancyReady = occupancy.Ready,

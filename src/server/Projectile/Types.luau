@@ -199,6 +199,11 @@ export type State = {
 	_rewindCache: { [EntityLike]: { Body: Vector3, Head: Vector3? } },
 	_simulationDebt: number,
 	_rayParams: RaycastParams,
+	-- beam body casts: _rayParams plus pierced entities, rebuilt only when the
+	-- pierced count changes (see ResolveBeamSpan); never mutated, so beam
+	-- samples cloned from this packet may share it
+	_spanParams: RaycastParams?,
+	_spanPierced: number?,
 	_spawnStreamed: boolean,
 	_streamedSynced: boolean,
 	_lastStreamedTimeScale: number,
