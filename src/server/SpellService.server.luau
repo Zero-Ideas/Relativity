@@ -17,8 +17,8 @@ local SpellStore = require(script.Parent:WaitForChild("SpellStore"))
 local SpellRuntime = require(script.Parent:WaitForChild("SpellRuntime"))
 local BeamHandler = require(script.Parent:WaitForChild("Projectile"):WaitForChild("BeamProjectileHandler"))
 
-local MANA = 10_000_000_000_000
-local CAST_INTERVAL = 0.25
+local PlayerResources = require(script.Parent.PlayerResources)
+local CAST_INTERVAL = require(Shared.SpellSettings).CastCooldown
 local COMMAND_INTERVAL = 0.15
 
 local remoteFolder = ReplicatedStorage:FindFirstChild("SpellRemotes") or Instance.new("Folder")
@@ -32,6 +32,10 @@ command.Parent = remoteFolder
 local cast = remoteFolder:FindFirstChild("SpellCast") or Instance.new("RemoteEvent")
 cast.Name = "SpellCast"
 cast.Parent = remoteFolder
+
+local feedback = remoteFolder:FindFirstChild("SpellFeedback") or Instance.new("RemoteEvent")
+feedback.Name = "SpellFeedback"
+feedback.Parent = remoteFolder
 
 local channel = remoteFolder:FindFirstChild("SpellChannel") or Instance.new("RemoteEvent")
 channel.Name = "SpellChannel"
@@ -60,22 +64,55 @@ local function validPoint(value: any): boolean
 		and math.abs(value.X) < 1e6 and math.abs(value.Y) < 1e6 and math.abs(value.Z) < 1e6
 end
 
-aimRemote.OnServerEvent:Connect(function(player: Player, position: any)
+-- GUI spellcasting is available while alive and not holding another weapon.
+-- Legacy assembler Tools remain compatible, but no Tool is required.
+local function canCastSpells(player: Player): boolean
 	local character = player.Character
-	local tool = character and character:FindFirstChild("SpellAssembler")
+	local humanoid = character and character:FindFirstChildOfClass("Humanoid")
+	if not character or not humanoid or humanoid.Health <= 0 then return false end
+	for _, child in character:GetChildren() do
+		if child:IsA("Tool") and child.Name ~= "SpellAssembler" then return false end
+	end
+	return true
+end
+
+aimRemote.OnServerEvent:Connect(function(player: Player, position: any)
 	local now = os.clock()
 	local previous = liveAim[player]
-	if tool and tool:IsA("Tool") and validPoint(position) and (not previous or now - previous.time >= 0.025) then
+	if canCastSpells(player) and SpellStore.GetActive(player) and validPoint(position) and (not previous or now - previous.time >= 0.025) then
 		liveAim[player] = { position = position, time = now }
 	end
 end)
 
-local lastCast: { [Player]: number } = {}
+local lastCast: { [Player]: { [number]: number } } = {}
 local lastCommand: { [Player]: number } = {}
 
+local function coolingDown(player: Player, slot: number?): boolean
+	local key = slot or SpellStore.GetActiveSlot(player)
+	local previous = key and lastCast[player] and lastCast[player][key]
+	return previous ~= nil and os.clock() - previous < CAST_INTERVAL
+end
+
+local function markCast(player: Player, slot: number?)
+	if not slot then return end
+	local deadlines = lastCast[player]
+	if not deadlines then deadlines = {}; lastCast[player] = deadlines end
+	deadlines[slot] = os.clock()
+	local deadline = workspace:GetServerTimeNow() + CAST_INTERVAL
+	player:SetAttribute("SpellCooldownEndsAt" .. slot, deadline)
+	feedback:FireClient(player, { Accepted = true, Slot = slot, EndsAt = deadline })
+end
+
+local function rejectCast(player: Player, slot: number?)
+	local key = slot or SpellStore.GetActiveSlot(player)
+	feedback:FireClient(player, { Accepted = false, Slot = key, EndsAt = if key then player:GetAttribute("SpellCooldownEndsAt" .. key) or 0 else 0 })
+end
+
 local function onPlayer(player: Player)
-	player:SetAttribute("MaxMana", MANA)
-	player:SetAttribute("Mana", MANA)
+	PlayerResources.Initialize(player)
+	player:SetAttribute("SpellCooldownEndsAt", nil)
+	for slot = 1, 5 do player:SetAttribute("SpellCooldownEndsAt" .. slot, 0) end
+	player:SetAttribute("SpellFrozenSlot", nil)
 end
 
 for _, player in Players:GetPlayers() do onPlayer(player) end
@@ -175,12 +212,6 @@ command.OnServerInvoke = function(player: Player, action: any, payload: any)
 	return result
 end
 
-local function equippedAssembler(player: Player): Tool?
-	local character = player.Character
-	local tool = character and character:FindFirstChild("SpellAssembler")
-	return if tool and tool:IsA("Tool") then tool else nil
-end
-
 local function aimedEntity(character: Model, origin: Vector3, targetPoint: Vector3)
 	local offset = targetPoint - origin
 	if offset.Magnitude < 1e-3 then return nil end
@@ -231,7 +262,7 @@ local function circleBegin(player: Player)
 	local character = player.Character
 	local record = SpellStore.GetActive(player)
 	local spec = record and circleSpecFor(record)
-	if not character or not spec or not equippedAssembler(player) then
+	if not character or not spec or not canCastSpells(player) then
 		return
 	end
 	lastCircleBegin[player] = now
@@ -251,7 +282,7 @@ end
 -- launched later from where their circle hung, oldest first. One frozen
 -- before full charge keeps charging while it hangs, up to 1x (never into
 -- overcharge); the extra is paid for when it fires, if the mana is there.
-type FrozenSpell = { compiled: any, charge: number, started: number, origin: Vector3 }
+type FrozenSpell = { compiled: any, charge: number, started: number, origin: Vector3, slot: number? }
 local frozenSpells: { [Player]: { FrozenSpell } } = {}
 local FROZEN_FALLBACK_RANGE = 100 -- auto-fire target when there's no fresh cursor
 
@@ -272,9 +303,9 @@ end
 
 local function fireFrozen(player: Player, target: Vector3): boolean
 	local queue = frozenSpells[player]
-	local entry = queue and table.remove(queue, 1)
+	local entry = queue and queue[1]
 	local character = livingCharacter(player)
-	if not entry or not character then
+	if not entry or not character or coolingDown(player, entry.slot) then
 		return false
 	end
 	local charge = entry.charge
@@ -283,10 +314,13 @@ local function fireFrozen(player: Player, target: Vector3): boolean
 		local extra = entry.compiled.manaCost * (SpellRunes.ChargeEnergyMultiplier(grown) - SpellRunes.ChargeEnergyMultiplier(charge))
 		local mana = player:GetAttribute("Mana")
 		if grown > charge and typeof(mana) == "number" and mana >= extra then
-			player:SetAttribute("Mana", mana - extra)
+			if not PlayerResources.Consume(player, "Mana", extra) then return false end
 			charge = grown
 		end
 	end
+	table.remove(queue :: { FrozenSpell }, 1)
+	player:SetAttribute("SpellFrozenSlot", if queue and queue[1] then queue[1].slot else nil)
+	markCast(player, entry.slot)
 	VisualOffload.Fire("SpellCircle", { Phase = "FireFrozen", Caster = character, Target = target })
 	-- launch once the circle has reassembled on clients (SpellCircleVFX)
 	local origin = entry.origin
@@ -317,7 +351,7 @@ end
 local function freezeSpell(player: Player, rawPosition: any)
 	local started = chargeStart[player]
 	local character, head = livingCharacter(player)
-	if not started or not character or not head or not equippedAssembler(player) then
+	if not started or not character or not head or not canCastSpells(player) then
 		return
 	end
 	local record = SpellStore.GetActive(player)
@@ -329,13 +363,15 @@ local function freezeSpell(player: Player, rawPosition: any)
 	if held > SpellRunes.Charge.StaleAfter then
 		return
 	end
+	local existing = frozenSpells[player]
+	if existing and #existing >= SpellRunes.Freeze.MaxQueued and coolingDown(player, existing[1].slot) then return end
 	local charge = SpellRunes.ChargeFromHold(held)
 	local manaCost = compiled.manaCost * SpellRunes.ChargeEnergyMultiplier(charge)
 	local mana = player:GetAttribute("Mana")
 	if typeof(mana) ~= "number" or mana < manaCost then
 		return
 	end
-	player:SetAttribute("Mana", mana - manaCost)
+	if not PlayerResources.Consume(player, "Mana", manaCost) then return end
 	chargeStart[player] = nil
 	circleOpen[player] = nil
 
@@ -357,7 +393,8 @@ local function freezeSpell(player: Player, rawPosition: any)
 	if #queue >= SpellRunes.Freeze.MaxQueued then
 		fireFrozen(player, aim or origin + facing * FROZEN_FALLBACK_RANGE)
 	end
-	table.insert(queue, { compiled = compiled, charge = charge, started = started, origin = origin })
+	table.insert(queue, { compiled = compiled, charge = charge, started = started, origin = origin, slot = SpellStore.GetActiveSlot(player) })
+	player:SetAttribute("SpellFrozenSlot", queue[1].slot)
 	VisualOffload.Fire("SpellCircle", {
 		Phase = "Freeze",
 		Caster = character,
@@ -373,6 +410,7 @@ local function clearFrozen(player: Player, character: Model?)
 		return
 	end
 	frozenSpells[player] = nil
+	player:SetAttribute("SpellFrozenSlot", nil)
 	if character then
 		VisualOffload.Fire("SpellCircle", { Phase = "ClearFrozen", Caster = character })
 	end
@@ -428,6 +466,8 @@ channel.OnServerEvent:Connect(function(player: Player, action: any, payload: any
 	elseif action == "KeepAlive" then
 		BeamHandler.KeepAlive(player)
 	elseif action == "ChargeBegin" then
+		if coolingDown(player) or not canCastSpells(player) or not SpellStore.GetActive(player) then return end
+		if chargeStart[player] and os.clock() - chargeStart[player] <= SpellRunes.Charge.StaleAfter then return end
 		chargeStart[player] = os.clock()
 		circleBegin(player)
 	elseif action == "ChargeCancel" then
@@ -439,8 +479,10 @@ channel.OnServerEvent:Connect(function(player: Player, action: any, payload: any
 	elseif action == "Freeze" then
 		freezeSpell(player, payload)
 	elseif action == "FireFrozen" then
-		if typeof(payload) == "Vector3" and not SafeMath.hasNaN(payload) and equippedAssembler(player) then
-			fireFrozen(player, SafeMath.vector(payload, Vector3.zero))
+		if typeof(payload) == "Vector3" and not SafeMath.hasNaN(payload) and canCastSpells(player) then
+			if not fireFrozen(player, SafeMath.vector(payload, Vector3.zero)) then rejectCast(player, player:GetAttribute("SpellFrozenSlot")) end
+		else
+			rejectCast(player)
 		end
 	end
 end)
@@ -453,10 +495,10 @@ local function castSpell(player: Player, rawTarget: any): boolean
 		return false
 	end
 	local targetPoint = SafeMath.vector(rawTarget, Vector3.zero)
-	local tool = equippedAssembler(player)
+	local allowed = canCastSpells(player)
 	local character = player.Character
 	local root = character and (character.PrimaryPart or character:FindFirstChild("HumanoidRootPart"))
-	if not tool or not character or not root or not root:IsA("BasePart") then
+	if not allowed or not character or not root or not root:IsA("BasePart") then
 		return false
 	end
 	local record = SpellStore.GetActive(player)
@@ -465,7 +507,7 @@ local function castSpell(player: Player, rawTarget: any): boolean
 	if not compiled then return false end
 
 	local now = os.clock()
-	if lastCast[player] and now - lastCast[player] < CAST_INTERVAL then return false end
+	if coolingDown(player) then return false end
 	if SpellRuntime.IsSustaining(player) then return false end
 	local humanoid = character:FindFirstChildOfClass("Humanoid")
 	if not humanoid or humanoid.Health <= 0 then return false end
@@ -484,8 +526,8 @@ local function castSpell(player: Player, rawTarget: any): boolean
 	local manaCost = compiled.manaCost * SpellRunes.ChargeEnergyMultiplier(charge)
 	local mana = player:GetAttribute("Mana")
 	if typeof(mana) ~= "number" or mana < manaCost then return false end
-	lastCast[player] = now
-	player:SetAttribute("Mana", mana - manaCost)
+	if not PlayerResources.Consume(player, "Mana", manaCost) then return false end
+	markCast(player, SpellStore.GetActiveSlot(player))
 
 	local head = character:FindFirstChild("Head")
 	local origin = if head and head:IsA("BasePart") then head.Position else root.Position
@@ -522,9 +564,13 @@ local function castSpell(player: Player, rawTarget: any): boolean
 end
 
 cast.OnServerEvent:Connect(function(player: Player, rawTarget: any)
-	if not castSpell(player, rawTarget) and circleOpen[player] then
-		circleOpen[player] = nil
-		circleClose(player, "Cancel")
+	if not castSpell(player, rawTarget) then
+		rejectCast(player)
+		if circleOpen[player] then
+			circleOpen[player] = nil
+			chargeStart[player] = nil
+			circleClose(player, "Cancel")
+		end
 	end
 end)
 

@@ -500,6 +500,33 @@ local function buildGhost(builder: Builder, root: Frame, cs: any, start: number,
 	glyph(builder, root, cs.ElementGlyph, 0.5, 0.5, 0.1, cs.Core, 0, start, finish)
 end
 
+-- HUD canvas: identical primitives, timing, seeds and glyphs; no world cast,
+-- audio, global update registration or Workspace objects are created here.
+function SpellCircleVFX.BuildPreview(root: Frame, spec: any): any
+	local builder: Builder = { Items = {}, Layers = {} }
+	local count = #spec.Circles
+	local columns = math.max(1, math.ceil(math.sqrt(count)))
+	local rows = math.max(1, math.ceil(count / columns))
+	local size = 1 / math.max(columns, rows)
+	local function satellites(cs: any, parent: Frame, depth: number)
+		if depth > MAX_SAT_DEPTH then return end
+		for index, sat in cs.Satellites do
+			local angle = (index - 1) / math.max(#cs.Satellites, 1) * math.pi * 2
+			local x, y = polar(0.28, angle)
+			local frame = squareFrame(parent, x, y, 0.35)
+			buildSatellite(builder, frame, sat, cs.Color, Random.new(cs.Seed + depth), 0.75, 1)
+			for _, child in sat.Circles do satellites(child, frame, depth + 1) end
+		end
+	end
+	for index, cs in spec.Circles do
+		local column, row = (index - 1) % columns, (index - 1) // columns
+		local frame = squareFrame(root, 0.5 + (column - (columns - 1) / 2) * size, 0.5 + (row - (rows - 1) / 2) * size, size)
+		buildCircle(builder, function() return squareFrame(frame, 0.5, 0.5, 1) end, cs, spec.Numeral or "")
+		satellites(cs, frame, 1)
+	end
+	return builder
+end
+
 local function newCanvas(sizeStuds: number): (Part, SurfaceGui, Frame)
 	local part = Instance.new("Part")
 	part.Name = "SpellCircle"

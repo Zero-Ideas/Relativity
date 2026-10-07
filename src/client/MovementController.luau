@@ -227,7 +227,8 @@ local function step()
 	local baseWalk, baseJump, jumpMode = bases(current)
 
 	-- Horizontal movement dilation.
-	humanoid.WalkSpeed = resolve(baseWalk, "WalkSpeedAdd", "WalkSpeedMultiplier", "WalkSpeed") * effScale
+	local sprint = finite(humanoid:GetAttribute("SprintMultiplier")) or 1
+	humanoid.WalkSpeed = resolve(baseWalk, "WalkSpeedAdd", "WalkSpeedMultiplier", "WalkSpeed") * sprint * effScale
 
 	-- Jump impulse dilation (velocity scales with effScale; height with its square).
 	if baseJump then
@@ -330,7 +331,7 @@ function MovementController.GetWalkSpeed(): number?
 		return nil
 	end
 	local walk = bases(current)
-	return resolve(walk, "WalkSpeedAdd", "WalkSpeedMultiplier", "WalkSpeed")
+	return resolve(walk, "WalkSpeedAdd", "WalkSpeedMultiplier", "WalkSpeed") * (finite(current.humanoid:GetAttribute("SprintMultiplier")) or 1)
 end
 
 -- Undilated jump (power or height -- see GetBase) after modifiers.

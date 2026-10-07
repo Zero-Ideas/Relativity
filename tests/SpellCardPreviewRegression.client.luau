@@ -1,0 +1,40 @@
+-- Run in a Studio client. Does not change saved cards or cast projectiles.
+local Players = game:GetService("Players")
+local Shared = game:GetService("ReplicatedStorage").Shared
+local Compiler = require(Shared.SpellCompiler)
+local Preview = require(Players.LocalPlayer.PlayerScripts.Client.SpellCardPreview)
+local Settings = require(Shared.SpellSettings)
+assert(Settings.CastCooldown == 2.5)
+local gui = Instance.new("ScreenGui")
+gui.Name = "SpellPreviewRegression"
+gui.Parent = Players.LocalPlayer.PlayerGui
+local card = Instance.new("Frame")
+card.Size = UDim2.fromOffset(150, 200)
+card.Parent = gui
+local preview = Preview.new(card)
+local ok, err = pcall(function()
+	local graph = Compiler.CreateDefaultGraph()
+	preview:SetGraph(graph)
+	assert(preview.Frame.Visible and #preview.Builder.Items > 50, "Missing circle primitives")
+	assert(not preview.Frame:FindFirstChildWhichIsA("ViewportFrame", true), "Preview must use direct GUI drawing")
+	local scale = preview.Canvas:FindFirstChildOfClass("UIScale")
+	preview:SetGraph(nil)
+	preview:SetGraph(graph)
+	assert(preview.Canvas:FindFirstChildOfClass("UIScale") == scale, "Graph changes must preserve responsive scaling")
+	local now = workspace:GetServerTimeNow()
+	preview:Cooldown(now + Settings.CastCooldown, true)
+	assert(preview:Step(now + 0.1) and preview.Canvas.Rotation > 0, "Missing release animation")
+	preview:Step(now + 0.3)
+	assert(preview.Canvas.Rotation == 0 and preview.Timer.Visible, "Missing cooldown redraw")
+	assert(not preview:Step(now + Settings.CastCooldown + 0.1), "Cooldown did not finish")
+	for _, item in preview.Builder.Items do
+		assert(item.LastR == (if item.Over then 0 else 1), "Circle did not finish redrawing")
+	end
+	card.Size = UDim2.fromOffset(220, 280)
+	task.wait()
+	assert(math.abs(scale.Scale - preview.Frame.AbsoluteSize.X / 512) < 0.001, "Preview did not resize")
+end)
+preview:Destroy()
+gui:Destroy()
+assert(ok, err)
+print("[SpellCardPreviewRegression] PASS: direct drawing, graph replacement, cooldown, resize, cleanup")

@@ -45,6 +45,10 @@ local Players = game:GetService("Players")
 local playerEntities: { [Player]: any } = {} -- most recent Entity per player
 
 local function registerCharacter(player: Player, character: Model)
+	local dataFolder = character:FindFirstChild("DataFolder")
+	local scripts = dataFolder and dataFolder:FindFirstChild("Scripts")
+	local legacy = scripts and scripts:FindFirstChild("Server")
+	if legacy and legacy:IsA("Script") then legacy.Disabled = true end
 	local previous = playerEntities[player]
 	if previous and not previous.IsDestroyed then
 		previous:Destroy() -- drop the old corpse from the hit/homing index

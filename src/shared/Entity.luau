@@ -497,7 +497,7 @@ function Entity:_refreshHumanoidScale()
 		return
 	end
 	self._lastHumanoidScale = scale
-	humanoid.WalkSpeed = (self._baseWalkSpeed or 16) * scale
+	humanoid.WalkSpeed = (self._baseWalkSpeed or 16) * (humanoid:GetAttribute("SprintMultiplier") or 1) * scale
 	if humanoid.UseJumpPower then
 		humanoid.JumpPower = (self._baseJumpPower or 50) * scale
 	else

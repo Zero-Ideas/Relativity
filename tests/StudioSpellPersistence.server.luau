@@ -15,6 +15,10 @@ for slot = 1, 5 do
 end
 local ok, err = Store.SetActive(fake, 3)
 assert(ok, err)
+-- Activation now acknowledges the server cache immediately; explicitly flush
+-- before testing disk reload instead of relying on synchronous selection I/O.
+ok, err = Store.Save(fake)
+assert(ok, err)
 local raw = bridge:Invoke("Load", fake.UserId)
 local rejoined = { UserId = fake.UserId, Parent = game.Players }
 Store.Load(rejoined)

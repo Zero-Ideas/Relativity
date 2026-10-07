@@ -39,6 +39,7 @@ type Entry = {
 }
 
 local entries: { [Player]: Entry } = {}
+local selectionSaveQueued: { [Player]: boolean } = {}
 
 local function blankData()
 	return {
@@ -216,6 +217,12 @@ function SpellStore.GetActive(player: Player)
 	return entry.data.slots[tostring(entry.data.activeSlot)]
 end
 
+-- Cast feedback only needs the slot, not a copy of all five saved graphs.
+function SpellStore.GetActiveSlot(player: Player): number?
+	local entry = entries[player]
+	return if entry and entry.loaded and entry.available then entry.data.activeSlot else nil
+end
+
 function SpellStore.Save(player: Player): (boolean, string?)
 	local entry = entries[player]
 	if not entry or not entry.loaded or not entry.available then
@@ -310,8 +317,19 @@ function SpellStore.SetActive(player: Player, slot: number)
 	entry.data.activeSlot = slot
 	entry.dirty = true
 	entry.localRevision += 1
-	local ok, err = SpellStore.Save(player)
-	return ok, err, publicState(entry)
+	-- Selection is immediately authoritative in the server cache. Disk/network
+	-- persistence must not hold its acknowledgement hostage; coalesce rapid
+	-- changes, with the existing autosave/leave/shutdown flush as backstops.
+	if not selectionSaveQueued[player] then
+		selectionSaveQueued[player] = true
+		task.delay(1, function()
+			selectionSaveQueued[player] = nil
+			if entries[player] == entry and entry.dirty and entry.available and not entry.saving then
+				SpellStore.Save(player)
+			end
+		end)
+	end
+	return true, nil, publicState(entry)
 end
 
 local function onPlayer(player: Player)

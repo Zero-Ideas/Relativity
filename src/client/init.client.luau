@@ -47,6 +47,7 @@ end
 -- builds itself only for players allowed to use it (see DebugPanel)
 DebugPanel.start()
 ToolManager.start()
+task.spawn(function() require(script.MainHud).start() end)
 
 -- Optional: custom impact VFX for offloaded projectiles.
 -- ProjectileClient.SetImpactHandler(function(position, normal, model)
@@ -55,5 +56,10 @@ ToolManager.start()
 -- 	effect.Parent = workspace
 -- 	task.delay(1, effect.Destroy, effect)
 -- end)
+local StarterGui = game:GetService("StarterGui")
 
+-- Wait for the game to load the core GUI, then disable the backpack
+pcall(function()
+    StarterGui:SetCoreGuiEnabled(Enum.CoreGuiType.Backpack, false)
+end)
 print("[Relativity] client render systems online")

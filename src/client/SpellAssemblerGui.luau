@@ -1,9 +1,9 @@
 --!strict
 --[[
 	Spell circle editor: a full-screen whiteboard for building spell cards,
-	plus the compact HUD shown while the SpellAssembler tool is held.
-	Public API (used by ToolControllers/SpellAssembler): Open, Close, Toggle,
-	Cast, Equip, Unequip.
+	plus a compact casting HUD. MainHud launches it without a Tool.
+	Public API: start, Open, Close, Toggle, SelectSlot, GetState, StateChanged,
+	Cast, StopCast, CancelCast. Equip/Unequip preserve old Tool compatibility.
 
 	Layout: top bar (name, card slots, save/equip) over a row of
 	[Toolbox | Board | Inspector]. Both side panels resize by dragging their
@@ -32,6 +32,8 @@ local SpellCircleVFX = require(script.Parent:WaitForChild("SpellCircleVFX"))
 local remotes = ReplicatedStorage:WaitForChild("SpellRemotes")
 local command = remotes:WaitForChild("SpellCommand") :: RemoteFunction
 local castRemote = remotes:WaitForChild("SpellCast") :: RemoteEvent
+local feedbackRemote = remotes:WaitForChild("SpellFeedback") :: RemoteEvent
+local CAST_COOLDOWN = require(Shared.SpellSettings).CastCooldown
 local aimRemote = remotes:WaitForChild("SpellAim") :: UnreliableRemoteEvent
 local channelRemote = remotes:WaitForChild("SpellChannel") :: RemoteEvent
 local holdingCast = false
@@ -44,6 +46,30 @@ local Panels = require(EditorFolder:WaitForChild("Panels"))
 
 local Colors = Theme.Colors
 local SpellAssemblerGui = {}
+local stateEvent = Instance.new("BindableEvent")
+SpellAssemblerGui.StateChanged = stateEvent.Event
+local firedEvent = Instance.new("BindableEvent")
+SpellAssemblerGui.SpellFired = firedEvent.Event
+local cooldownDeadlines: { [number]: number } = {}
+function SpellAssemblerGui.GetCooldownRemaining(slot: number?): number
+	local key = slot or SpellAssemblerGui.GetSelectedSlot()
+	if not key then return 0 end
+	return math.max(0, math.max(cooldownDeadlines[key] or 0, player:GetAttribute("SpellCooldownEndsAt" .. key) or 0) - workspace:GetServerTimeNow())
+end
+feedbackRemote.OnClientEvent:Connect(function(data)
+	if typeof(data) ~= "table" or typeof(data.EndsAt) ~= "number" or typeof(data.Slot) ~= "number" then return end
+	cooldownDeadlines[data.Slot] = data.EndsAt
+	if data.Accepted then firedEvent:Fire(data) end
+end)
+local function sendCast(target: Vector3)
+	local slot = SpellAssemblerGui.GetSelectedSlot()
+	if slot then cooldownDeadlines[slot] = workspace:GetServerTimeNow() + CAST_COOLDOWN end
+	castRemote:FireServer(target)
+end
+local started = false
+local loadingCards = false
+local selectingCard = false
+local pendingActiveSlot: number? = nil
 
 local SLOT_COUNT = 5
 local TOP_BAR = 52
@@ -58,6 +84,15 @@ local SINK_KEYS = {
 }
 
 local equippedTool: Tool? = nil
+local function canCast(): boolean
+	local character = player.Character
+	local humanoid = character and character:FindFirstChildOfClass("Humanoid")
+	if not character or not humanoid or humanoid.Health <= 0 then return false end
+	for _, child in character:GetChildren() do
+		if child:IsA("Tool") and child.Name ~= "SpellAssembler" then return false end
+	end
+	return true
+end
 local gui: ScreenGui? = nil
 local root: Frame? = nil
 local hud: Frame? = nil
@@ -151,7 +186,7 @@ local function updateTopBar()
 	local dirty = savedSignature ~= signature()
 	for slot, button in slotButtons do
 		local record = slotRecord(slot)
-		local active = serverState.activeSlot == slot
+		local active = (pendingActiveSlot or serverState.activeSlot) == slot
 		button.Text = `{slot}  {if record then record.name else "Empty"}{if active then "  ◆" else ""}`
 		button.BackgroundColor3 = if selectedSlot == slot then Colors.accent:Lerp(Colors.panel, 0.45) else Colors.panel2
 		button.TextColor3 = if record then Colors.text else Colors.muted
@@ -162,10 +197,12 @@ local function updateTopBar()
 		saveButton.BackgroundColor3 = if compiledOk and dirty and available and not savingCard then Color3.fromRGB(58, 128, 86) else Colors.panel3
 		saveButton.AutoButtonColor = compiledOk and available and not savingCard
 	end
-	local active = serverState.activeSlot and slotRecord(serverState.activeSlot)
+	local displaySlot = pendingActiveSlot or serverState.activeSlot
+	local active = displaySlot and slotRecord(displaySlot)
 	if activeLabel then
 		activeLabel.Text = `Active spell: {if active then active.name else "None"}`
 	end
+	stateEvent:Fire(serverState)
 end
 
 local function refresh()
@@ -218,8 +255,13 @@ end
 local COMMAND_GAP = 0.2
 
 local function equipSlot(slot: number)
+	if pendingActiveSlot then return end
+	SpellAssemblerGui.CancelCast()
+	pendingActiveSlot = slot
+	updateTopBar()
 	setStatus("Equipping…", nil, true)
 	local result = invoke("SetActive", { slot = slot })
+	pendingActiveSlot = nil
 	if result.ok then
 		result.message = `Equipped "{(slotRecord(slot) or {}).name or "spell"}". Close the editor [E] and click to cast.`
 	end
@@ -635,7 +677,7 @@ local function buildGui()
 	Theme.corner(ghost :: TextLabel, 6)
 	Theme.make("UIPadding", { PaddingLeft = UDim.new(0, 10), PaddingRight = UDim.new(0, 10) }, ghost)
 
-	-- Compact HUD while the tool is held and the editor is closed.
+	-- Compact casting controls while the editor is closed (also supports touch).
 	local compact = Theme.make("Frame", {
 		Name = "Compact",
 		AnchorPoint = Vector2.new(1, 1),
@@ -674,11 +716,11 @@ local function buildGui()
 	-- TextBox never triggers shortcuts.
 	--------------------------------------------------------------------------
 	UserInputService.InputBegan:Connect(function(input, processed)
-		if input.KeyCode == Enum.KeyCode.E and not processed and equippedTool then
+		if input.KeyCode == Enum.KeyCode.E and not processed and (visible or canCast()) then
 			SpellAssemblerGui.Toggle()
 			return
 		end
-		if not processed and not visible and equippedTool then
+		if not processed and not visible and canCast() then
 			if input.KeyCode == Enum.KeyCode.R then
 				SpellAssemblerGui.Freeze()
 				return
@@ -773,8 +815,9 @@ local function sinkMovement(): Enum.ContextActionResult
 end
 
 function SpellAssemblerGui.Open()
-	SpellAssemblerGui.StopCast()
+	SpellAssemblerGui.CancelCast()
 	buildGui()
+	if not hasLoadedCards or serverState.available ~= true then task.spawn(SpellAssemblerGui.LoadCards) end
 	visible = true;
 	(gui :: ScreenGui).Enabled = true;
 	(root :: Frame).Visible = true;
@@ -795,7 +838,7 @@ function SpellAssemblerGui.Close()
 	if board then board:setCursor("") end
 	ContextActionService:UnbindAction(SINK_ACTION);
 	(root :: Frame).Visible = false;
-	(hud :: Frame).Visible = equippedTool ~= nil
+	(hud :: Frame).Visible = canCast()
 	updateTopBar()
 end
 
@@ -915,7 +958,7 @@ local function startChargeBar()
 end
 
 function SpellAssemblerGui.Cast()
-	if not equippedTool or visible or holdingCast or charging then return end
+	if pendingActiveSlot or SpellAssemblerGui.GetCooldownRemaining() > 0 or not canCast() or visible or holdingCast or charging then return end
 	if not serverState.activeSlot then
 		if activeLabel then
 			activeLabel.Text = "No spell equipped: press E, then Save"
@@ -941,7 +984,7 @@ function SpellAssemblerGui.Cast()
 	end
 	local mouse = player:GetMouse()
 	holdingCast = true
-	castRemote:FireServer(mouse.Hit.Position)
+	sendCast(mouse.Hit.Position)
 	local character = player.Character
 	if character and activeCache.spec then
 		SpellCircleVFX.Cast(character, activeCache.spec, 1, mouse.Hit.Position, true, true)
@@ -955,6 +998,7 @@ function SpellAssemblerGui.Freeze()
 	local character = player.Character
 	local compiled = activeCache.compiled
 	if not charging or not character or not compiled then return end
+	if SpellCircleVFX.FrozenCount(character) >= SpellRunes.Freeze.MaxQueued and SpellAssemblerGui.GetCooldownRemaining(player:GetAttribute("SpellFrozenSlot")) > 0 then return end
 	local charge = SpellRunes.ChargeFromHold(os.clock() - chargeStarted)
 	local mana = player:GetAttribute("Mana")
 	if typeof(mana) ~= "number" or mana < compiled.manaCost * SpellRunes.ChargeEnergyMultiplier(charge) then return end
@@ -969,8 +1013,10 @@ end
 -- T: the oldest frozen spell fires toward the cursor.
 function SpellAssemblerGui.FireFrozen()
 	local character = player.Character
-	if not character then return end
+	local frozenSlot = player:GetAttribute("SpellFrozenSlot")
+	if not character or not frozenSlot or SpellAssemblerGui.GetCooldownRemaining(frozenSlot) > 0 or not canCast() then return end
 	local target = player:GetMouse().Hit.Position
+	cooldownDeadlines[frozenSlot] = workspace:GetServerTimeNow() + CAST_COOLDOWN
 	channelRemote:FireServer("FireFrozen", target)
 	SpellCircleVFX.FireFrozen(character, target)
 end
@@ -978,8 +1024,13 @@ end
 function SpellAssemblerGui.StopCast()
 	if charging then
 		stopChargeBar()
+		if SpellAssemblerGui.GetCooldownRemaining() > 0 then
+			channelRemote:FireServer("ChargeCancel")
+			if player.Character then SpellCircleVFX.Cancel(player.Character) end
+			return
+		end
 		local target = player:GetMouse().Hit.Position
-		castRemote:FireServer(target)
+		sendCast(target)
 		local character = player.Character
 		if character then
 			-- predict the server's mana check so a cast it will refuse fizzles
@@ -1010,6 +1061,7 @@ local function startAimStream()
 	local mouse = player:GetMouse()
 	local elapsed, last, sinceSend = 0, nil, 0
 	aimConnection = game:GetService("RunService").Heartbeat:Connect(function(dt)
+		if not canCast() or (not holdingCast and not charging) then return end
 		elapsed += dt
 		sinceSend += dt
 		if elapsed < AIM_SEND_INTERVAL or visible then return end
@@ -1031,9 +1083,9 @@ local function stopAimStream()
 	end
 end
 
-function SpellAssemblerGui.Equip(tool: Tool)
-	equippedTool = tool
-	startAimStream()
+function SpellAssemblerGui.LoadCards()
+	if loadingCards then return end
+	loadingCards = true
 	buildGui()
 	setStatus("Loading spell cards…", nil, true)
 	local result = invoke("GetState")
@@ -1052,7 +1104,79 @@ function SpellAssemblerGui.Equip(tool: Tool)
 		setStatus(result.message or "Cards loaded.", result.ok)
 	end
 	updateTopBar()
+	loadingCards = false
+end
+
+function SpellAssemblerGui.Equip(tool: Tool)
+	equippedTool = tool
+	startAimStream()
+	SpellAssemblerGui.LoadCards()
 	SpellAssemblerGui.Open()
+end
+
+function SpellAssemblerGui.CancelCast()
+	if charging then
+		stopChargeBar()
+		channelRemote:FireServer("ChargeCancel")
+		if player.Character then SpellCircleVFX.Cancel(player.Character) end
+	end
+	SpellAssemblerGui.StopCast()
+end
+
+function SpellAssemblerGui.GetState(): any
+	return serverState
+end
+
+function SpellAssemblerGui.GetSelectedSlot(): number?
+	return pendingActiveSlot or serverState.activeSlot
+end
+
+function SpellAssemblerGui.IsOpen(): boolean
+	return visible
+end
+
+function SpellAssemblerGui.SelectSlot(slot: number)
+	if selectingCard or loadingCards then return end
+	if not slotRecord(slot) then
+		loadSlot(slot)
+		SpellAssemblerGui.Open()
+		return
+	end
+	selectingCard = true
+	local character = player.Character
+	local humanoid = character and character:FindFirstChildOfClass("Humanoid")
+	if humanoid then humanoid:UnequipTools() end
+	if serverState.activeSlot ~= slot then equipSlot(slot) end
+	selectingCard = false
+	if serverState.activeSlot == slot then SpellAssemblerGui.Close() end
+end
+
+function SpellAssemblerGui.start()
+	if started then return end
+	started = true
+	buildGui()
+	SpellAssemblerGui.Close()
+	startAimStream()
+	task.spawn(SpellAssemblerGui.LoadCards)
+	UserInputService.InputBegan:Connect(function(input, processed)
+		if not processed and not equippedTool and input.UserInputType == Enum.UserInputType.MouseButton1 then
+			SpellAssemblerGui.Cast()
+		end
+	end)
+	local function watchCharacter(character: Model)
+		SpellAssemblerGui.CancelCast()
+		character.ChildAdded:Connect(function(child)
+			if child:IsA("Tool") and child.Name ~= "SpellAssembler" then SpellAssemblerGui.CancelCast() end
+		end)
+		local humanoid = character:WaitForChild("Humanoid", 10)
+		if humanoid and humanoid:IsA("Humanoid") then
+			if not visible then SpellAssemblerGui.Close() end
+			humanoid.Died:Connect(function() SpellAssemblerGui.CancelCast(); SpellAssemblerGui.Close() end)
+		end
+	end
+	player.CharacterAdded:Connect(watchCharacter)
+	player.CharacterRemoving:Connect(function() SpellAssemblerGui.CancelCast(); SpellAssemblerGui.Close() end)
+	if player.Character then task.spawn(watchCharacter, player.Character) end
 end
 
 function SpellAssemblerGui.Unequip(tool: Tool)
@@ -1067,9 +1191,9 @@ function SpellAssemblerGui.Unequip(tool: Tool)
 	end
 	SpellAssemblerGui.StopCast()
 	equippedTool = nil
-	stopAimStream()
+	if started then startAimStream() else stopAimStream() end
 	if visible then SpellAssemblerGui.Close() end
-	if gui then gui.Enabled = false end
+	if gui then gui.Enabled = started end
 end
 
 return SpellAssemblerGui
