@@ -37,18 +37,68 @@ local Stats = game:GetService("Stats")
 -- Gated per player (see DebugAccess), not per environment: Team Test's
 -- cloud server isn't "Studio", but its testers still need the panel.
 local DebugAccess = require(script.Parent.DebugAccess)
+local PlayerDefaults = require(script.Parent.PlayerDefaults)
 
 local Shared = ReplicatedStorage:WaitForChild("Shared")
 local VisualOffload = require(Shared.VisualOffload)
 
--- Every request is dropped unless the sender may use the debug panel.
-local function onAllowed(channel: string, handler: (any, Player) -> ())
+-- Every request is dropped unless the sender may use one of the panel tabs
+-- that sends it (DebugAccess.CanUseTab: listed players any tab, everyone else
+-- only the tabs made public while the panel is open to all).
+local function onAllowed(tabs: { string }, channel: string, handler: (any, Player) -> ())
 	VisualOffload.On(channel, function(data, player)
-		if player and DebugAccess.IsAllowed(player) then
-			handler(data, player)
+		if not player then
+			return
+		end
+		for _, tab in tabs do
+			if DebugAccess.CanUseTab(player, tab) then
+				handler(data, player)
+				return
+			end
 		end
 	end)
 end
+
+-- Opening the panel to everyone is for listed players only (DebugAccess
+-- checks); the result reaches every client as ReplicatedStorage's
+-- "DebugPublic" attribute.
+VisualOffload.On("DebugSetPublic", function(enabled, player)
+	if player and typeof(enabled) == "boolean" then
+		DebugAccess.SetPublic(player, enabled)
+	end
+end)
+
+-- Defaults tab: the stats every character spawns with (listed players only).
+VisualOffload.On("DebugSetDefaults", function(data, player)
+	if not player or not DebugAccess.CanUseTab(player, "Defaults") or typeof(data) ~= "table" then
+		return
+	end
+	if typeof(data.Enabled) == "boolean" then
+		PlayerDefaults.SetEnabled(data.Enabled)
+	elseif data.Reset == true then
+		PlayerDefaults.Reset()
+	else
+		PlayerDefaults.Set(data)
+	end
+end)
+
+-- Admin tab: take a tab from (or give it back to) one player you outrank.
+VisualOffload.On("DebugSetPlayerTab", function(data, player)
+	if not player or typeof(data) ~= "table" or typeof(data.Tab) ~= "string" or typeof(data.Allowed) ~= "boolean" then
+		return
+	end
+	local target = data.Player
+	if typeof(target) == "Instance" and target:IsA("Player") and target.Parent == Players then
+		DebugAccess.SetPlayerTab(player, target, data.Tab, data.Allowed)
+	end
+end)
+
+-- Admin tab: which tabs non-listed players see (listed players only).
+VisualOffload.On("DebugSetTabPublic", function(data, player)
+	if player and typeof(data) == "table" and typeof(data.Tab) == "string" and typeof(data.Enabled) == "boolean" then
+		DebugAccess.SetTabPublic(player, data.Tab, data.Enabled)
+	end
+end)
 local ChunkManager = require(Shared.ChunkManager)
 local Heartbeat = require(Shared.Heartbeat)
 local Entity = require(Shared.Entity)
@@ -99,7 +149,7 @@ local function ownsTool(player: Player, name: string): boolean
 	return (backpack ~= nil and backpack:FindFirstChild(name) ~= nil) or (held ~= nil and held:IsA("Tool"))
 end
 
-onAllowed("DebugRequestTools", function(_, player)
+onAllowed({ "Tools", "Entities" }, "DebugRequestTools", function(_, player)
 	if player then
 		sendToolList(player)
 	end
@@ -125,13 +175,13 @@ local function clearTools(containers: { Instance? })
 	end
 end
 
-onAllowed("DebugGiveTool", function(name, player)
+onAllowed({ "Tools" }, "DebugGiveTool", function(name, player)
 	if player and typeof(name) == "string" then
 		giveToPlayer(player, name)
 	end
 end)
 
-onAllowed("DebugClearTools", function(_, player)
+onAllowed({ "Tools" }, "DebugClearTools", function(_, player)
 	if player then
 		clearTools({ player:FindFirstChildOfClass("Backpack"), player.Character })
 	end
@@ -274,6 +324,12 @@ local function finite(value: any): number?
 	return if typeof(value) == "number" and value == value and math.abs(value) < 1e9 then value else nil
 end
 
+-- The player whose character `entity` is, if any.
+local function playerOf(entity: any): Player?
+	local instance = entity and entity.Instance
+	return if instance then Players:GetPlayerFromCharacter(instance) else nil
+end
+
 local actions = {
 	SetHealth = function(entity, data)
 		local value = finite(data.Value)
@@ -291,7 +347,10 @@ local actions = {
 		setHealth(entity, entity.MaxHealth)
 	end,
 	Kill = function(entity)
-		setHealth(entity, 0)
+		-- the allowlist is immune to the panel's Kill button
+		if not DebugAccess.IsListed(playerOf(entity)) then
+			setHealth(entity, 0)
+		end
 	end,
 	ApplyEffect = function(entity, data)
 		local duration, potency = finite(data.Duration), finite(data.Potency)
@@ -323,7 +382,7 @@ local actions = {
 
 -- Summary of live projectiles, for chasing leaks (who's alive past their
 -- lifetime, which channels they belong to).
-onAllowed("DebugProjectileReport", function(_, player)
+onAllowed({ "Stats" }, "DebugProjectileReport", function(_, player)
 	if not player then
 		return
 	end
@@ -349,18 +408,23 @@ onAllowed("DebugProjectileReport", function(_, player)
 	VisualOffload.FireClient(player, "DebugProjectileReport", { Total = #Projectile.GetAll(), Rows = rows })
 end)
 
-onAllowed("DebugRequestEntities", function(_, player)
+onAllowed({ "Entities" }, "DebugRequestEntities", function(_, player)
 	if player then
 		sendEntityList(player)
 	end
 end)
 
-onAllowed("DebugEntityAction", function(data, player)
+onAllowed({ "Entities" }, "DebugEntityAction", function(data, player)
 	if not player or typeof(data) ~= "table" then
 		return
 	end
 	local action = actions[data.Action]
 	local entity = findEntity(data.Id)
+	-- ranks: a player's character can only be changed by someone who
+	-- outranks them (or themselves) -- the master by no one else
+	if entity and not DebugAccess.CanAffect(player, playerOf(entity)) then
+		return
+	end
 	if action and entity then
 		action(entity, data)
 		-- reply right away instead of waiting for the next tick
@@ -482,13 +546,13 @@ local chunkActions = {
 	end,
 }
 
-onAllowed("DebugRequestChunks", function(_, player)
+onAllowed({ "Chunks" }, "DebugRequestChunks", function(_, player)
 	if player then
 		VisualOffload.FireClient(player, "DebugChunks", chunkSnapshot())
 	end
 end)
 
-onAllowed("DebugChunkAction", function(data, player)
+onAllowed({ "Chunks" }, "DebugChunkAction", function(data, player)
 	if not player or typeof(data) ~= "table" then
 		return
 	end
@@ -605,13 +669,13 @@ local function refreshTicker()
 	end
 end
 
-onAllowed("DebugClientNet", function(sent, player)
+onAllowed({ "Stats" }, "DebugClientNet", function(sent, player)
 	if player and subscribers[player] and typeof(sent) == "number" and sent == sent and sent >= 0 and sent < 1e6 then
 		clientOut[player] = sent
 	end
 end)
 
-onAllowed("DebugStats", function(subscribed, player)
+onAllowed({ "Stats" }, "DebugStats", function(subscribed, player)
 	if player then
 		subscribers[player] = if subscribed == true then true else nil
 		if not subscribers[player] then
@@ -621,7 +685,7 @@ onAllowed("DebugStats", function(subscribed, player)
 	end
 end)
 
-onAllowed("DebugEntityWatch", function(id, player)
+onAllowed({ "Entities" }, "DebugEntityWatch", function(id, player)
 	if player then
 		watchers[player] = if typeof(id) == "number" then id else nil
 		refreshTicker()
@@ -631,7 +695,7 @@ onAllowed("DebugEntityWatch", function(id, player)
 	end
 end)
 
-onAllowed("DebugChunkWatch", function(watching, player)
+onAllowed({ "Chunks" }, "DebugChunkWatch", function(watching, player)
 	if player then
 		chunkWatchers[player] = if watching == true then true else nil
 		refreshTicker()

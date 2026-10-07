@@ -38,6 +38,7 @@ local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local Shared = ReplicatedStorage:WaitForChild("Shared")
 
 local Entity = require(Shared.Entity)
+local PlayerDefaults = require(script.Parent.PlayerDefaults)
 
 local Players = game:GetService("Players")
 
@@ -47,6 +48,14 @@ local function registerCharacter(player: Player, character: Model)
 	local previous = playerEntities[player]
 	if previous and not previous.IsDestroyed then
 		previous:Destroy() -- drop the old corpse from the hit/homing index
+	end
+
+	-- Forced spawn stats first (only while an admin has them switched on):
+	-- the Entity reads its health and movement base from the Humanoid as
+	-- it's created.
+	local humanoid = character:FindFirstChildOfClass("Humanoid") or character:WaitForChild("Humanoid", 5)
+	if humanoid and humanoid:IsA("Humanoid") then
+		PlayerDefaults.Apply(humanoid, true)
 	end
 
 	local entity = Entity.new(character, {
@@ -83,6 +92,28 @@ for _, player in Players:GetPlayers() do
 	onPlayer(player)
 end
 Players.PlayerAdded:Connect(onPlayer)
+
+-- Admins changed the forced spawn stats or switched forcing on/off (debug
+-- panel Defaults tab): living characters follow right away, keeping their
+-- health fraction -- switched off, they go back to the game's own defaults.
+PlayerDefaults.OnChanged(function(_, enabled)
+	for _, entity in playerEntities do
+		local humanoid = entity.Humanoid
+		if entity.IsDestroyed or not humanoid or not humanoid.Parent or humanoid.Health <= 0 then
+			continue
+		end
+		local walk, jump
+		if enabled then
+			walk, jump = PlayerDefaults.Apply(humanoid, false)
+		else
+			walk, jump = PlayerDefaults.Restore(humanoid)
+		end
+		entity.MaxHealth = humanoid.MaxHealth
+		if walk and jump then
+			entity:SetMovementBase(walk, jump)
+		end
+	end
+end)
 
 Players.PlayerRemoving:Connect(function(player)
 	local entity = playerEntities[player]

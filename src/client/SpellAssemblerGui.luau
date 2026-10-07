@@ -183,6 +183,10 @@ local function refresh()
 	board:render()
 	inspector:show(context())
 	local summary = if analysis then `Valid · {analysis.manaCost} mana per cast` else "Valid"
+	local warnings = if analysis and analysis.warnings then analysis.warnings else {}
+	if #warnings > 0 then
+		summary ..= `  ·  ⚠ {warnings[1].message}` .. (if #warnings > 1 then ` (+{#warnings - 1} more)` else "")
+	end
 	problems:show(errors, summary)
 	updateTopBar()
 end

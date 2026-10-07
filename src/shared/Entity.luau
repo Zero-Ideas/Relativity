@@ -475,6 +475,15 @@ function Entity:GetEffectiveTimeScale(): number
 	return Heartbeat.GetGlobalTimeScale() * ChunkManager.GetTimeScaleAt(self:GetPosition()) * self.TimeScale
 end
 
+-- New undilated walk speed / jump power (e.g. server PlayerDefaults
+-- changing mid-life); reapplied at the current time scale right away.
+function Entity:SetMovementBase(walkSpeed: number, jumpPower: number)
+	self._baseWalkSpeed = walkSpeed
+	self._baseJumpPower = jumpPower
+	self._lastHumanoidScale = nil
+	self:_refreshHumanoidScale()
+end
+
 function Entity:_refreshHumanoidScale()
 	if not self.ScaleHumanoid then
 		return

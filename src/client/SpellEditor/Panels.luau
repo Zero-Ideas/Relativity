@@ -466,6 +466,10 @@ function Inspector:showOverview(context: any)
 			end
 		end
 	end
+	-- soft limits: still valid, but these parts won't work (SpellCompiler)
+	for _, warning in (analysis and analysis.warnings) or {} do
+		self:text(`⚠ {warning.message}`, 12, Color3.fromRGB(255, 190, 80))
+	end
 	if #context.errors == 0 then
 		self:text("✓ Ready to save.", 13, Colors.good)
 	else

@@ -40,6 +40,12 @@ local SpellCircleVFX = {}
 
 local localPlayer = Players.LocalPlayer
 
+-- Live aim of other casters' circles (SpellService's aim relay) is shown at
+-- graphics level LIVE_AIM_QUALITY and up; below that a circle keeps the aim
+-- it was sent with on Begin/Cast. "Automatic" graphics counts as eligible.
+local LIVE_AIM_QUALITY = 5
+local AIM_SMOOTHING = 14 -- 1/s: how quickly a relayed aim is eased toward
+
 -- Canvas layout (fractions of the circle's square canvas, centre 0.5).
 local CANVAS = 512
 local OUTER = 0.36 -- outer (segmented) ring; the part is sized so this is the circle's radius
@@ -51,7 +57,7 @@ local MOD_R = 0.205
 local POLY_R = 0.17
 local CORE_R = 0.09
 local MARK_R = 0.385
-local OVER_RINGS = 4
+local OVER_RINGS = 3 -- one per third of the overcharge; the last lands at full (2x) charge
 local SAT_RING = 0.45 -- a satellite canvas's outer ring radius (its part is sized from this)
 local SAT_MOD_R = 0.27 -- satellite modifier nodes: radius they sit at, and their size
 local SAT_MOD_SIZE = 0.11
@@ -65,6 +71,18 @@ local CLOUD_DRIFT_MIN, CLOUD_DRIFT_MAX = 0.15, 0.6 -- radians per second each pi
 -- Cloud placement is random per cast (not from the spell's seed), so no two
 -- frozen clouds move alike.
 local cloudRng = Random.new()
+
+-- Sounds: cloned from ReplicatedStorage.audio and played from each cast's own
+-- emitter at its main circle, so everyone hears them in 3D.
+local SOUND_CHARGE = "spell charge" -- while charging; cut off on a tap release
+local SOUND_FIRE = "Fire" -- the spell going off (a frozen one: once it has reassembled)
+local SOUND_MANIFEST = "Mang Manifest" -- an overcharge ring appearing...
+local SOUND_MANIFEST_END = "Mang End" -- ...and the last one
+local SOUND_HUM = "Generator Hum" -- looped around a frozen spell
+local TAP_TIME = 0.3 -- a release this soon after Begin counts as a tap
+local HUM_RANGE = 40 -- studs: the frozen spell's hum fades to silence by here
+local SOUND_LINGER = 6 -- seconds a cast's emitter outlives it so one-shots can finish
+local GLOW_BOOST, GLOW_TIME = 4, 0.35 -- extra brightness when an overcharge ring manifests, and its fade
 local PIECE_GAP = 0.02 -- studs between a circle's stacked pieces (avoids z-fighting)
 
 local BASE_RADIUS = 3 -- studs, for a full-share first circle
@@ -138,6 +156,7 @@ type CastState = {
 	Spin: number,
 	SustainLeft: number,
 	Target: Vector3?,
+	AimGoal: Vector3?, -- latest relayed live aim (other casters); Target eases toward it
 	IsLocal: boolean,
 	-- set while frozen (and for its release): the circle hangs in world space
 	-- at FrozenOrigin + FrozenDirection * HAND_DISTANCE instead of following
@@ -146,6 +165,11 @@ type CastState = {
 	FrozenDirection: Vector3?,
 	ChargeCap: number?, -- frozen before full charge: keeps drawing up to 1x, never overcharges
 	AssembleStart: number?, -- os.clock when a frozen cloud began reassembling (T)
+	Emitter: Attachment, -- where this cast's sounds play from (follows the main circle)
+	ChargeSound: Sound?,
+	Hum: Sound?,
+	RingsShown: number, -- overcharge rings that have manifested (sound + glow played)
+	Glow: number, -- 1 right after a ring manifests, fading to 0
 	LastP: number,
 	LastO: number,
 	LastV: number,
@@ -522,6 +546,48 @@ local function newPiece(part: Part, gui: SurfaceGui, reach: number): Piece
 	}
 end
 
+local audioFolder: Instance? = nil
+
+-- Plays a clone of ReplicatedStorage.audio[name] at the cast's emitter.
+-- `configure` runs before Play. One-shots clean themselves up.
+local function playSound(cast: CastState, name: string, configure: ((Sound) -> ())?): Sound?
+	audioFolder = audioFolder or ReplicatedStorage:FindFirstChild("audio")
+	local template = audioFolder and audioFolder:FindFirstChild(name)
+	if not template or not template:IsA("Sound") then
+		return nil
+	end
+	local sound = template:Clone()
+	if configure then
+		configure(sound)
+	end
+	sound.Parent = cast.Emitter
+	sound:Play()
+	if not sound.Looped then
+		sound.Ended:Once(function()
+			sound:Destroy()
+		end)
+	end
+	return sound
+end
+
+local function stopSound(sound: Sound?)
+	if sound and sound.Parent then
+		sound:Stop()
+		sound:Destroy()
+	end
+end
+
+local function configureHum(sound: Sound)
+	sound.Looped = true
+	sound.RollOffMode = Enum.RollOffMode.Linear
+	sound.RollOffMaxDistance = HUM_RANGE
+	sound.RollOffMinDistance = math.min(sound.RollOffMinDistance, HUM_RANGE / 4)
+	-- start somewhere random so several frozen spells don't hum in unison
+	if sound.TimeLength > 1 then
+		sound.TimePosition = cloudRng:NextNumber(0, sound.TimeLength - 1)
+	end
+end
+
 --------------------------------------------------------------------------------
 -- Cast lifecycle
 --------------------------------------------------------------------------------
@@ -533,6 +599,12 @@ local function destroyCast(cast: CastState)
 		end
 	end
 	table.clear(cast.Circles)
+	stopSound(cast.Hum)
+	cast.Hum = nil
+	local emitter = cast.Emitter
+	task.delay(SOUND_LINGER, function()
+		emitter:Destroy()
+	end)
 	if current[cast.Caster] == cast then
 		current[cast.Caster] = nil
 	end
@@ -629,6 +701,9 @@ local function createCast(caster: Model, spec: any, target: Vector3?, isLocal: b
 			end
 		end
 	end
+	local emitter = Instance.new("Attachment")
+	emitter.Name = "SpellCircleSound"
+	emitter.Parent = workspace.Terrain
 	local cast: CastState = {
 		Caster = caster,
 		Spec = spec,
@@ -644,6 +719,9 @@ local function createCast(caster: Model, spec: any, target: Vector3?, isLocal: b
 		SustainLeft = 0,
 		Target = target,
 		IsLocal = isLocal,
+		Emitter = emitter,
+		RingsShown = 0,
+		Glow = 0,
 		LastP = -1,
 		LastO = -1,
 		LastV = -1,
@@ -707,6 +785,13 @@ local function step(dt: number)
 			progress = math.min(cast.Charge, 1)
 			over = math.clamp((cast.Charge - 1) / (SpellRunes.Charge.Max - 1), 0, 1)
 			spinBoost = 1 + over * 2
+			-- each overcharge ring that finishes drawing manifests: a sound and a flare
+			local shown = math.floor(over * OVER_RINGS + 1e-6)
+			while cast.RingsShown < shown do
+				cast.RingsShown += 1
+				playSound(cast, if cast.RingsShown >= OVER_RINGS then SOUND_MANIFEST_END else SOUND_MANIFEST)
+				cast.Glow = 1
+			end
 		elseif cast.State == "frozen" then
 			-- held in place, idling and pulsing; one frozen mid-draw finishes
 			-- drawing (its charge keeps growing to 1x, like the server's)
@@ -726,6 +811,7 @@ local function step(dt: number)
 			flash = 1.5 * f
 			if f >= 1 then
 				cast.State, cast.StateAge = "release", 0
+				playSound(cast, SOUND_FIRE)
 			end
 		elseif cast.State == "sustain" then
 			over = math.clamp((cast.Charge - 1) / (SpellRunes.Charge.Max - 1), 0, 1)
@@ -756,6 +842,15 @@ local function step(dt: number)
 			table.remove(casts, index)
 			continue
 		end
+		if cast.State == "frozen" then
+			if not cast.Hum then
+				cast.Hum = playSound(cast, SOUND_HUM, configureHum)
+			end
+		elseif cast.Hum then
+			stopSound(cast.Hum)
+			cast.Hum = nil
+		end
+		cast.Glow = math.max(0, cast.Glow - dt / GLOW_TIME)
 
 		cast.Spin += ddt * spinBoost
 		for _, l in cast.Layers do
@@ -763,13 +858,16 @@ local function step(dt: number)
 		end
 		applyItems(cast, progress, over, visible)
 
+		if cast.AimGoal and cast.Target then
+			cast.Target = cast.Target:Lerp(cast.AimGoal, 1 - math.exp(-dt * AIM_SMOOTHING))
+		end
 		local direction = cast.FrozenDirection
 		if not direction then
 			local aim = aimPoint(cast, origin) - origin
 			direction = if aim.Magnitude > 1e-3 then aim.Unit else caster:GetPivot().LookVector
 		end
 		assert(direction)
-		local brightness = 2.5 + over * 1.5 + math.sin(cast.Age * 10) * over * 0.8 + flash
+		local brightness = 2.5 + over * 1.5 + math.sin(cast.Age * 10) * over * 0.8 + flash + cast.Glow * GLOW_BOOST
 		local basis = CFrame.lookAt(origin, origin + direction)
 		-- how far apart the pieces are: 0 = assembled circle(s), 1 = frozen cloud
 		local cloud = 0
@@ -780,6 +878,7 @@ local function step(dt: number)
 		end
 		cloud = cloud * cloud * (3 - 2 * cloud) -- smoothstep
 		local cloudCentre = origin + direction * HAND_DISTANCE
+		cast.Emitter.WorldPosition = cloudCentre
 		for _, circle in cast.Circles do
 			local anchor = circle.Anchor
 			if anchor then
@@ -842,6 +941,7 @@ function SpellCircleVFX.Begin(caster: Model, spec: any, target: Vector3?, isLoca
 	local cast = createCast(caster, spec, target, isLocal == true)
 	if cast then
 		current[caster] = cast
+		cast.ChargeSound = playSound(cast, SOUND_CHARGE)
 		ensureRunning()
 	end
 end
@@ -857,9 +957,14 @@ function SpellCircleVFX.Cast(caster: Model, spec: any?, charge: number, target: 
 		end
 		ensureRunning()
 	end
+	if cast.State == "charge" and os.clock() - cast.Began < TAP_TIME then
+		stopSound(cast.ChargeSound) -- a tap: no wind-up to hear
+	end
+	playSound(cast, SOUND_FIRE)
 	cast.Charge = math.max(charge, 1) -- draw everything; >1 keeps the overcharge rings
 	if target then
 		cast.Target = target
+		cast.AimGoal = nil -- the real shot's aim wins over the last relayed one
 	end
 	cast.StateAge = 0
 	if sustain then
@@ -875,6 +980,7 @@ end
 function SpellCircleVFX.Cancel(caster: Model)
 	local cast = current[caster]
 	if cast then
+		stopSound(cast.ChargeSound)
 		cast.State, cast.StateAge = "cancel", 0
 		current[caster] = nil
 	end
@@ -960,6 +1066,47 @@ end
 function SpellCircleVFX.FrozenCount(caster: Model): number
 	local queue = frozen[caster]
 	return if queue then #queue else 0
+end
+
+-- A relayed live aim for `caster`'s charging/channelling circle.
+function SpellCircleVFX.SetAim(caster: Model, position: Vector3)
+	local cast = current[caster]
+	if not cast or cast.IsLocal then
+		return
+	end
+	cast.AimGoal = position
+	if not cast.Target then
+		cast.Target = position
+	end
+end
+
+do
+	local remotes = ReplicatedStorage:WaitForChild("SpellRemotes")
+	local relay = remotes:WaitForChild("SpellAimRelay") :: UnreliableRemoteEvent
+	local channel = remotes:WaitForChild("SpellChannel") :: RemoteEvent
+	local gameSettings = UserSettings():GetService("UserGameSettings")
+
+	local function wantsLiveAim(): boolean
+		local saved = gameSettings.SavedQualityLevel
+		return saved == Enum.SavedQualitySetting.Automatic or saved.Value >= LIVE_AIM_QUALITY
+	end
+
+	local subscribed: boolean? = nil
+	local function updateSubscription()
+		local wanted = wantsLiveAim()
+		if wanted ~= subscribed then
+			subscribed = wanted
+			channel:FireServer("AimSubscribe", wanted)
+		end
+	end
+	updateSubscription()
+	gameSettings:GetPropertyChangedSignal("SavedQualityLevel"):Connect(updateSubscription)
+
+	relay.OnClientEvent:Connect(function(caster: any, position: any)
+		if subscribed and typeof(caster) == "Instance" and caster:IsA("Model") and typeof(position) == "Vector3" then
+			SpellCircleVFX.SetAim(caster, position)
+		end
+	end)
 end
 
 VisualOffload.On("SpellCircle", function(data)

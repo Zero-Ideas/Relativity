@@ -46,6 +46,11 @@ local chargeStart: { [Player]: number } = {}
 local aimRemote = remoteFolder:FindFirstChild("SpellAim") or Instance.new("UnreliableRemoteEvent")
 aimRemote.Name = "SpellAim"
 aimRemote.Parent = remoteFolder
+-- Live aim of a charging/channelling caster, forwarded to clients that asked
+-- for it (SpellChannel "AimSubscribe"; SpellCircleVFX turns their circle).
+local aimRelay = remoteFolder:FindFirstChild("SpellAimRelay") or Instance.new("UnreliableRemoteEvent")
+aimRelay.Name = "SpellAimRelay"
+aimRelay.Parent = remoteFolder
 local LIVE_AIM_MAX_AGE = 0.5
 local liveAim: { [Player]: { position: Vector3, time: number } } = {}
 
@@ -390,8 +395,34 @@ end
 for _, player in Players:GetPlayers() do watchCharacters(player) end
 Players.PlayerAdded:Connect(watchCharacters)
 
+-- Live aim relay: while a caster's circle is up (charging, or a channelled
+-- Sustain), their streamed cursor goes to every subscribed client at up to
+-- 1 / AIM_RELAY_INTERVAL per second.
+local AIM_RELAY_INTERVAL = 1 / 15
+local aimSubscribers: { [Player]: boolean } = {}
+local lastAimRelay: { [Player]: number } = {}
+
+aimRemote.OnServerEvent:Connect(function(player: Player, position: any)
+	if not validPoint(position) or not (circleOpen[player] or SpellRuntime.IsSustaining(player)) then
+		return
+	end
+	local character = player.Character
+	local now = os.clock()
+	if not character or (lastAimRelay[player] and now - lastAimRelay[player] < AIM_RELAY_INTERVAL) then
+		return
+	end
+	lastAimRelay[player] = now
+	for subscriber in aimSubscribers do
+		if subscriber ~= player then
+			aimRelay:FireClient(subscriber, character, position)
+		end
+	end
+end)
+
 channel.OnServerEvent:Connect(function(player: Player, action: any, payload: any)
-	if action == "Stop" then
+	if action == "AimSubscribe" then
+		aimSubscribers[player] = if payload == true then true else nil
+	elseif action == "Stop" then
 		BeamHandler.Stop(player)
 		circleClose(player, "End")
 	elseif action == "KeepAlive" then
@@ -506,6 +537,8 @@ Players.PlayerRemoving:Connect(function(player)
 	circleOpen[player] = nil
 	lastCircleBegin[player] = nil
 	frozenSpells[player] = nil
+	aimSubscribers[player] = nil
+	lastAimRelay[player] = nil
 end)
 
 print("[Relativity] spell service online")

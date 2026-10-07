@@ -53,6 +53,18 @@ function ProjectileClient.SetImpactHandler(fn: (Vector3, Vector3, Instance?, str
 	Impact.SetHandler(fn)
 end
 
+-- Pass-by: every frame each visual moving at least passMinSpeed (studs/s,
+-- dilation included) is checked against the camera; one that was closing in
+-- and then goes past calls the handler once with its closest point, speed
+-- and miss distance (only if it came within passRadius). Projectiles that
+-- only ever move away -- your own shots -- never count.
+local passByHandler: ((Vector3, number, number) -> ())? = nil
+local passMinSpeed, passRadius = math.huge, 0
+
+function ProjectileClient.SetPassByHandler(fn: (Vector3, number, number) -> (), minSpeed: number, radius: number)
+	passByHandler, passMinSpeed, passRadius = fn, minSpeed, radius
+end
+
 -- Matches the server's own default -- used only if a spawn payload is ever
 -- missing MaxRealLifetime, which shouldn't normally happen.
 local DEFAULT_MAX_REAL_LIFETIME = 60
@@ -561,6 +573,43 @@ local function compactVisualOrder()
 	visualTombstones = 0
 end
 
+-- See SetPassByHandler. Poses are extrapolated from each visual's last
+-- simulated one, since the round-robin scheduler doesn't visit every visual
+-- every frame.
+local function checkPassBys()
+	local camera = workspace.CurrentCamera
+	if not camera then
+		return
+	end
+	local listener = camera.CFrame.Position
+	local globalScale = Heartbeat.GetGlobalTimeScale()
+	local handler = passByHandler :: (Vector3, number, number) -> ()
+	for _, visual in visuals do
+		if visual.passDone then
+			continue
+		end
+		local velocity = visual.velocity * visual.timeScale
+		local rate = velocity.Magnitude
+		local speed = rate * globalScale
+		if speed < passMinSpeed then
+			continue
+		end
+		local direction = velocity / rate
+		local position = visual.position + velocity * math.max(globalSimulationClock - visual.lastSimulationTime, 0)
+		local toListener = listener - position
+		local along = toListener:Dot(direction)
+		if along > 0 then
+			local miss = (toListener - direction * along).Magnitude
+			visual.passApproaching = miss <= passRadius
+			visual.passDistance = miss
+			visual.passPoint = position + direction * along
+		elseif visual.passApproaching then
+			visual.passDone = true
+			handler(visual.passPoint or position, speed, visual.passDistance or 0)
+		end
+	end
+end
+
 -- Visits visuals round-robin until MAX_VISUAL_UPDATES_PER_FRAME on-screen
 -- transforms have been spent (or every visual was visited once).
 local function renderStep(globalDt: number)
@@ -615,6 +664,10 @@ local function renderStep(globalDt: number)
 			VisualModel.Step(visual, math.max(now - (visual.lastSmoothStep or now), 0))
 			visual.lastSmoothStep = now
 		end
+	end
+
+	if passByHandler then
+		checkPassBys()
 	end
 
 	-- Avoid an ever-growing sparse order array without changing which live

@@ -66,6 +66,12 @@ export type Visual = {
 	transformElapsed: number,
 	transformDuration: number,
 	suspendedTrails: { Trail }?,
+
+	-- pass-by sound tracking (ProjectileClient.SetPassByHandler)
+	passApproaching: boolean?, -- closing on the camera, on a line within the pass radius
+	passDistance: number?, -- that line's closest distance to the camera
+	passPoint: Vector3?, -- and where on it
+	passDone: boolean?, -- already reported
 	suspendedParticles: { ParticleEmitter }?,
 }
 

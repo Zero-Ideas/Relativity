@@ -156,7 +156,6 @@ local function spawn(player, data, playerRoot, target)
 	local list = owned[player] or {}
 	owned[player] = list
 	for i = #list, 1, -1 do if not list[i].Parent then table.remove(list, i) end end
-	if #list >= 10 then table.remove(list, 1):Destroy() end
 	model:SetAttribute("SpawnedBy", player.UserId)
 	model.Parent = folder
 	for _, instance in model:GetDescendants() do
@@ -217,9 +216,9 @@ end
 local MAX_PLACE_DISTANCE = 500
 
 VisualOffload.On("DummySpawner", function(data, player)
-	-- Debug-panel feature: only for players DebugAccess allows (anyone in a
-	-- Studio-hosted server; owner/allow-listed testers on Team Test or live).
-	if not DebugAccess.IsAllowed(player) or typeof(data) ~= "table" then return end
+	-- Debug-panel feature: only for players who may use its Dummies tab (see
+	-- DebugAccess.CanUseTab).
+	if not DebugAccess.CanUseTab(player, "Dummies") or typeof(data) ~= "table" then return end
 	if data.Action == "Models" then
 		local names = {}
 		for name in templates() do table.insert(names, name) end

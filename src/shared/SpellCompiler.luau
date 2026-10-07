@@ -28,6 +28,7 @@ SpellCompiler.MaxRunes = 64
 SpellCompiler.MaxWires = 128
 SpellCompiler.MaxZones = 24
 SpellCompiler.MaxTriggerDepth = 3
+SpellCompiler.MaxChainQuantity = 2 -- Quantity runes allowed along one trigger chain (cast -> trigger -> ...)
 SpellCompiler.BoardLimit = 20000
 
 -- Card geometry shared with the editor. A rune "sits in" a zone when the
@@ -284,6 +285,20 @@ function SpellCompiler.Compile(graph: any)
 	if not normalized or not runeById then
 		return nil, errors, nil
 	end
+	-- Soft limits (splitting): the spell stays valid, but the vessel or
+	-- Quantity over the limit doesn't work -- `disabled` vessels never fire
+	-- (their energy fizzles), `noQuantity` vessels fire a single copy. Each is
+	-- reported in `warnings` for the editor. Soft on purpose: cards saved
+	-- before these limits existed must keep casting.
+	local warnings: { Error } = {}
+	local disabled: { [string]: boolean } = {}
+	local noQuantity: { [string]: boolean } = {}
+	local function limit(message: string, rune: string?)
+		for _, existing in warnings do
+			if existing.message == message and existing.rune == rune then return end
+		end
+		table.insert(warnings, { message = message, rune = rune })
+	end
 	local function fail(message: string, rune: string?, zone: string?)
 		for _, existing in errors do
 			if existing.message == message and existing.rune == rune then return end
@@ -421,22 +436,53 @@ function SpellCompiler.Compile(graph: any)
 	local estimates: { [string]: any } = {}
 	local elements: { [string]: string } = {}
 	local reached = {}
-	local function follow(id: string, port: string, energy: number, element: string?, depth: number)
+	-- `source` is the vessel whose trigger this flow came out of (nil at cast
+	-- time); `quantities` how many Quantity runes the vessels above it on this
+	-- trigger chain used. Splitting limits (soft -- see `limit` above), so
+	-- trigger chains can't multiply projectiles without bound:
+	--  * at most MaxChainQuantity Quantity runes along any one chain (extra
+	--    ones are ignored);
+	--  * only one trigger hop may make a new non-Explosion vessel -- one
+	--    fired by a vessel that was itself fired by a trigger doesn't fire;
+	--  * a Beam's triggers only fire Explosions (anything else doesn't fire).
+	local function follow(id: string, port: string, energy: number, element: string?, depth: number, source: string?, quantities: number?)
+		quantities = quantities or 0
 		for _, link in (outputs[id][port] or {}) do
 			local rune = runeById[link.to]
 			local def = SpellRunes.Runes[rune.rune]
 			reached[link.to] = true
 			estimates[link.to] = { energy = energy }
 			if def.Element then
-				follow(link.to, "out", energy, def.Element, depth)
+				follow(link.to, "out", energy, def.Element, depth, source, quantities)
 			elseif def.Id == "If" then
-				follow(link.to, "yes", energy, element, depth)
-				follow(link.to, "no", energy, element, depth)
+				follow(link.to, "yes", energy, element, depth, source, quantities)
+				follow(link.to, "no", energy, element, depth, source, quantities)
 			elseif def.Id == "Divide" then
 				local share = rune.params.Share / 100
-				follow(link.to, "a", energy * share, element, depth)
-				follow(link.to, "b", energy * (1 - share), element, depth)
+				follow(link.to, "a", energy * share, element, depth, source, quantities)
+				follow(link.to, "b", energy * (1 - share), element, depth, source, quantities)
 			elseif def.Vessel then
+				local chainQuantities = quantities :: number
+				for _, modId in vesselInfo[link.to].mods do
+					if runeById[modId].rune == "Quantity" then
+						if chainQuantities >= SpellCompiler.MaxChainQuantity then
+							limit(`Only {SpellCompiler.MaxChainQuantity} Quantity runes work along one trigger chain -- this one is ignored.`, modId)
+							noQuantity[link.to] = true
+							vesselInfo[link.to].count = 1
+						else
+							chainQuantities += 1
+						end
+					end
+				end
+				if def.Id ~= "Explosion" then
+					if source == "Beam" then
+						limit(`Beam triggers can only fire an Explosion -- this {def.Name} won't fire.`, link.to)
+						disabled[link.to] = true
+					elseif depth >= 2 then
+						limit(`Only an Explosion can come from a vessel fired by a trigger -- this {def.Name} won't fire.`, link.to)
+						disabled[link.to] = true
+					end
+				end
 				if not element then
 					fail(`Energy reaches this {def.Name} without a Transform rune (Fire, Arcane or Shock).`, link.to)
 				else
@@ -457,7 +503,7 @@ function SpellCompiler.Compile(graph: any)
 							local triggerEnergy = perBolt * runeById[triggerId].params.Share / 100
 							reached[triggerId] = true
 							estimates[triggerId] = { energy = triggerEnergy }
-							follow(triggerId, "out", triggerEnergy, element, depth + 1)
+							follow(triggerId, "out", triggerEnergy, element, depth + 1, def.Id, chainQuantities)
 						end
 					end
 				end
@@ -487,7 +533,7 @@ function SpellCompiler.Compile(graph: any)
 		manaCost += runeById[rootId].params.Amount
 	end
 
-	local analysis = { estimates = estimates, manaCost = manaCost }
+	local analysis = { estimates = estimates, manaCost = manaCost, warnings = warnings }
 	if #errors > 0 then
 		return nil, errors, normalized, analysis
 	end
@@ -507,6 +553,9 @@ function SpellCompiler.Compile(graph: any)
 		vessels = vesselInfo,
 		elements = elements,
 		estimates = estimates,
+		disabledVessels = disabled, -- soft limits: these never fire
+		noQuantity = noQuantity, -- soft limits: these ignore their Quantity
+		warnings = warnings,
 	}, errors, normalized, analysis
 end
 

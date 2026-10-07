@@ -3851,7 +3851,13 @@ ReGui:DefineElement("Checkbox", {
 			Tick.BackgroundTransparency = 0
 			UICorner.CornerRadius = UDim.new(1, 0)
 		else
-			PaddingSize = UDim.new(0, 2)
+			-- Relativity patch: the checkmark image (an rbxasset:// Studio
+			-- texture, Icons.Checkmark) doesn't load in the game client, so a
+			-- ticked box looked empty. Draw the tick as a filled square in the
+			-- CheckMark colour instead, the way radio buttons are drawn.
+			Tick.ImageTransparency = 1
+			Tick.BackgroundTransparency = 0
+			PaddingSize = UDim.new(0, 4)
 		end
 		
 		--// Apply UIPadding sizes
@@ -3864,7 +3870,6 @@ ReGui:DefineElement("Checkbox", {
 
 		--// Callback
 		local function Callback(...)
-			print("CALLED")
 			local func = Config.Callback
 			return func(Class, ...)
 		end

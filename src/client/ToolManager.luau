@@ -110,12 +110,20 @@ local function watchTool(instance: Instance)
 	if not instance:IsA("Tool") or watched[instance] then
 		return
 	end
+	-- Copies of tools inside GUIs (e.g. the debug panel's Entities preview
+	-- clones a character, held tool and all, into a ViewportFrame in
+	-- PlayerGui) are under the Player too, but are never ours to drive.
+	local playerGui = player:FindFirstChildOfClass("PlayerGui")
+	if playerGui and instance:IsDescendantOf(playerGui) then
+		return
+	end
 	watched[instance] = true
 
 	-- the tool may already be sitting equipped in the character by the time
-	-- we discover it (e.g. a respawn that re-equips instantly)
+	-- we discover it (e.g. a respawn that re-equips instantly) -- but only
+	-- OUR current character counts as equipping it
 	local parent = instance.Parent
-	if parent and parent:IsA("Model") and parent:FindFirstChildOfClass("Humanoid") then
+	if parent and parent == player.Character then
 		onEquipped(instance)
 	end
 

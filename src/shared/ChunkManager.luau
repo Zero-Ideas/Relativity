@@ -519,8 +519,21 @@ function ChunkManager.EnableReplication()
 	local VisualOffload = require(script.Parent.VisualOffload)
 
 	if RunService:IsServer() then
-		-- snapshot for joining players
-		Players.PlayerAdded:Connect(function(player)
+		-- Snapshot for a joining client, sent when IT asks (below): pushed on
+		-- PlayerAdded it would usually arrive before the client registered its
+		-- ChunkSnapshot handler, and VisualOffload drops messages nobody is
+		-- listening for -- live-server joiners then never saw the time scales
+		-- already in place. One request per player per few seconds.
+		local lastRequest: { [Player]: number } = {}
+		VisualOffload.On("ChunkSnapshotRequest", function(_, player)
+			if not player then
+				return
+			end
+			local now = os.clock()
+			if lastRequest[player] and now - lastRequest[player] < 3 then
+				return
+			end
+			lastRequest[player] = now
 			local snapshot = {}
 			for key, chunk in chunks do
 				if chunk.TimeScale ~= 1 then
@@ -532,6 +545,9 @@ function ChunkManager.EnableReplication()
 				Zones = timeZones,
 				GlobalScale = Heartbeat.GetGlobalTimeScale(),
 			})
+		end)
+		Players.PlayerRemoving:Connect(function(player)
+			lastRequest[player] = nil
 		end)
 		-- Mirror global scale changes. Polled in REAL time via a plain task loop,
 		-- deliberately NOT a Heartbeat connection: every Heartbeat dt (dilated or
@@ -578,6 +594,8 @@ function ChunkManager.EnableReplication()
 		VisualOffload.On("GlobalScale", function(scale)
 			Heartbeat.SetGlobalTimeScale(scale)
 		end)
+		-- every handler above is registered now, so the reply can't be dropped
+		VisualOffload.Fire("ChunkSnapshotRequest")
 	end
 end
 

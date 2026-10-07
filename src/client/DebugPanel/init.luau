@@ -1,7 +1,14 @@
 --!optimize 2
 --[[
-	DebugPanel  (client, Studio only)
-	ReGui window (toggle with F2) with seven tabs:
+	DebugPanel  (client)
+	ReGui window (toggle with F2) for players allowed to use it: anyone in
+	Studio, players on the allowlist (Player attribute "DebugListed", set by
+	server/DebugAccess), and everyone while a listed player has opened it to
+	all (ReplicatedStorage attribute "DebugPublic"). Non-listed players only
+	see the tabs listed players have made public ("DebugPublicTabs"; Stats and
+	Dummies by default) -- both switches live in the Admin tab, which only
+	listed players see. The panel is only built once a player is allowed, and
+	hides again if that access is withdrawn. Tabs:
 	  Tools    -- give any Tool the server can find (see DebugService.server.luau)
 	              or clear your backpack.
 	  Time     -- your personal time ratio; drives TimeControlGui headless, so the
@@ -18,6 +25,10 @@
 	              DummySpawner tool).
 	  VFX      -- local ExplosionVFX preview: power, radius, tint; spawn in front,
 	              at the cursor, or a weakest-to-strongest sweep.
+	  Defaults -- (listed only) max health / walk speed / jump power every
+	              player spawns with.
+	  Admin    -- (listed only) your rank; open the panel to everyone; choose
+	              which tabs other players see.
 
 	One module per tab in Tabs/ (see TAB_ORDER); shared helpers in Util,
 	cross-tab state in State.
@@ -40,10 +51,65 @@ local DebugPanel = {}
 
 local TOGGLE_KEY = Enum.KeyCode.F2
 local STATS_INTERVAL = Util.STATS_INTERVAL
-local TAB_ORDER = { "Tools", "Time", "Stats", "Entities", "Chunks", "Dummies", "VFX" }
+local TAB_ORDER = { "Tools", "Time", "Stats", "Entities", "Chunks", "Dummies", "VFX", "Defaults", "Admin" }
+-- Tabs only listed players ever see (the server checks these requests too).
+local LISTED_ONLY = { Defaults = true, Admin = true }
 
 local started = false
 local localPlayer = Players.LocalPlayer
+local panelWindow: any = nil -- the built ReGui window, once allowed
+local anyTabVisible = true -- false when every tab has been taken from this player
+
+local function listed(): boolean
+	return localPlayer:GetAttribute("DebugListed") == true
+end
+
+-- Mirrors server/DebugAccess.IsAllowed (the server re-checks every request).
+local function allowed(): boolean
+	return RunService:IsStudio() or listed() or ReplicatedStorage:GetAttribute("DebugPublic") == true
+end
+
+-- Mirrors server/DebugAccess.CanUseTab: Defaults and Admin are for listed
+-- players only; every other tab for listed players and Studio, else only the
+-- public ones.
+local function tabVisible(name: string): boolean
+	-- taken from this player by someone who outranks them
+	local taken = localPlayer:GetAttribute("DebugDeniedTabs")
+	if typeof(taken) == "string" and table.find(string.split(taken, ","), name) then
+		return false
+	end
+	if LISTED_ONLY[name] then
+		return listed()
+	end
+	if RunService:IsStudio() or listed() then
+		return true
+	end
+	local raw = ReplicatedStorage:GetAttribute("DebugPublicTabs")
+	return typeof(raw) == "string" and table.find(string.split(raw, ","), name) ~= nil
+end
+
+-- Hides the buttons of tabs this player may not use, moving off one that was
+-- showing.
+local function applyTabVisibility(window)
+	local selector = window.WindowTabSelector
+	local firstVisible = nil
+	local activeHidden = false
+	for _, entry in selector.Tabs do
+		local visible = tabVisible(entry.Name)
+		entry.Tab.Visible = visible
+		if visible and not firstVisible then
+			firstVisible = entry.Name
+		elseif not visible and entry.IsSelected then
+			activeHidden = true
+		end
+	end
+	anyTabVisible = firstVisible ~= nil
+	if not anyTabVisible then
+		window:SetVisible(false) -- nothing left to show
+	elseif activeHidden then
+		selector:SetActiveTab(firstVisible)
+	end
+end
 
 local function tabShowing(window, name: string): boolean
 	if not window.Visible or window.Collapsed then
@@ -113,9 +179,20 @@ local function build()
 		table.insert(tabs, { Name = name, Active = tab.Active, Tick = tab.Tick, Showing = false })
 	end
 
+	panelWindow = window
+	applyTabVisibility(window)
+	local function refreshTabs()
+		applyTabVisibility(window)
+	end
+	localPlayer:GetAttributeChangedSignal("DebugListed"):Connect(refreshTabs)
+	localPlayer:GetAttributeChangedSignal("DebugDeniedTabs"):Connect(refreshTabs)
+	ReplicatedStorage:GetAttributeChangedSignal("DebugPublicTabs"):Connect(refreshTabs)
+	if not RunService:IsStudio() then
+		window:SetVisible(false) -- live servers: wait for F2 instead of popping up
+	end
 	UserInputService.InputBegan:Connect(function(input, processed)
-		if input.KeyCode == TOGGLE_KEY and not processed then
-		window:SetVisible(not window.Visible)
+		if input.KeyCode == TOGGLE_KEY and not processed and allowed() and anyTabVisible then
+			window:SetVisible(not window.Visible)
 		end
 	end)
 
@@ -149,17 +226,32 @@ local function build()
 end
 
 function DebugPanel.start()
-	if started or not RunService:IsStudio() then
+	if started then
 		return
 	end
 	started = true
-	-- never block (or break) the rest of client startup
-	task.spawn(function()
-		local ok, err = xpcall(build, debug.traceback)
-		if not ok then
-			warn("[DebugPanel] failed to build:", err)
+	local building = false
+	-- Builds the panel the first time the player is allowed; hides it when
+	-- access is withdrawn (F2 is ignored until it comes back).
+	local function refresh()
+		if allowed() then
+			if not building then
+				building = true
+				-- never block (or break) the rest of client startup
+				task.spawn(function()
+					local ok, err = xpcall(build, debug.traceback)
+					if not ok then
+						warn("[DebugPanel] failed to build:", err)
+					end
+				end)
+			end
+		elseif panelWindow and panelWindow.Visible then
+			panelWindow:SetVisible(false)
 		end
-	end)
+	end
+	localPlayer:GetAttributeChangedSignal("DebugListed"):Connect(refresh)
+	ReplicatedStorage:GetAttributeChangedSignal("DebugPublic"):Connect(refresh)
+	refresh()
 end
 
 return DebugPanel

@@ -41,10 +41,11 @@ ChunkVisualizer.start()
 if RunService:IsStudio() then
 	-- the time slider lives in the debug panel (F2) instead of its own HUD
 	TimeControlGui.start({ Headless = true })
-	DebugPanel.start()
 else
 	TimeControlGui.start()
 end
+-- builds itself only for players allowed to use it (see DebugPanel)
+DebugPanel.start()
 ToolManager.start()
 
 -- Optional: custom impact VFX for offloaded projectiles.

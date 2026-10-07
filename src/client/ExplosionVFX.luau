@@ -58,6 +58,8 @@ local RunService = game:GetService("RunService")
 local Shared = ReplicatedStorage:WaitForChild("Shared")
 local ChunkManager = require(Shared.ChunkManager)
 local Heartbeat = require(Shared.Heartbeat)
+local SpatialAudio = require(script.Parent.SpatialAudio)
+local Crater = require(script.Parent.Crater)
 
 local ExplosionVFX = {}
 
@@ -71,9 +73,20 @@ ExplosionVFX.PowerFloor, ExplosionVFX.PowerCeiling = POWER_FLOOR, POWER_CEILING
 local MIN_RADIUS, MAX_RADIUS = 1.5, 120
 local LOD_DISTANCE = 600
 local MAX_DETAILED_ACTIVE = 12
-local SHAKE_FROM = 0.3
-local SHAKE_RANGE_RADII = 8
-local MAX_SHAKE_DEGREES = 1.6
+local SHAKE_FROM = 0.2
+local SHAKE_RANGE_RADII = 11
+local MAX_SHAKE_DEGREES = 2.6
+local SHAKE_JOLT = 0.35 -- studs of positional jolt at full strength, on top of the rotation
+-- The shake hits when the shockwave reaches the camera. Inside the blast
+-- radius that follows the template's expanding ring (Shockwaves.ShockwaveOut2:
+-- its size curve, as a fraction of its final size, over its ~0.375s life --
+-- its final radius is the blast radius); past it the wave carries on at the
+-- speed of sound, like the boom (SpatialAudio).
+local SHOCKWAVE_TIME = 0.375
+local SHOCKWAVE_CURVE = { -- { fraction of SHOCKWAVE_TIME, fraction of the radius reached }
+	{ 0, 0 }, { 0.1, 0.47 }, { 0.2, 0.663 }, { 0.3, 0.778 }, { 0.4, 0.852 }, { 0.5, 0.902 },
+	{ 0.6, 0.936 }, { 0.7, 0.96 }, { 0.8, 0.977 }, { 0.9, 0.989 }, { 1, 1 },
+}
 local MAX_REAL_LIFETIME = 30
 
 -- Intensity at which each role group starts playing, and its count factor
@@ -287,8 +300,26 @@ local function updateBlast(blast: Blast, dt: number): boolean
 	return true
 end
 
+-- Seconds (blast clock) until the shockwave front reaches `distance` studs out.
+local function shockwaveArrival(radius: number, distance: number): number
+	if distance >= radius then
+		return SHOCKWAVE_TIME + (distance - radius) / SpatialAudio.SpeedOfSound
+	end
+	local reached = distance / radius
+	for index = 2, #SHOCKWAVE_CURVE do
+		local previous, point = SHOCKWAVE_CURVE[index - 1], SHOCKWAVE_CURVE[index]
+		if reached <= point[2] then
+			local t = (reached - previous[2]) / (point[2] - previous[2])
+			return (previous[1] + (point[1] - previous[1]) * t) * SHOCKWAVE_TIME
+		end
+	end
+	return SHOCKWAVE_TIME
+end
+
 -- Camera shake: the strongest nearby blast wins; applied after the camera
 -- scripts each frame, so it never accumulates into the camera's own state.
+-- Each blast's shake starts when its shockwave reaches the camera, hitting
+-- hardest on arrival and dying away after.
 local function applyShake()
 	local camera = workspace.CurrentCamera
 	if not camera then
@@ -297,16 +328,23 @@ local function applyShake()
 	local strength = 0
 	for _, blast in active do
 		if blast.Shake > 0 then
-			local envelope = math.clamp(1 - blast.Age / (0.3 + 0.9 * blast.Spec.Intensity), 0, 1)
+			local distance = (camera.CFrame.Position - blast.Position).Magnitude
+			local since = blast.Age - shockwaveArrival(blast.Spec.Radius, distance)
+			local envelope = if since < 0 then 0 else math.clamp(1 - since / (0.4 + 1.1 * blast.Spec.Intensity), 0, 1)
 			local reach = blast.Spec.Radius * SHAKE_RANGE_RADII
-			local falloff = 1 - math.clamp((camera.CFrame.Position - blast.Position).Magnitude / reach, 0, 1)
+			local falloff = 1 - math.clamp(distance / reach, 0, 1)
 			strength = math.max(strength, blast.Shake * envelope * envelope * falloff)
 		end
 	end
 	if strength > 0.001 then
 		local now = os.clock() * 37
 		local amplitude = math.rad(MAX_SHAKE_DEGREES) * strength
-		camera.CFrame *= CFrame.Angles(
+		local jolt = SHAKE_JOLT * strength
+		camera.CFrame *= CFrame.new(
+			math.noise(now, 1.9) * jolt,
+			math.noise(2.3, now) * jolt,
+			0
+		) * CFrame.Angles(
 			math.noise(now, 0.3) * amplitude,
 			math.noise(0.7, now) * amplitude,
 			math.noise(now, now * 0.5) * amplitude * 0.5
@@ -351,6 +389,7 @@ function ExplosionVFX.Play(position: Vector3, options: PlayOptions?)
 	local radius = opts.Radius
 	local power = opts.Power or (if radius then (radius / 1.2) ^ 3 else 50)
 	local spec = ExplosionVFX.Describe(power, radius)
+	SpatialAudio.Explosion(position, spec.Intensity) -- arrives distance / speed of sound later
 	local scale = spec.Scale
 	local camera = workspace.CurrentCamera
 	local distance = if camera then (camera.CFrame.Position - position).Magnitude else 0
@@ -368,6 +407,9 @@ function ExplosionVFX.Play(position: Vector3, options: PlayOptions?)
 	local frame = if surface then upright(surface.Position, surface.Normal)
 		elseif hasNormal then upright(position, up)
 		else upright(position, Vector3.yAxis)
+	if surface then
+		Crater.Spawn(surface, spec.Radius, spec.Intensity, far or busy) -- rim, scorch and flying rubble
+	end
 
 	local root = Instance.new("Part")
 	root.Name = "Explosion"

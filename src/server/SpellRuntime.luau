@@ -366,7 +366,10 @@ local function vesselStats(compiled: any, ctx: Context, id: string): any
 			if stats.lifetime then stats.lifetime *= tables.Range[level] end
 			if stats.range then stats.range *= tables.Range[level] end
 		elseif kind == "Quantity" then
-			stats.quantity = params
+			-- over the chain's Quantity limit (SpellCompiler): one copy
+			if not (compiled.noQuantity and compiled.noQuantity[id]) then
+				stats.quantity = params
+			end
 		elseif kind == "Sustain" then
 			stats.sustain = tables.Sustain[level]
 		elseif kind == "Homing" then
@@ -722,6 +725,10 @@ end
 
 
 local function fireVessel(compiled: any, ctx: Context, id: string, energy: number, element: string)
+	-- over a splitting limit (SpellCompiler's soft limits): fizzles
+	if compiled.disabledVessels and compiled.disabledVessels[id] then
+		return
+	end
 	local info = compiled.vessels[id]
 	local vessel = compiled.runes[id].rune
 	local stats = vesselStats(compiled, ctx, id)
