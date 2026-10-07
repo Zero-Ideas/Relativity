@@ -47,7 +47,6 @@
 	by one physics step.
 ]]
 
-local SharedTableRegistry = game:GetService("SharedTableRegistry")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local ServerScriptService = game:GetService("ServerScriptService")
 
@@ -87,7 +86,10 @@ local SWEEP_DONE = Sweep.Done
 local LIMIT = SafeMath.Limit
 local abs = math.abs
 
-type Worker = { Actor: Actor, Output: SharedTable }
+type Worker = { Actor: Actor, Id: number }
+-- A worker's latest result, as fired through ProjectileActors.Results.
+type Result = { Frame: number, Count: number, Ms: number, Data: buffer?, Checks: number, Skipped: number }
+local results: { [number]: Result } = {} -- worker id -> latest
 
 -- Receives a result Apply can't take directly and says what happens to its
 -- slot (Refresh or Drop): the projectile, the result (status, position,
@@ -132,25 +134,38 @@ end
 local released: { number } = {} -- scratch for Apply
 local deferred: { number } = {} -- scratch for Apply
 
-local stats = { Parallel = 0, Resumed = 0, Serial = 0, Fallback = 0, Late = 0, Frames = 0, SlowestWorkerMs = 0, WorkerMs = 0, AppliedFrames = 0 }
+local stats = { Parallel = 0, Resumed = 0, Serial = 0, Fallback = 0, Late = 0, Frames = 0, SlowestWorkerMs = 0, WorkerMs = 0,
+	AppliedFrames = 0, WorkerChecks = 0, WorkerSkipped = 0 }
 
 local function refreshWorkers()
 	if #workers > 0 then
 		return
 	end
 	local root = ServerScriptService:FindFirstChild("ProjectileActors", true)
-	if not root then
+	local event = root and root:FindFirstChild("Results")
+	if not root or not event then
 		return
 	end
 	for _, child in root:GetChildren() do
 		local id = tonumber(string.match(child.Name, "(%d+)$"))
 		if child:IsA("Actor") and id then
-			local outputTable = SharedTableRegistry:GetSharedTable(`RelativityProjectileSweep{id}`)
-			if outputTable then
-				table.insert(workers, { Actor = child, Output = outputTable })
-			end
+			table.insert(workers, { Actor = child, Id = id })
 		end
 	end
+	if #workers == 0 then
+		return
+	end
+	(event :: BindableEvent).Event:Connect(function(id: number, resultFrame: number, count: number, ms: number,
+		data: buffer, checks: number, skipped: number)
+		local result = results[id]
+		if not result then
+			result = { Frame = 0, Count = 0, Ms = 0, Data = nil, Checks = 0, Skipped = 0 }
+			results[id] = result
+		end
+		result.Frame, result.Count, result.Ms, result.Data = resultFrame, count, ms, data
+		stats.WorkerChecks += checks
+		stats.WorkerSkipped += skipped
+	end)
 	table.sort(workers, function(a, b)
 		return a.Actor.Name < b.Actor.Name
 	end)
@@ -540,7 +555,7 @@ end
 function Parallel.Apply(apply: Applier, mark: number, now: number, timeVersion: number)
 	local clock = os.clock
 	local decodeTime, loopTime, slowTime, releaseTime, releases, kept = 0, 0, 0, 0, 0, 0
-	local readTime, transferred = 0, 0
+	local transferred = 0
 	local slowest, total, any = 0, 0, false
 	local sameVersion = timeVersion == batchTimeVersion
 	for w, batch in batches do
@@ -550,23 +565,20 @@ function Parallel.Apply(apply: Applier, mark: number, now: number, timeVersion: 
 		end
 		batch.Sent = 0
 		local worker = workers[w]
-		local outputTable = worker and worker.Output
-		if not outputTable or outputTable.frame ~= frame or outputTable.count ~= count then
+		local result = worker and results[worker.Id]
+		local data = result and result.Data
+		if not result or not data or result.Frame ~= frame or result.Count ~= count then
 			stats.Late += count
 			releases += batch.Count
 			releaseBatch(batch)
 			continue
 		end
+		-- (the event already handed us our own copy of the worker's buffer)
 		local decodeStarted = clock()
-		local ms = tonumber(outputTable.ms) or 0
+		result.Data = nil
+		local ms = result.Ms
 		slowest, total, any = math.max(slowest, ms), total + ms, true
-		-- (timed in two parts: copying the string out of the SharedTable, then
-		-- into a buffer -- see the Stats tab's decode line)
-		local text = outputTable.data :: string
-		local readDone = clock()
-		local data = buffer.fromstring(text)
-		readTime += readDone - decodeStarted
-		transferred += #text
+		transferred += buffer.len(data)
 		local input = batch.Input
 		local projectiles, slots, generations, scales, deadlines =
 			batch.Projectiles, batch.Slot, batch.Generation, batch.Scale, batch.Deadline
@@ -629,8 +641,6 @@ function Parallel.Apply(apply: Applier, mark: number, now: number, timeVersion: 
 	end
 	stats.Parallel += kept
 	Profile.Add("ApplyDecode", decodeTime)
-	Profile.Add("DecodeRead", readTime)
-	Profile.Add("DecodeBuffer", decodeTime - readTime)
 	Profile.Count("TransferKB", transferred / 1024)
 	Profile.Add("ApplyLoop", loopTime - slowTime)
 	Profile.Add("ApplySlow", slowTime)
@@ -660,6 +670,7 @@ function Parallel.TakeStats()
 	snapshot.SlowestWorkerMs = stats.SlowestWorkerMs / frames -- per frame, averaged
 	snapshot.WorkerMs = stats.WorkerMs / frames
 	stats.Parallel, stats.Resumed, stats.Serial, stats.Fallback, stats.Late, stats.Frames = 0, 0, 0, 0, 0, 0
+	stats.WorkerChecks, stats.WorkerSkipped = 0, 0
 	stats.SlowestWorkerMs, stats.WorkerMs, stats.AppliedFrames = 0, 0, 0
 	return snapshot
 end

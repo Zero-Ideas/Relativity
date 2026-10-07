@@ -626,8 +626,9 @@ local function buildStats()
 		BeamWorstMs = timing.BeamWorstMs,
 		ReplicationMs = timing.ReplicationMs,
 		ReplicationWorstMs = timing.ReplicationWorstMs,
-		RaycastChecks = occupancy.Checks,
-		RaycastsSkipped = occupancy.Skipped,
+		-- main thread (serial path) + every worker
+		RaycastChecks = occupancy.Checks + (parallel.WorkerChecks or 0),
+		RaycastsSkipped = occupancy.Skipped + (parallel.WorkerSkipped or 0),
 		OccupancyReady = occupancy.Ready,
 		OccupancyCells = occupancy.StaticCells,
 		OccupancyDynamic = occupancy.DynamicParts,

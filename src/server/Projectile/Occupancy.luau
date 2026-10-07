@@ -19,6 +19,14 @@
 	re-marked at its new place, never cleared at the old one), so staleness
 	can only cost a skipped skip, never a missed hit.
 
+	Parts with CanQuery off are skipped (raycasts can't hit them) until it's
+	turned on. A part bigger than REFINE_OVER studs whose shape isn't its box
+	(meshes, unions, wedges, balls...) is baked by its real collision geometry:
+	its box is split recursively and each piece tested with GetPartsInPart
+	(the same geometry raycasts hit), so e.g. a tree's mostly-empty bounding
+	box isn't marked solid. While that runs the part counts as dynamic (coarse,
+	conservative); the initial bake finishes it before anything is skipped.
+
 	Dynamic geometry -- anything unanchored, and every part of a model with a
 	Humanoid (characters, dummies, ragdolls) -- is re-marked at coarse level
 	once per physics frame, the first time a query needs it, grown by its
@@ -54,6 +62,8 @@ local TERRAIN_BLOCK = 256 -- studs per ReadVoxels block edge (64^3 voxels)
 local TERRAIN_AROUND_PARTS = 512 -- studs of terrain scanned beyond the map's parts
 local TERRAIN_DEFAULT_MIN = Vector3.new(-2048, -512, -2048) -- terrain-only maps
 local TERRAIN_DEFAULT_MAX = Vector3.new(2048, 1024, 2048)
+local REFINE_OVER = 32 -- studs: bigger non-box parts are baked by their real shape
+local REFINE_SLICE = 0.004 -- seconds of shape probing per resumption
 
 -- Sweeps wider than this always raycast (the padding wouldn't cover them).
 Occupancy.MaxRadius = PAD - 0.25
@@ -209,6 +219,74 @@ local function inCharacter(part: BasePart): boolean
 	return false
 end
 
+-- Is this part's collision shape its own box?
+local function boxShaped(part: BasePart): boolean
+	return part:IsA("Part") and (part :: Part).Shape == Enum.PartType.Block
+end
+
+-- The FINE-voxel boxes (lo, hi pairs) of `part`'s real collision geometry,
+-- each grown by PAD for the test (so marking them needs no further padding):
+-- its box is split into octants on the voxel grid and a piece is kept only
+-- if GetPartsInPart finds the part in it. Yields every REFINE_SLICE. nil if
+-- the part left the world meanwhile.
+local probe = Instance.new("Part")
+probe.Anchored = true
+
+local function refineShape(part: BasePart): { Vector3 }?
+	local params = OverlapParams.new()
+	params.FilterType = Enum.RaycastFilterType.Include
+	params.FilterDescendantsInstances = { part }
+	local grow = Vector3.one * (2 * PAD)
+	local lo, hi = bounds(part, 0)
+	lo = Vector3.new(floor(lo.X / FINE) * FINE, floor(lo.Y / FINE) * FINE, floor(lo.Z / FINE) * FINE)
+	hi = Vector3.new(math.ceil(hi.X / FINE) * FINE, math.ceil(hi.Y / FINE) * FINE, math.ceil(hi.Z / FINE) * FINE)
+	local boxes: { Vector3 } = {}
+	local stack: { Vector3 } = { lo, hi }
+	local sliceStarted = os.clock()
+	-- an axis range split in two on the voxel grid (one range if it's one voxel)
+	local function halves(a: number, b: number): { number }
+		if b - a <= FINE then
+			return { a, b }
+		end
+		local m = a + math.ceil((b - a) / FINE / 2) * FINE
+		return { a, m, m, b }
+	end
+	while #stack > 0 do
+		local nodeHi = table.remove(stack) :: Vector3
+		local nodeLo = table.remove(stack) :: Vector3
+		if os.clock() - sliceStarted > REFINE_SLICE then
+			task.wait()
+			sliceStarted = os.clock()
+			if not part.Parent then
+				return nil
+			end
+		end
+		probe.Size = nodeHi - nodeLo + grow
+		probe.CFrame = CFrame.new((nodeLo + nodeHi) * 0.5)
+		if #workspace:GetPartsInPart(probe, params) == 0 then
+			continue
+		end
+		local size = nodeHi - nodeLo
+		if size.X <= FINE and size.Y <= FINE and size.Z <= FINE then
+			table.insert(boxes, nodeLo)
+			table.insert(boxes, nodeHi)
+			continue
+		end
+		local xs, ys, zs = halves(nodeLo.X, nodeHi.X), halves(nodeLo.Y, nodeHi.Y), halves(nodeLo.Z, nodeHi.Z)
+		for i = 1, #xs, 2 do
+			for j = 1, #ys, 2 do
+				for k = 1, #zs, 2 do
+					table.insert(stack, Vector3.new(xs[i], ys[j], zs[k]))
+					table.insert(stack, Vector3.new(xs[i + 1], ys[j + 1], zs[k + 1]))
+				end
+			end
+		end
+	end
+	return boxes
+end
+
+local queryWatched: { [BasePart]: boolean } = {}
+
 local function makeDynamic(part: BasePart)
 	if not dynamicParts[part] then
 		dynamicParts[part] = true
@@ -273,15 +351,42 @@ function classify(part: BasePart)
 	if part:IsA("Terrain") or not part:IsDescendantOf(workspace) then
 		return
 	end
+	if not part.CanQuery then
+		-- raycasts can't hit it: nothing to mark until that changes
+		dynamicParts[part] = nil
+		if not queryWatched[part] then
+			queryWatched[part] = true
+			part:GetPropertyChangedSignal("CanQuery"):Connect(function()
+				if part.CanQuery and part.Parent then
+					makeDynamic(part)
+					task.spawn(classify, part)
+				end
+			end)
+		end
+		return
+	end
 	local root = part.AssemblyRootPart
 	local anchored = part.Anchored or (root ~= nil and root.Anchored)
 	if not anchored or inCharacter(part) then
 		makeDynamic(part)
 		return
 	end
+	local size = part.Size
+	if (size.X > REFINE_OVER or size.Y > REFINE_OVER or size.Z > REFINE_OVER) and not boxShaped(part) then
+		makeDynamic(part) -- (conservative while its shape is probed)
+		local boxes = refineShape(part)
+		if not boxes or not part.Parent then
+			return
+		end
+		local inset = Vector3.one * 0.01 -- (a voxel's far face would also mark its neighbour)
+		for index = 1, #boxes, 2 do
+			markStatic(boxes[index], boxes[index + 1] - inset)
+		end
+	else
+		local lo, hi = bounds(part, PAD)
+		markStatic(lo, hi)
+	end
 	dynamicParts[part] = nil
-	local lo, hi = bounds(part, PAD)
-	markStatic(lo, hi)
 	watchStatic(part)
 end
 
@@ -479,6 +584,7 @@ workspace.DescendantRemoving:Connect(function(instance)
 	if instance:IsA("BasePart") then
 		dynamicParts[instance] = nil
 		staticMoves[instance] = nil
+		queryWatched[instance] = nil
 	elseif instance:IsA("JointInstance") or instance:IsA("WeldConstraint") then
 		jointRemoved(instance)
 	end

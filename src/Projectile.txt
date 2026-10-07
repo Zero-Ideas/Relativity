@@ -22,14 +22,14 @@
 --     src/server/Projectile/Config.luau (192 lines)
 --     src/server/Projectile/Math.luau (71 lines)
 --     src/server/Projectile/Raycast.luau (284 lines)
---     src/server/Projectile/Occupancy.luau (516 lines)
+--     src/server/Projectile/Occupancy.luau (622 lines)
 --     src/server/Projectile/Homing.luau (150 lines)
 --     src/server/Projectile/RewindHit.luau (144 lines)
 --     src/server/Projectile/Replication.luau (579 lines)
 --     src/server/Projectile/Store.luau (275 lines)
 --     src/server/Projectile/Sweep.luau (209 lines)
 --     src/server/Projectile/Profile.luau (67 lines)
---     src/server/Projectile/Parallel.luau (667 lines)
+--     src/server/Projectile/Parallel.luau (678 lines)
 --     src/server/Projectile/init.luau (1286 lines)
 --     src/server/Projectile/BeamProjectileHandler.luau (338 lines)
 --     src/server/ProjectileQuota.luau (41 lines)
@@ -3873,6 +3873,14 @@ return Raycast
 	re-marked at its new place, never cleared at the old one), so staleness
 	can only cost a skipped skip, never a missed hit.
 
+	Parts with CanQuery off are skipped (raycasts can't hit them) until it's
+	turned on. A part bigger than REFINE_OVER studs whose shape isn't its box
+	(meshes, unions, wedges, balls...) is baked by its real collision geometry:
+	its box is split recursively and each piece tested with GetPartsInPart
+	(the same geometry raycasts hit), so e.g. a tree's mostly-empty bounding
+	box isn't marked solid. While that runs the part counts as dynamic (coarse,
+	conservative); the initial bake finishes it before anything is skipped.
+
 	Dynamic geometry -- anything unanchored, and every part of a model with a
 	Humanoid (characters, dummies, ragdolls) -- is re-marked at coarse level
 	once per physics frame, the first time a query needs it, grown by its
@@ -3908,6 +3916,8 @@ local TERRAIN_BLOCK = 256 -- studs per ReadVoxels block edge (64^3 voxels)
 local TERRAIN_AROUND_PARTS = 512 -- studs of terrain scanned beyond the map's parts
 local TERRAIN_DEFAULT_MIN = Vector3.new(-2048, -512, -2048) -- terrain-only maps
 local TERRAIN_DEFAULT_MAX = Vector3.new(2048, 1024, 2048)
+local REFINE_OVER = 32 -- studs: bigger non-box parts are baked by their real shape
+local REFINE_SLICE = 0.004 -- seconds of shape probing per resumption
 
 -- Sweeps wider than this always raycast (the padding wouldn't cover them).
 Occupancy.MaxRadius = PAD - 0.25
@@ -4063,6 +4073,74 @@ local function inCharacter(part: BasePart): boolean
 	return false
 end
 
+-- Is this part's collision shape its own box?
+local function boxShaped(part: BasePart): boolean
+	return part:IsA("Part") and (part :: Part).Shape == Enum.PartType.Block
+end
+
+-- The FINE-voxel boxes (lo, hi pairs) of `part`'s real collision geometry,
+-- each grown by PAD for the test (so marking them needs no further padding):
+-- its box is split into octants on the voxel grid and a piece is kept only
+-- if GetPartsInPart finds the part in it. Yields every REFINE_SLICE. nil if
+-- the part left the world meanwhile.
+local probe = Instance.new("Part")
+probe.Anchored = true
+
+local function refineShape(part: BasePart): { Vector3 }?
+	local params = OverlapParams.new()
+	params.FilterType = Enum.RaycastFilterType.Include
+	params.FilterDescendantsInstances = { part }
+	local grow = Vector3.one * (2 * PAD)
+	local lo, hi = bounds(part, 0)
+	lo = Vector3.new(floor(lo.X / FINE) * FINE, floor(lo.Y / FINE) * FINE, floor(lo.Z / FINE) * FINE)
+	hi = Vector3.new(math.ceil(hi.X / FINE) * FINE, math.ceil(hi.Y / FINE) * FINE, math.ceil(hi.Z / FINE) * FINE)
+	local boxes: { Vector3 } = {}
+	local stack: { Vector3 } = { lo, hi }
+	local sliceStarted = os.clock()
+	-- an axis range split in two on the voxel grid (one range if it's one voxel)
+	local function halves(a: number, b: number): { number }
+		if b - a <= FINE then
+			return { a, b }
+		end
+		local m = a + math.ceil((b - a) / FINE / 2) * FINE
+		return { a, m, m, b }
+	end
+	while #stack > 0 do
+		local nodeHi = table.remove(stack) :: Vector3
+		local nodeLo = table.remove(stack) :: Vector3
+		if os.clock() - sliceStarted > REFINE_SLICE then
+			task.wait()
+			sliceStarted = os.clock()
+			if not part.Parent then
+				return nil
+			end
+		end
+		probe.Size = nodeHi - nodeLo + grow
+		probe.CFrame = CFrame.new((nodeLo + nodeHi) * 0.5)
+		if #workspace:GetPartsInPart(probe, params) == 0 then
+			continue
+		end
+		local size = nodeHi - nodeLo
+		if size.X <= FINE and size.Y <= FINE and size.Z <= FINE then
+			table.insert(boxes, nodeLo)
+			table.insert(boxes, nodeHi)
+			continue
+		end
+		local xs, ys, zs = halves(nodeLo.X, nodeHi.X), halves(nodeLo.Y, nodeHi.Y), halves(nodeLo.Z, nodeHi.Z)
+		for i = 1, #xs, 2 do
+			for j = 1, #ys, 2 do
+				for k = 1, #zs, 2 do
+					table.insert(stack, Vector3.new(xs[i], ys[j], zs[k]))
+					table.insert(stack, Vector3.new(xs[i + 1], ys[j + 1], zs[k + 1]))
+				end
+			end
+		end
+	end
+	return boxes
+end
+
+local queryWatched: { [BasePart]: boolean } = {}
+
 local function makeDynamic(part: BasePart)
 	if not dynamicParts[part] then
 		dynamicParts[part] = true
@@ -4127,15 +4205,42 @@ function classify(part: BasePart)
 	if part:IsA("Terrain") or not part:IsDescendantOf(workspace) then
 		return
 	end
+	if not part.CanQuery then
+		-- raycasts can't hit it: nothing to mark until that changes
+		dynamicParts[part] = nil
+		if not queryWatched[part] then
+			queryWatched[part] = true
+			part:GetPropertyChangedSignal("CanQuery"):Connect(function()
+				if part.CanQuery and part.Parent then
+					makeDynamic(part)
+					task.spawn(classify, part)
+				end
+			end)
+		end
+		return
+	end
 	local root = part.AssemblyRootPart
 	local anchored = part.Anchored or (root ~= nil and root.Anchored)
 	if not anchored or inCharacter(part) then
 		makeDynamic(part)
 		return
 	end
+	local size = part.Size
+	if (size.X > REFINE_OVER or size.Y > REFINE_OVER or size.Z > REFINE_OVER) and not boxShaped(part) then
+		makeDynamic(part) -- (conservative while its shape is probed)
+		local boxes = refineShape(part)
+		if not boxes or not part.Parent then
+			return
+		end
+		local inset = Vector3.one * 0.01 -- (a voxel's far face would also mark its neighbour)
+		for index = 1, #boxes, 2 do
+			markStatic(boxes[index], boxes[index + 1] - inset)
+		end
+	else
+		local lo, hi = bounds(part, PAD)
+		markStatic(lo, hi)
+	end
 	dynamicParts[part] = nil
-	local lo, hi = bounds(part, PAD)
-	markStatic(lo, hi)
 	watchStatic(part)
 end
 
@@ -4333,6 +4438,7 @@ workspace.DescendantRemoving:Connect(function(instance)
 	if instance:IsA("BasePart") then
 		dynamicParts[instance] = nil
 		staticMoves[instance] = nil
+		queryWatched[instance] = nil
 	elseif instance:IsA("JointInstance") or instance:IsA("WeldConstraint") then
 		jointRemoved(instance)
 	end
@@ -5890,7 +5996,6 @@ return Profile
 	by one physics step.
 ]]
 
-local SharedTableRegistry = game:GetService("SharedTableRegistry")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local ServerScriptService = game:GetService("ServerScriptService")
 
@@ -5930,7 +6035,10 @@ local SWEEP_DONE = Sweep.Done
 local LIMIT = SafeMath.Limit
 local abs = math.abs
 
-type Worker = { Actor: Actor, Output: SharedTable }
+type Worker = { Actor: Actor, Id: number }
+-- A worker's latest result, as fired through ProjectileActors.Results.
+type Result = { Frame: number, Count: number, Ms: number, Data: buffer?, Checks: number, Skipped: number }
+local results: { [number]: Result } = {} -- worker id -> latest
 
 -- Receives a result Apply can't take directly and says what happens to its
 -- slot (Refresh or Drop): the projectile, the result (status, position,
@@ -5975,25 +6083,38 @@ end
 local released: { number } = {} -- scratch for Apply
 local deferred: { number } = {} -- scratch for Apply
 
-local stats = { Parallel = 0, Resumed = 0, Serial = 0, Fallback = 0, Late = 0, Frames = 0, SlowestWorkerMs = 0, WorkerMs = 0, AppliedFrames = 0 }
+local stats = { Parallel = 0, Resumed = 0, Serial = 0, Fallback = 0, Late = 0, Frames = 0, SlowestWorkerMs = 0, WorkerMs = 0,
+	AppliedFrames = 0, WorkerChecks = 0, WorkerSkipped = 0 }
 
 local function refreshWorkers()
 	if #workers > 0 then
 		return
 	end
 	local root = ServerScriptService:FindFirstChild("ProjectileActors", true)
-	if not root then
+	local event = root and root:FindFirstChild("Results")
+	if not root or not event then
 		return
 	end
 	for _, child in root:GetChildren() do
 		local id = tonumber(string.match(child.Name, "(%d+)$"))
 		if child:IsA("Actor") and id then
-			local outputTable = SharedTableRegistry:GetSharedTable(`RelativityProjectileSweep{id}`)
-			if outputTable then
-				table.insert(workers, { Actor = child, Output = outputTable })
-			end
+			table.insert(workers, { Actor = child, Id = id })
 		end
 	end
+	if #workers == 0 then
+		return
+	end
+	(event :: BindableEvent).Event:Connect(function(id: number, resultFrame: number, count: number, ms: number,
+		data: buffer, checks: number, skipped: number)
+		local result = results[id]
+		if not result then
+			result = { Frame = 0, Count = 0, Ms = 0, Data = nil, Checks = 0, Skipped = 0 }
+			results[id] = result
+		end
+		result.Frame, result.Count, result.Ms, result.Data = resultFrame, count, ms, data
+		stats.WorkerChecks += checks
+		stats.WorkerSkipped += skipped
+	end)
 	table.sort(workers, function(a, b)
 		return a.Actor.Name < b.Actor.Name
 	end)
@@ -6383,7 +6504,7 @@ end
 function Parallel.Apply(apply: Applier, mark: number, now: number, timeVersion: number)
 	local clock = os.clock
 	local decodeTime, loopTime, slowTime, releaseTime, releases, kept = 0, 0, 0, 0, 0, 0
-	local readTime, transferred = 0, 0
+	local transferred = 0
 	local slowest, total, any = 0, 0, false
 	local sameVersion = timeVersion == batchTimeVersion
 	for w, batch in batches do
@@ -6393,23 +6514,20 @@ function Parallel.Apply(apply: Applier, mark: number, now: number, timeVersion: 
 		end
 		batch.Sent = 0
 		local worker = workers[w]
-		local outputTable = worker and worker.Output
-		if not outputTable or outputTable.frame ~= frame or outputTable.count ~= count then
+		local result = worker and results[worker.Id]
+		local data = result and result.Data
+		if not result or not data or result.Frame ~= frame or result.Count ~= count then
 			stats.Late += count
 			releases += batch.Count
 			releaseBatch(batch)
 			continue
 		end
+		-- (the event already handed us our own copy of the worker's buffer)
 		local decodeStarted = clock()
-		local ms = tonumber(outputTable.ms) or 0
+		result.Data = nil
+		local ms = result.Ms
 		slowest, total, any = math.max(slowest, ms), total + ms, true
-		-- (timed in two parts: copying the string out of the SharedTable, then
-		-- into a buffer -- see the Stats tab's decode line)
-		local text = outputTable.data :: string
-		local readDone = clock()
-		local data = buffer.fromstring(text)
-		readTime += readDone - decodeStarted
-		transferred += #text
+		transferred += buffer.len(data)
 		local input = batch.Input
 		local projectiles, slots, generations, scales, deadlines =
 			batch.Projectiles, batch.Slot, batch.Generation, batch.Scale, batch.Deadline
@@ -6472,8 +6590,6 @@ function Parallel.Apply(apply: Applier, mark: number, now: number, timeVersion: 
 	end
 	stats.Parallel += kept
 	Profile.Add("ApplyDecode", decodeTime)
-	Profile.Add("DecodeRead", readTime)
-	Profile.Add("DecodeBuffer", decodeTime - readTime)
 	Profile.Count("TransferKB", transferred / 1024)
 	Profile.Add("ApplyLoop", loopTime - slowTime)
 	Profile.Add("ApplySlow", slowTime)
@@ -6503,6 +6619,7 @@ function Parallel.TakeStats()
 	snapshot.SlowestWorkerMs = stats.SlowestWorkerMs / frames -- per frame, averaged
 	snapshot.WorkerMs = stats.WorkerMs / frames
 	stats.Parallel, stats.Resumed, stats.Serial, stats.Fallback, stats.Late, stats.Frames = 0, 0, 0, 0, 0, 0
+	stats.WorkerChecks, stats.WorkerSkipped = 0, 0
 	stats.SlowestWorkerMs, stats.WorkerMs, stats.AppliedFrames = 0, 0, 0
 	return snapshot
 end
@@ -8208,15 +8325,16 @@ return ProjectileQuota
 	main-thread side and Projectile/Sweep.luau for the loop they run).
 
 	Run normally, this script creates WORKER_COUNT Actors under
-	ProjectileActors, each holding a clone of itself, plus one SharedTable per
-	worker for its results. Inside an Actor it becomes a worker that keeps its
+	ProjectileActors, each holding a clone of itself, plus the Results event
+	they report through. Inside an Actor it becomes a worker that keeps its
 	own mirrors of everything Sweep needs -- chunk time scales and zones
 	("TimeWorld"), raycast filters ("Filter"), and its own Occupancy bake --
-	and on each "Sweep" message runs its batch in parallel, writing a packed
-	result string plus the frame it belongs to into its SharedTable.
+	and on each "Sweep" message runs its batch in parallel, then fires its
+	result buffer (plus the frame it belongs to) through the "Results"
+	BindableEvent next to the actors -- one copy, no strings. It arrives
+	before that frame's Heartbeat, where Parallel.Apply reads it.
 ]]
 
-local SharedTableRegistry = game:GetService("SharedTableRegistry")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 
 local WORKER_COUNT = 4
@@ -8229,13 +8347,12 @@ if not actor then
 		folder.Name = "ProjectileActors"
 		folder.Parent = script.Parent
 	end
-	for index = 1, WORKER_COUNT do
-		local key = `RelativityProjectileSweep{index}`
-		if not SharedTableRegistry:GetSharedTable(key) then
-			SharedTableRegistry:SetSharedTable(key, SharedTable.new())
-		end
+	if not folder:FindFirstChild("Results") then
+		local results = Instance.new("BindableEvent")
+		results.Name = "Results"
+		results.Parent = folder
 	end
-	if #folder:GetChildren() == 0 then
+	if not folder:FindFirstChildWhichIsA("Actor") then
 		for index = 1, WORKER_COUNT do
 			local workerActor = Instance.new("Actor")
 			workerActor.Name = `ProjectileWorker{index}`
@@ -8258,7 +8375,7 @@ local ChunkManager = require(Shared:WaitForChild("ChunkManager"))
 local projectileModule = (actor.Parent :: Instance).Parent:WaitForChild("Projectile")
 local Sweep = require(projectileModule:WaitForChild("Sweep"))
 local Occupancy = require(projectileModule:WaitForChild("Occupancy"))
-local output = SharedTableRegistry:GetSharedTable(`RelativityProjectileSweep{workerId}`)
+local results = (actor.Parent :: Instance):WaitForChild("Results") :: BindableEvent
 
 local filters: { [number]: RaycastParams } = {}
 local specs: { [number]: Sweep.MotionSpec } = {}
@@ -8332,10 +8449,10 @@ actor:BindToMessageParallel("Sweep", function(frame: number, input: buffer, coun
 	for item = 1, count do
 		Sweep.Run(input, item, result, uniformTime, specs, castHits, hasEntities)
 	end
-	output.data = buffer.tostring(result)
-	output.count = count
-	output.ms = (os.clock() - started) * 1000 -- how long this batch took (Stats tab)
-	output.frame = frame
+	local ms = (os.clock() - started) * 1000 -- how long this batch took (Stats tab)
+	local occupancy = Occupancy.TakeStats()
+	task.synchronize()
+	results:Fire(workerId, frame, count, ms, result, occupancy.Checks, occupancy.Skipped)
 end)
 -- =============================================================================
 -- END FILE: src/server/ProjectileWorkerBootstrap.server.luau

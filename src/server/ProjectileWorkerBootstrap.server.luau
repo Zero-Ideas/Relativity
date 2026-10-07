@@ -5,15 +5,16 @@
 	main-thread side and Projectile/Sweep.luau for the loop they run).
 
 	Run normally, this script creates WORKER_COUNT Actors under
-	ProjectileActors, each holding a clone of itself, plus one SharedTable per
-	worker for its results. Inside an Actor it becomes a worker that keeps its
+	ProjectileActors, each holding a clone of itself, plus the Results event
+	they report through. Inside an Actor it becomes a worker that keeps its
 	own mirrors of everything Sweep needs -- chunk time scales and zones
 	("TimeWorld"), raycast filters ("Filter"), and its own Occupancy bake --
-	and on each "Sweep" message runs its batch in parallel, writing a packed
-	result string plus the frame it belongs to into its SharedTable.
+	and on each "Sweep" message runs its batch in parallel, then fires its
+	result buffer (plus the frame it belongs to) through the "Results"
+	BindableEvent next to the actors -- one copy, no strings. It arrives
+	before that frame's Heartbeat, where Parallel.Apply reads it.
 ]]
 
-local SharedTableRegistry = game:GetService("SharedTableRegistry")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 
 local WORKER_COUNT = 4
@@ -26,13 +27,12 @@ if not actor then
 		folder.Name = "ProjectileActors"
 		folder.Parent = script.Parent
 	end
-	for index = 1, WORKER_COUNT do
-		local key = `RelativityProjectileSweep{index}`
-		if not SharedTableRegistry:GetSharedTable(key) then
-			SharedTableRegistry:SetSharedTable(key, SharedTable.new())
-		end
+	if not folder:FindFirstChild("Results") then
+		local results = Instance.new("BindableEvent")
+		results.Name = "Results"
+		results.Parent = folder
 	end
-	if #folder:GetChildren() == 0 then
+	if not folder:FindFirstChildWhichIsA("Actor") then
 		for index = 1, WORKER_COUNT do
 			local workerActor = Instance.new("Actor")
 			workerActor.Name = `ProjectileWorker{index}`
@@ -55,7 +55,7 @@ local ChunkManager = require(Shared:WaitForChild("ChunkManager"))
 local projectileModule = (actor.Parent :: Instance).Parent:WaitForChild("Projectile")
 local Sweep = require(projectileModule:WaitForChild("Sweep"))
 local Occupancy = require(projectileModule:WaitForChild("Occupancy"))
-local output = SharedTableRegistry:GetSharedTable(`RelativityProjectileSweep{workerId}`)
+local results = (actor.Parent :: Instance):WaitForChild("Results") :: BindableEvent
 
 local filters: { [number]: RaycastParams } = {}
 local specs: { [number]: Sweep.MotionSpec } = {}
@@ -129,8 +129,8 @@ actor:BindToMessageParallel("Sweep", function(frame: number, input: buffer, coun
 	for item = 1, count do
 		Sweep.Run(input, item, result, uniformTime, specs, castHits, hasEntities)
 	end
-	output.data = buffer.tostring(result)
-	output.count = count
-	output.ms = (os.clock() - started) * 1000 -- how long this batch took (Stats tab)
-	output.frame = frame
+	local ms = (os.clock() - started) * 1000 -- how long this batch took (Stats tab)
+	local occupancy = Occupancy.TakeStats()
+	task.synchronize()
+	results:Fire(workerId, frame, count, ms, result, occupancy.Checks, occupancy.Skipped)
 end)
