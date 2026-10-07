@@ -321,6 +321,7 @@ local Replication = require(script.Replication)
 local Occupancy = require(script.Occupancy)
 local Sweep = require(script.Sweep)
 local Parallel = require(script.Parallel)
+local Profile = require(script.Profile)
 local RewindHit = require(script.RewindHit)
 local Types = require(script.Types)
 
@@ -358,6 +359,7 @@ local PHASES = { "Step", "Beam", "Replication" }
 local phaseTotal: { [string]: number } = { Step = 0, Beam = 0, Replication = 0 }
 local phaseWorst: { [string]: number } = { Step = 0, Beam = 0, Replication = 0 }
 local phaseFrames = 0
+local dispatchElapsed = 0 -- this frame's parallel dispatch, counted into its Step time
 local function recordPhase(name: string, elapsed: number)
 	phaseTotal[name] += elapsed
 	if elapsed > phaseWorst[name] then
@@ -495,6 +497,7 @@ function Projectile.new(config: Config): Projectile
 	local self: Projectile = setmetatable(state, Projectile) :: any
 	table.insert(active, self)
 	Replication.spawnVisual(self)
+	Parallel.Offer(self)
 	return self
 end
 
@@ -515,10 +518,13 @@ function Projectile.CreateBeamSample(template: Projectile, position: Vector3, ve
 	state._ignore, state._rewindCache, state._simulationDebt = table.clone(template._ignore), {}, 0
 	state._rayParams = Raycast.buildRayParams(state.Source, state.IgnoreInstances)
 	state.Dead, state._beamBodyHit = false, nil
+	-- never inherit the parent's slot or applied-this-frame mark
+	state._parallelState, state._sweepMark = nil, nil
 	state._beamReserveChildren, state._beamBindChild, state._beamScaleEnergy = nil, nil, nil
 	state.OnHit, state.OnDestroy = Signal.new() :: any, Signal.new() :: any
 	local self = setmetatable(state, Projectile) :: any
 	table.insert(active, self)
+	Parallel.Offer(self)
 	return self
 end
 
@@ -584,6 +590,12 @@ end
 -- (see Parallel), then resets -- DebugService's Stats tab reads this.
 function Projectile.TakeParallelStats()
 	return Parallel.TakeStats()
+end
+
+-- Average ms per frame of each part of the main thread's movement work (see
+-- Profile.luau), then resets -- DebugService's Stats tab reads this.
+function Projectile.TakeProfile(): { [string]: number }
+	return Profile.Take()
 end
 
 -- Average and worst ms per frame of each phase (Step / Beam / Replication)
@@ -904,46 +916,132 @@ end
 -- scale if so. Homing (target choice runs Filter callbacks) and lag-
 -- compensated shots (need entity history) stay serial, as does anything the
 -- prologue of Step would stop.
+--
+-- Everything below runs once per projectile per frame on the main thread
+-- (tens of thousands of times under load), so the common case avoids calls:
+-- SafeMath checks and combinedTimeScale are inlined, os.clock() is read once
+-- per frame, and replication helpers are only called when their state would
+-- actually change.
+local LIMIT = SafeMath.Limit
+local abs = math.abs
+local dispatchNow = 0 -- os.clock() at this frame's dispatch
+-- step outcomes this frame, flushed to Parallel's stats once per frame
+local counted = { Parallel = 0, Resumed = 0, Serial = 0, Fallback = 0 }
+
+local function finiteVector(v: Vector3): boolean
+	return abs(v.X) <= LIMIT and abs(v.Y) <= LIMIT and abs(v.Z) <= LIMIT
+end
+
+-- combinedTimeScale for ordinary values (falls back to it for anything else),
+-- with identical results.
+local function fastScale(projectile: Projectile): number
+	local source = projectile.Source
+	local sourceScale = if source then source.TimeScale else 1
+	local ownScale = projectile.TimeScale
+	if type(sourceScale) == "number" and type(ownScale) == "number" and sourceScale >= 0 and ownScale >= 0
+		and sourceScale < LIMIT and ownScale < LIMIT then
+		local scale = sourceScale * ownScale
+		if scale < LIMIT then
+			return scale
+		end
+	end
+	return combinedTimeScale(projectile)
+end
+
 local function parallelScale(projectile: Projectile): number?
 	if projectile.Dead or projectile.Homing or projectile.RewindSeconds > 0 or debugRays then
 		return nil
 	end
-	if os.clock() - projectile._spawnRealTime >= projectile.MaxRealLifetime then
+	if dispatchNow - projectile._spawnRealTime >= projectile.MaxRealLifetime then
 		return nil
 	end
-	if not SafeMath.isFiniteVector(projectile.Position) or not SafeMath.isFiniteVector(projectile.Velocity) then
+	if not finiteVector(projectile.Position) or not finiteVector(projectile.Velocity) then
 		return nil
 	end
-	local scale = combinedTimeScale(projectile)
-	return if scale > 0 then scale else nil
+	local scale = fastScale(projectile)
+	if not (scale > 0) then
+		return nil
+	end
+	-- Neither can change while it keeps its slot (a new scale or homing sends
+	-- it back through here), so its applier doesn't re-check them per frame.
+	Replication.updateTimeScale(projectile, scale)
+	Replication.updateSyncState(projectile)
+	return scale
 end
+Parallel.SetEligibility(parallelScale)
 
 -- Applies a worker's result in place of Step, or falls back to Step when the
 -- projectile changed after it was dispatched (an ability moved it, it gained
--- homing, time scales changed...). Same return as Step.
-local function applySweep(self: Projectile, result: Parallel.Result, globalDt: number): boolean
+-- homing, time scales changed...). Same return as Step. Plain values (see
+-- Parallel.Apply), so a result costs no tables.
+local function applySweep(self: Projectile, globalDt: number, status: number, position: Vector3,
+	velocity: Vector3, age: number, remaining: number, guard: number, fromPosition: Vector3,
+	fromVelocity: Vector3, fromAge: number, fromDebt: number, fromScale: number, timeVersion: number,
+	uniform: boolean): boolean
 	if self.Dead then
 		return false
 	end
 	if os.clock() - self._spawnRealTime >= self.MaxRealLifetime then
 		return false
 	end
-	local from = result.From
-	if self.Position ~= from.Position or self.Velocity ~= from.Velocity or self.Age ~= from.Age
-		or self._simulationDebt ~= from.Debt or self.Homing or self.RewindSeconds > 0
-		or combinedTimeScale(self) ~= from.Scale or ChunkManager.GetTimeVersion() ~= from.TimeVersion then
-		Parallel.Count("Fallback")
+	if self.Position ~= fromPosition or self.Velocity ~= fromVelocity or self.Age ~= fromAge
+		or self._simulationDebt ~= fromDebt or self.Homing or self.RewindSeconds > 0
+		or combinedTimeScale(self) ~= fromScale or ChunkManager.GetTimeVersion() ~= timeVersion then
+		counted.Fallback += 1
 		return self:Step(globalDt)
 	end
-	Parallel.Count("Parallel")
-	Replication.updateTimeScale(self, from.Scale)
-	self.Position, self.Velocity, self.Age = result.Position, result.Velocity, result.Age
-	if result.Status == Sweep.Expired then
-		return false
-	elseif result.Status == Sweep.Contact then
-		return runSubsteps(self, result.Remaining, result.Guard, result.Uniform)
+	if status == Sweep.Contact then
+		counted.Resumed += 1
+	else
+		counted.Parallel += 1
 	end
-	return finishStep(self, result.Remaining)
+	Replication.updateTimeScale(self, fromScale)
+	self.Position, self.Velocity, self.Age = position, velocity, age
+	if status == Sweep.Expired then
+		return false
+	elseif status == Sweep.Contact then
+		return runSubsteps(self, remaining, guard, uniform)
+	end
+	return finishStep(self, remaining)
+end
+
+-- Results are applied in one pass before the step loop; each projectile is
+-- marked with this frame's stepMark (negated when it died), and the loop only
+-- reads the mark (see the server step loop below). The plain "moved, hit
+-- nothing" result is handled inline and keeps the slot; anything else goes
+-- through applySweep and has its slot repacked (or released if it died).
+local stepMark = 0
+local applyDt = 0
+local applyNow = 0
+local applyTimeVersion = 0
+local SWEEP_DONE = Sweep.Done
+
+local PARALLEL_DROP, PARALLEL_KEEP, PARALLEL_REFRESH = Parallel.Drop, Parallel.Keep, Parallel.Refresh
+
+local function applySwept(self: Projectile, status: number, position: Vector3, velocity: Vector3,
+	age: number, remaining: number, guard: number, fromPosition: Vector3, fromVelocity: Vector3,
+	fromAge: number, fromDebt: number, fromScale: number, deadline: number, timeVersion: number,
+	uniform: boolean): number
+	if status == SWEEP_DONE and applyNow < deadline and not self.Dead
+		and self.Position == fromPosition and self.Velocity == fromVelocity and self.Age == fromAge
+		and self._simulationDebt == fromDebt and not self.Homing and self.RewindSeconds <= 0
+		and timeVersion == applyTimeVersion and fastScale(self) == fromScale then
+		counted.Parallel += 1
+		self.Position, self.Velocity, self.Age, self._simulationDebt = position, velocity, age, remaining
+		if not finiteVector(position) then
+			self._sweepMark = -stepMark -- flew past SafeMath.Limit
+			return PARALLEL_DROP
+		end
+		self._sweepMark = stepMark
+		return PARALLEL_KEEP
+	end
+	if applySweep(self, applyDt, status, position, velocity, age, remaining, guard,
+		fromPosition, fromVelocity, fromAge, fromDebt, fromScale, timeVersion, uniform) then
+		self._sweepMark = stepMark
+		return PARALLEL_REFRESH
+	end
+	self._sweepMark = -stepMark
+	return PARALLEL_DROP
 end
 
 -- Linked-body tests must never advance/reflect the distant back endpoint.
@@ -1106,33 +1204,59 @@ Heartbeat.Connect(function(globalDt: number)
 
 	debug.profilebegin("Projectile.StepAll")
 	local stepStarted = os.clock()
-	local swept = Parallel.Collect()
+	-- Projectiles spawned by hits while applying results are appended past
+	-- this count and first step next frame, as with spawns during the loop.
+	local stepCount = #active
+	stepMark += 1
+	applyDt = globalDt
+	applyNow = os.clock()
+	applyTimeVersion = ChunkManager.GetTimeVersion()
+	Parallel.Apply(applySwept)
+	local loopStarted = os.clock()
+	local destroyTime = 0
 	-- Backwards with swap-removal: dead projectiles leave `active` the same
 	-- frame (so GetAll/GetInRadius never return them), and anything spawned by
 	-- an OnHit/OnDestroy handler mid-loop is appended past `i` and first steps
 	-- next frame.
-	for i = #active, 1, -1 do
+	for i = stepCount, 1, -1 do
 		local projectile = active[i]
-		local result = swept[projectile]
 		local alive
-		if result then
-			alive = applySweep(projectile, result, globalDt)
+		local mark = projectile._sweepMark
+		if mark == stepMark then
+			-- (something earlier in this loop may have destroyed it since)
+			alive = not projectile.Dead
+		elseif mark == -stepMark then
+			alive = false
 		else
-			Parallel.Count("Serial")
+			counted.Serial += 1
 			alive = projectile:Step(globalDt)
+			if alive then
+				Parallel.Offer(projectile)
+			end
 		end
 		if alive then
 			-- Ordinary homing streams continuously; beams are filtered into sparse
 			-- refreshes and immediate topology corrections after link refinement.
-			Replication.queuePose(projectile)
+			-- (queuePose's own condition, checked here to skip the call)
+			if projectile.Visualize and projectile._spawnStreamed and (projectile._streamedSynced or projectile.Beam ~= nil) then
+				Replication.queuePose(projectile)
+			end
 		else
 			local last = #active
 			active[i] = active[last]
 			active[last] = nil
+			local destroyStarted = os.clock()
 			projectile:Destroy(nil, nil)
+			destroyTime += os.clock() - destroyStarted
 		end
 	end
-	recordPhase("Step", os.clock() - stepStarted)
+	Profile.Add("StepLoop", os.clock() - loopStarted - destroyTime)
+	Profile.Add("StepDestroy", destroyTime)
+	Profile.Frame()
+	Parallel.AddCounts(counted.Parallel, counted.Resumed, counted.Serial, counted.Fallback)
+	counted.Parallel, counted.Resumed, counted.Serial, counted.Fallback = 0, 0, 0, 0
+	recordPhase("Step", dispatchElapsed + os.clock() - stepStarted)
+	dispatchElapsed = 0
 	debug.profileend()
 	if beamSpanStep then
 		debug.profilebegin("Projectile.BeamSpans")
@@ -1157,8 +1281,9 @@ end, { Name = "ProjectileSystem.Step", Priority = 5 })
 -- dilated the same way Heartbeat.Connect callbacks receive it).
 RunService.PreSimulation:Connect(function(dt: number)
 	local started = os.clock()
-	Parallel.Dispatch(active, dt * Heartbeat.GetGlobalTimeScale(), parallelScale)
-	recordPhase("Step", os.clock() - started)
+	dispatchNow = started
+	Parallel.Dispatch(#active, dt * Heartbeat.GetGlobalTimeScale(), not debugRays)
+	dispatchElapsed = os.clock() - started
 end)
 
 return Projectile

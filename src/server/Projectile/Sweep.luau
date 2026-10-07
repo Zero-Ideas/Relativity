@@ -42,6 +42,12 @@ Sweep.InputSlots = 26
 Sweep.OutputSlots = 11
 local IN, OUT = Sweep.InputSlots * 8, Sweep.OutputSlots * 8
 
+-- Byte strides and offsets Parallel's persistent slots update in place.
+Sweep.InputStride, Sweep.OutputStride = IN, OUT
+Sweep.InputMotion, Sweep.OutputMotion = 16, 16 -- position then velocity, 48 bytes, in both
+Sweep.InputAge = 184
+Sweep.InputRemaining = 200
+
 local writef64, readf64 = buffer.writef64, buffer.readf64
 
 --------------------------------------------------------------------------------
@@ -137,6 +143,14 @@ function Sweep.ReadOutput(b: buffer, item: number): Result
 		Remaining = readf64(b, o + 72),
 		Guard = readf64(b, o + 80),
 	}
+end
+
+-- The same fields as ReadOutput, as plain values (no table): status,
+-- position, velocity, age, remaining, guard.
+function Sweep.ReadOutputValues(b: buffer, item: number): (number, Vector3, Vector3, number, number, number)
+	local o = (item - 1) * OUT
+	return readf64(b, o + 8), readVector(b, o + 16), readVector(b, o + 40), readf64(b, o + 64),
+		readf64(b, o + 72), readf64(b, o + 80)
 end
 
 --------------------------------------------------------------------------------

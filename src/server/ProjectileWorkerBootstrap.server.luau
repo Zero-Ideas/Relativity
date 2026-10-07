@@ -61,7 +61,10 @@ local filters: { [number]: RaycastParams } = {}
 local entityChunks: { [Vector3]: boolean } = {}
 
 -- Raycast filter `id` (a projectile's movement RaycastParams, by content).
-actor:BindToMessageParallel("Filter", function(id: number, instances: { Instance }, ignoreWater: boolean, group: string)
+-- A SERIAL handler: setting FilterDescendantsInstances isn't allowed in
+-- parallel. Filters are only used from the frame after they're sent; until
+-- one arrives, castHits reports a contact and the serial path casts it.
+actor:BindToMessage("Filter", function(id: number, instances: { Instance }, ignoreWater: boolean, group: string)
 	local params = RaycastParams.new()
 	params.FilterType = Enum.RaycastFilterType.Exclude
 	params.FilterDescendantsInstances = instances
@@ -110,6 +113,7 @@ local function castHits(from: Vector3, displacement: Vector3, radius: number, fi
 end
 
 actor:BindToMessageParallel("Sweep", function(frame: number, input: buffer, count: number, uniformTime: boolean, entityKeys: { Vector3 })
+	local started = os.clock()
 	table.clear(entityChunks)
 	for _, key in entityKeys do
 		entityChunks[key] = true
@@ -120,5 +124,6 @@ actor:BindToMessageParallel("Sweep", function(frame: number, input: buffer, coun
 	end
 	output.data = buffer.tostring(result)
 	output.count = count
+	output.ms = (os.clock() - started) * 1000 -- how long this batch took (Stats tab)
 	output.frame = frame
 end)

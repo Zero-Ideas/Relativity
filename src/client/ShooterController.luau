@@ -86,8 +86,11 @@ end
 -- in Shooter.server.luau). Press N to fire a stress-test batch.
 local STRESS_TEST_COUNT = 10000
 
-local function stressTest()
-	VisualOffload.Fire("StressTestFire", { Count = STRESS_TEST_COUNT })
+-- N: a normal stress test (rendered on every client). Shift+N: server-only --
+-- the server simulates the same projectiles but never replicates them, so
+-- the client isn't loaded at all and the Stats tab shows pure server cost.
+local function stressTest(serverOnly: boolean?)
+	VisualOffload.Fire("StressTestFire", { Count = STRESS_TEST_COUNT, ServerOnly = serverOnly == true })
 end
 
 function ShooterController.start()
@@ -110,7 +113,7 @@ function ShooterController.start()
 			debugRays = not debugRays
 			VisualOffload.Fire("SetProjectileDebug", debugRays)
 		elseif input.KeyCode == Enum.KeyCode.N then
-			stressTest()
+			stressTest(UserInputService:IsKeyDown(Enum.KeyCode.LeftShift) or UserInputService:IsKeyDown(Enum.KeyCode.RightShift))
 		elseif input.KeyCode == Enum.KeyCode.R then
 			reload()
 		elseif input.KeyCode == Enum.KeyCode.V then

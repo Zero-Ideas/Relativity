@@ -204,6 +204,12 @@ export type State = {
 	-- samples cloned from this packet may share it
 	_spanParams: RaycastParams?,
 	_spanPierced: number?,
+	-- parallel movement (Parallel.luau): its raycast filter's id, queued /
+	-- slotted, and the frame mark of a result applied before this frame's step
+	-- loop (+mark: alive, -mark: dead)
+	_filterId: number?,
+	_parallelState: number?,
+	_sweepMark: number?,
 	_spawnStreamed: boolean,
 	_streamedSynced: boolean,
 	_lastStreamedTimeScale: number,

@@ -484,6 +484,8 @@ VisualOffload.On("StressTestFire", function(data, player)
 
 	local requestedCount = typeof(data) == "table" and data.Count or nil
 	local count = math.floor(num(requestedCount, 500, 1, MAX_STRESS_COUNT))
+	-- server-only: simulated in full but never replicated, so no client load
+	local serverOnly = typeof(data) == "table" and data.ServerOnly == true
 	local shooter = Entity.Get(character)
 
 	for _ = 1, count do
@@ -496,22 +498,15 @@ VisualOffload.On("StressTestFire", function(data, player)
 			Damage = 0, -- pure load test; never affects real gameplay/entities
 			Source = shooter,
 			IgnoreInstances = { character },
-			Visualize = true,
+			Visualize = not serverOnly,
 			VisualRange = 8000,
 			Visual = { Shape = "Ball", Size = Vector3.one * 0.4, Color = Color3.fromRGB(255, 140, 60) },
-			Homing = {
-				AcquireRadius = num(60, 60, 0, 300),
-				TargetTags = { "Enemy", "Player" },
-				Retarget = true,
-				ReacquireRate = 0.3,
-				Permalock = true,
-				TurnRate = math.rad(num(140, 140, 0, 360)),
-				Delay = 0.05,
-			},
+			-- No Homing: plain straight bullets like the TimeBlaster's own shots
+			-- (homing projectiles step serially -- see Projectile/Parallel.luau).
 		})
 	end
 
-	print(`[Relativity] stress test: spawned {count} projectiles for {player.Name}`)
+	print(`[Relativity] stress test: spawned {count}{if serverOnly then " server-only" else ""} projectiles for {player.Name}`)
 
 	-- Real frame-cost data while the batch is in flight (Heartbeat.GetStats() is
 	-- shared module state, so this reads the actual live loop -- not a
