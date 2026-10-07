@@ -9,10 +9,10 @@
 	packed movement record (Sweep's input layout) and what the projectile
 	looked like after the last frame, and it persists across frames: a
 	projectile that just flies is packed once, and from then on its record is
-	updated straight from the worker's output. So the per-frame main-thread
-	cost is a pass over compact arrays plus the applier, instead of re-reading
-	every projectile table (which, at tens of thousands of projectiles, is
-	mostly cache misses).
+	updated straight from the worker's output. Together with Store.luau (the
+	projectile's own hot fields in a buffer), a projectile that just flies
+	costs the main thread only buffer reads and writes per frame -- its table
+	(at tens of thousands of projectiles, mostly cache misses) isn't touched.
 
 	  Offer()                 a projectile that stepped serially (or was just
 	                          made) asks for a slot; it's queued.
@@ -24,17 +24,17 @@
 	                          batch is sent off.
 	  parallel phase          workers (ProjectileWorkerBootstrap) run Sweep.Run:
 	                          plan, cast, integrate, stop at the first contact.
-	  Heartbeat (serial)      Apply(): results of THIS frame's batches go to
-	                          Projectile's applier, which says what happens to
-	                          the slot: Keep (the slot takes the result),
-	                          Refresh (the serial code finished the frame:
-	                          repack, or release if no longer eligible) or Drop
-	                          (dead: release). A late batch is released whole.
+	  Heartbeat (serial)      Apply(): a plain "moved, hit nothing" result for a
+	                          projectile nothing touched is written straight
+	                          into its Store record and its slot. Anything else
+	                          goes to Projectile's applier (the serial code),
+	                          which answers Refresh (repack, or release if no
+	                          longer eligible) or Drop (dead: release). A late
+	                          batch is released whole.
 
-	Anything changed behind a slot's back (an ability moved it, it gained
-	homing, time scales changed...) is caught by the applier comparing the
-	projectile with the slot, and stepped serially -- so the slot never has to
-	be told.
+	Anything changed behind a slot's back (an ability moved it, a time scale
+	changed...) shows up as the record's Dirty flag or a different scale, and
+	the projectile is stepped serially -- so the slot never has to be told.
 
 	Workers mirror what they need: time scales/zones (sent when
 	ChunkManager.GetTimeVersion changes), raycast filters (sent once per
@@ -54,7 +54,9 @@ local ServerScriptService = game:GetService("ServerScriptService")
 local Shared = ReplicatedStorage:WaitForChild("Shared")
 local ChunkManager = require(Shared:WaitForChild("ChunkManager"))
 local Sweep = require(script.Parent.Sweep)
+local Store = require(script.Parent.Store)
 local Profile = require(script.Parent.Profile)
+local SafeMath = require(Shared:WaitForChild("SafeMath"))
 
 local Parallel = {}
 
@@ -63,29 +65,38 @@ Parallel.MinProjectiles = 32 -- below this, dispatch overhead isn't worth it
 
 -- What an applier returns for a result (see Parallel.Apply).
 Parallel.Drop = 0 -- dead: release the slot
-Parallel.Keep = 1 -- moved exactly as the worker said: the slot takes the result
 Parallel.Refresh = 2 -- alive, but the serial code finished the frame: repack or release
-local DROP, KEEP, REFRESH = Parallel.Drop, Parallel.Keep, Parallel.Refresh
+local REFRESH = Parallel.Refresh
 
 -- projectile._parallelState
 local QUEUED, SLOTTED = 1, 2
 
 local IN, OUT = Sweep.InputStride, Sweep.OutputStride
-local IN_MOTION, OUT_MOTION = Sweep.InputMotion, Sweep.OutputMotion
+local IN_MOTION = Sweep.InputMotion
+local OUT_STATUS, OUT_POSITION, OUT_VELOCITY = Sweep.OutStatus, Sweep.OutPosition, Sweep.OutVelocity
+local OUT_AGE, OUT_REMAINING = Sweep.OutAge, Sweep.OutRemaining
 local IN_AGE, IN_REMAINING = Sweep.InputAge, Sweep.InputRemaining
 local MIN_CAPACITY = 64
-local writef64, bufferCopy = buffer.writef64, buffer.copy
+local readf64, writef64, readf32, writef32, bufferCopy = buffer.readf64, buffer.writef64, buffer.readf32, buffer.writef32, buffer.copy
+local readu8, readu32, writeu8, band = buffer.readu8, buffer.readu32, buffer.writeu8, bit32.band
+local STRIDE = Store.Stride
+local S_POSITION, S_VELOCITY, S_AGE, S_DEBT = Store.Position, Store.Velocity, Store.Age, Store.Debt
+local S_SCALE, S_MARK, S_SOURCE, S_FLAGS = Store.TimeScale, Store.Mark, Store.Source, Store.Flags
+local DEAD_OR_DIRTY = bit32.bor(Store.Dead, Store.Dirty)
+local SWEEP_DONE = Sweep.Done
+local LIMIT = SafeMath.Limit
+local abs = math.abs
 
 type Worker = { Actor: Actor, Output: SharedTable }
 
--- Receives one finished result and says what happens to its slot: the
--- projectile, the result (status, position, velocity, age, remaining,
--- guard), what it looked like when the worker started (position, velocity,
--- age, debt, scale), its real-time deadline, and the dispatch's time version
+-- Receives a result Apply can't take directly and says what happens to its
+-- slot (Refresh or Drop): the projectile, the result (status, position,
+-- velocity, age, remaining, guard), whether it was changed since it was
+-- packed (Dirty), the scale it was sent with, and the dispatch's time version
 -- and uniform-time flag.
 export type Applier = (projectile: any, status: number, position: Vector3, velocity: Vector3, age: number,
-	remaining: number, guard: number, fromPosition: Vector3, fromVelocity: Vector3, fromAge: number,
-	fromDebt: number, fromScale: number, deadline: number, timeVersion: number, uniform: boolean) -> number
+	remaining: number, guard: number, dirty: boolean, fromScale: number, timeVersion: number,
+	uniform: boolean) -> number
 
 -- A worker's slots, item 1..Count (compact: released slots are swap-removed).
 type Batch = {
@@ -94,10 +105,8 @@ type Batch = {
 	Capacity: number,
 	Input: buffer,
 	Projectiles: { any },
-	Position: { Vector3 },
-	Velocity: { Vector3 },
-	Age: { number },
-	Debt: { number },
+	Slot: { number }, -- its Store record
+	Generation: { number }, -- Store.Generation[slot] when packed (a mismatch: released since)
 	Scale: { number },
 	Deadline: { number }, -- os.clock() past which MaxRealLifetime is up
 }
@@ -117,6 +126,7 @@ local scaleOf: (any) -> number? = function()
 	return nil
 end
 local released: { number } = {} -- scratch for Apply
+local deferred: { number } = {} -- scratch for Apply
 
 local stats = { Parallel = 0, Resumed = 0, Serial = 0, Fallback = 0, Late = 0, Frames = 0, SlowestWorkerMs = 0, WorkerMs = 0, AppliedFrames = 0 }
 
@@ -214,7 +224,7 @@ end
 local function newBatch(): Batch
 	return {
 		Count = 0, Sent = 0, Capacity = MIN_CAPACITY, Input = buffer.create(Sweep.InputSize(MIN_CAPACITY)),
-		Projectiles = {}, Position = {}, Velocity = {}, Age = {}, Debt = {}, Scale = {}, Deadline = {},
+		Projectiles = {}, Slot = {}, Generation = {}, Scale = {}, Deadline = {},
 	}
 end
 
@@ -227,19 +237,22 @@ end
 
 -- Packs `projectile` into slot `item` (new or reused) with its current state.
 local function pack(batch: Batch, item: number, projectile: any, filter: number, scale: number)
+	local slot = projectile._slot
 	batch.Projectiles[item] = projectile
-	batch.Position[item] = projectile.Position
-	batch.Velocity[item] = projectile.Velocity
-	batch.Age[item] = projectile.Age
-	batch.Debt[item] = projectile._simulationDebt
+	batch.Slot[item] = slot
+	batch.Generation[item] = Store.Generation[slot]
 	batch.Scale[item] = scale
 	batch.Deadline[item] = projectile._spawnRealTime + projectile.MaxRealLifetime
 	-- remaining is written at each dispatch
 	Sweep.WriteInput(batch.Input, item, item, filter, projectile, 0)
+	Store.ClearDirty(slot)
 end
 
 -- Its scale and filter id if it may have a slot right now, else nil.
 local function eligible(projectile: any): (number?, number?)
+	if not projectile._slot then
+		return nil, nil -- (released: it's gone)
+	end
 	local scale = scaleOf(projectile)
 	if not scale then
 		return nil, nil
@@ -262,10 +275,8 @@ local function release(batch: Batch, item: number)
 		bufferCopy(input, o, input, (last - 1) * IN, IN)
 		writef64(input, o, item) -- (the record's index slot)
 		projectiles[item] = projectiles[last]
-		batch.Position[item] = batch.Position[last]
-		batch.Velocity[item] = batch.Velocity[last]
-		batch.Age[item] = batch.Age[last]
-		batch.Debt[item] = batch.Debt[last]
+		batch.Slot[item] = batch.Slot[last]
+		batch.Generation[item] = batch.Generation[last]
 		batch.Scale[item] = batch.Scale[last]
 		batch.Deadline[item] = batch.Deadline[last]
 	end
@@ -373,11 +384,13 @@ function Parallel.Dispatch(activeCount: number, globalDt: number, allowed: boole
 
 	-- this frame's step budget for every slot
 	local loopStarted = clock()
+	local store = Store.data
 	for w = 1, workerCount do
 		local batch = batches[w]
-		local input, debts, scales = batch.Input, batch.Debt, batch.Scale
+		local input, slots, scales = batch.Input, batch.Slot, batch.Scale
 		for item = 1, batch.Count do
-			writef64(input, (item - 1) * IN + IN_REMAINING, globalDt * scales[item] + debts[item])
+			local debt = readf64(store, slots[item] * STRIDE + S_DEBT)
+			writef64(input, (item - 1) * IN + IN_REMAINING, globalDt * scales[item] + debt)
 		end
 	end
 
@@ -402,15 +415,37 @@ function Parallel.Dispatch(activeCount: number, globalDt: number, allowed: boole
 	Profile.Count("Acquired", acquired)
 end
 
--- Hands every finished result of this frame to `apply`, straight from the
--- workers' buffers (no per-projectile tables), and updates or releases each
--- slot by its answer. Batches a worker hasn't finished (or never got) are
--- released -- those projectiles just step serially and are offered again.
-function Parallel.Apply(apply: Applier)
+-- The current scale of the projectile in Store record `o` (its own scale
+-- times its source's), or nil when anything is unusual -- then the serial
+-- code decides (combinedTimeScale).
+local function storeScale(store: buffer, o: number): number?
+	local own = readf64(store, o + S_SCALE)
+	local index = readu32(store, o + S_SOURCE)
+	local sourceScale: any = 1
+	if index ~= 0 then
+		sourceScale = Store.Sources[index].TimeScale
+	end
+	if type(sourceScale) == "number" and sourceScale >= 0 and own >= 0 and sourceScale < LIMIT and own < LIMIT then
+		local scale = sourceScale * own
+		if scale < LIMIT then
+			return scale
+		end
+	end
+	return nil
+end
+
+-- Applies this frame's results. `mark` is the step loop's frame mark (written
+-- into the record of every projectile handled here), `now` its os.clock(),
+-- `timeVersion` ChunkManager's current time version. A plain "moved, hit
+-- nothing" result for an untouched projectile is written straight into its
+-- record and slot; anything else goes to `apply` (see Applier). Batches a
+-- worker hasn't finished (or never got) are released -- those projectiles
+-- just step serially and are offered again.
+function Parallel.Apply(apply: Applier, mark: number, now: number, timeVersion: number)
 	local clock = os.clock
-	local SAMPLE = Profile.SAMPLE
-	local decodeTime, loopTime, readTime, applyTime, releaseTime, applied, sampled, releases = 0, 0, 0, 0, 0, 0, 0, 0
+	local decodeTime, loopTime, slowTime, releaseTime, releases, kept = 0, 0, 0, 0, 0, 0
 	local slowest, total, any = 0, 0, false
+	local sameVersion = timeVersion == batchTimeVersion
 	for w, batch in batches do
 		local count = batch.Sent
 		if count == 0 then
@@ -430,57 +465,89 @@ function Parallel.Apply(apply: Applier)
 		slowest, total, any = math.max(slowest, ms), total + ms, true
 		local data = buffer.fromstring(outputTable.data :: string)
 		local input = batch.Input
-		local projectiles, positions, velocities, ages, debts, scales, deadlines =
-			batch.Projectiles, batch.Position, batch.Velocity, batch.Age, batch.Debt, batch.Scale, batch.Deadline
+		local projectiles, slots, generations, scales, deadlines =
+			batch.Projectiles, batch.Slot, batch.Generation, batch.Scale, batch.Deadline
+		local generationOf = Store.Generation
 		local loopStarted = clock()
 		decodeTime += loopStarted - decodeStarted
-		local dropped = 0
-		-- One result in SAMPLE has its read and its applier timed (Profile.luau).
-		local tick = 0
+		local dropped, slow = 0, 0
+		table.clear(released)
+		-- Pass 1, buffers only: every plain result for an untouched projectile.
+		-- The rest are deferred to pass 2, so the serial code (raycasts,
+		-- Step, allocation) doesn't keep evicting this loop's working set.
+		local store = Store.data
 		for item = 1, count do
-			tick += 1
-			local timed = tick == SAMPLE
-			local t0 = 0
-			if timed then
-				tick = 0
-				sampled += 1
-				t0 = clock()
+			local slot = slots[item]
+			if generationOf[slot] ~= generations[item] then
+				-- released since (the step loop dropped it): nothing to apply
+				dropped += 1
+				released[dropped] = item
+				continue
 			end
-			local status, position, velocity, age, remaining, guard = Sweep.ReadOutputValues(data, item)
-			local t1 = 0
-			if timed then
-				t1 = clock()
+			local o = slot * STRIDE
+			local out = (item - 1) * OUT
+			if readu8(data, out + OUT_STATUS) ~= SWEEP_DONE or band(readu8(store, o + S_FLAGS), DEAD_OR_DIRTY) ~= 0
+				or not sameVersion or not (now < deadlines[item]) or storeScale(store, o) ~= scales[item] then
+				slow += 1
+				deferred[slow] = item
+				continue
 			end
-			local projectile = projectiles[item]
-			local outcome = apply(projectile, status, position, velocity, age, remaining, guard,
-				positions[item], velocities[item], ages[item], debts[item], scales[item], deadlines[item],
-				batchTimeVersion, batchUniform)
-			if outcome == KEEP then
-				positions[item], velocities[item], ages[item], debts[item] = position, velocity, age, remaining
-				local o = (item - 1) * IN
-				bufferCopy(input, o + IN_MOTION, data, (item - 1) * OUT + OUT_MOTION, 48)
-				writef64(input, o + IN_AGE, age)
+			-- position/velocity are float32 in both the output and the record
+			bufferCopy(store, o + S_POSITION, data, out + OUT_POSITION, 24)
+			local age = readf64(data, out + OUT_AGE)
+			writef64(store, o + S_AGE, age)
+			writef64(store, o + S_DEBT, readf64(data, out + OUT_REMAINING))
+			local px, py, pz = readf32(data, out + OUT_POSITION), readf32(data, out + OUT_POSITION + 4),
+				readf32(data, out + OUT_POSITION + 8)
+			-- and the slot's packed record (f64) for next frame
+			local i = (item - 1) * IN + IN_MOTION
+			writef64(input, i, px)
+			writef64(input, i + 8, py)
+			writef64(input, i + 16, pz)
+			writef64(input, i + 24, readf32(data, out + OUT_VELOCITY))
+			writef64(input, i + 32, readf32(data, out + OUT_VELOCITY + 4))
+			writef64(input, i + 40, readf32(data, out + OUT_VELOCITY + 8))
+			writef64(input, (item - 1) * IN + IN_AGE, age)
+			if abs(px) <= LIMIT and abs(py) <= LIMIT and abs(pz) <= LIMIT then
+				writef64(store, o + S_MARK, mark)
+				kept += 1
 			else
-				local keep = false
-				if outcome == REFRESH and not projectile.Dead then
-					local scale, filter = eligible(projectile)
-					if scale and filter then
-						pack(batch, item, projectile, filter, scale)
-						keep = true
-					end
-				end
-				if not keep then
-					dropped += 1
-					released[dropped] = item
-				end
-			end
-			if timed then
-				local t2 = clock()
-				readTime += t1 - t0
-				applyTime += t2 - t1
+				-- flew past SafeMath.Limit: dies in the step loop
+				writef64(store, o + S_MARK, -mark)
+				dropped += 1
+				released[dropped] = item
 			end
 		end
-		applied += count
+
+		-- Pass 2: the serial code finishes the rest.
+		local slowStarted = clock()
+		for index = 1, slow do
+			local item = deferred[index]
+			local projectile = projectiles[item]
+			local status, position, velocity, age, remaining, guard = Sweep.ReadOutputValues(data, item)
+			local flags = readu8(Store.data, slots[item] * STRIDE + S_FLAGS)
+			local outcome = apply(projectile, status, position, velocity, age, remaining, guard,
+				band(flags, Store.Dirty) ~= 0, scales[item], batchTimeVersion, batchUniform)
+			local keep = false
+			if outcome == REFRESH and not projectile.Dead then
+				local scale, filter = eligible(projectile)
+				if scale and filter then
+					pack(batch, item, projectile, filter, scale)
+					keep = true
+				end
+			end
+			if not keep then
+				dropped += 1
+				released[dropped] = item
+			end
+		end
+		slowTime += clock() - slowStarted
+		-- (releases must go highest item first; pass 2 added some out of order)
+		if slow > 0 then
+			table.sort(released, function(x, y)
+				return x < y
+			end)
+		end
 		local releaseStarted = clock()
 		loopTime += releaseStarted - loopStarted
 		-- backwards, so a swap never moves a slot that's still to be released
@@ -490,15 +557,12 @@ function Parallel.Apply(apply: Applier)
 		releases += dropped
 		releaseTime += clock() - releaseStarted
 	end
+	stats.Parallel += kept
 	Profile.Add("ApplyDecode", decodeTime)
-	Profile.Add("ApplyLoop", loopTime)
+	Profile.Add("ApplyLoop", loopTime - slowTime)
+	Profile.Add("ApplySlow", slowTime)
 	Profile.Add("ApplyRelease", releaseTime)
 	Profile.Count("Released", releases)
-	if sampled > 0 then
-		local scaleUp = applied / sampled
-		Profile.Add("ApplyRead", readTime * scaleUp)
-		Profile.Add("ApplyResult", applyTime * scaleUp)
-	end
 	if any then
 		stats.SlowestWorkerMs += slowest
 		stats.WorkerMs += total

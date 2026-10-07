@@ -208,6 +208,7 @@ export type State = {
 	-- slotted, and the frame mark of a result applied before this frame's step
 	-- loop (+mark: alive, -mark: dead)
 	_filterId: number?,
+	_slot: number?, -- its Store record while live (see Store.luau)
 	_parallelState: number?,
 	_sweepMark: number?,
 	_spawnStreamed: boolean,

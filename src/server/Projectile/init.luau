@@ -321,6 +321,7 @@ local Replication = require(script.Replication)
 local Occupancy = require(script.Occupancy)
 local Sweep = require(script.Sweep)
 local Parallel = require(script.Parallel)
+local Store = require(script.Store)
 local Profile = require(script.Profile)
 local RewindHit = require(script.RewindHit)
 local Types = require(script.Types)
@@ -331,6 +332,9 @@ export type DestroyInfo = Types.DestroyInfo
 
 local Projectile = {}
 Projectile.__index = Projectile
+-- Live projectiles keep their per-frame fields in Store's buffer behind this
+-- metatable (fields read and write as usual); released ones get Projectile.
+local Live = Store.Metatable(Projectile)
 
 -- The live projectile: its public/internal state plus the methods below.
 -- Declared as an intersection (not typeof(setmetatable(...))) so a projectile
@@ -352,6 +356,7 @@ local MAX_HOMING_TURN_STEP = math.rad(5)
 local MAX_BURST_COUNT = 10000
 
 local active: { Projectile } = {} -- server-side live projectiles
+local activeSlot: { number } = {} -- active[i]'s Store record (kept in step with active)
 -- Time per frame spent in each phase of the server loop, for the debug
 -- panel (TakeStepTiming): projectile movement, beam body refinement, and
 -- replication flushing.
@@ -494,8 +499,9 @@ function Projectile.new(config: Config): Projectile
 	-- spawn snapshot's TimeScale matches.
 	state._lastStreamedTimeScale = combinedTimeScale(state)
 
-	local self: Projectile = setmetatable(state, Projectile) :: any
+	local self: Projectile = Store.Adopt(state, Live)
 	table.insert(active, self)
+	table.insert(activeSlot, (self :: any)._slot)
 	Replication.spawnVisual(self)
 	Parallel.Offer(self)
 	return self
@@ -504,7 +510,7 @@ end
 -- A real beamlet: unique identity, ordinary simulation, replication and
 -- collision events. The handler binds spell energy/quota before its first step.
 function Projectile.CreateBeamSample(template: Projectile, position: Vector3, velocity: Vector3, turns: { Vector3 }): Projectile
-	local state = table.clone(template)
+	local state = Store.CloneRaw(template) -- (plain fields, no record yet)
 	nextId += 1
 	state.Id = nextId
 	state.Position, state.Velocity, state.Speed = position, velocity, velocity.Magnitude
@@ -522,8 +528,9 @@ function Projectile.CreateBeamSample(template: Projectile, position: Vector3, ve
 	state._parallelState, state._sweepMark = nil, nil
 	state._beamReserveChildren, state._beamBindChild, state._beamScaleEnergy = nil, nil, nil
 	state.OnHit, state.OnDestroy = Signal.new() :: any, Signal.new() :: any
-	local self = setmetatable(state, Projectile) :: any
+	local self = Store.Adopt(state, Live)
 	table.insert(active, self)
+	table.insert(activeSlot, self._slot)
 	Parallel.Offer(self)
 	return self
 end
@@ -971,21 +978,19 @@ end
 Parallel.SetEligibility(parallelScale)
 
 -- Applies a worker's result in place of Step, or falls back to Step when the
--- projectile changed after it was dispatched (an ability moved it, it gained
--- homing, time scales changed...). Same return as Step. Plain values (see
--- Parallel.Apply), so a result costs no tables.
+-- projectile changed after it was dispatched (`dirty`: an ability moved it;
+-- or it gained homing, time scales changed...). Same return as Step. Plain
+-- values (see Parallel.Apply), so a result costs no tables.
 local function applySweep(self: Projectile, globalDt: number, status: number, position: Vector3,
-	velocity: Vector3, age: number, remaining: number, guard: number, fromPosition: Vector3,
-	fromVelocity: Vector3, fromAge: number, fromDebt: number, fromScale: number, timeVersion: number,
-	uniform: boolean): boolean
+	velocity: Vector3, age: number, remaining: number, guard: number, dirty: boolean, fromScale: number,
+	timeVersion: number, uniform: boolean): boolean
 	if self.Dead then
 		return false
 	end
 	if os.clock() - self._spawnRealTime >= self.MaxRealLifetime then
 		return false
 	end
-	if self.Position ~= fromPosition or self.Velocity ~= fromVelocity or self.Age ~= fromAge
-		or self._simulationDebt ~= fromDebt or self.Homing or self.RewindSeconds > 0
+	if dirty or self.Homing or self.RewindSeconds > 0
 		or combinedTimeScale(self) ~= fromScale or ChunkManager.GetTimeVersion() ~= timeVersion then
 		counted.Fallback += 1
 		return self:Step(globalDt)
@@ -1007,36 +1012,18 @@ end
 
 -- Results are applied in one pass before the step loop; each projectile is
 -- marked with this frame's stepMark (negated when it died), and the loop only
--- reads the mark (see the server step loop below). The plain "moved, hit
--- nothing" result is handled inline and keeps the slot; anything else goes
--- through applySweep and has its slot repacked (or released if it died).
+-- reads the mark (see the server step loop below). Parallel.Apply writes the
+-- plain "moved, hit nothing" results straight into Store; this applier gets
+-- the rest and finishes them serially.
 local stepMark = 0
 local applyDt = 0
-local applyNow = 0
-local applyTimeVersion = 0
-local SWEEP_DONE = Sweep.Done
-
-local PARALLEL_DROP, PARALLEL_KEEP, PARALLEL_REFRESH = Parallel.Drop, Parallel.Keep, Parallel.Refresh
+local PARALLEL_DROP, PARALLEL_REFRESH = Parallel.Drop, Parallel.Refresh
 
 local function applySwept(self: Projectile, status: number, position: Vector3, velocity: Vector3,
-	age: number, remaining: number, guard: number, fromPosition: Vector3, fromVelocity: Vector3,
-	fromAge: number, fromDebt: number, fromScale: number, deadline: number, timeVersion: number,
+	age: number, remaining: number, guard: number, dirty: boolean, fromScale: number, timeVersion: number,
 	uniform: boolean): number
-	if status == SWEEP_DONE and applyNow < deadline and not self.Dead
-		and self.Position == fromPosition and self.Velocity == fromVelocity and self.Age == fromAge
-		and self._simulationDebt == fromDebt and not self.Homing and self.RewindSeconds <= 0
-		and timeVersion == applyTimeVersion and fastScale(self) == fromScale then
-		counted.Parallel += 1
-		self.Position, self.Velocity, self.Age, self._simulationDebt = position, velocity, age, remaining
-		if not finiteVector(position) then
-			self._sweepMark = -stepMark -- flew past SafeMath.Limit
-			return PARALLEL_DROP
-		end
-		self._sweepMark = stepMark
-		return PARALLEL_KEEP
-	end
-	if applySweep(self, applyDt, status, position, velocity, age, remaining, guard,
-		fromPosition, fromVelocity, fromAge, fromDebt, fromScale, timeVersion, uniform) then
+	if applySweep(self, applyDt, status, position, velocity, age, remaining, guard, dirty, fromScale,
+		timeVersion, uniform) then
 		self._sweepMark = stepMark
 		return PARALLEL_REFRESH
 	end
@@ -1196,6 +1183,11 @@ end
 -- Server step loop
 --------------------------------------------------------------------------------
 
+local readf64, readu8, band = buffer.readf64, buffer.readu8, bit32.band
+local STORE_STRIDE, STORE_MARK, STORE_FLAGS, STORE_DEAD = Store.Stride, Store.Mark, Store.Flags, Store.Dead
+local POSE_NEEDS = bit32.bor(Store.Visualize, Store.SpawnStreamed)
+local POSE_EITHER = bit32.bor(Store.Synced, Store.Beam)
+
 Heartbeat.Connect(function(globalDt: number)
 	phaseFrames += 1
 	local replicationStarted = os.clock()
@@ -1209,22 +1201,22 @@ Heartbeat.Connect(function(globalDt: number)
 	local stepCount = #active
 	stepMark += 1
 	applyDt = globalDt
-	applyNow = os.clock()
-	applyTimeVersion = ChunkManager.GetTimeVersion()
-	Parallel.Apply(applySwept)
+	Parallel.Apply(applySwept, stepMark, os.clock(), ChunkManager.GetTimeVersion())
 	local loopStarted = os.clock()
 	local destroyTime = 0
 	-- Backwards with swap-removal: dead projectiles leave `active` the same
 	-- frame (so GetAll/GetInRadius never return them), and anything spawned by
 	-- an OnHit/OnDestroy handler mid-loop is appended past `i` and first steps
 	-- next frame.
+	-- Reads each projectile's Store record, not its table (see Store.luau).
 	for i = stepCount, 1, -1 do
 		local projectile = active[i]
+		local o = activeSlot[i] * STORE_STRIDE
 		local alive
-		local mark = projectile._sweepMark
+		local mark = readf64(Store.data, o + STORE_MARK)
 		if mark == stepMark then
 			-- (something earlier in this loop may have destroyed it since)
-			alive = not projectile.Dead
+			alive = band(readu8(Store.data, o + STORE_FLAGS), STORE_DEAD) == 0
 		elseif mark == -stepMark then
 			alive = false
 		else
@@ -1237,16 +1229,21 @@ Heartbeat.Connect(function(globalDt: number)
 		if alive then
 			-- Ordinary homing streams continuously; beams are filtered into sparse
 			-- refreshes and immediate topology corrections after link refinement.
-			-- (queuePose's own condition, checked here to skip the call)
-			if projectile.Visualize and projectile._spawnStreamed and (projectile._streamedSynced or projectile.Beam ~= nil) then
+			-- (queuePose's own condition -- Visualize and _spawnStreamed and
+			-- (_streamedSynced or Beam ~= nil) -- checked here to skip the call)
+			local flags = readu8(Store.data, o + STORE_FLAGS)
+			if band(flags, POSE_NEEDS) == POSE_NEEDS and band(flags, POSE_EITHER) ~= 0 then
 				Replication.queuePose(projectile)
 			end
 		else
 			local last = #active
 			active[i] = active[last]
 			active[last] = nil
+			activeSlot[i] = activeSlot[last]
+			activeSlot[last] = nil
 			local destroyStarted = os.clock()
 			projectile:Destroy(nil, nil)
+			Store.Release(projectile, Projectile)
 			destroyTime += os.clock() - destroyStarted
 		end
 	end

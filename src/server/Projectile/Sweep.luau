@@ -18,8 +18,9 @@
 	         acceleration (kind + value), acceleration direction (flag +
 	         vector), gravity (kind + value), min/max speed, radius, age,
 	         lifetime, remaining
-	  output (OUTPUT_SLOTS f64): index, status, position, velocity, age,
-	         remaining, guard
+	  output (OUTPUT_BYTES): status u8, guard u8, position 3 x f32, velocity
+	         3 x f32 (both are Vector3s, float32 already: exact), age f64,
+	         remaining f64
 ]]
 
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
@@ -39,16 +40,19 @@ local MAX_SUBSTEPS = Sweep.MaxSubsteps
 local DONE, CONTACT, EXPIRED = Sweep.Done, Sweep.Contact, Sweep.Expired
 
 Sweep.InputSlots = 26
-Sweep.OutputSlots = 11
-local IN, OUT = Sweep.InputSlots * 8, Sweep.OutputSlots * 8
+local IN, OUT = Sweep.InputSlots * 8, 44
 
 -- Byte strides and offsets Parallel's persistent slots update in place.
 Sweep.InputStride, Sweep.OutputStride = IN, OUT
-Sweep.InputMotion, Sweep.OutputMotion = 16, 16 -- position then velocity, 48 bytes, in both
+Sweep.InputMotion = 16 -- position then velocity, 6 x f64
+-- output offsets
+Sweep.OutStatus, Sweep.OutGuard, Sweep.OutPosition, Sweep.OutVelocity, Sweep.OutAge, Sweep.OutRemaining =
+	0, 1, 4, 16, 28, 36
 Sweep.InputAge = 184
 Sweep.InputRemaining = 200
 
 local writef64, readf64 = buffer.writef64, buffer.readf64
+local writef32, readf32, writeu8, readu8 = buffer.writef32, buffer.readf32, buffer.writeu8, buffer.readu8
 
 --------------------------------------------------------------------------------
 -- Packing
@@ -111,46 +115,32 @@ function Sweep.WriteInput(b: buffer, item: number, index: number, filter: number
 	writef64(b, o + 200, remaining)
 end
 
-function Sweep.WriteOutput(b: buffer, item: number, index: number, status: number, position: Vector3, velocity: Vector3, age: number, remaining: number, guard: number)
-	local o = (item - 1) * OUT
-	writef64(b, o, index)
-	writef64(b, o + 8, status)
-	writeVector(b, o + 16, position)
-	writeVector(b, o + 40, velocity)
-	writef64(b, o + 64, age)
-	writef64(b, o + 72, remaining)
-	writef64(b, o + 80, guard)
+local function writeVector32(b: buffer, offset: number, v: Vector3)
+	writef32(b, offset, v.X)
+	writef32(b, offset + 4, v.Y)
+	writef32(b, offset + 8, v.Z)
 end
 
-export type Result = {
-	Index: number,
-	Status: number,
-	Position: Vector3,
-	Velocity: Vector3,
-	Age: number,
-	Remaining: number,
-	Guard: number,
-}
-
-function Sweep.ReadOutput(b: buffer, item: number): Result
-	local o = (item - 1) * OUT
-	return {
-		Index = readf64(b, o),
-		Status = readf64(b, o + 8),
-		Position = readVector(b, o + 16),
-		Velocity = readVector(b, o + 40),
-		Age = readf64(b, o + 64),
-		Remaining = readf64(b, o + 72),
-		Guard = readf64(b, o + 80),
-	}
+local function readVector32(b: buffer, offset: number): Vector3
+	return Vector3.new(readf32(b, offset), readf32(b, offset + 4), readf32(b, offset + 8))
 end
 
--- The same fields as ReadOutput, as plain values (no table): status,
--- position, velocity, age, remaining, guard.
+function Sweep.WriteOutput(b: buffer, item: number, status: number, position: Vector3, velocity: Vector3, age: number, remaining: number, guard: number)
+	local o = (item - 1) * OUT
+	writeu8(b, o, status)
+	writeu8(b, o + 1, guard)
+	writeVector32(b, o + 4, position)
+	writeVector32(b, o + 16, velocity)
+	writef64(b, o + 28, age)
+	writef64(b, o + 36, remaining)
+end
+
+-- One result as plain values (no table): status, position, velocity, age,
+-- remaining, guard.
 function Sweep.ReadOutputValues(b: buffer, item: number): (number, Vector3, Vector3, number, number, number)
 	local o = (item - 1) * OUT
-	return readf64(b, o + 8), readVector(b, o + 16), readVector(b, o + 40), readf64(b, o + 64),
-		readf64(b, o + 72), readf64(b, o + 80)
+	return readu8(b, o), readVector32(b, o + 4), readVector32(b, o + 16), readf64(b, o + 28),
+		readf64(b, o + 36), readu8(b, o + 1)
 end
 
 --------------------------------------------------------------------------------
@@ -191,7 +181,7 @@ function Sweep.Run(
 		guard += 1
 		local lifeRemaining = lifetime - age
 		if lifeRemaining <= MIN_STEP_DT then
-			Sweep.WriteOutput(output, item, index, EXPIRED, position, velocity, age, remaining, guard)
+			Sweep.WriteOutput(output, item, EXPIRED, position, velocity, age, remaining, guard)
 			return
 		end
 
@@ -213,7 +203,7 @@ function Sweep.Run(
 		local displacement = movementVelocity * stepDt
 		if castHits(position, displacement, radius, filter) then
 			-- hand this substep back untouched; Step redoes it serially
-			Sweep.WriteOutput(output, item, index, CONTACT, position, velocity, age, remaining, guard - 1)
+			Sweep.WriteOutput(output, item, CONTACT, position, velocity, age, remaining, guard - 1)
 			return
 		end
 		velocity = endVelocity
@@ -221,11 +211,11 @@ function Sweep.Run(
 		age += stepDt
 		remaining -= stepDt / chunkScale
 		if age >= lifetime - MIN_STEP_DT then
-			Sweep.WriteOutput(output, item, index, EXPIRED, position, velocity, age, remaining, guard)
+			Sweep.WriteOutput(output, item, EXPIRED, position, velocity, age, remaining, guard)
 			return
 		end
 	end
-	Sweep.WriteOutput(output, item, index, DONE, position, velocity, age, remaining, guard)
+	Sweep.WriteOutput(output, item, DONE, position, velocity, age, remaining, guard)
 end
 
 return Sweep
