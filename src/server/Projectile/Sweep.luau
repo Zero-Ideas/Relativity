@@ -101,6 +101,18 @@ function Sweep.SpecOf(p: any): MotionSpec
 	}
 end
 
+-- WriteInput from plain values (a freshly fired projectile; Parallel.PackNew).
+function Sweep.WriteInputValues(b: buffer, item: number, spec: number, filter: number, position: Vector3,
+	velocity: Vector3, age: number, remaining: number)
+	local o = (item - 1) * IN
+	writeu32(b, o, spec)
+	writeu32(b, o + 4, filter)
+	writeVector32(b, o + 8, position)
+	writeVector32(b, o + 20, velocity)
+	writef64(b, o + 32, age)
+	writef64(b, o + 40, remaining)
+end
+
 function Sweep.WriteInput(b: buffer, item: number, spec: number, filter: number, p: any, remaining: number)
 	local o = (item - 1) * IN
 	writeu32(b, o, spec)
@@ -144,8 +156,9 @@ function Sweep.Run(
 	output: buffer,
 	uniformTime: boolean,
 	specs: { [number]: MotionSpec },
-	castHits: (Vector3, Vector3, number, number) -> boolean,
-	hasEntities: (Vector3) -> boolean
+	castHits: (Vector3, Vector3, number, number) -> any,
+	hasEntities: (Vector3) -> boolean,
+	onContact: ((item: number, from: Vector3, displacement: Vector3, hit: any) -> ())?
 )
 	local o = (item - 1) * IN
 	local filter = readu32(input, o + 4)
@@ -189,8 +202,13 @@ function Sweep.Run(
 		local endVelocity, movementVelocity = ProjectileMotion.Integrate(velocity, acceleration, direction, gravity,
 			minSpeed, maxSpeed, stepDt)
 		local displacement = movementVelocity * stepDt
-		if castHits(position, displacement, radius, filter) then
-			-- hand this substep back untouched; Step redoes it serially
+		local hit = castHits(position, displacement, radius, filter)
+		if hit then
+			-- hand this substep back untouched; Step redoes it serially (with
+			-- this cast's result, so it needn't cast it again -- see onContact)
+			if onContact and hit ~= true then
+				onContact(item, position, displacement, hit)
+			end
 			Sweep.WriteOutput(output, item, CONTACT, position, velocity, age, remaining, guard - 1)
 			return
 		end

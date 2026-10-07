@@ -17,7 +17,10 @@
 
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 
-local WORKER_COUNT = 4
+-- More workers than cores is fine (the parallel phase spreads them over the
+-- engine's threads) and evens out the slowest batch; each costs a Luau VM and
+-- its own occupancy copy.
+local WORKER_COUNT = 6
 
 local actor = script:GetActor()
 if not actor then
@@ -128,18 +131,31 @@ end
 
 -- Same as Raycast.castMovement's decision: empty space is skipped, otherwise
 -- the engine cast with the projectile's filter. True when anything is hit.
-local function castHits(from: Vector3, displacement: Vector3, radius: number, filter: number): boolean
+-- The cast's RaycastResult when it hits something (true when it can't be
+-- cast here), else nil.
+local function castHits(from: Vector3, displacement: Vector3, radius: number, filter: number): any
 	if Occupancy.SegmentClear(from, displacement, radius, filterIgnores[filter]) then
-		return false
+		return nil
 	end
 	local params = filters[filter]
 	if not params then
 		return true -- unknown filter: let the serial path cast it
 	end
 	if radius > 0 then
-		return workspace:Spherecast(from, radius, displacement, params) ~= nil
+		return workspace:Spherecast(from, radius, displacement, params)
 	end
-	return workspace:Raycast(from, displacement, params) ~= nil
+	return workspace:Raycast(from, displacement, params)
+end
+
+-- This batch's contacts, handed back with the results so the main thread can
+-- resolve them without casting the same segment again (columns, by order of
+-- item).
+local contacts = { Item = {}, From = {}, Displacement = {}, Instance = {}, Position = {}, Normal = {}, Distance = {} }
+local function onContact(item: number, from: Vector3, displacement: Vector3, hit: RaycastResult)
+	local n = #contacts.Item + 1
+	contacts.Item[n], contacts.From[n], contacts.Displacement[n] = item, from, displacement
+	contacts.Instance[n], contacts.Position[n], contacts.Normal[n], contacts.Distance[n] =
+		hit.Instance, hit.Position, hit.Normal, hit.Distance
 end
 
 actor:BindToMessageParallel("Sweep", function(frame: number, input: buffer, count: number, uniformTime: boolean, entityKeys: { Vector3 })
@@ -149,8 +165,11 @@ actor:BindToMessageParallel("Sweep", function(frame: number, input: buffer, coun
 		entityChunks[key] = true
 	end
 	local result = buffer.create(Sweep.OutputSize(count))
+	for _, column in contacts do
+		table.clear(column)
+	end
 	for item = 1, count do
-		Sweep.Run(input, item, result, uniformTime, specs, castHits, hasEntities)
+		Sweep.Run(input, item, result, uniformTime, specs, castHits, hasEntities, onContact)
 	end
 	local ms = (os.clock() - started) * 1000 -- how long this batch took (Stats tab)
 	local occupancy = Occupancy.TakeStats()
@@ -158,5 +177,5 @@ actor:BindToMessageParallel("Sweep", function(frame: number, input: buffer, coun
 	results:Fire(workerId, frame, count, ms, result, occupancy.Checks, occupancy.Skipped, {
 		occupancy.NotReady, occupancy.TooWide, occupancy.OutsideTerrain, occupancy.Blocked, occupancy.BlockedMoving,
 		occupancy.DynamicParts, occupancy.LargestDynamic,
-	})
+	}, contacts)
 end)

@@ -58,6 +58,7 @@ local Store = {}
 -- column strides (bytes per slot)
 local MOTION, TIME, MARKS, SCALES, COLD = 24, 16, 4, 16, 32
 Store.MotionStride, Store.TimeStride, Store.MarkStride, Store.ScaleStride = MOTION, TIME, MARKS, SCALES
+Store.ColdStride = COLD -- (Id 0, _spawnRealTime 8, _lastStreamedTimeScale 16, _parallelState 24)
 
 local DEAD, DIRTY, SPAWN_STREAMED, SYNCED, VISUALIZE, BEAM = 1, 2, 4, 8, 16, 32
 Store.Dead, Store.Dirty, Store.SpawnStreamed, Store.Synced, Store.Visualize, Store.Beam =
@@ -92,6 +93,7 @@ local HOT: { [string]: number } = {
 	Id = 10, _spawnRealTime = 11, _lastStreamedTimeScale = 12, _parallelState = 13,
 }
 Store.HotFields = HOT
+local KIND_COUNT = 13
 local MOTION_LAST = 6 -- kinds 1..6 mark the record Dirty when written
 
 local NAN = 0 / 0
@@ -294,8 +296,12 @@ function Store.HandleMetatable(spec: any, class: any, lazy: { [string]: () -> an
 			local kind = HOT[key]
 			if kind then
 				local slot = rawget(self, "_slot")
-				-- (released: its record fields were copied in, so a missing one is nil)
-				return if slot then read(slot, kind) else nil
+				if slot then
+					return read(slot, kind)
+				end
+				-- released: its record fields were kept in one array (see Release)
+				local dead = rawget(self, "_dead")
+				return dead and dead[kind]
 			end
 			local extras = rawget(self, "_x")
 			if extras then
@@ -323,9 +329,16 @@ function Store.HandleMetatable(spec: any, class: any, lazy: { [string]: () -> an
 		__newindex = function(self: any, key: any, value: any)
 			local kind = HOT[key]
 			local slot = rawget(self, "_slot")
-			if kind and slot then
-				write(slot, kind, value)
-				return
+			if kind then
+				if slot then
+					write(slot, kind, value)
+					return
+				end
+				local dead = rawget(self, "_dead")
+				if dead then
+					dead[kind] = value
+					return
+				end
 			end
 			local extras = rawget(self, "_x")
 			if value == nil then
@@ -426,12 +439,21 @@ function Store.Release(state: any, metatable: any?)
 		return
 	end
 	dropSource(readu32(Store.Scales, slot * SCALES + 8))
-	if metatable then
-		setmetatable(state, metatable)
-	end
 	rawset(state, "_slot", nil)
-	for key, kind in HOT do
-		rawset(state, key, read(slot, kind))
+	if metatable then
+		-- a full projectile becomes a plain table again
+		setmetatable(state, metatable)
+		for key, kind in HOT do
+			rawset(state, key, read(slot, kind))
+		end
+	else
+		-- an efficient handle keeps its metatable, which reads these by kind:
+		-- one array instead of growing the handle's own hash several times
+		local dead = table.create(KIND_COUNT)
+		for kind = 1, KIND_COUNT do
+			dead[kind] = read(slot, kind)
+		end
+		rawset(state, "_dead", dead)
 	end
 	local watched = rawget(state, "_w")
 	if watched then

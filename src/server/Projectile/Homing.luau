@@ -126,7 +126,11 @@ function Homing.update(projectile: State, dt: number)
 				projectile.HomingTarget = target
 			end
 		end
-	elseif not homing.Permalock and homing.Retarget then
+	elseif not homing.Permalock and homing.Retarget and target ~= homing.Target then
+		-- (a target passed in the config -- homing.Target, e.g. a spell's "Lock
+		-- on" -- is a lock: rechecking for the nearest only re-evaluates targets
+		-- the projectile picked itself. If the locked one goes away, targetGone
+		-- above falls back to normal acquisition.)
 		projectile.ReacquireTimer -= dt
 		if projectile.ReacquireTimer <= 0 then
 			projectile.ReacquireTimer = homing.ReacquireRate

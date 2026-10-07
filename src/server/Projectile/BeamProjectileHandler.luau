@@ -7,6 +7,7 @@ local Shared = game:GetService("ReplicatedStorage").Shared
 local Heartbeat = require(Shared.Heartbeat)
 local ChunkManager = require(Shared.ChunkManager)
 local Projectile = require(script.Parent)
+local Profile = require(script.Parent.Profile)
 local BeamPath = require(Shared:WaitForChild("Projectile"):WaitForChild("BeamPath"))
 
 local Handler = {}
@@ -122,7 +123,10 @@ end
 
 local function resolve(node: any, points: { Vector3 }, dt: number)
 	local p = node.projectile
+	local started = os.clock()
 	p._beamSpan = p:ResolveBeamSpan(points, dt > 0)
+	Profile.Add("BeamResolve", os.clock() - started)
+	Profile.Count("BeamLinks", 1)
 end
 
 Projectile.SetBeamSpanStep(function(globalDt: number)
@@ -160,7 +164,9 @@ Projectile.SetBeamSpanStep(function(globalDt: number)
 			if not previous then resolve(node, initialPath(node), globalDt); continue end
 			local front = previous.projectile
 			local behindReal, aheadReal = realBehind(p), realAhead(front)
+			local planStarted = os.clock()
 			local corners, needed = BeamPath.Plan(p.Position, front.Position, p._beamTurns, front._beamTurns)
+			Profile.Add("BeamPlan", os.clock() - planStarted)
 			local reason = if not corners then "Geometry"
 				elseif needed > 0 and realAge(behindReal) > Handler.MaxJoinerSourceAge
 					and realAge(aheadReal) > Handler.MaxJoinerSourceAge then "SourceAge"
@@ -179,6 +185,7 @@ Projectile.SetBeamSpanStep(function(globalDt: number)
 			-- links. New children enter the ordinary simulation once next frame;
 			-- their bodies can collide immediately at their insertion positions.
 			local chain = {node}
+			local createStarted = os.clock()
 			local behind, ahead = p._beamTurns or {}, front._beamTurns or {}
 			for leg = 1, #corners-1 do
 				local from, to = corners[leg], corners[leg+1]
@@ -212,6 +219,8 @@ Projectile.SetBeamSpanStep(function(globalDt: number)
 			if needed > 0 then
 				if p._beamScaleEnergy then p._beamScaleEnergy(1/(needed+1))
 				else p.Damage /= needed+1 end
+				Profile.Add("BeamCreate", os.clock() - createStarted)
+				Profile.Count("BeamCreated", needed)
 			end
 			table.insert(chain, previous)
 			for link = 1, #chain-1 do
@@ -220,7 +229,11 @@ Projectile.SetBeamSpanStep(function(globalDt: number)
 				aheadNode.everLinked, aheadNode.incoming = true, true
 				local bp, fp = back.projectile, aheadNode.projectile
 				bp._beamPrevious, bp.Beam.PreviousId = fp, fp.Id
-				local path = BeamPath.Connect(bp.Position, fp.Position, bp._beamTurns, fp._beamTurns)
+				local connectStarted = os.clock()
+				-- (one link, nothing inserted: it's exactly the link just planned)
+				local path = if #chain == 2 then BeamPath.Fill(corners)
+					else BeamPath.Connect(bp.Position, fp.Position, bp._beamTurns, fp._beamTurns)
+				Profile.Add("BeamPlan", os.clock() - connectStarted)
 				if path then resolve(back, path, globalDt)
 				else unlink(back); resolve(back, initialPath(back), globalDt) end
 				if link > 1 then Projectile.PublishBeamSample(bp) end

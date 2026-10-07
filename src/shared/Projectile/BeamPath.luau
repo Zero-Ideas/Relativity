@@ -12,23 +12,27 @@ export type Joiner = { Position: Vector3 }
 
 -- Plan against the real bounce corners, never a shortcut through a wall.
 -- Count before allocating joiners so a huge flick is rejected in bounded work.
+-- (runs for every beam link every frame: no closure, no throwaway tables)
+local EMPTY: { Vector3 } = table.freeze({})
+
 function BeamPath.Plan(back: Vector3, front: Vector3, backTurns: { Vector3 }?, frontTurns: { Vector3 }?): ({ Vector3 }?, number)
-	local behind, ahead = backTurns or {}, frontTurns or {}
-	if #behind > #ahead then return nil, 0 end
+	local behind, ahead = backTurns or EMPTY, frontTurns or EMPTY
+	local behindCount, aheadCount = #behind, #ahead
+	if behindCount > aheadCount then return nil, 0 end
 	local corners = { back }
+	local last = back
 	local count = 0
-	local function append(point: Vector3): boolean
-		local distance = (point - corners[#corners]).Magnitude
-		if distance <= 1e-4 then return true end
-		count += math.max(math.ceil(distance / BeamPath.MaxStretch) - 1, 0)
-		if count > BeamPath.MaxJoinersPerLink then return false end
-		table.insert(corners, point)
-		return true
+	local maxStretch, maxJoiners = BeamPath.MaxStretch, BeamPath.MaxJoinersPerLink
+	for index = behindCount + 1, aheadCount + 1 do
+		local point = if index <= aheadCount then ahead[index] else front
+		local distance = (point - last).Magnitude
+		if distance > 1e-4 then
+			count += math.max(math.ceil(distance / maxStretch) - 1, 0)
+			if count > maxJoiners then return nil, count end
+			table.insert(corners, point)
+			last = point
+		end
 	end
-	for index = #behind + 1, #ahead do
-		if not append(ahead[index]) then return nil, count end
-	end
-	if not append(front) then return nil, count end
 	return corners, count
 end
 

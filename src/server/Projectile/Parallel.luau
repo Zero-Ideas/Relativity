@@ -54,6 +54,7 @@ local Shared = ReplicatedStorage:WaitForChild("Shared")
 local ChunkManager = require(Shared:WaitForChild("ChunkManager"))
 local Sweep = require(script.Parent.Sweep)
 local Store = require(script.Parent.Store)
+local ApplyPass = require(script.Parent.ApplyPass)
 local Profile = require(script.Parent.Profile)
 local SafeMath = require(Shared:WaitForChild("SafeMath"))
 
@@ -87,7 +88,7 @@ local abs = math.abs
 
 type Worker = { Actor: Actor, Id: number }
 -- A worker's latest result, as fired through ProjectileActors.Results.
-type Result = { Frame: number, Count: number, Ms: number, Data: buffer?, Checks: number, Skipped: number }
+type Result = { Frame: number, Count: number, Ms: number, Data: buffer?, Checks: number, Skipped: number, Contacts: any }
 local results: { [number]: Result } = {} -- worker id -> latest
 
 -- Receives a result Apply can't take directly and says what happens to its
@@ -97,7 +98,12 @@ local results: { [number]: Result } = {} -- worker id -> latest
 -- and uniform-time flag.
 export type Applier = (projectile: any, status: number, position: Vector3, velocity: Vector3, age: number,
 	remaining: number, guard: number, dirty: boolean, fromScale: number, timeVersion: number,
-	uniform: boolean) -> number
+	uniform: boolean, contact: WorkerContact?) -> number
+
+-- A worker's contact for a result that stopped at one: the segment it cast
+-- and what it hit, so the serial code can resolve it without casting again.
+export type WorkerContact = { From: Vector3, Displacement: Vector3, Instance: Instance, Position: Vector3,
+	Normal: Vector3, Distance: number }
 
 -- A worker's slots, item 1..Count (compact: released slots are swap-removed).
 type Batch = {
@@ -126,6 +132,7 @@ local batches: { Batch } = {}
 local batchUniform = true
 local batchTimeVersion = 0
 local running = false -- the last Dispatch sent batches
+local inFlight = false -- between a Dispatch and its Apply
 local queue: { any } = {}
 local scaleOf: (any) -> number? = function()
 	return nil
@@ -138,46 +145,67 @@ local stats = { Parallel = 0, Resumed = 0, Serial = 0, Fallback = 0, Late = 0, F
 -- workers' reasons a cast wasn't skipped: not ready, too wide, outside terrain, blocked, blocked by a moving part
 local workerReasons = { 0, 0, 0, 0, 0 }
 
-local function refreshWorkers()
-	if #workers > 0 then
-		return
+-- Rescanned whenever an actor is added or removed (the bootstrap may still be
+-- creating them when the first dispatch runs). Returns true when the list
+-- changed, so Dispatch can release every slot (batches follow worker order).
+local workersStale = true
+local actorsRoot: Instance? = nil
+local resultsConnected = false
+
+local function refreshWorkers(): boolean
+	if not workersStale then
+		return false
 	end
-	local root = ServerScriptService:FindFirstChild("ProjectileActors", true)
+	local root = actorsRoot or ServerScriptService:FindFirstChild("ProjectileActors", true)
 	local event = root and root:FindFirstChild("Results")
 	if not root or not event then
-		return
+		return false
 	end
+	if not actorsRoot then
+		actorsRoot = root
+		root.ChildAdded:Connect(function()
+			workersStale = true
+		end)
+		root.ChildRemoved:Connect(function()
+			workersStale = true
+		end)
+	end
+	workersStale = false
+	table.clear(workers)
 	for _, child in root:GetChildren() do
 		local id = tonumber(string.match(child.Name, "(%d+)$"))
 		if child:IsA("Actor") and id then
 			table.insert(workers, { Actor = child, Id = id })
 		end
 	end
-	if #workers == 0 then
-		return
-	end
-	(event :: BindableEvent).Event:Connect(function(id: number, resultFrame: number, count: number, ms: number,
-		data: buffer, checks: number, skipped: number, reasons: { number }?)
-		local result = results[id]
-		if not result then
-			result = { Frame = 0, Count = 0, Ms = 0, Data = nil, Checks = 0, Skipped = 0 }
-			results[id] = result
-		end
-		result.Frame, result.Count, result.Ms, result.Data = resultFrame, count, ms, data
-		stats.WorkerChecks += checks
-		stats.WorkerSkipped += skipped
-		if reasons then
-			for index = 1, 5 do
-				workerReasons[index] += reasons[index] or 0
+	table.sort(workers, function(x, y)
+		return x.Id < y.Id
+	end)
+	if not resultsConnected then
+		resultsConnected = true
+		local resultsEvent = event :: BindableEvent
+		resultsEvent.Event:Connect(function(id: number, resultFrame: number, count: number, ms: number,
+			data: buffer, checks: number, skipped: number, reasons: { number }?, contacts: any)
+			local result = results[id]
+			if not result then
+				result = { Frame = 0, Count = 0, Ms = 0, Data = nil, Checks = 0, Skipped = 0, Contacts = nil }
+				results[id] = result
 			end
-			-- (6: that worker's moving-part count; the largest is kept)
-			workerReasons[6] = math.max(workerReasons[6] or 0, reasons[6] or 0)
-			workerReasons[7] = reasons[7] or workerReasons[7] -- (7: a worker's largest moving part, by name)
-		end
-	end)
-	table.sort(workers, function(a, b)
-		return a.Actor.Name < b.Actor.Name
-	end)
+			result.Frame, result.Count, result.Ms, result.Data = resultFrame, count, ms, data
+			result.Contacts = contacts
+			stats.WorkerChecks += checks
+			stats.WorkerSkipped += skipped
+			if reasons then
+				for index = 1, 5 do
+					workerReasons[index] += reasons[index] or 0
+				end
+				-- (6: that worker's moving-part count; the largest is kept)
+				workerReasons[6] = math.max(workerReasons[6] or 0, reasons[6] or 0)
+				workerReasons[7] = reasons[7] or workerReasons[7] -- (7: a worker's largest moving part, by name)
+			end
+		end)
+	end
+	return true
 end
 
 -- Filter id for a projectile's movement RaycastParams, by content (beam
@@ -287,7 +315,7 @@ end
 -- usable next frame. nil if not usable yet (or the values can't be keys).
 local NIL = newproxy()
 local values = table.create(7) -- scratch
-local function specFor(projectile: any): number?
+local function lookupSpec(projectile: any): number?
 	local node = specIds
 	values[1], values[2], values[3] = projectile.Acceleration or 0, projectile.AccelerationDirection, projectile.Gravity or 0
 	values[4], values[5], values[6], values[7] = projectile.MinSpeed, projectile.MaxSpeed, projectile.Radius, projectile.Lifetime
@@ -318,12 +346,42 @@ local function specFor(projectile: any): number?
 		end
 		node = nextNode
 	end
-	local id = node :: any
-	return if specReady[id] <= frame then id else nil
+	return node :: any
+end
+
+-- An efficient projectile with no per-projectile overrides has exactly its
+-- compiled config's motion constants, so its spec id is cached per handle
+-- metatable (one per config) and packing it skips lookupSpec. (Full
+-- projectiles share one metatable and carry their own `_w`: never cached.)
+local specByMetatable: { [any]: number } = setmetatable({}, { __mode = "k" }) :: any
+
+local function specFor(projectile: any): number?
+	local plainHandle = rawget(projectile, "_slot") ~= nil and rawget(projectile, "_x") == nil
+		and rawget(projectile, "_w") == nil
+	local metatable = if plainHandle then getmetatable(projectile) else nil
+	local id = metatable and specByMetatable[metatable]
+	if not id then
+		id = lookupSpec(projectile)
+		if id and metatable then
+			specByMetatable[metatable] = id
+		end
+	end
+	return if id and specReady[id] <= frame then id else nil
 end
 
 -- Its scale, filter id and motion spec id if it may have a slot right now,
 -- else nil.
+-- Per handle metatable (one per compiled config), what packing a plain
+-- efficient projectile needs beyond its Store columns: its filter id, spec id
+-- and MaxRealLifetime -- filled the first time one of them is packed the
+-- slow way (eligible), used by fastAcquire.
+type HandleInfo = { Filter: number, Spec: number, MaxRealLifetime: number }
+local handleInfo: { [any]: HandleInfo } = setmetatable({}, { __mode = "k" }) :: any
+
+local function plainHandle(projectile: any): boolean
+	return rawget(projectile, "_slot") ~= nil and rawget(projectile, "_x") == nil and rawget(projectile, "_w") == nil
+end
+
 local function eligible(projectile: any): (number?, number?, number?)
 	if not projectile._slot then
 		return nil, nil, nil -- (released: it's gone)
@@ -333,7 +391,14 @@ local function eligible(projectile: any): (number?, number?, number?)
 		return nil, nil, nil
 	end
 	local filter = filterFor(projectile)
-	return scale, filter, specFor(projectile)
+	local spec = specFor(projectile)
+	if filter and spec and plainHandle(projectile) then
+		local metatable = getmetatable(projectile)
+		if not handleInfo[metatable] then
+			handleInfo[metatable] = { Filter = filter, Spec = spec, MaxRealLifetime = projectile.MaxRealLifetime }
+		end
+	end
+	return scale, filter, spec
 end
 
 -- Swap-removes slot `item`.
@@ -381,6 +446,51 @@ function Parallel.SetEligibility(fn: (any) -> number?)
 	scaleOf = fn
 end
 
+-- Packs a freshly fired efficient projectile straight into a slot from the
+-- values its creator already has (Projectile.Fire) -- no eligibility reads,
+-- no lookups. False when it can't (parallel movement off, a batch in flight
+-- -- it would also be stepped serially this frame --, its filter or spec
+-- not yet known to the workers): Offer it instead.
+function Parallel.PackNew(projectile: any, position: Vector3, velocity: Vector3, scale: number,
+	rayParams: RaycastParams, deadline: number): boolean
+	if not running or inFlight or not (scale > 0) then
+		return false
+	end
+	local filter = filterByParams[rayParams]
+	if not filter or filterReady[filter] > frame then
+		return false
+	end
+	local spec = specByMetatable[getmetatable(projectile)]
+	if not spec or specReady[spec] > frame then
+		return false
+	end
+	local batch = batches[1]
+	if not batch then
+		return false
+	end
+	for w = 2, #workers do
+		local candidate = batches[w]
+		if candidate and candidate.Count < batch.Count then
+			batch = candidate
+		end
+	end
+	local item = batch.Count + 1
+	if item > batch.Capacity then
+		resize(batch, batch.Capacity * 2)
+	end
+	batch.Count = item
+	local slot = rawget(projectile, "_slot")
+	batch.Projectiles[item] = projectile
+	batch.Slot[item] = slot
+	batch.Generation[item] = Store.Generation[slot]
+	batch.Scale[item] = scale
+	batch.Deadline[item] = deadline
+	-- (remaining holds the carried debt -- none yet -- until dispatch adds the budget)
+	Sweep.WriteInputValues(batch.Input, item, spec, filter, position, velocity, 0, 0)
+	projectile._parallelState = SLOTTED
+	return true
+end
+
 -- Asks for a slot for `projectile` (call after it stepped serially or was
 -- created). Packed at the next Dispatch if it's still eligible then.
 function Parallel.Offer(projectile: any)
@@ -394,6 +504,70 @@ end
 -- Frame
 --------------------------------------------------------------------------------
 
+-- Packs a queued plain efficient projectile from its Store columns, with no
+-- metatable reads: the same checks as eligible + pack (parallelScale's),
+-- read straight from the columns, and its config's cached filter / spec.
+-- False when anything is unusual (no cached info yet, its time scale or sync
+-- state needs streaming...): the caller takes the ordinary path.
+local function fastAcquire(projectile: any, batch: Batch, now: number): boolean
+	local info = handleInfo[getmetatable(projectile)]
+	if not info or filterReady[info.Filter] > frame or specReady[info.Spec] > frame then
+		return false
+	end
+	local slot = rawget(projectile, "_slot")
+	local flags = buffer.readu8(Store.Flags, slot)
+	if bit32.band(flags, bit32.bor(Store.Dead, Store.Synced)) ~= 0 then
+		return false
+	end
+	local cold = slot * Store.ColdStride
+	local deadline = buffer.readf64(Store.Cold, cold + 8) + info.MaxRealLifetime
+	if not (now < deadline) then
+		return false
+	end
+	-- scale: own * source's, the ordinary case only (else parallelScale decides)
+	local s = slot * S_SCALE
+	local own = buffer.readf64(Store.Scales, s)
+	local index = buffer.readu32(Store.Scales, s + 8)
+	local sourceScale: any = if index ~= 0 then Store.Sources[index].TimeScale else 1
+	if not (type(sourceScale) == "number" and sourceScale >= 0 and own >= 0 and sourceScale < LIMIT and own < LIMIT) then
+		return false
+	end
+	local scale = sourceScale * own
+	-- (a changed scale has to be streamed first: parallelScale does that)
+	if not (scale > 0 and scale < LIMIT) or scale ~= buffer.readf64(Store.Cold, cold + 16) then
+		return false
+	end
+	local m = slot * S_MOTION
+	local motion = Store.Motion
+	for offset = 0, 20, 4 do
+		if not (abs(buffer.readf32(motion, m + offset)) <= LIMIT) then
+			return false
+		end
+	end
+	local item = batch.Count + 1
+	if item > batch.Capacity then
+		resize(batch, batch.Capacity * 2)
+	end
+	batch.Count = item
+	batch.Projectiles[item] = projectile
+	batch.Slot[item] = slot
+	batch.Generation[item] = Store.Generation[slot]
+	batch.Scale[item] = scale
+	batch.Deadline[item] = deadline
+	local t = slot * S_TIME
+	local o = (item - 1) * IN
+	local input = batch.Input
+	buffer.writeu32(input, o, info.Spec)
+	buffer.writeu32(input, o + 4, info.Filter)
+	bufferCopy(input, o + IN_MOTION, motion, m, 24)
+	writef64(input, o + IN_AGE, buffer.readf64(Store.Time, t))
+	-- (remaining holds the carried debt until dispatch adds the frame's budget)
+	writef64(input, o + IN_REMAINING, buffer.readf64(Store.Time, t + 8))
+	Store.ClearDirty(slot)
+	buffer.writef64(Store.Cold, cold + 24, SLOTTED) -- (_parallelState)
+	return true
+end
+
 -- Packs queued projectiles and sends this frame's batches. `allowed` false
 -- (e.g. debug rays on) pauses parallel movement: every slot is released and
 -- everything steps serially.
@@ -403,7 +577,9 @@ function Parallel.Dispatch(activeCount: number, globalDt: number, allowed: boole
 	for _, batch in batches do
 		batch.Sent = 0
 	end
-	refreshWorkers()
+	if refreshWorkers() then
+		releaseAll() -- (batches follow worker order; this only happens at startup)
+	end
 	local workerCount = #workers
 	running = Parallel.Enabled and allowed and workerCount > 0 and activeCount >= Parallel.MinProjectiles and globalDt > 0
 	if not running then
@@ -427,7 +603,22 @@ function Parallel.Dispatch(activeCount: number, globalDt: number, allowed: boole
 	-- the queue: into the emptiest batch
 	local acquireStarted = clock()
 	local acquired = 0
+	local acquireNow = clock()
 	for _, projectile in queue do
+		local batch = batches[1]
+		for w = 2, workerCount do
+			if batches[w].Count < batch.Count then
+				batch = batches[w]
+			end
+		end
+		if plainHandle(projectile) then
+			if fastAcquire(projectile, batch, acquireNow) then
+				acquired += 1
+				Profile.Count("FastAcquired", 1)
+				continue
+			end
+			Profile.Count("FastMissed", 1)
+		end
 		projectile._parallelState = nil
 		if projectile.Dead then
 			continue
@@ -435,12 +626,6 @@ function Parallel.Dispatch(activeCount: number, globalDt: number, allowed: boole
 		local scale, filter, spec = eligible(projectile)
 		if not scale or not filter or not spec then
 			continue
-		end
-		local batch = batches[1]
-		for w = 2, workerCount do
-			if batches[w].Count < batch.Count then
-				batch = batches[w]
-			end
 		end
 		local item = batch.Count + 1
 		if item > batch.Capacity then
@@ -475,6 +660,7 @@ function Parallel.Dispatch(activeCount: number, globalDt: number, allowed: boole
 		slots += count
 		if count > 0 then
 			batch.Sent = count
+			inFlight = true
 			workers[w].Actor:SendMessage("Sweep", frame, batch.Input, count, batchUniform, keys)
 		end
 	end
@@ -487,66 +673,8 @@ function Parallel.Dispatch(activeCount: number, globalDt: number, allowed: boole
 	Profile.Count("Acquired", acquired)
 end
 
--- Pass 1 of Apply: every result that is a plain "moved, hit nothing" for a
--- projectile nothing touched is written straight into its Store record and
--- its slot's packed record; the rest go into `deferred` (and released slots
--- into `released`). Its own function, with typed buffers, so the native
--- compiler specialises every buffer access. Returns dropped, deferred, kept.
-local function applyPlain(motion: buffer, times: buffer, marks: buffer, flagsColumn: buffer, scalesColumn: buffer,
-	data: buffer, input: buffer, count: number, slots: { number }, generations: { number }, scales: { number },
-	deadlines: { number }, generationOf: { number }, sources: { any }, now: number, mark: number): (number, number, number)
-	local dropped, slow, kept = 0, 0, 0
-	for item = 1, count do
-		local slot = slots[item]
-		if generationOf[slot] ~= generations[item] then
-			-- released since (the step loop dropped it): nothing to apply
-			dropped += 1
-			released[dropped] = item
-			continue
-		end
-		local out = (item - 1) * OUT
-		local plain = readu8(data, out + OUT_STATUS) == SWEEP_DONE and band(readu8(flagsColumn, slot), DEAD_OR_DIRTY) == 0
-			and now < deadlines[item]
-		if plain then
-			-- its scale is still the one it was sent with (own * source's; anything
-			-- unusual goes to the serial code, which uses combinedTimeScale)
-			local s = slot * S_SCALE
-			local own = readf64(scalesColumn, s)
-			local index = readu32(scalesColumn, s + 8)
-			local sourceScale: any = if index ~= 0 then sources[index].TimeScale else 1
-			plain = type(sourceScale) == "number" and sourceScale >= 0 and own >= 0 and sourceScale < LIMIT
-				and own < LIMIT and sourceScale * own == scales[item]
-		end
-		if not plain then
-			slow += 1
-			deferred[slow] = item
-			continue
-		end
-		-- position/velocity are float32 in the output, the column and the slot
-		bufferCopy(motion, slot * S_MOTION, data, out + OUT_POSITION, 24)
-		local age = readf64(data, out + OUT_AGE)
-		local debt = readf64(data, out + OUT_REMAINING)
-		local t = slot * S_TIME
-		writef64(times, t, age)
-		writef64(times, t + 8, debt)
-		local i = (item - 1) * IN
-		bufferCopy(input, i + IN_MOTION, data, out + OUT_POSITION, 24)
-		writef64(input, i + IN_AGE, age)
-		writef64(input, i + IN_REMAINING, debt) -- (dispatch adds next frame's budget)
-		local px, py, pz = readf32(data, out + OUT_POSITION), readf32(data, out + OUT_POSITION + 4),
-			readf32(data, out + OUT_POSITION + 8)
-		if abs(px) <= LIMIT and abs(py) <= LIMIT and abs(pz) <= LIMIT then
-			writei32(marks, slot * S_MARK, mark)
-			kept += 1
-		else
-			-- flew past SafeMath.Limit: dies in the step loop
-			writei32(marks, slot * S_MARK, -mark)
-			dropped += 1
-			released[dropped] = item
-		end
-	end
-	return dropped, slow, kept
-end
+-- (Pass 1 of Apply lives in ApplyPass.luau, a small module of its own so it
+-- always gets native code.)
 
 -- Applies this frame's results. `mark` is the step loop's frame mark (written
 -- into the record of every projectile handled here), `now` its os.clock(),
@@ -559,7 +687,9 @@ function Parallel.Apply(apply: Applier, mark: number, now: number, timeVersion: 
 	local clock = os.clock
 	local decodeTime, loopTime, slowTime, releaseTime, releases, kept = 0, 0, 0, 0, 0, 0
 	local transferred = 0
+	local plainTime = 0
 	local slowest, total, any = 0, 0, false
+	inFlight = false
 	local sameVersion = timeVersion == batchTimeVersion
 	for w, batch in batches do
 		local count = batch.Sent
@@ -593,9 +723,11 @@ function Parallel.Apply(apply: Applier, mark: number, now: number, timeVersion: 
 		-- The rest are deferred to pass 2, so the serial code (raycasts,
 		-- Step, allocation) doesn't keep evicting this loop's working set.
 		local dropped, slow, keptHere = 0, 0, 0
+		local plainStarted = clock()
 		if sameVersion then
-			dropped, slow, keptHere = applyPlain(Store.Motion, Store.Time, Store.Marks, Store.Flags, Store.Scales,
-				data, input, count, slots, generations, scales, deadlines, generationOf, Store.Sources, now, mark)
+			dropped, slow, keptHere = ApplyPass(Store.Motion, Store.Time, Store.Marks, Store.Flags, Store.Scales,
+				data, input, count, slots, generations, scales, deadlines, generationOf, Store.Sources, now, mark,
+				released, deferred)
 		else
 			for item = 1, count do
 				deferred[item] = item
@@ -603,23 +735,44 @@ function Parallel.Apply(apply: Applier, mark: number, now: number, timeVersion: 
 			slow = count
 		end
 		kept += keptHere
+		plainTime += clock() - plainStarted
 
-		-- Pass 2: the serial code finishes the rest.
+		-- Pass 2: the serial code finishes the rest. Both `deferred` and the
+		-- worker's contacts are in item order, so they're matched as we go.
 		local slowStarted = clock()
+		local contacts = result.Contacts
+		local contactItems = contacts and contacts.Item
+		local nextContact = 1
+		result.Contacts = nil
 		for index = 1, slow do
 			local item = deferred[index]
 			local projectile = projectiles[item]
 			local status, position, velocity, age, remaining, guard = Sweep.ReadOutputValues(data, item)
 			local flags = readu8(Store.Flags, slots[item])
+			local contact: WorkerContact? = nil
+			if contactItems then
+				while contactItems[nextContact] and contactItems[nextContact] < item do
+					nextContact += 1
+				end
+				if contactItems[nextContact] == item then
+					contact = {
+						From = contacts.From[nextContact], Displacement = contacts.Displacement[nextContact],
+						Instance = contacts.Instance[nextContact], Position = contacts.Position[nextContact],
+						Normal = contacts.Normal[nextContact], Distance = contacts.Distance[nextContact],
+					}
+				end
+			end
 			local outcome = apply(projectile, status, position, velocity, age, remaining, guard,
-				band(flags, Store.Dirty) ~= 0, scales[item], batchTimeVersion, batchUniform)
+				band(flags, Store.Dirty) ~= 0, scales[item], batchTimeVersion, batchUniform, contact)
 			local keep = false
 			if outcome == REFRESH and not projectile.Dead then
+				local repackStarted = clock()
 				local scale, filter, spec = eligible(projectile)
 				if scale and filter and spec then
 					pack(batch, item, projectile, filter, spec, scale)
 					keep = true
 				end
+				Profile.Add("SerialRepack", clock() - repackStarted)
 			end
 			if not keep then
 				dropped += 1
@@ -647,6 +800,7 @@ function Parallel.Apply(apply: Applier, mark: number, now: number, timeVersion: 
 	Profile.Count("TransferKB", transferred / 1024)
 	Profile.Add("ApplyLoop", loopTime - slowTime)
 	Profile.Add("ApplySlow", slowTime)
+	Profile.Add("ApplyPlain", plainTime)
 	Profile.Add("ApplyRelease", releaseTime)
 	Profile.Count("Released", releases)
 	if any then

@@ -216,6 +216,9 @@
 	              -- default, a dropped-out-of-range lock is genuinely released (not
 	              -- silently kept stale). The projectile's own Source is always
 	              -- excluded from acquisition, and Filter (if set) is respected.
+	              -- An explicit Target is always a lock: Retarget only re-checks
+	              -- targets the projectile acquired itself, so a passed-in Target
+	              -- is kept (whatever its range or Filter) until it's gone.
 	   Visualize = false, VisualRange = math.huge
 	   Model = Instance?        (cloned client-side) or Visual = {Shape,Size,Color}
 	   VisualScale = 1          (0.05..20; applied once when the client clones
@@ -371,6 +374,7 @@ export type Compiled = {
 	Metatable: any,
 	Spread: number,
 	InitialScale: number,
+	RayParams: RaycastParams?,
 }
 
 local MIN_STEP_DT = ProjectileMotion.MinStepDt
@@ -648,9 +652,9 @@ function Projectile.Compile(config: Config): Compiled
 	local settings = Config.normalize(copy, defaultMaxRealLifetime)
 	local efficient = copy.Efficient ~= false and not settings.Homing and not settings.Beam
 		and settings.RewindSeconds <= 0
-	local metatable = nil
+	local metatable, rayParams = nil, nil
 	if efficient then
-		local rayParams = Raycast.buildRayParams(settings.Source, settings.IgnoreInstances)
+		rayParams = Raycast.buildRayParams(settings.Source, settings.IgnoreInstances)
 		local _, found = Spec.Get(settings, rayParams, Projectile, LAZY)
 		metatable = found
 	end
@@ -662,6 +666,7 @@ function Projectile.Compile(config: Config): Compiled
 		Spread = Config.spread(copy),
 		-- the combined scale a shot starts with, unless Source's changes
 		InitialScale = SafeMath.number(settings.TimeScale, 1, 0),
+		RayParams = rayParams,
 	}) :: any
 end
 
@@ -679,12 +684,18 @@ function Projectile.Fire(compiled: Compiled, origin: Vector3, direction: Vector3
 		-- (combinedTimeScale, inline: the Source's scale is read live)
 		local sourceScale = SafeMath.number(source and source.TimeScale, 1, 0)
 		local lastScale = SafeMath.number(sourceScale * ownScale, 0, 0)
-		self = Store.AdoptFast({ _slot = 0 }, compiled.Metatable, origin, direction * settings.Speed, ownScale,
-			nextId, os.clock(), lastScale, settings.Visualize, source)
+		local velocity = direction * settings.Speed
+		local spawnTime = os.clock()
+		self = Store.AdoptFast({ _slot = 0 }, compiled.Metatable, origin, velocity, ownScale,
+			nextId, spawnTime, lastScale, settings.Visualize, source)
 		table.insert(active, self)
 		table.insert(activeSlot, (self :: any)._slot)
 		Replication.spawnVisual(self)
-		Parallel.Offer(self)
+		-- straight into a worker slot when it can be (else queued as usual)
+		if debugRays or not Parallel.PackNew(self, origin, velocity, lastScale, compiled.RayParams :: RaycastParams,
+			spawnTime + settings.MaxRealLifetime) then
+			Parallel.Offer(self)
+		end
 	else
 		local config = table.clone(compiled.Config) :: any
 		config.Origin, config.Direction = origin, direction
@@ -800,7 +811,30 @@ end
 -- Per-substep movement
 --------------------------------------------------------------------------------
 
+-- The motion constants of the projectile runSubsteps is stepping, read once
+-- instead of on every integrate (each read of an efficient projectile goes
+-- through its metatable). Dropped whenever a contact is settled -- the only
+-- point mid-step where user code (OnHit, OnBounce, Destroy handlers) can run
+-- and change them -- so the next substep re-reads.
+local cached: any = nil
+local cAcceleration: any, cDirection: Vector3?, cGravity: any = 0, nil, 0
+local cMinSpeed, cMaxSpeed, cLifetime = 0, math.huge, 0
+
+local function cacheMotion(projectile: any)
+	cached = projectile
+	cAcceleration, cDirection, cGravity = projectile.Acceleration, projectile.AccelerationDirection, projectile.Gravity
+	cMinSpeed, cMaxSpeed, cLifetime = projectile.MinSpeed, projectile.MaxSpeed, projectile.Lifetime
+end
+
+-- A worker's contact for the projectile about to resume serially from it
+-- (applySweep), consumed by its first substep's cast (advance).
+local pendingFor: any = nil
+local pendingContact: any = nil
+
 local function integrate(projectile: Types.State, velocity: Vector3, dt: number): (Vector3, Vector3)
+	if projectile == cached then
+		return ProjectileMotion.Integrate(velocity, cAcceleration, cDirection, cGravity, cMinSpeed, cMaxSpeed, dt)
+	end
 	return ProjectileMotion.Integrate(
 		velocity,
 		projectile.Acceleration,
@@ -863,6 +897,7 @@ local function settle(
 	contactPosition: Vector3,
 	consumed: number
 ): number?
+	cached = nil -- (handlers may have changed its motion constants)
 	if verdict == "destroy" then
 		projectile:Destroy(contact, kind)
 		return nil
@@ -905,7 +940,22 @@ local function advance(projectile: Projectile, stepDt: number, highRes: boolean)
 		end
 	end
 
-	local contact = Raycast.castMovement(projectile, from, displacement)
+	-- A worker that stopped at this very segment already cast it: use its hit
+	-- (when it's exactly this segment and what it hit still exists).
+	local contact: Types.Contact? = nil
+	local reused = false
+	if pendingFor == projectile then
+		local pending = pendingContact
+		pendingFor, pendingContact = nil, nil
+		if pending and pending.From == from and pending.Displacement == displacement and pending.Instance.Parent then
+			contact = { Position = pending.Position, Normal = pending.Normal, Instance = pending.Instance,
+				Distance = pending.Distance }
+			reused = true
+		end
+	end
+	if not reused then
+		contact = Raycast.castMovement(projectile, from, displacement)
+	end
 	if debugRays then
 		Replication.streamRay(projectile, from, if contact then contact.Position else to, not highRes)
 	end
@@ -1001,14 +1051,19 @@ function runSubsteps(self: Projectile, remaining: number, guard: number, uniform
 	local homing = self.Homing
 	while remaining > MIN_STEP_DT and guard < MAX_SUBSTEPS do
 		guard += 1
-		local lifeRemaining = self.Lifetime - self.Age
+		if cached ~= self then
+			cacheMotion(self)
+		end
+		local age = self.Age
+		local lifeRemaining = cLifetime - age
 		if lifeRemaining <= MIN_STEP_DT then
+			cached = nil
 			return false
 		end
 
-		local accelerationVector =
-			ProjectileMotion.GetAcceleration(self.Velocity, self.Acceleration, self.AccelerationDirection, self.Gravity)
-		local sample, chunkScale = Planner.Sample(self.Position, self.Velocity, accelerationVector, uniformTime)
+		local position, velocity = self.Position, self.Velocity
+		local accelerationVector = ProjectileMotion.GetAcceleration(velocity, cAcceleration, cDirection, cGravity)
+		local sample, chunkScale = Planner.Sample(position, velocity, accelerationVector, uniformTime)
 		if chunkScale <= 0 then
 			-- Real time spent in a frozen chunk is consumed without building a
 			-- catch-up burst for when the chunk is unfrozen.
@@ -1025,8 +1080,8 @@ function runSubsteps(self: Projectile, remaining: number, guard: number, uniform
 			maxDt = MAX_HOMING_TURN_STEP / homing.TurnRate
 		end
 		local stepDt = Planner.StepDt(
-			self.Position,
-			self.Velocity,
+			position,
+			velocity,
 			accelerationVector,
 			chunkScale,
 			remaining,
@@ -1041,15 +1096,18 @@ function runSubsteps(self: Projectile, remaining: number, guard: number, uniform
 
 		local consumed = advance(self, stepDt, highRes)
 		if not consumed then
+			cached = nil
 			return false -- destroyed by a hit
 		end
 		remaining -= consumed / chunkScale
 
 		if self.Age >= self.Lifetime - MIN_STEP_DT then
+			cached = nil
 			return false
 		end
 	end
 
+	cached = nil
 	return finishStep(self, remaining)
 end
 
@@ -1133,7 +1191,7 @@ Parallel.SetEligibility(parallelScale)
 -- values (see Parallel.Apply), so a result costs no tables.
 local function applySweep(self: Projectile, globalDt: number, status: number, position: Vector3,
 	velocity: Vector3, age: number, remaining: number, guard: number, dirty: boolean, fromScale: number,
-	timeVersion: number, uniform: boolean): boolean
+	timeVersion: number, uniform: boolean, contact: Parallel.WorkerContact?): boolean
 	if self.Dead then
 		return false
 	end
@@ -1143,7 +1201,10 @@ local function applySweep(self: Projectile, globalDt: number, status: number, po
 	if dirty or self.Homing or self.RewindSeconds > 0
 		or combinedTimeScale(self) ~= fromScale or ChunkManager.GetTimeVersion() ~= timeVersion then
 		counted.Fallback += 1
-		return self:Step(globalDt)
+		local started = os.clock()
+		local alive = self:Step(globalDt)
+		Profile.Add("SerialFallback", os.clock() - started)
+		return alive
 	end
 	if status == Sweep.Contact then
 		counted.Resumed += 1
@@ -1155,7 +1216,15 @@ local function applySweep(self: Projectile, globalDt: number, status: number, po
 	if status == Sweep.Expired then
 		return false
 	elseif status == Sweep.Contact then
-		return runSubsteps(self, remaining, guard, uniform)
+		-- (timed for the Stats tab: finishing a frame at a contact -- the cast,
+		-- hit resolution, and Destroy when it dies there)
+		local started = os.clock()
+		pendingFor, pendingContact = self, contact
+		local alive = runSubsteps(self, remaining, guard, uniform)
+		pendingFor, pendingContact = nil, nil
+		Profile.Add("SerialContact", os.clock() - started)
+		Profile.Count("SerialContacts", 1)
+		return alive
 	end
 	return finishStep(self, remaining)
 end
@@ -1171,9 +1240,9 @@ local PARALLEL_DROP, PARALLEL_REFRESH = Parallel.Drop, Parallel.Refresh
 
 local function applySwept(self: Projectile, status: number, position: Vector3, velocity: Vector3,
 	age: number, remaining: number, guard: number, dirty: boolean, fromScale: number, timeVersion: number,
-	uniform: boolean): number
+	uniform: boolean, contact: Parallel.WorkerContact?): number
 	if applySweep(self, applyDt, status, position, velocity, age, remaining, guard, dirty, fromScale,
-		timeVersion, uniform) then
+		timeVersion, uniform, contact) then
 		self._sweepMark = stepMark
 		return PARALLEL_REFRESH
 	end
@@ -1347,7 +1416,7 @@ end
 -- Server step loop
 --------------------------------------------------------------------------------
 
-local readf64, readu8, band = buffer.readf64, buffer.readu8, bit32.band
+local readu8, band = buffer.readu8, bit32.band
 local STORE_MARK_STRIDE, STORE_DEAD = Store.MarkStride, Store.Dead
 local readi32 = buffer.readi32
 local POSE_NEEDS = bit32.bor(Store.Visualize, Store.SpawnStreamed)

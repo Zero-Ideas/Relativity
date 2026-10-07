@@ -38,6 +38,7 @@ SECTIONS = [
         "src/server/Projectile/Spec.luau",
         "src/server/Projectile/Sweep.luau",
         "src/server/Projectile/Profile.luau",
+        "src/server/Projectile/ApplyPass.luau",
         "src/server/Projectile/Parallel.luau",
         "src/server/Projectile/init.luau",
         "src/server/Projectile/BeamProjectileHandler.luau",

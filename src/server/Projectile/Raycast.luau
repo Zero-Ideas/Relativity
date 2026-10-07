@@ -103,13 +103,34 @@ end
 -- plain table (see Types.Contact) or nil. Distance is how far the ray -- or
 -- the sphere's center -- travelled, which is what the time accounting in
 -- init.luau needs; for a Spherecast, Position is the surface point instead.
+-- The instances a movement RaycastParams excludes, as a set, for Occupancy:
+-- moving parts that belong to them (the shooter's own character...) don't
+-- stop a cast from being skipped. Cached per params (they're shared, see
+-- buildRayParams), so FilterDescendantsInstances is read once.
+local ignoreSets: { [RaycastParams]: { [Instance]: boolean } } = setmetatable({}, { __mode = "k" }) :: any
+
+local function ignoreSetFor(params: RaycastParams): { [Instance]: boolean }
+	local set = ignoreSets[params]
+	if not set then
+		set = {}
+		for _, instance in params.FilterDescendantsInstances do
+			set[instance] = true
+		end
+		ignoreSets[params] = set
+	end
+	return set
+end
+
 function Raycast.castMovement(projectile: State, origin: Vector3, displacement: Vector3, overrideParams: RaycastParams?): Types.Contact?
 	-- Provably empty space: the cast would find nothing, so don't make it
 	-- (see Occupancy -- it only says yes when nothing could be in the way).
-	if Occupancy.SegmentClear(origin, displacement, projectile.Radius) then
+	-- The projectile's own filter is passed so its shooter doesn't block the
+	-- skip; an override (a beam body's params) only ever excludes more.
+	local baseParams: RaycastParams = projectile._rayParams
+	if Occupancy.SegmentClear(origin, displacement, projectile.Radius, ignoreSetFor(baseParams)) then
 		return nil
 	end
-	local params = overrideParams or projectile._rayParams
+	local params = overrideParams or baseParams
 	local result
 	if projectile.Radius > 0 then
 		-- Sweeping a sphere along a line is exactly a capsule: a cylindrical
