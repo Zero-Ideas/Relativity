@@ -56,6 +56,7 @@ ChunkManager.UseY = false -- 2D (XZ) chunking by default
 local chunks: { [Vector3]: any } = {} -- keyed by chunk-coordinate Vector3
 local chunkCount = 0
 local dilatedChunkCount = 0 -- chunks whose TimeScale ~= 1; see IsTimeUniform
+local timeVersion = 0 -- bumped on every chunk scale / zone change; see GetTimeVersion
 local autoLoadConnection = nil
 local timeZones = {} -- ordered oldest -> newest; newest containing zone wins
 local timeZonesById = {}
@@ -100,7 +101,10 @@ end
 
 -- Every chunk TimeScale write goes through here so dilatedChunkCount stays exact.
 local function setChunkScale(chunk, scale: number)
-	if chunk.TimeScale ~= scale then ChunkManager.BeforeTimeScaleChange:Fire() end
+	if chunk.TimeScale ~= scale then
+		timeVersion += 1
+		ChunkManager.BeforeTimeScaleChange:Fire()
+	end
 	if (chunk.TimeScale ~= 1) ~= (scale ~= 1) then
 		dilatedChunkCount += if scale ~= 1 then 1 else -1
 	end
@@ -143,6 +147,12 @@ end
 
 -- True when GetTimeScaleAt is 1 everywhere (no dilated chunk, no zone), so
 -- per-step boundary searches can be skipped entirely.
+-- Changes whenever any chunk time scale or zone changes -- lets mirrors (the
+-- parallel projectile workers) resync only when something actually changed.
+function ChunkManager.GetTimeVersion(): number
+	return timeVersion
+end
+
 function ChunkManager.IsTimeUniform(): boolean
 	return dilatedChunkCount == 0 and #timeZones == 0
 end
@@ -160,6 +170,7 @@ local function replicateZone(channel: string, payload)
 end
 
 function ChunkManager.AddTimeScaleZone(id: any, position: Vector3, radius: number, scale: number)
+	timeVersion += 1
 	ChunkManager.BeforeTimeScaleChange:Fire()
 	local existing = timeZonesById[id]
 	if existing then
@@ -185,6 +196,7 @@ function ChunkManager.RemoveTimeScaleZone(id: any)
 	if not zone then
 		return
 	end
+	timeVersion += 1
 	ChunkManager.BeforeTimeScaleChange:Fire()
 	timeZonesById[id] = nil
 	local index = table.find(timeZones, zone)

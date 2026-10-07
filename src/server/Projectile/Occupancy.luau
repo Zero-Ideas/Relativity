@@ -8,8 +8,11 @@
 	is identical to casting (no hit) -- just without the engine call.
 
 	Static geometry (anchored assemblies) is baked into a sparse two-level
-	grid: COARSE-stud cells, each holding a 512-bit mask (a 64-byte buffer) of
-	FINE-stud sub-voxels. Every part is marked by its world AABB grown by PAD
+	grid: COARSE-stud cells, each holding a 4096-bit mask (a 512-byte buffer)
+	of FINE-stud sub-voxels. Masks are interned: a cell points at a shared,
+	never-mutated mask (marking copies, edits and re-interns), so the many
+	identical cells along a floor or wall cost one table slot each -- which
+	matters because every parallel projectile worker bakes its own copy. Every part is marked by its world AABB grown by PAD
 	studs, which is what makes a centreline walk safe for sphere sweeps up to
 	MaxRadius: any surface within that distance of the path lies in a marked
 	voxel on the path. Marks are only ever added (a moved static part is
@@ -37,9 +40,11 @@
 
 local Occupancy = {}
 
-local COARSE = 32 -- studs per coarse cell edge
+local COARSE = 64 -- studs per coarse cell edge
 local FINE = 4 -- studs per sub-voxel edge
-local DIV = COARSE // FINE -- sub-voxels per coarse edge (8 -> 512-bit masks)
+local DIV = COARSE // FINE -- sub-voxels per coarse edge (16 -> 4096-bit masks)
+local ROW_BYTES = DIV // 8 -- one x-row of a cell (16 bits)
+local MASK_BYTES = DIV * DIV * ROW_BYTES -- 512
 local PAD = FINE -- studs every part's AABB is grown by
 local DYNAMIC_MARGIN = 2 -- extra studs around moving parts
 local DYNAMIC_LOOKAHEAD = 1 / 15 -- seconds of travel added around moving parts
@@ -60,13 +65,18 @@ local STRIDE2 = STRIDE * STRIDE
 
 local floor, min, max, abs = math.floor, math.min, math.max, math.abs
 local bor, btest, lshift = bit32.bor, bit32.btest, bit32.lshift
-local readu8, writeu8 = buffer.readu8, buffer.writeu8
+local readu16, writeu16 = buffer.readu16, buffer.writeu16
 
 local function cellKey(cx: number, cy: number, cz: number): number
 	return (cx + OFFSET) + (cy + OFFSET) * STRIDE + (cz + OFFSET) * STRIDE2
 end
 
-local static: { [number]: buffer } = {} -- coarse key -> sub-voxel mask
+local static: { [number]: buffer } = {} -- coarse key -> interned sub-voxel mask
+local masks: { [string]: buffer } = {} -- mask contents -> the one shared buffer
+local FULL = buffer.create(MASK_BYTES)
+buffer.fill(FULL, 0, 255)
+masks[buffer.tostring(FULL)] = FULL
+local scratch = buffer.create(MASK_BYTES)
 local dynamic: { [number]: boolean } = {} -- coarse key -> something moving there this frame
 local dynamicParts: { [BasePart]: boolean } = {}
 local staticMoves: { [BasePart]: number } = {}
@@ -77,7 +87,19 @@ local ready = false
 local hasTerrain = false
 local terrainMin, terrainMax = Vector3.zero, Vector3.zero
 
-local stats = { Checks = 0, Skipped = 0, Coarse = 0, StaticCells = 0, DynamicParts = 0 }
+local stats = { Checks = 0, Skipped = 0, Coarse = 0, StaticCells = 0, DistinctMasks = 1, DynamicParts = 0 }
+
+local function intern(mask: buffer): buffer
+	local contents = buffer.tostring(mask)
+	local existing = masks[contents]
+	if existing then
+		return existing
+	end
+	local copy = buffer.fromstring(contents)
+	masks[contents] = copy
+	stats.DistinctMasks += 1
+	return copy
+end
 
 --------------------------------------------------------------------------------
 -- Marking
@@ -97,8 +119,8 @@ local function bounds(part: BasePart, grow: number): (Vector3, Vector3)
 	return centre - extent, centre + extent
 end
 
--- Sets every sub-voxel overlapping [lo, hi]. Bit (fx + fy*8 + fz*64) lives in
--- byte (fy + fz*8), so one x-row of a cell is one byte write.
+-- Sets every sub-voxel overlapping [lo, hi]. Bit (fx + fy*16 + fz*256) is bit
+-- fx of the u16 row at (fy + fz*16), so one x-row of a cell is one write.
 local function markStatic(lo: Vector3, hi: Vector3)
 	local fx0, fy0, fz0 = floor(lo.X / FINE), floor(lo.Y / FINE), floor(lo.Z / FINE)
 	local fx1, fy1, fz1 = floor(hi.X / FINE), floor(hi.Y / FINE), floor(hi.Z / FINE)
@@ -109,23 +131,31 @@ local function markStatic(lo: Vector3, hi: Vector3)
 			for cx = fx0 // DIV, fx1 // DIV do
 				local ax, bx = max(fx0 - cx * DIV, 0), min(fx1 - cx * DIV, DIV - 1)
 				local k = cellKey(cx, cy, cz)
-				local mask = static[k]
-				if not mask then
-					mask = buffer.create(64)
-					static[k] = mask
+				local current = static[k]
+				if current == FULL then
+					continue
+				end
+				if not current then
 					stats.StaticCells += 1
 				end
 				if ax == 0 and bx == DIV - 1 and ay == 0 and by == DIV - 1 and az == 0 and bz == DIV - 1 then
-					buffer.fill(mask, 0, 255)
+					static[k] = FULL
+					continue
+				end
+				-- shared masks are never edited in place: edit a copy, re-intern
+				if current then
+					buffer.copy(scratch, 0, current, 0, MASK_BYTES)
 				else
-					local row = lshift(lshift(1, bx - ax + 1) - 1, ax)
-					for fz = az, bz do
-						for fy = ay, by do
-							local byte = fy + fz * DIV
-							writeu8(mask, byte, bor(readu8(mask, byte), row))
-						end
+					buffer.fill(scratch, 0, 0)
+				end
+				local row = lshift(lshift(1, bx - ax + 1) - 1, ax)
+				for fz = az, bz do
+					for fy = ay, by do
+						local offset = (fy + fz * DIV) * ROW_BYTES
+						writeu16(scratch, offset, bor(readu16(scratch, offset), row))
 					end
 				end
+				static[k] = intern(scratch)
 			end
 		end
 	end
@@ -280,7 +310,7 @@ local function fineOccupied(fx: number, fy: number, fz: number): boolean
 		return false
 	end
 	local lx, ly, lz = fx - cx * DIV, fy - cy * DIV, fz - cz * DIV
-	return btest(readu8(mask, ly + lz * DIV), lshift(1, lx))
+	return btest(readu16(mask, (ly + lz * DIV) * ROW_BYTES), lshift(1, lx))
 end
 
 local function coarseOccupied(cx: number, cy: number, cz: number): boolean

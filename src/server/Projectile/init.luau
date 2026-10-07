@@ -301,6 +301,7 @@
 ]]
 
 
+local RunService = game:GetService("RunService")
 local Shared = game:GetService("ReplicatedStorage"):WaitForChild("Shared")
 
 local Heartbeat = require(Shared:WaitForChild("Heartbeat"))
@@ -318,6 +319,8 @@ local Math = require(script.Math)
 local Raycast = require(script.Raycast)
 local Replication = require(script.Replication)
 local Occupancy = require(script.Occupancy)
+local Sweep = require(script.Sweep)
+local Parallel = require(script.Parallel)
 local RewindHit = require(script.RewindHit)
 local Types = require(script.Types)
 
@@ -341,7 +344,7 @@ type Methods = {
 export type Projectile = Types.State & Methods
 
 local MIN_STEP_DT = ProjectileMotion.MinStepDt
-local MAX_SUBSTEPS = 16
+local MAX_SUBSTEPS = Sweep.MaxSubsteps -- shared with the parallel workers' copy of the loop
 -- Homing re-aims once per substep, so cap how far one substep can turn.
 local MAX_HOMING_TURN_STEP = math.rad(5)
 -- Projectile.Burst never creates more than this many pellets in one call.
@@ -577,6 +580,12 @@ function Projectile.TakeOccupancyStats()
 	return Occupancy.TakeStats()
 end
 
+-- Projectile-steps done by parallel workers vs serially since the last call
+-- (see Parallel), then resets -- DebugService's Stats tab reads this.
+function Projectile.TakeParallelStats()
+	return Parallel.TakeStats()
+end
+
 -- Average and worst ms per frame of each phase (Step / Beam / Replication)
 -- since the last call, then resets -- DebugService's Stats tab reads this.
 -- e.g. { StepMs = 12.1, StepWorstMs = 18.0, BeamMs = ..., ReplicationMs = ... }
@@ -763,6 +772,9 @@ end
 -- Per-projectile step
 --------------------------------------------------------------------------------
 
+local runSubsteps: (self: Projectile, remaining: number, guard: number, uniformTime: boolean) -> boolean
+local finishStep: (self: Projectile, remaining: number) -> boolean
+
 -- Advances the projectile one frame; returns false when it should be
 -- removed. Returning false without hitting anything (Lifetime/MaxRealLifetime
 -- expiry, leaving the world limit) is a natural expiry: no OnHit fires, and
@@ -810,9 +822,14 @@ function Projectile.Step(self: Projectile, globalDt: number): boolean
 	local remaining = globalDt * combinedScale + self._simulationDebt
 	-- With no dilated chunk or zone anywhere, every boundary search can only
 	-- return "none", so skip them (they dominate substep cost at scale).
-	local uniformTime = ChunkManager.IsTimeUniform()
+	return runSubsteps(self, remaining, 0, ChunkManager.IsTimeUniform())
+end
+
+-- The rest of a frame's substeps, from `remaining` personal/global seconds
+-- with `guard` substeps already spent -- Step's own loop, and where a parallel
+-- worker's result resumes when it stopped at a contact (see applySweep).
+function runSubsteps(self: Projectile, remaining: number, guard: number, uniformTime: boolean): boolean
 	local homing = self.Homing
-	local guard = 0
 	while remaining > MIN_STEP_DT and guard < MAX_SUBSTEPS do
 		guard += 1
 		local lifeRemaining = self.Lifetime - self.Age
@@ -864,16 +881,69 @@ function Projectile.Step(self: Projectile, globalDt: number): boolean
 		end
 	end
 
-	-- Whatever wasn't simulated -- past this frame's substep budget, too small
-	-- to integrate, or overspent by a pass-through (negative) -- carries to the
-	-- next frame, so no time is ever lost or gained relative to the client.
-	self._simulationDebt = remaining
+	return finishStep(self, remaining)
+end
 
+-- Whatever wasn't simulated -- past this frame's substep budget, too small to
+-- integrate, or overspent by a pass-through (negative) -- carries to the next
+-- frame, so no time is ever lost or gained relative to the client.
+function finishStep(self: Projectile, remaining: number): boolean
+	self._simulationDebt = remaining
 	if not SafeMath.isFiniteVector(self.Position) then
 		return false -- flew past SafeMath.Limit
 	end
 	Replication.updateSyncState(self)
 	return true
+end
+
+--------------------------------------------------------------------------------
+-- Parallel movement (see Parallel.luau / Sweep.luau)
+--------------------------------------------------------------------------------
+
+-- May this projectile be swept by a worker this frame? Its combined time
+-- scale if so. Homing (target choice runs Filter callbacks) and lag-
+-- compensated shots (need entity history) stay serial, as does anything the
+-- prologue of Step would stop.
+local function parallelScale(projectile: Projectile): number?
+	if projectile.Dead or projectile.Homing or projectile.RewindSeconds > 0 or debugRays then
+		return nil
+	end
+	if os.clock() - projectile._spawnRealTime >= projectile.MaxRealLifetime then
+		return nil
+	end
+	if not SafeMath.isFiniteVector(projectile.Position) or not SafeMath.isFiniteVector(projectile.Velocity) then
+		return nil
+	end
+	local scale = combinedTimeScale(projectile)
+	return if scale > 0 then scale else nil
+end
+
+-- Applies a worker's result in place of Step, or falls back to Step when the
+-- projectile changed after it was dispatched (an ability moved it, it gained
+-- homing, time scales changed...). Same return as Step.
+local function applySweep(self: Projectile, result: Parallel.Result, globalDt: number): boolean
+	if self.Dead then
+		return false
+	end
+	if os.clock() - self._spawnRealTime >= self.MaxRealLifetime then
+		return false
+	end
+	local from = result.From
+	if self.Position ~= from.Position or self.Velocity ~= from.Velocity or self.Age ~= from.Age
+		or self._simulationDebt ~= from.Debt or self.Homing or self.RewindSeconds > 0
+		or combinedTimeScale(self) ~= from.Scale or ChunkManager.GetTimeVersion() ~= from.TimeVersion then
+		Parallel.Count("Fallback")
+		return self:Step(globalDt)
+	end
+	Parallel.Count("Parallel")
+	Replication.updateTimeScale(self, from.Scale)
+	self.Position, self.Velocity, self.Age = result.Position, result.Velocity, result.Age
+	if result.Status == Sweep.Expired then
+		return false
+	elseif result.Status == Sweep.Contact then
+		return runSubsteps(self, result.Remaining, result.Guard, result.Uniform)
+	end
+	return finishStep(self, result.Remaining)
 end
 
 -- Linked-body tests must never advance/reflect the distant back endpoint.
@@ -1036,13 +1106,22 @@ Heartbeat.Connect(function(globalDt: number)
 
 	debug.profilebegin("Projectile.StepAll")
 	local stepStarted = os.clock()
+	local swept = Parallel.Collect()
 	-- Backwards with swap-removal: dead projectiles leave `active` the same
 	-- frame (so GetAll/GetInRadius never return them), and anything spawned by
 	-- an OnHit/OnDestroy handler mid-loop is appended past `i` and first steps
 	-- next frame.
 	for i = #active, 1, -1 do
 		local projectile = active[i]
-		if projectile:Step(globalDt) then
+		local result = swept[projectile]
+		local alive
+		if result then
+			alive = applySweep(projectile, result, globalDt)
+		else
+			Parallel.Count("Serial")
+			alive = projectile:Step(globalDt)
+		end
+		if alive then
 			-- Ordinary homing streams continuously; beams are filtered into sparse
 			-- refreshes and immediate topology corrections after link refinement.
 			Replication.queuePose(projectile)
@@ -1072,5 +1151,14 @@ Heartbeat.Connect(function(globalDt: number)
 	Replication.flushMoveBatch()
 	recordPhase("Replication", replicationElapsed + os.clock() - flushStarted)
 end, { Name = "ProjectileSystem.Step", Priority = 5 })
+
+-- Parallel movement dispatch: before physics, so the workers' parallel phase
+-- finishes before the Heartbeat loop above collects it (dt is this frame's,
+-- dilated the same way Heartbeat.Connect callbacks receive it).
+RunService.PreSimulation:Connect(function(dt: number)
+	local started = os.clock()
+	Parallel.Dispatch(active, dt * Heartbeat.GetGlobalTimeScale(), parallelScale)
+	recordPhase("Step", os.clock() - started)
+end)
 
 return Projectile

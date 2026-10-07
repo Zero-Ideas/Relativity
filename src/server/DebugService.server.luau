@@ -604,6 +604,7 @@ local function buildStats()
 	local projectiles = Projectile.GetStats()
 	local timing = Projectile.TakeStepTiming()
 	local occupancy = Projectile.TakeOccupancyStats()
+	local parallel = Projectile.TakeParallelStats()
 	local chunks = ChunkManager.GetStats()
 	local averageFrame = if frames > 0 then frameTime / frames else 0
 	return {
@@ -629,6 +630,11 @@ local function buildStats()
 		OccupancyReady = occupancy.Ready,
 		OccupancyCells = occupancy.StaticCells,
 		OccupancyDynamic = occupancy.DynamicParts,
+		ParallelSteps = parallel.Parallel,
+		SerialSteps = parallel.Serial,
+		FallbackSteps = parallel.Fallback,
+		LateSteps = parallel.Late,
+		ParallelWorkers = parallel.Workers,
 		PendingSpawns = projectiles.PendingVisualSpawns,
 		PendingHits = projectiles.PendingVisualHits,
 		BeamPoseUpdates = projectiles.BeamPoseUpdates,

@@ -51,6 +51,7 @@ return function(window)
 	local sReplication = statLine(tab, "Projectile replication ms (avg / worst)")
 	local sProjectileTotal = statLine(tab, "Projectile total ms")
 	local sSkipped = statLine(tab, "Raycasts skipped (empty space)")
+	local sParallel = statLine(tab, "Parallel movement")
 	local sQueues = statLine(tab, "Visual queue (spawn / hit)")
 	local sBeams = statLine(tab, "Beam pose updates (total)")
 	local sEntities = statLine(tab, "Entities")
@@ -82,6 +83,15 @@ return function(window)
 		sReplication(`{fmt("%.2f", s.ReplicationMs)} / {fmt("%.2f", s.ReplicationWorstMs)}{share(s.ReplicationMs)}`)
 		local total = (tonumber(s.StepMs) or 0) + (tonumber(s.BeamMs) or 0) + (tonumber(s.ReplicationMs) or 0)
 		sProjectileTotal(`{fmt("%.2f", total)}{share(total)} of a {fmt("%.1f", s.FrameMs)} ms frame`)
+		local parallelSteps = tonumber(s.ParallelSteps) or 0
+		local allSteps = parallelSteps + (tonumber(s.SerialSteps) or 0) + (tonumber(s.FallbackSteps) or 0)
+		if allSteps > 0 then
+			sParallel(string.format("%d%% of steps on %d workers  (fallback %d, late %d)",
+				math.floor(parallelSteps / allSteps * 100 + 0.5), tonumber(s.ParallelWorkers) or 0,
+				tonumber(s.FallbackSteps) or 0, tonumber(s.LateSteps) or 0))
+		else
+			sParallel("-")
+		end
 		if s.OccupancyReady == false then
 			sSkipped("baking map...")
 		elseif typeof(s.RaycastChecks) == "number" and s.RaycastChecks > 0 then
