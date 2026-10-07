@@ -21,6 +21,7 @@ local Players = game:GetService("Players")
 local Shared = game:GetService("ReplicatedStorage"):WaitForChild("Shared")
 local VisualOffload = require(Shared:WaitForChild("VisualOffload"))
 local Protocol = require(Shared:WaitForChild("ProjectileProtocol"))
+local Codec = require(Shared:WaitForChild("ProjectileCodec"))
 local Heartbeat = require(Shared:WaitForChild("Heartbeat"))
 
 local Types = require(script.Parent.Types)
@@ -81,6 +82,7 @@ type Entry = {
 	Position: Vector3,
 	Payload: any,
 	Recipients: { [Player]: boolean }?,
+	Chunk: buffer?, -- Payload encoded once (binary channels), shared by every recipient
 }
 
 type BounceSnap = {
@@ -124,9 +126,25 @@ end
 
 -- Sends each entry to every player within its Range (everyone when the range
 -- is unlimited), as ONE event per recipient no matter how many entries.
-local function fanOut(channel: string, entries: { Entry })
+-- With `encode` (ProjMove / ProjHitBatch -- see ProjectileCodec) each entry is
+-- encoded once and every recipient's message is one packed buffer of them.
+local function fanOut(channel: string, entries: { Entry }, encode: ((any) -> buffer)?)
 	if #entries == 0 then
 		return
+	end
+	local function item(entry: Entry): any
+		if not encode then
+			return entry.Payload
+		end
+		local chunk = entry.Chunk
+		if not chunk then
+			chunk = encode(entry.Payload)
+			entry.Chunk = chunk
+		end
+		return chunk
+	end
+	local function message(list: { any }): any
+		return if encode then Codec.Join(list) else list
 	end
 	local broadcast: { any } = {}
 	local perPlayer: { [Player]: { any } } = {}
@@ -137,10 +155,10 @@ local function fanOut(channel: string, entries: { Entry })
 				if not player.Parent then continue end
 				local list = perPlayer[player] or {}
 				perPlayer[player] = list
-				table.insert(list, entry.Payload)
+				table.insert(list, item(entry))
 			end
 		elseif entry.Range >= math.huge then
-			table.insert(broadcast, entry.Payload)
+			table.insert(broadcast, item(entry))
 		else
 			roots = roots or playerRoots()
 			for player, root in roots :: { [Player]: BasePart } do
@@ -150,16 +168,16 @@ local function fanOut(channel: string, entries: { Entry })
 						list = {}
 						perPlayer[player] = list
 					end
-					table.insert(list, entry.Payload)
+					table.insert(list, item(entry))
 				end
 			end
 		end
 	end
 	if #broadcast > 0 then
-		VisualOffload.Fire(channel, broadcast)
+		VisualOffload.Fire(channel, message(broadcast))
 	end
 	for player, list in perPlayer do
-		VisualOffload.FireClient(player, channel, list)
+		VisualOffload.FireClient(player, channel, message(list))
 	end
 end
 
@@ -290,7 +308,7 @@ function Replication.flushHitBatch()
 		table.insert(batch, hitQueue[index])
 	end
 	hitQueue, hitQueueHead = compact(hitQueue, last + 1)
-	fanOut(Channels.HitBatch, batch)
+	fanOut(Channels.HitBatch, batch, Codec.EncodeHit)
 end
 
 -- Sends at most MAX_SPAWNS_PER_FRAME new visuals per frame, combined into one
@@ -542,7 +560,7 @@ function Replication.flushMoveBatch()
 		moveStats.batches += 1
 		moveStats.entries += #batch
 	end
-	fanOut(Channels.Move, batch)
+	fanOut(Channels.Move, batch, Codec.EncodeMove)
 end
 
 -- Once-a-second ProjMove rate summary (see DebugSync) -- real time, not

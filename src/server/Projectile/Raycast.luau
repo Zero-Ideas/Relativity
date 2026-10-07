@@ -1,3 +1,4 @@
+--!native
 --!strict
 --!optimize 2
 --[[
@@ -15,6 +16,7 @@ local ChunkManager = require(Shared:WaitForChild("ChunkManager"))
 local SafeMath = require(Shared:WaitForChild("SafeMath"))
 
 local Replication = require(script.Parent.Replication)
+local Occupancy = require(script.Parent.Occupancy)
 local Types = require(script.Parent.Types)
 
 type State = Types.State
@@ -62,6 +64,11 @@ end
 -- the sphere's center -- travelled, which is what the time accounting in
 -- init.luau needs; for a Spherecast, Position is the surface point instead.
 function Raycast.castMovement(projectile: State, origin: Vector3, displacement: Vector3, overrideParams: RaycastParams?): Types.Contact?
+	-- Provably empty space: the cast would find nothing, so don't make it
+	-- (see Occupancy -- it only says yes when nothing could be in the way).
+	if Occupancy.SegmentClear(origin, displacement, projectile.Radius) then
+		return nil
+	end
 	local params = overrideParams or projectile._rayParams
 	local result
 	if projectile.Radius > 0 then

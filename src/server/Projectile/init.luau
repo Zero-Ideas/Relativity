@@ -1,3 +1,4 @@
+--!native
 --!strict
 --!optimize 2
 --[[
@@ -316,6 +317,7 @@ local Homing = require(script.Homing)
 local Math = require(script.Math)
 local Raycast = require(script.Raycast)
 local Replication = require(script.Replication)
+local Occupancy = require(script.Occupancy)
 local RewindHit = require(script.RewindHit)
 local Types = require(script.Types)
 
@@ -346,6 +348,8 @@ local MAX_HOMING_TURN_STEP = math.rad(5)
 local MAX_BURST_COUNT = 10000
 
 local active: { Projectile } = {} -- server-side live projectiles
+-- Time spent in the step loop, for the debug panel (TakeStepTiming).
+local stepTime, stepFrames, stepWorst = 0, 0, 0
 local nextId = 0
 local beamSpanStep: ((number) -> ())? = nil
 
@@ -554,6 +558,21 @@ function Projectile.GetStats()
 		BeamRefreshInterval = stats.BeamRefreshInterval,
 		BeamHomingRefreshInterval = stats.BeamHomingRefreshInterval,
 	}
+end
+
+-- Movement raycasts skipped through empty space since the last call (see
+-- Occupancy), then resets -- DebugService's Stats tab reads this.
+function Projectile.TakeOccupancyStats()
+	return Occupancy.TakeStats()
+end
+
+-- Average and worst step-loop time (ms per frame) since the last call, then
+-- resets -- DebugService's Stats tab reads this.
+function Projectile.TakeStepTiming(): (number, number)
+	local average = if stepFrames > 0 then stepTime / stepFrames * 1000 else 0
+	local worst = stepWorst * 1000
+	stepTime, stepFrames, stepWorst = 0, 0, 0
+	return average, worst
 end
 
 function Projectile.GetBySource(source: Types.EntityLike): { Projectile }
@@ -965,6 +984,7 @@ Heartbeat.Connect(function(globalDt: number)
 	Replication.flushHitBatch()
 
 	debug.profilebegin("Projectile.StepAll")
+	local stepStarted = os.clock()
 	-- Backwards with swap-removal: dead projectiles leave `active` the same
 	-- frame (so GetAll/GetInRadius never return them), and anything spawned by
 	-- an OnHit/OnDestroy handler mid-loop is appended past `i` and first steps
@@ -982,6 +1002,10 @@ Heartbeat.Connect(function(globalDt: number)
 			projectile:Destroy(nil, nil)
 		end
 	end
+	local stepElapsed = os.clock() - stepStarted
+	stepTime += stepElapsed
+	stepFrames += 1
+	if stepElapsed > stepWorst then stepWorst = stepElapsed end
 	debug.profileend()
 	if beamSpanStep then beamSpanStep(globalDt) end
 

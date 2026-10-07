@@ -1,3 +1,4 @@
+--!native
 --!strict
 -- Pure geometry union for a sustained channel. Overlapping collinear packet
 -- tails become one cylinder, not stacked bars/glow. Distinct paths stay

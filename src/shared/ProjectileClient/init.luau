@@ -1,3 +1,4 @@
+--!native
 --!strict
 --!optimize 2
 --[[
@@ -34,6 +35,7 @@ local Heartbeat = require(Shared:WaitForChild("Heartbeat"))
 local ChunkManager = require(Shared:WaitForChild("ChunkManager"))
 local VisualOffload = require(Shared:WaitForChild("VisualOffload"))
 local Protocol = require(Shared:WaitForChild("ProjectileProtocol"))
+local Codec = require(Shared:WaitForChild("ProjectileCodec"))
 
 local DebugRays = require(script.DebugRays)
 local Impact = require(script.Impact)
@@ -703,7 +705,11 @@ function ProjectileClient.EnableClientRendering()
 	end)
 	VisualOffload.On(Channels.TimeScale, onTimeScale)
 	VisualOffload.On(Channels.Sync, onSync)
-	VisualOffload.On(Channels.Move, onMove)
+	-- ProjMove / ProjHitBatch arrive packed (see ProjectileCodec); a plain
+	-- table batch is still accepted.
+	VisualOffload.On(Channels.Move, function(batch: any)
+		onMove(if typeof(batch) == "buffer" then Codec.DecodeMoves(batch) else batch)
+	end)
 	VisualOffload.On(Channels.RangeExit, function(ids: { number })
 		for _, id in ids do
 			local visual = visuals[id]
@@ -715,7 +721,8 @@ function ProjectileClient.EnableClientRendering()
 			else destroyVisual(id) end
 		end
 	end)
-	VisualOffload.On(Channels.HitBatch, function(batch: { Protocol.HitPayload })
+	VisualOffload.On(Channels.HitBatch, function(packed: any)
+		local batch: { Protocol.HitPayload } = if typeof(packed) == "buffer" then Codec.DecodeHits(packed) else packed
 		for _, data in batch do
 			onHit(data)
 		end

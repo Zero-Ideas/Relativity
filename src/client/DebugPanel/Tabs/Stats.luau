@@ -46,6 +46,8 @@ return function(window)
 	local sMemory = statLine(tab, "Memory")
 	local sInstances = statLine(tab, "Instances")
 	local sProjectiles = statLine(tab, "Projectiles")
+	local sProjectileStep = statLine(tab, "Projectile step ms (avg / worst)")
+	local sSkipped = statLine(tab, "Raycasts skipped (empty space)")
 	local sQueues = statLine(tab, "Visual queue (spawn / hit)")
 	local sBeams = statLine(tab, "Beam pose updates (total)")
 	local sEntities = statLine(tab, "Entities")
@@ -66,6 +68,19 @@ return function(window)
 		sMemory(fmt("%.0f MB", s.MemoryMb))
 		sInstances(fmt("%d", s.Instances))
 		sProjectiles(fmt("%d", s.Projectiles))
+		-- share of the whole server frame the projectile step takes
+		local share = if typeof(s.FrameMs) == "number" and s.FrameMs > 0 and typeof(s.StepMs) == "number"
+			then string.format("  (%d%% of frame)", math.floor(s.StepMs / s.FrameMs * 100 + 0.5))
+			else ""
+		sProjectileStep(`{fmt("%.2f", s.StepMs)} / {fmt("%.2f", s.StepWorstMs)}{share}`)
+		if s.OccupancyReady == false then
+			sSkipped("baking map...")
+		elseif typeof(s.RaycastChecks) == "number" and s.RaycastChecks > 0 then
+			sSkipped(string.format("%d%% of %d  (%s cells, %s moving parts)", math.floor(s.RaycastsSkipped / s.RaycastChecks * 100 + 0.5),
+				s.RaycastChecks, tostring(s.OccupancyCells), tostring(s.OccupancyDynamic)))
+		else
+			sSkipped("-")
+		end
 		sQueues(`{fmt("%d", s.PendingSpawns)} / {fmt("%d", s.PendingHits)}`)
 		sBeams(fmt("%d", s.BeamPoseUpdates))
 		sEntities(fmt("%d", s.Entities))
