@@ -97,6 +97,10 @@ export type Homing = {
 -- init.luau for what each field means. Every value is treated as untrusted
 -- and normalized by Config.normalize before use.
 export type Config = {
+	-- false: a full per-projectile table instead of a handle on shared data
+	-- (see Projectile.new / Store.luau). Default true; homing, beams and lag
+	-- compensation always get a full table.
+	Efficient: boolean?,
 	Origin: Vector3?,
 	Direction: Vector3?,
 	TargetPosition: Vector3?,
@@ -207,7 +211,6 @@ export type State = {
 	-- parallel movement (Parallel.luau): its raycast filter's id, queued /
 	-- slotted, and the frame mark of a result applied before this frame's step
 	-- loop (+mark: alive, -mark: dead)
-	_filterId: number?,
 	_slot: number?, -- its Store record while live (see Store.luau)
 	_parallelState: number?,
 	_sweepMark: number?,

@@ -18,22 +18,23 @@
 --     src/shared/ProjectileCodec.luau (222 lines)
 --     src/shared/Projectile/BeamPath.luau (82 lines)
 --   Server simulation
---     src/server/Projectile/Types.luau (239 lines)
+--     src/server/Projectile/Types.luau (242 lines)
 --     src/server/Projectile/Config.luau (192 lines)
 --     src/server/Projectile/Math.luau (71 lines)
---     src/server/Projectile/Raycast.luau (284 lines)
---     src/server/Projectile/Occupancy.luau (622 lines)
+--     src/server/Projectile/Raycast.luau (294 lines)
+--     src/server/Projectile/Occupancy.luau (846 lines)
 --     src/server/Projectile/Homing.luau (150 lines)
 --     src/server/Projectile/RewindHit.luau (144 lines)
 --     src/server/Projectile/Replication.luau (579 lines)
---     src/server/Projectile/Store.luau (275 lines)
+--     src/server/Projectile/Store.luau (482 lines)
+--     src/server/Projectile/Spec.luau (124 lines)
 --     src/server/Projectile/Sweep.luau (209 lines)
 --     src/server/Projectile/Profile.luau (67 lines)
---     src/server/Projectile/Parallel.luau (678 lines)
---     src/server/Projectile/init.luau (1286 lines)
+--     src/server/Projectile/Parallel.luau (686 lines)
+--     src/server/Projectile/init.luau (1473 lines)
 --     src/server/Projectile/BeamProjectileHandler.luau (338 lines)
 --     src/server/ProjectileQuota.luau (41 lines)
---     src/server/ProjectileWorkerBootstrap.server.luau (136 lines)
+--     src/server/ProjectileWorkerBootstrap.server.luau (162 lines)
 --   Client prediction and visuals
 --     src/shared/ProjectileClient/Types.luau (79 lines)
 --     src/shared/ProjectileClient/Prediction.luau (147 lines)
@@ -3137,6 +3138,10 @@ export type Homing = {
 -- init.luau for what each field means. Every value is treated as untrusted
 -- and normalized by Config.normalize before use.
 export type Config = {
+	-- false: a full per-projectile table instead of a handle on shared data
+	-- (see Projectile.new / Store.luau). Default true; homing, beams and lag
+	-- compensation always get a full table.
+	Efficient: boolean?,
 	Origin: Vector3?,
 	Direction: Vector3?,
 	TargetPosition: Vector3?,
@@ -3247,7 +3252,6 @@ export type State = {
 	-- parallel movement (Parallel.luau): its raycast filter's id, queued /
 	-- slotted, and the frame mark of a result applied before this frame's step
 	-- loop (+mark: alive, -mark: dead)
-	_filterId: number?,
 	_slot: number?, -- its Store record while live (see Store.luau)
 	_parallelState: number?,
 	_sweepMark: number?,
@@ -3581,6 +3585,7 @@ local SafeMath = require(Shared:WaitForChild("SafeMath"))
 local Replication = require(script.Parent.Replication)
 local Occupancy = require(script.Parent.Occupancy)
 local Types = require(script.Parent.Types)
+local Store = require(script.Parent.Store)
 
 type State = Types.State
 type Verdict = Types.Verdict
@@ -3610,6 +3615,15 @@ local MAX_SHARED_PARAMS = 1024
 local sharedParams: { [any]: any } = {}
 local sharedCount = 0
 local LEAF = newproxy() -- (trie key for a node's params; can't collide with an Instance)
+
+-- OnHit, if anyone connected (an efficient projectile only has the signal
+-- once someone has).
+local function fireHit(projectile: any, info: any)
+	local signal = Store.Peek(projectile, "OnHit")
+	if signal then
+		signal:Fire(info)
+	end
+end
 
 function Raycast.buildRayParams(source: Types.EntityLike?, ignoreInstances: { Instance }?): RaycastParams
 	local ignore: { Instance } = {}
@@ -3729,7 +3743,7 @@ function Raycast.resolveEntityHit(
 		return "fallthrough"
 	end
 
-	projectile.OnHit:Fire(Raycast.buildHitInfo(contact, entity, hurtbox))
+	fireHit(projectile, Raycast.buildHitInfo(contact, entity, hurtbox))
 	if projectile.PiercesLeft > 0 then
 		projectile.PiercesLeft -= 1
 		projectile.DamageMultiplier *= (1 - projectile.PierceFalloff)
@@ -3809,7 +3823,7 @@ function Raycast.resolveHit(projectile: State, contact: Types.Contact): (Verdict
 	if projectile.Penetration > 0 then
 		local exitPosition = attemptPenetration(projectile, contact)
 		if exitPosition then
-			projectile.OnHit:Fire(Raycast.buildHitInfo(contact, entity, nil))
+			fireHit(projectile, Raycast.buildHitInfo(contact, entity, nil))
 			projectile.Position = exitPosition
 			return "pass", nil
 		end
@@ -3836,11 +3850,11 @@ function Raycast.resolveHit(projectile: State, contact: Types.Contact): (Verdict
 		if onBounce then
 			task.spawn(onBounce, projectile, contact)
 		end
-		projectile.OnHit:Fire(Raycast.buildHitInfo(contact, entity, nil))
+		fireHit(projectile, Raycast.buildHitInfo(contact, entity, nil))
 		return "bounce", nil
 	end
 
-	projectile.OnHit:Fire(Raycast.buildHitInfo(contact, entity, nil))
+	fireHit(projectile, Raycast.buildHitInfo(contact, entity, nil))
 	return "destroy", "world"
 end
 
@@ -3917,6 +3931,8 @@ local TERRAIN_AROUND_PARTS = 512 -- studs of terrain scanned beyond the map's pa
 local TERRAIN_DEFAULT_MIN = Vector3.new(-2048, -512, -2048) -- terrain-only maps
 local TERRAIN_DEFAULT_MAX = Vector3.new(2048, 1024, 2048)
 local REFINE_OVER = 32 -- studs: bigger non-box parts are baked by their real shape
+local REFINE_DIVISIONS = 16 -- a part is refined down to about 1/16 of its size (power-of-two pieces)
+local REFINE_MAX_PROBES = 6000 -- per part; past this the rest is kept whole
 local REFINE_SLICE = 0.004 -- seconds of shape probing per resumption
 
 -- Sweeps wider than this always raycast (the padding wouldn't cover them).
@@ -3941,7 +3957,15 @@ local FULL = buffer.create(MASK_BYTES)
 buffer.fill(FULL, 0, 255)
 masks[buffer.tostring(FULL)] = FULL
 local scratch = buffer.create(MASK_BYTES)
-local dynamic: { [number]: boolean } = {} -- coarse key -> something moving there this frame
+-- coarse key -> the padded boxes of whatever moves through that cell this
+-- frame, as (lo, hi, owner) triples; a fine voxel is only blocked if it
+-- overlaps one. `owner` is the part's top-level ancestor under workspace (a
+-- character, a model...): a query whose raycast filter excludes that owner
+-- ignores its boxes (see SegmentClear), so e.g. slow shots hanging around
+-- their own shooter still skip.
+local dynamic: { [number]: { any } } = {}
+local ownerOf: { [BasePart]: Instance } = {}
+local currentIgnore: { [Instance]: boolean }? = nil -- the running query's excluded instances
 local dynamicParts: { [BasePart]: boolean } = {}
 local staticMoves: { [BasePart]: number } = {}
 local watchedRoots: { [BasePart]: { BasePart } } = {} -- anchored root -> parts welded to it
@@ -3951,7 +3975,12 @@ local ready = false
 local hasTerrain = false
 local terrainMin, terrainMax = Vector3.zero, Vector3.zero
 
-local stats = { Checks = 0, Skipped = 0, Coarse = 0, StaticCells = 0, DistinctMasks = 1, DynamicParts = 0 }
+local stats = { Checks = 0, Skipped = 0, Coarse = 0, StaticCells = 0, DistinctMasks = 1, DynamicParts = 0,
+	-- why a check wasn't skipped (Stats tab)
+	NotReady = 0, TooWide = 0, OutsideTerrain = 0, Blocked = 0, BlockedMoving = 0,
+	LargestDynamic = nil :: string?, -- (diagnostic: the biggest moving part, by name)
+}
+local blockedByMoving = false -- set by fineOccupied when a moving part's cell is what blocked
 
 local function intern(mask: buffer): buffer
 	local contents = buffer.tostring(mask)
@@ -4025,11 +4054,68 @@ local function markStatic(lo: Vector3, hi: Vector3)
 	end
 end
 
-local function markDynamicBox(lo: Vector3, hi: Vector3)
+-- Marks many boxes at once (`boxes`: lo, hi pairs on the FINE grid, e.g.
+-- from refineShape). Each touched cell is edited in one private copy and
+-- interned once at the end -- marking them one by one through markStatic
+-- would intern (and keep forever) every intermediate state of every cell,
+-- which for a big mesh's ~10^5 voxels was gigabytes.
+local function markVoxels(boxes: { Vector3 })
+	local pending: { [number]: buffer } = {}
+	for index = 1, #boxes, 2 do
+		local lo, hi = boxes[index], boxes[index + 1]
+		local fx0, fy0, fz0 = math.round(lo.X / FINE), math.round(lo.Y / FINE), math.round(lo.Z / FINE)
+		local fx1, fy1, fz1 = math.round(hi.X / FINE) - 1, math.round(hi.Y / FINE) - 1, math.round(hi.Z / FINE) - 1
+		for cz = fz0 // DIV, fz1 // DIV do
+			local az, bz = max(fz0 - cz * DIV, 0), min(fz1 - cz * DIV, DIV - 1)
+			for cy = fy0 // DIV, fy1 // DIV do
+				local ay, by = max(fy0 - cy * DIV, 0), min(fy1 - cy * DIV, DIV - 1)
+				for cx = fx0 // DIV, fx1 // DIV do
+					local ax, bx = max(fx0 - cx * DIV, 0), min(fx1 - cx * DIV, DIV - 1)
+					local k = cellKey(cx, cy, cz)
+					local mask = pending[k]
+					if not mask then
+						local current = static[k]
+						if current == FULL then
+							continue
+						end
+						mask = buffer.create(MASK_BYTES)
+						if current then
+							buffer.copy(mask, 0, current, 0, MASK_BYTES)
+						end
+						pending[k] = mask
+					end
+					local row = lshift(lshift(1, bx - ax + 1) - 1, ax)
+					for fz = az, bz do
+						for fy = ay, by do
+							local offset = (fy + fz * DIV) * ROW_BYTES
+							writeu16(mask, offset, bor(readu16(mask, offset), row))
+						end
+					end
+				end
+			end
+		end
+	end
+	for k, mask in pending do
+		if not static[k] then
+			stats.StaticCells += 1
+		end
+		static[k] = intern(mask)
+	end
+end
+
+local function markDynamicBox(lo: Vector3, hi: Vector3, owner: Instance)
 	for cz = floor(lo.Z / COARSE), floor(hi.Z / COARSE) do
 		for cy = floor(lo.Y / COARSE), floor(hi.Y / COARSE) do
 			for cx = floor(lo.X / COARSE), floor(hi.X / COARSE) do
-				dynamic[cellKey(cx, cy, cz)] = true
+				local k = cellKey(cx, cy, cz)
+				local boxes = dynamic[k]
+				if not boxes then
+					boxes = {}
+					dynamic[k] = boxes
+				end
+				table.insert(boxes, lo)
+				table.insert(boxes, hi)
+				table.insert(boxes, owner)
 			end
 		end
 	end
@@ -4045,17 +4131,32 @@ local function refreshDynamic()
 	dynamicStamp = stamp
 	table.clear(dynamic)
 	local count = 0
+	local largest, largestSize = nil, 0
 	for part in dynamicParts do
 		if not part.Parent then
 			dynamicParts[part] = nil
 			continue
 		end
 		count += 1
+		local size = part.Size.Magnitude
+		if size > largestSize then
+			largest, largestSize = part, size
+		end
 		local reach = PAD + DYNAMIC_MARGIN + part.AssemblyLinearVelocity.Magnitude * DYNAMIC_LOOKAHEAD
 		local lo, hi = bounds(part, reach)
-		markDynamicBox(lo, hi)
+		local owner = ownerOf[part]
+		if not owner or not owner.Parent then
+			local node: Instance = part
+			while node.Parent and node.Parent ~= workspace do
+				node = node.Parent :: Instance
+			end
+			owner = node
+			ownerOf[part] = node
+		end
+		markDynamicBox(lo, hi, owner :: Instance)
 	end
 	stats.DynamicParts = count
+	stats.LargestDynamic = if largest then `{largest:GetFullName()} ({math.floor(largestSize)})` else nil
 end
 
 --------------------------------------------------------------------------------
@@ -4078,36 +4179,57 @@ local function boxShaped(part: BasePart): boolean
 	return part:IsA("Part") and (part :: Part).Shape == Enum.PartType.Block
 end
 
--- The FINE-voxel boxes (lo, hi pairs) of `part`'s real collision geometry,
--- each grown by PAD for the test (so marking them needs no further padding):
--- its box is split into octants on the voxel grid and a piece is kept only
--- if GetPartsInPart finds the part in it. Yields every REFINE_SLICE. nil if
--- the part left the world meanwhile.
+-- The boxes (lo, hi pairs on the FINE grid) covering `part`'s real
+-- collision geometry, each tested grown by PAD (so marking them needs no
+-- further padding): its box is split into octants and a piece is kept only
+-- if GetPartsInPart finds the part in it. Pieces stop at a power-of-two
+-- `leaf` near 1/REFINE_DIVISIONS of the part (so a 900-stud tree costs about
+-- what a 50-stud rock does), and past REFINE_MAX_PROBES whatever is left is
+-- kept whole (still safe, just coarser). Yields every REFINE_SLICE; nil if the
+-- part left the world meanwhile.
 local probe = Instance.new("Part")
 probe.Anchored = true
+
+local function leafFor(part: BasePart): number
+	local size = part.Size
+	local wanted = max(size.X, size.Y, size.Z) / REFINE_DIVISIONS
+	local leaf = FINE
+	while leaf < wanted and leaf < COARSE do
+		leaf *= 2
+	end
+	return leaf
+end
 
 local function refineShape(part: BasePart): { Vector3 }?
 	local params = OverlapParams.new()
 	params.FilterType = Enum.RaycastFilterType.Include
 	params.FilterDescendantsInstances = { part }
 	local grow = Vector3.one * (2 * PAD)
+	local leaf = leafFor(part)
 	local lo, hi = bounds(part, 0)
-	lo = Vector3.new(floor(lo.X / FINE) * FINE, floor(lo.Y / FINE) * FINE, floor(lo.Z / FINE) * FINE)
-	hi = Vector3.new(math.ceil(hi.X / FINE) * FINE, math.ceil(hi.Y / FINE) * FINE, math.ceil(hi.Z / FINE) * FINE)
+	lo = Vector3.new(floor(lo.X / leaf) * leaf, floor(lo.Y / leaf) * leaf, floor(lo.Z / leaf) * leaf)
+	hi = Vector3.new(math.ceil(hi.X / leaf) * leaf, math.ceil(hi.Y / leaf) * leaf, math.ceil(hi.Z / leaf) * leaf)
 	local boxes: { Vector3 } = {}
 	local stack: { Vector3 } = { lo, hi }
 	local sliceStarted = os.clock()
-	-- an axis range split in two on the voxel grid (one range if it's one voxel)
+	local probes = 0
+	-- an axis range split in two on the leaf grid (one range if it's one leaf)
 	local function halves(a: number, b: number): { number }
-		if b - a <= FINE then
+		if b - a <= leaf then
 			return { a, b }
 		end
-		local m = a + math.ceil((b - a) / FINE / 2) * FINE
+		local m = a + math.ceil((b - a) / leaf / 2) * leaf
 		return { a, m, m, b }
 	end
 	while #stack > 0 do
 		local nodeHi = table.remove(stack) :: Vector3
 		local nodeLo = table.remove(stack) :: Vector3
+		if probes >= REFINE_MAX_PROBES then
+			-- out of budget: keep the rest whole
+			table.insert(boxes, nodeLo)
+			table.insert(boxes, nodeHi)
+			continue
+		end
 		if os.clock() - sliceStarted > REFINE_SLICE then
 			task.wait()
 			sliceStarted = os.clock()
@@ -4115,13 +4237,14 @@ local function refineShape(part: BasePart): { Vector3 }?
 				return nil
 			end
 		end
+		probes += 1
 		probe.Size = nodeHi - nodeLo + grow
 		probe.CFrame = CFrame.new((nodeLo + nodeHi) * 0.5)
 		if #workspace:GetPartsInPart(probe, params) == 0 then
 			continue
 		end
 		local size = nodeHi - nodeLo
-		if size.X <= FINE and size.Y <= FINE and size.Z <= FINE then
+		if size.X <= leaf and size.Y <= leaf and size.Z <= leaf then
 			table.insert(boxes, nodeLo)
 			table.insert(boxes, nodeHi)
 			continue
@@ -4137,6 +4260,67 @@ local function refineShape(part: BasePart): { Vector3 }?
 		end
 	end
 	return boxes
+end
+
+-- Workers don't probe (that's the main thread's job, once): they keep a big
+-- shaped part dynamic until the main thread sends its boxes (ApplyShape).
+local isWorker = _G.__RelativityOccupancyWorker == true
+local shaped: { [BasePart]: boolean } = {} -- (worker) boxes already applied
+local watched: { [BasePart]: boolean } = {}
+
+-- (main) Every refined shape so far, so a worker that starts listening
+-- late (messages sent before an Actor binds its handler are dropped) still
+-- gets them all: each worker fires ProjectileActors.OccupancyHello once its
+-- handler is bound, and is sent the lot.
+local shapes: { [BasePart]: { Vector3 } } = {}
+
+local function actorsFolder(): Instance?
+	return game:GetService("ServerScriptService"):FindFirstChild("ProjectileActors", true)
+end
+
+-- (main) Sends a part's refined boxes to every projectile worker.
+local function broadcastShape(part: BasePart, boxes: { Vector3 })
+	shapes[part] = boxes
+	local folder = actorsFolder()
+	if not folder then
+		return
+	end
+	for _, actor in folder:GetChildren() do
+		if actor:IsA("Actor") then
+			local ok, err = pcall(function()
+				actor:SendMessage("OccupancyShape", part, boxes)
+			end)
+			if not ok then
+				warn(`[Projectile] occupancy: couldn't send {part:GetFullName()}'s shape ({#boxes // 2} boxes) to a worker: {err}`)
+			end
+		end
+	end
+end
+
+if not isWorker then
+	task.spawn(function()
+		local folder = actorsFolder()
+		while not folder do
+			task.wait(0.5)
+			folder = actorsFolder()
+		end
+		local function sendAll(actor: Actor)
+			for part, boxes in shapes do
+				if part.Parent then
+					actor:SendMessage("OccupancyShape", part, boxes)
+				end
+			end
+		end
+		local hello = (folder :: Instance):WaitForChild("OccupancyHello") :: BindableEvent
+		hello.Event:Connect(sendAll)
+		-- and once now, for any worker that said hello before we listened
+		-- (duplicates are harmless: ApplyShape just marks the same voxels)
+		for _, actor in (folder :: Instance):GetChildren() do
+			if actor:IsA("Actor") then
+				sendAll(actor)
+			end
+		end
+	end)
 end
 
 local queryWatched: { [BasePart]: boolean } = {}
@@ -4227,21 +4411,42 @@ function classify(part: BasePart)
 	end
 	local size = part.Size
 	if (size.X > REFINE_OVER or size.Y > REFINE_OVER or size.Z > REFINE_OVER) and not boxShaped(part) then
+		if isWorker then
+			if not shaped[part] then
+				makeDynamic(part) -- (conservative until the main thread's boxes arrive)
+			end
+			return
+		end
 		makeDynamic(part) -- (conservative while its shape is probed)
 		local boxes = refineShape(part)
 		if not boxes or not part.Parent then
 			return
 		end
-		local inset = Vector3.one * 0.01 -- (a voxel's far face would also mark its neighbour)
-		for index = 1, #boxes, 2 do
-			markStatic(boxes[index], boxes[index + 1] - inset)
-		end
+		markVoxels(boxes)
+		broadcastShape(part, boxes)
 	else
 		local lo, hi = bounds(part, PAD)
 		markStatic(lo, hi)
 	end
 	dynamicParts[part] = nil
-	watchStatic(part)
+	if not watched[part] then
+		watched[part] = true
+		watchStatic(part)
+	end
+end
+
+-- (worker) The main thread's refined boxes for a big shaped part.
+function Occupancy.ApplyShape(part: BasePart, boxes: { Vector3 })
+	if not part.Parent then
+		return
+	end
+	shaped[part] = true
+	markVoxels(boxes)
+	dynamicParts[part] = nil
+	if not watched[part] then
+		watched[part] = true
+		watchStatic(part)
+	end
 end
 
 -- A joint went away: its parts may now be loose, so stop trusting them as static.
@@ -4261,8 +4466,19 @@ end
 local function fineOccupied(fx: number, fy: number, fz: number): boolean
 	local cx, cy, cz = fx // DIV, fy // DIV, fz // DIV
 	local k = cellKey(cx, cy, cz)
-	if dynamic[k] then
-		return true
+	local moving = dynamic[k]
+	if moving then
+		local x0, y0, z0 = fx * FINE, fy * FINE, fz * FINE
+		local x1, y1, z1 = x0 + FINE, y0 + FINE, z0 + FINE
+		local ignore = currentIgnore
+		for index = 1, #moving, 3 do
+			local lo, hi = moving[index], moving[index + 1]
+			if x1 > lo.X and x0 < hi.X and y1 > lo.Y and y0 < hi.Y and z1 > lo.Z and z0 < hi.Z
+				and not (ignore and ignore[moving[index + 2]]) then
+				blockedByMoving = true
+				return true
+			end
+		end
 	end
 	local mask = static[k]
 	if not mask then
@@ -4274,7 +4490,7 @@ end
 
 local function coarseOccupied(cx: number, cy: number, cz: number): boolean
 	local k = cellKey(cx, cy, cz)
-	return dynamic[k] == true or static[k] ~= nil
+	return dynamic[k] ~= nil or static[k] ~= nil
 end
 
 -- Amanatides-Woo walk of every `size`-stud voxel the segment passes through;
@@ -4326,18 +4542,35 @@ end
 -- hits nothing, so the caller can skip its raycast. Conservative: any doubt
 -- (not baked yet, too wide, outside scanned terrain, anything near the path)
 -- returns false.
-function Occupancy.SegmentClear(origin: Vector3, displacement: Vector3, radius: number): boolean
+-- `ignore` (optional): instances the caller's raycast excludes (with their
+-- descendants); moving parts belonging to them don't block.
+function Occupancy.SegmentClear(origin: Vector3, displacement: Vector3, radius: number,
+	ignore: { [Instance]: boolean }?): boolean
 	stats.Checks += 1
-	if not ready or not Occupancy.Enabled or radius > Occupancy.MaxRadius then
+	if not ready or not Occupancy.Enabled then
+		stats.NotReady += 1
+		return false
+	end
+	if radius > Occupancy.MaxRadius then
+		stats.TooWide += 1
 		return false
 	end
 	if hasTerrain and not insideTerrainScan(origin, origin + displacement) then
+		stats.OutsideTerrain += 1
 		return false
 	end
 	refreshDynamic()
 	if walk(origin, displacement, COARSE, coarseOccupied) then
 		stats.Coarse += 1
-		if walk(origin, displacement, FINE, fineOccupied) then
+		blockedByMoving = false
+		currentIgnore = ignore
+		local blocked = walk(origin, displacement, FINE, fineOccupied)
+		currentIgnore = nil
+		if blocked then
+			stats.Blocked += 1
+			if blockedByMoving then
+				stats.BlockedMoving += 1
+			end
 			return false
 		end
 	end
@@ -4350,6 +4583,7 @@ function Occupancy.TakeStats()
 	local snapshot = table.clone(stats)
 	snapshot.Ready = ready
 	stats.Checks, stats.Skipped, stats.Coarse = 0, 0, 0
+	stats.NotReady, stats.TooWide, stats.OutsideTerrain, stats.Blocked, stats.BlockedMoving = 0, 0, 0, 0, 0
 	return snapshot
 end
 
@@ -4439,6 +4673,10 @@ workspace.DescendantRemoving:Connect(function(instance)
 		dynamicParts[instance] = nil
 		staticMoves[instance] = nil
 		queryWatched[instance] = nil
+		ownerOf[instance] = nil
+		shaped[instance] = nil
+		shapes[instance] = nil
+		watched[instance] = nil
 	elseif instance:IsA("JointInstance") or instance:IsA("WeldConstraint") then
 		jointRemoved(instance)
 	end
@@ -5380,28 +5618,44 @@ return Replication
 --!optimize 2
 --[[
 	Projectile/Store.luau
-	The hot half of every live projectile, packed into one buffer.
+	The hot half of every live projectile, packed into buffers.
 
 	A projectile is still the table Projectile.new returns, and every field
 	reads and writes as before (projectile.Position, projectile.Velocity = v,
-	projectile.Dead, ...). But the fields touched every frame live in a 64-byte
-	record here instead of in the table, behind the table's metatable. The
+	projectile.Dead, ...). But the fields touched every frame live in the
+	column buffers here (see Layout) instead of in the table, behind the table's metatable. The
 	per-frame loops (Parallel's dispatch/apply, the server step loop) read the
 	records directly, so a projectile that just flies never has its table
 	touched -- a 45-field table is ~2 KB of scattered hash nodes, and at
 	100k+ projectiles each field read was roughly a cache miss.
 
-	Record (STRIDE bytes, slot * STRIDE):
-	   0  Position        3 x f32 (Vector3 is float32, so this is exact)
-	  12  Velocity        3 x f32
-	  24  Age             f64
-	  32  _simulationDebt f64
-	  40  TimeScale       f64 (its OWN scale; non-numbers are stored as 1, which
-	                           is what combinedTimeScale made of them anyway)
-	  48  _sweepMark      f64 (0 when unset)
-	  56  Source          u32 index into a refcounted source list (0: none)
-	  60  flags           u8  (Dead, Dirty, _spawnStreamed, _streamedSynced, and
-	                           Visualize / Beam ~= nil, fixed at adopt)
+	Layout: structure-of-arrays, one buffer ("column") per group of fields
+	used together, indexed by slot. Measured on the apply pass at 180k
+	projectiles, columns beat one 96-byte record per projectile by ~40% with
+	slots in random order (and ~5x on the step loop's mark/flag reads): each
+	hot column is small enough to stay in cache.
+	  Motion  24 B  Position, Velocity (3 x f32 each; Vector3 is float32: exact)
+	  Time    16 B  Age f64, _simulationDebt f64
+	  Marks    4 B  _sweepMark i32 (0 when unset)
+	  Flags    1 B  Dead, Dirty, _spawnStreamed, _streamedSynced, and
+	                Visualize / Beam ~= nil (fixed at adopt)
+	  Scales  16 B  TimeScale f64 (its OWN scale; non-numbers are stored as 1,
+	                which is what combinedTimeScale made of them anyway),
+	                Source u32 (index into a refcounted source list, 0: none)
+	  Cold    32 B  Id, _spawnRealTime, _lastStreamedTimeScale, _parallelState
+	                (f64 each; touched at spawn / death / repack, not per frame)
+	The buffers are replaced when they grow, so read Store.Motion etc. afresh
+	rather than keeping them across anything that can spawn a projectile.
+
+	EFFICIENT projectiles (the default for plain shots, see Projectile.new)
+	have no table of their own beyond a tiny handle ({ _slot }): everything
+	constant per config lives in one shared, frozen spec (Spec.luau), and the
+	handle's metatable (Store.HandleMetatable) reads a field from, in order:
+	the record, the handle's own extras (`_x`, created by the first write of
+	a non-record field -- that projectile's override), lazily created values
+	(signals, scratch tables), the spec, then the class. Writing a motion
+	constant (Gravity, Radius...) also marks the record Dirty, so the worker
+	repacks it next frame.
 
 	Dirty is set by any write of a motion field (Position, Velocity, Age,
 	_simulationDebt, TimeScale, Dead) through the table: it tells Parallel the
@@ -5416,12 +5670,9 @@ return Replication
 
 local Store = {}
 
-local STRIDE = 64
-local POSITION, VELOCITY, AGE, DEBT, SCALE, MARK, SOURCE, FLAGS = 0, 12, 24, 32, 40, 48, 56, 60
-
-Store.Stride = STRIDE
-Store.Position, Store.Velocity, Store.Age, Store.Debt = POSITION, VELOCITY, AGE, DEBT
-Store.TimeScale, Store.Mark, Store.Source, Store.Flags = SCALE, MARK, SOURCE, FLAGS
+-- column strides (bytes per slot)
+local MOTION, TIME, MARKS, SCALES, COLD = 24, 16, 4, 16, 32
+Store.MotionStride, Store.TimeStride, Store.MarkStride, Store.ScaleStride = MOTION, TIME, MARKS, SCALES
 
 local DEAD, DIRTY, SPAWN_STREAMED, SYNCED, VISUALIZE, BEAM = 1, 2, 4, 8, 16, 32
 Store.Dead, Store.Dirty, Store.SpawnStreamed, Store.Synced, Store.Visualize, Store.Beam =
@@ -5429,10 +5680,16 @@ Store.Dead, Store.Dirty, Store.SpawnStreamed, Store.Synced, Store.Visualize, Sto
 
 local readf32, writef32, readf64, writef64 = buffer.readf32, buffer.writef32, buffer.readf64, buffer.writef64
 local readu8, writeu8, readu32, writeu32 = buffer.readu8, buffer.writeu8, buffer.readu32, buffer.writeu32
+local readi32, writei32 = buffer.readi32, buffer.writei32
 local band, bor, bnot = bit32.band, bit32.bor, bit32.bnot
 
 local capacity = 1024
-Store.data = buffer.create(capacity * STRIDE)
+Store.Motion = buffer.create(capacity * MOTION)
+Store.Time = buffer.create(capacity * TIME)
+Store.Marks = buffer.create(capacity * MARKS)
+Store.Flags = buffer.create(capacity)
+Store.Scales = buffer.create(capacity * SCALES)
+Store.Cold = buffer.create(capacity * COLD)
 Store.Generation = {} :: { number } -- [slot] = times released
 local used = 0 -- slots ever handed out
 local free: { number } = {}
@@ -5447,6 +5704,7 @@ local freeSources: { number } = {}
 local HOT: { [string]: number } = {
 	Position = 1, Velocity = 2, Age = 3, _simulationDebt = 4, TimeScale = 5,
 	Dead = 6, _spawnStreamed = 7, _streamedSynced = 8, _sweepMark = 9,
+	Id = 10, _spawnRealTime = 11, _lastStreamedTimeScale = 12, _parallelState = 13,
 }
 Store.HotFields = HOT
 local MOTION_LAST = 6 -- kinds 1..6 mark the record Dirty when written
@@ -5464,74 +5722,104 @@ local function writeVector(b: buffer, o: number, v: Vector3)
 	writef32(b, o + 8, v.Z)
 end
 
-local function flag(b: buffer, o: number, bitValue: number, on: boolean)
-	local flags = readu8(b, o + FLAGS)
-	writeu8(b, o + FLAGS, if on then bor(flags, bitValue) else band(flags, bnot(bitValue)))
+local function flag(slot: number, bitValue: number, on: boolean)
+	local flags = readu8(Store.Flags, slot)
+	writeu8(Store.Flags, slot, if on then bor(flags, bitValue) else band(flags, bnot(bitValue)))
 end
 
 local function read(slot: number, kind: number): any
-	local b, o = Store.data, slot * STRIDE
 	if kind == 1 then
-		return readVector(b, o + POSITION)
+		return readVector(Store.Motion, slot * MOTION)
 	elseif kind == 2 then
-		return readVector(b, o + VELOCITY)
+		return readVector(Store.Motion, slot * MOTION + 12)
 	elseif kind == 3 then
-		return readf64(b, o + AGE)
+		return readf64(Store.Time, slot * TIME)
 	elseif kind == 4 then
-		return readf64(b, o + DEBT)
+		return readf64(Store.Time, slot * TIME + 8)
 	elseif kind == 5 then
-		return readf64(b, o + SCALE)
+		return readf64(Store.Scales, slot * SCALES)
 	elseif kind == 6 then
-		return band(readu8(b, o + FLAGS), DEAD) ~= 0
+		return band(readu8(Store.Flags, slot), DEAD) ~= 0
 	elseif kind == 7 then
-		return band(readu8(b, o + FLAGS), SPAWN_STREAMED) ~= 0
+		return band(readu8(Store.Flags, slot), SPAWN_STREAMED) ~= 0
 	elseif kind == 8 then
-		return band(readu8(b, o + FLAGS), SYNCED) ~= 0
+		return band(readu8(Store.Flags, slot), SYNCED) ~= 0
+	elseif kind == 9 then
+		return readi32(Store.Marks, slot * MARKS)
+	elseif kind == 10 then
+		return readf64(Store.Cold, slot * COLD)
+	elseif kind == 11 then
+		return readf64(Store.Cold, slot * COLD + 8)
+	elseif kind == 12 then
+		return readf64(Store.Cold, slot * COLD + 16)
 	end
-	return readf64(b, o + MARK)
+	local state = readf64(Store.Cold, slot * COLD + 24)
+	return if state == 0 then nil else state
 end
 
 local function write(slot: number, kind: number, value: any)
-	local b, o = Store.data, slot * STRIDE
 	if kind == 1 then
-		writeVector(b, o + POSITION, if typeof(value) == "Vector3" then value else BAD_POSITION)
+		writeVector(Store.Motion, slot * MOTION, if typeof(value) == "Vector3" then value else BAD_POSITION)
 	elseif kind == 2 then
 		-- (Step turns a non-vector Velocity into zero; same here)
-		writeVector(b, o + VELOCITY, if typeof(value) == "Vector3" then value else Vector3.zero)
+		writeVector(Store.Motion, slot * MOTION + 12, if typeof(value) == "Vector3" then value else Vector3.zero)
 	elseif kind == 3 then
-		writef64(b, o + AGE, tonumber(value) or 0)
+		writef64(Store.Time, slot * TIME, tonumber(value) or 0)
 	elseif kind == 4 then
-		writef64(b, o + DEBT, tonumber(value) or 0)
+		writef64(Store.Time, slot * TIME + 8, tonumber(value) or 0)
 	elseif kind == 5 then
-		writef64(b, o + SCALE, if type(value) == "number" then value else 1)
+		writef64(Store.Scales, slot * SCALES, if type(value) == "number" then value else 1)
 	elseif kind == 6 then
-		flag(b, o, DEAD, value == true)
+		flag(slot, DEAD, value == true)
 	elseif kind == 7 then
-		flag(b, o, SPAWN_STREAMED, value == true)
+		flag(slot, SPAWN_STREAMED, value == true)
 	elseif kind == 8 then
-		flag(b, o, SYNCED, value == true)
+		flag(slot, SYNCED, value == true)
+	elseif kind == 9 then
+		writei32(Store.Marks, slot * MARKS, tonumber(value) or 0)
+	elseif kind == 10 then
+		writef64(Store.Cold, slot * COLD, tonumber(value) or 0)
+	elseif kind == 11 then
+		writef64(Store.Cold, slot * COLD + 8, tonumber(value) or 0)
+	elseif kind == 12 then
+		writef64(Store.Cold, slot * COLD + 16, tonumber(value) or 1)
 	else
-		writef64(b, o + MARK, tonumber(value) or 0)
+		writef64(Store.Cold, slot * COLD + 24, tonumber(value) or 0)
 	end
 	if kind <= MOTION_LAST then
-		flag(b, o, DIRTY, true)
+		flag(slot, DIRTY, true)
 	end
 end
 
+local function grow(old: buffer, stride: number): buffer
+	local grown = buffer.create(capacity * 2 * stride)
+	buffer.copy(grown, 0, old, 0, capacity * stride)
+	return grown
+end
+
+-- A fresh slot, every column zeroed.
 local function allocate(): number
 	local slot = table.remove(free)
-	if slot then
-		return slot
+	if not slot then
+		slot = used
+		used += 1
+		if used > capacity then
+			Store.Motion = grow(Store.Motion, MOTION)
+			Store.Time = grow(Store.Time, TIME)
+			Store.Marks = grow(Store.Marks, MARKS)
+			Store.Flags = grow(Store.Flags, 1)
+			Store.Scales = grow(Store.Scales, SCALES)
+			Store.Cold = grow(Store.Cold, COLD)
+			capacity *= 2
+		end
+		Store.Generation[slot] = 0
 	end
-	slot = used
-	used += 1
-	if used > capacity then
-		local grown = buffer.create(capacity * 2 * STRIDE)
-		buffer.copy(grown, 0, Store.data, 0, capacity * STRIDE)
-		capacity *= 2
-		Store.data = grown
-	end
-	Store.Generation[slot] = 0
+	buffer.fill(Store.Motion, slot * MOTION, 0, MOTION)
+	buffer.fill(Store.Time, slot * TIME, 0, TIME)
+	writei32(Store.Marks, slot * MARKS, 0)
+	writeu8(Store.Flags, slot, 0)
+	buffer.fill(Store.Scales, slot * SCALES, 0, SCALES)
+	buffer.fill(Store.Cold, slot * COLD, 0, COLD)
 	return slot
 end
 
@@ -5562,8 +5850,22 @@ local function dropSource(index: number)
 	end
 end
 
--- The metatable live projectiles get: hot fields go to the record, anything
--- else is an ordinary field (or a method from `class`).
+-- REPACK fields: what a worker's packed copy of a projectile depends on
+-- besides the record -- its motion constants (Sweep.MotionSpec) and what
+-- makes it eligible for the workers at all (Homing, lag compensation).
+-- Writing one mid-flight marks the record Dirty, so that frame's worker
+-- result is discarded, the projectile steps serially with the new value and
+-- is repacked (or stays serial, e.g. once it has Homing). On a full
+-- projectile they live in a side table (`_w`) instead of on the table itself,
+-- so that writing them reaches __newindex.
+local REPACK = {
+	Acceleration = true, AccelerationDirection = true, Gravity = true, MinSpeed = true, MaxSpeed = true,
+	Radius = true, Lifetime = true, Homing = true, RewindSeconds = true,
+}
+
+-- The metatable full (table-backed) live projectiles get: hot fields go to
+-- the record, REPACK fields to `_w`, anything else is an ordinary field (or
+-- a method from `class`).
 function Store.Metatable(class: any): any
 	return {
 		__index = function(self: any, key: any): any
@@ -5571,55 +5873,187 @@ function Store.Metatable(class: any): any
 			if kind then
 				return read(self._slot, kind)
 			end
+			if REPACK[key] then
+				local watched = rawget(self, "_w")
+				if watched then
+					return watched[key]
+				end
+			end
 			return class[key]
 		end,
 		__newindex = function(self: any, key: any, value: any)
 			local kind = HOT[key]
 			if kind then
 				write(self._slot, kind, value)
-			else
-				rawset(self, key, value)
+				return
+			end
+			local watched = REPACK[key] and rawget(self, "_w")
+			if watched then
+				watched[key] = value
+				flag(self._slot, DIRTY, true)
+				return
+			end
+			rawset(self, key, value)
+		end,
+	}
+end
+
+local NIL = newproxy() -- an extras entry meaning "overridden to nil"
+
+-- The metatable of an efficient projectile handle built from `spec` (see the
+-- module comment). `lazy[key]()` makes a value the first time it's read
+-- (signals, scratch tables) and keeps it in the handle's extras.
+function Store.HandleMetatable(spec: any, class: any, lazy: { [string]: () -> any }): any
+	return {
+		__index = function(self: any, key: any): any
+			local kind = HOT[key]
+			if kind then
+				local slot = rawget(self, "_slot")
+				-- (released: its record fields were copied in, so a missing one is nil)
+				return if slot then read(slot, kind) else nil
+			end
+			local extras = rawget(self, "_x")
+			if extras then
+				local value = extras[key]
+				if value ~= nil then
+					return if value == NIL then nil else value
+				end
+			end
+			local make = lazy[key]
+			if make then
+				local value = make()
+				if not extras then
+					extras = {}
+					rawset(self, "_x", extras)
+				end
+				extras[key] = value
+				return value
+			end
+			local value = spec[key]
+			if value ~= nil then
+				return value
+			end
+			return class[key]
+		end,
+		__newindex = function(self: any, key: any, value: any)
+			local kind = HOT[key]
+			local slot = rawget(self, "_slot")
+			if kind and slot then
+				write(slot, kind, value)
+				return
+			end
+			local extras = rawget(self, "_x")
+			if value == nil then
+				if spec[key] == nil then
+					-- nothing to shadow: just drop any override
+					if extras then
+						extras[key] = nil
+					end
+					return
+				end
+				value = NIL
+			end
+			if not extras then
+				extras = {}
+				rawset(self, "_x", extras)
+			end
+			extras[key] = value
+			if slot and REPACK[key] then
+				flag(slot, DIRTY, true)
 			end
 		end,
 	}
 end
 
--- Moves a new projectile table's hot fields into a fresh record and gives it
--- `metatable` (from Store.Metatable). Returns the table.
-function Store.Adopt(state: any, metatable: any): any
+-- A field's value if it already exists, without creating a lazy one (so
+-- firing or cleaning up a signal nobody connected to costs nothing).
+function Store.Peek(state: any, key: string): any
+	local value = rawget(state, key)
+	if value ~= nil then
+		return value
+	end
+	local extras = rawget(state, "_x")
+	value = extras and extras[key]
+	return if value == NIL then nil else value
+end
+
+-- Moves hot fields into a fresh record and gives `state` `metatable`.
+-- They're read from `values` (default: `state` itself, whose copies are then
+-- removed); Visualize / Beam / Source come from there too. Returns `state`.
+function Store.Adopt(state: any, metatable: any, values: any?): any
+	local from = values or state
 	local slot = allocate()
-	local b, o = Store.data, slot * STRIDE
-	buffer.fill(b, o, 0, STRIDE)
 	for key, kind in HOT do
-		local value = rawget(state, key)
-		rawset(state, key, nil)
+		local value = rawget(from, key)
+		if from == state then
+			rawset(state, key, nil)
+		end
 		write(slot, kind, value)
 	end
-	local flags = band(readu8(b, o + FLAGS), bnot(DIRTY))
-	if state.Visualize then
+	local flags = band(readu8(Store.Flags, slot), bnot(DIRTY))
+	if rawget(from, "Visualize") then
 		flags = bor(flags, VISUALIZE)
 	end
-	if state.Beam ~= nil then
+	if rawget(from, "Beam") ~= nil then
 		flags = bor(flags, BEAM)
 	end
-	writeu8(b, o + FLAGS, flags)
-	writeu32(b, o + SOURCE, addSource(state.Source))
+	writeu8(Store.Flags, slot, flags)
+	writeu32(Store.Scales, slot * SCALES + 8, addSource(rawget(from, "Source")))
+	if from == state then
+		local watched = {}
+		for key in REPACK do
+			watched[key] = rawget(state, key)
+			rawset(state, key, nil)
+		end
+		rawset(state, "_w", watched)
+	end
 	rawset(state, "_slot", slot)
 	return setmetatable(state, metatable)
 end
 
--- Copies a projectile's hot fields back into its table as plain fields,
--- gives it `metatable` (the class) and frees its record. No-op if it has none.
-function Store.Release(state: any, metatable: any)
+-- Store.Adopt for a fresh efficient handle from plain values (no temporary
+-- table: Projectile.Fire's path). Age, debt, mark and the stream flags start
+-- at 0 / false.
+function Store.AdoptFast(handle: any, metatable: any, position: Vector3, velocity: Vector3, timeScale: number,
+	id: number, spawnTime: number, lastScale: number, visualize: boolean, source: any): any
+	local slot = allocate()
+	local m = slot * MOTION
+	writeVector(Store.Motion, m, position)
+	writeVector(Store.Motion, m + 12, velocity)
+	writef64(Store.Scales, slot * SCALES, timeScale)
+	writeu32(Store.Scales, slot * SCALES + 8, addSource(source))
+	local c = slot * COLD
+	writef64(Store.Cold, c, id)
+	writef64(Store.Cold, c + 8, spawnTime)
+	writef64(Store.Cold, c + 16, lastScale)
+	writeu8(Store.Flags, slot, if visualize then VISUALIZE else 0)
+	rawset(handle, "_slot", slot)
+	return setmetatable(handle, metatable)
+end
+
+-- Copies a projectile's hot fields back into its table as plain fields
+-- (so a kept handle still reads them), gives it `metatable` if one is given
+-- (a full projectile goes back to the class; an efficient handle keeps its
+-- own) and frees its record. No-op if it has none.
+function Store.Release(state: any, metatable: any?)
 	local slot = rawget(state, "_slot")
 	if not slot then
 		return
 	end
-	dropSource(readu32(Store.data, slot * STRIDE + SOURCE))
-	setmetatable(state, metatable)
+	dropSource(readu32(Store.Scales, slot * SCALES + 8))
+	if metatable then
+		setmetatable(state, metatable)
+	end
 	rawset(state, "_slot", nil)
 	for key, kind in HOT do
 		rawset(state, key, read(slot, kind))
+	end
+	local watched = rawget(state, "_w")
+	if watched then
+		rawset(state, "_w", nil)
+		for key, value in watched do
+			rawset(state, key, value)
+		end
 	end
 	Store.Generation[slot] += 1
 	table.insert(free, slot)
@@ -5637,11 +6071,22 @@ function Store.CloneRaw(state: any): any
 		end
 		rawset(copy, "_slot", nil)
 	end
+	local watched = rawget(state, "_w")
+	if watched then
+		rawset(copy, "_w", nil)
+		for key, value in watched do
+			rawset(copy, key, value)
+		end
+	end
 	return copy
 end
 
+function Store.MarkDirty(slot: number)
+	flag(slot, DIRTY, true)
+end
+
 function Store.ClearDirty(slot: number)
-	flag(Store.data, slot * STRIDE, DIRTY, false)
+	flag(slot, DIRTY, false)
 end
 
 -- Live slots (for the Stats tab).
@@ -5652,6 +6097,137 @@ end
 return Store
 -- =============================================================================
 -- END FILE: src/server/Projectile/Store.luau
+-- =============================================================================
+
+-- =============================================================================
+-- BEGIN FILE: src/server/Projectile/Spec.luau
+-- =============================================================================
+--!strict
+--!optimize 2
+--[[
+	Projectile/Spec.luau
+	Compiled configs for EFFICIENT projectiles (see Store.luau): everything a
+	projectile's normalized config makes constant -- damage, visuals, motion
+	constants, bounce/pierce allowances, its raycast filter... -- in one
+	frozen table shared by every projectile fired with an equal config, plus
+	the handle metatable that reads from it.
+
+	Configs are usually fresh tables per shot, so specs are found by VALUE: a
+	trie over the normalized settings (tables by content: IgnoreInstances via
+	the shared RaycastParams it produced, Visual by its shallow contents).
+	Past MAX_SPECS distinct specs the trie is reset -- live projectiles keep
+	theirs, new shots just build new ones.
+]]
+
+local Store = require(script.Parent.Store)
+
+local Spec = {}
+
+local MAX_SPECS = 512
+
+local NIL = newproxy() -- (trie key for nil)
+local trie: { [any]: any } = {}
+local count = 0
+
+-- A shallow table as a key: its sorted contents (nested tables count by
+-- identity, so they just don't share).
+local function contentKey(value: { [any]: any }): string
+	local parts = {}
+	for k, v in value do
+		table.insert(parts, `{tostring(k)}={typeof(v)}:{tostring(v)}`)
+	end
+	table.sort(parts)
+	return table.concat(parts, "|")
+end
+
+-- The spec and handle metatable for these normalized settings (Config.normalize)
+-- and movement RaycastParams. `class` is the Projectile class; `lazy` its
+-- per-projectile values made on first read (see Store.HandleMetatable).
+function Spec.Get(settings: any, rayParams: RaycastParams, class: any, lazy: { [string]: () -> any }): (any, any)
+	local visual = settings.Visual
+	local keys = {
+		settings.Speed, settings.Acceleration, settings.AccelerationDirection, settings.MinSpeed, settings.MaxSpeed,
+		settings.Gravity, settings.Radius, settings.Lifetime, settings.MaxRealLifetime, settings.Damage,
+		settings.Source, settings.Filter, settings.Bounces, settings.Restitution, settings.Penetration,
+		settings.MaxPierces, settings.PierceFalloff, settings.Visualize, settings.VisualRange, settings.Model,
+		if visual then contentKey(visual) else nil, settings.VisualScale, settings.DestroyDelay,
+		settings.WaitForParticles, settings.WaitForTrails, settings.ActivateParticlesOnCreate, settings.OnBounce,
+		rayParams,
+	}
+	local node = trie
+	for index = 1, 28 do
+		local key = keys[index]
+		if key == nil then
+			key = NIL
+		end
+		local nextNode = node[key]
+		if not nextNode then
+			nextNode = {}
+			node[key] = nextNode
+		end
+		node = nextNode
+	end
+	local found = node[NIL]
+	if found then
+		return found[1], found[2]
+	end
+
+	local spec = table.freeze({
+		Speed = settings.Speed,
+		Acceleration = settings.Acceleration,
+		AccelerationDirection = settings.AccelerationDirection,
+		MinSpeed = settings.MinSpeed,
+		MaxSpeed = settings.MaxSpeed,
+		Gravity = settings.Gravity,
+		Radius = settings.Radius,
+		Lifetime = settings.Lifetime,
+		MaxRealLifetime = settings.MaxRealLifetime,
+		Damage = settings.Damage,
+		DamageMultiplier = 1,
+		Source = settings.Source,
+		IgnoreInstances = settings.IgnoreInstances,
+		Filter = settings.Filter,
+		BouncesLeft = settings.Bounces,
+		Restitution = settings.Restitution,
+		Penetration = settings.Penetration,
+		PiercesLeft = settings.MaxPierces,
+		PierceFalloff = settings.PierceFalloff,
+		HomingDelay = 0,
+		ReacquireTimer = 0,
+		Visualize = settings.Visualize,
+		VisualRange = settings.VisualRange,
+		Model = settings.Model,
+		Visual = settings.Visual,
+		VisualScale = settings.VisualScale,
+		DestroyDelay = settings.DestroyDelay,
+		WaitForParticles = settings.WaitForParticles,
+		WaitForTrails = settings.WaitForTrails,
+		ActivateParticlesOnCreate = settings.ActivateParticlesOnCreate,
+		OnBounce = settings.OnBounce,
+		RewindSeconds = 0,
+		_acquireTimer = 0,
+		_rewindTime = 0,
+		_rayParams = rayParams,
+	})
+	local metatable = Store.HandleMetatable(spec, class, lazy)
+	count += 1
+	if count > MAX_SPECS then
+		table.clear(trie)
+		count = 0
+	else
+		node[NIL] = { spec, metatable }
+	end
+	return spec, metatable
+end
+
+-- Distinct specs currently cached (Stats).
+function Spec.Count(): number
+	return count
+end
+
+return Spec
+-- =============================================================================
+-- END FILE: src/server/Projectile/Spec.luau
 -- =============================================================================
 
 -- =============================================================================
@@ -6027,9 +6603,8 @@ local IN_AGE, IN_REMAINING = Sweep.InputAge, Sweep.InputRemaining
 local MIN_CAPACITY = 64
 local readf64, writef64, readf32, writef32, bufferCopy = buffer.readf64, buffer.writef64, buffer.readf32, buffer.writef32, buffer.copy
 local readu8, readu32, writeu8, band = buffer.readu8, buffer.readu32, buffer.writeu8, bit32.band
-local STRIDE = Store.Stride
-local S_POSITION, S_VELOCITY, S_AGE, S_DEBT = Store.Position, Store.Velocity, Store.Age, Store.Debt
-local S_SCALE, S_MARK, S_SOURCE, S_FLAGS = Store.TimeScale, Store.Mark, Store.Source, Store.Flags
+local S_MOTION, S_TIME, S_MARK, S_SCALE = Store.MotionStride, Store.TimeStride, Store.MarkStride, Store.ScaleStride
+local writei32 = buffer.writei32
 local DEAD_OR_DIRTY = bit32.bor(Store.Dead, Store.Dirty)
 local SWEEP_DONE = Sweep.Done
 local LIMIT = SafeMath.Limit
@@ -6085,6 +6660,8 @@ local deferred: { number } = {} -- scratch for Apply
 
 local stats = { Parallel = 0, Resumed = 0, Serial = 0, Fallback = 0, Late = 0, Frames = 0, SlowestWorkerMs = 0, WorkerMs = 0,
 	AppliedFrames = 0, WorkerChecks = 0, WorkerSkipped = 0 }
+-- workers' reasons a cast wasn't skipped: not ready, too wide, outside terrain, blocked, blocked by a moving part
+local workerReasons = { 0, 0, 0, 0, 0 }
 
 local function refreshWorkers()
 	if #workers > 0 then
@@ -6105,7 +6682,7 @@ local function refreshWorkers()
 		return
 	end
 	(event :: BindableEvent).Event:Connect(function(id: number, resultFrame: number, count: number, ms: number,
-		data: buffer, checks: number, skipped: number)
+		data: buffer, checks: number, skipped: number, reasons: { number }?)
 		local result = results[id]
 		if not result then
 			result = { Frame = 0, Count = 0, Ms = 0, Data = nil, Checks = 0, Skipped = 0 }
@@ -6114,6 +6691,14 @@ local function refreshWorkers()
 		result.Frame, result.Count, result.Ms, result.Data = resultFrame, count, ms, data
 		stats.WorkerChecks += checks
 		stats.WorkerSkipped += skipped
+		if reasons then
+			for index = 1, 5 do
+				workerReasons[index] += reasons[index] or 0
+			end
+			-- (6: that worker's moving-part count; the largest is kept)
+			workerReasons[6] = math.max(workerReasons[6] or 0, reasons[6] or 0)
+			workerReasons[7] = reasons[7] or workerReasons[7] -- (7: a worker's largest moving part, by name)
+		end
 	end)
 	table.sort(workers, function(a, b)
 		return a.Actor.Name < b.Actor.Name
@@ -6126,16 +6711,13 @@ end
 local filterByParams: { [RaycastParams]: number } = setmetatable({}, { __mode = "k" }) :: any
 
 local function filterFor(projectile: any): number?
-	local cached = projectile._filterId
-	if cached then
-		return if filterReady[cached] and filterReady[cached] <= frame then cached else nil
-	end
 	local params: RaycastParams = projectile._rayParams
 	-- params are shared between projectiles (Raycast.buildRayParams), so most
-	-- lookups end here, without reading FilterDescendantsInstances back
+	-- lookups end here, without reading FilterDescendantsInstances back (and
+	-- nothing is written to the projectile, which for an efficient one would
+	-- mean a per-projectile override table)
 	local known = filterByParams[params]
 	if known then
-		projectile._filterId = known
 		return if filterReady[known] <= frame then known else nil
 	end
 	local instances = params.FilterDescendantsInstances
@@ -6159,7 +6741,6 @@ local function filterFor(projectile: any): number?
 			worker.Actor:SendMessage("Filter", id, instances, params.IgnoreWater, params.CollisionGroup)
 		end
 	end
-	projectile._filterId = id
 	filterByParams[params] = id
 	return if filterReady[id] <= frame then id else nil
 end
@@ -6276,10 +6857,7 @@ local function eligible(projectile: any): (number?, number?, number?)
 	if not scale then
 		return nil, nil, nil
 	end
-	local filter = projectile._filterId
-	if not filter or filterReady[filter] > frame then
-		filter = filterFor(projectile)
-	end
+	local filter = filterFor(projectile)
 	return scale, filter, specFor(projectile)
 end
 
@@ -6439,9 +7017,9 @@ end
 -- its slot's packed record; the rest go into `deferred` (and released slots
 -- into `released`). Its own function, with typed buffers, so the native
 -- compiler specialises every buffer access. Returns dropped, deferred, kept.
-local function applyPlain(store: buffer, data: buffer, input: buffer, count: number, slots: { number },
-	generations: { number }, scales: { number }, deadlines: { number }, generationOf: { number },
-	sources: { any }, now: number, mark: number): (number, number, number)
+local function applyPlain(motion: buffer, times: buffer, marks: buffer, flagsColumn: buffer, scalesColumn: buffer,
+	data: buffer, input: buffer, count: number, slots: { number }, generations: { number }, scales: { number },
+	deadlines: { number }, generationOf: { number }, sources: { any }, now: number, mark: number): (number, number, number)
 	local dropped, slow, kept = 0, 0, 0
 	for item = 1, count do
 		local slot = slots[item]
@@ -6451,15 +7029,15 @@ local function applyPlain(store: buffer, data: buffer, input: buffer, count: num
 			released[dropped] = item
 			continue
 		end
-		local o = slot * STRIDE
 		local out = (item - 1) * OUT
-		local plain = readu8(data, out + OUT_STATUS) == SWEEP_DONE and band(readu8(store, o + S_FLAGS), DEAD_OR_DIRTY) == 0
+		local plain = readu8(data, out + OUT_STATUS) == SWEEP_DONE and band(readu8(flagsColumn, slot), DEAD_OR_DIRTY) == 0
 			and now < deadlines[item]
 		if plain then
 			-- its scale is still the one it was sent with (own * source's; anything
 			-- unusual goes to the serial code, which uses combinedTimeScale)
-			local own = readf64(store, o + S_SCALE)
-			local index = readu32(store, o + S_SOURCE)
+			local s = slot * S_SCALE
+			local own = readf64(scalesColumn, s)
+			local index = readu32(scalesColumn, s + 8)
 			local sourceScale: any = if index ~= 0 then sources[index].TimeScale else 1
 			plain = type(sourceScale) == "number" and sourceScale >= 0 and own >= 0 and sourceScale < LIMIT
 				and own < LIMIT and sourceScale * own == scales[item]
@@ -6469,12 +7047,13 @@ local function applyPlain(store: buffer, data: buffer, input: buffer, count: num
 			deferred[slow] = item
 			continue
 		end
-		-- position/velocity are float32 in the output, the record and the slot
-		bufferCopy(store, o + S_POSITION, data, out + OUT_POSITION, 24)
+		-- position/velocity are float32 in the output, the column and the slot
+		bufferCopy(motion, slot * S_MOTION, data, out + OUT_POSITION, 24)
 		local age = readf64(data, out + OUT_AGE)
 		local debt = readf64(data, out + OUT_REMAINING)
-		writef64(store, o + S_AGE, age)
-		writef64(store, o + S_DEBT, debt)
+		local t = slot * S_TIME
+		writef64(times, t, age)
+		writef64(times, t + 8, debt)
 		local i = (item - 1) * IN
 		bufferCopy(input, i + IN_MOTION, data, out + OUT_POSITION, 24)
 		writef64(input, i + IN_AGE, age)
@@ -6482,11 +7061,11 @@ local function applyPlain(store: buffer, data: buffer, input: buffer, count: num
 		local px, py, pz = readf32(data, out + OUT_POSITION), readf32(data, out + OUT_POSITION + 4),
 			readf32(data, out + OUT_POSITION + 8)
 		if abs(px) <= LIMIT and abs(py) <= LIMIT and abs(pz) <= LIMIT then
-			writef64(store, o + S_MARK, mark)
+			writei32(marks, slot * S_MARK, mark)
 			kept += 1
 		else
 			-- flew past SafeMath.Limit: dies in the step loop
-			writef64(store, o + S_MARK, -mark)
+			writei32(marks, slot * S_MARK, -mark)
 			dropped += 1
 			released[dropped] = item
 		end
@@ -6540,8 +7119,8 @@ function Parallel.Apply(apply: Applier, mark: number, now: number, timeVersion: 
 		-- Step, allocation) doesn't keep evicting this loop's working set.
 		local dropped, slow, keptHere = 0, 0, 0
 		if sameVersion then
-			dropped, slow, keptHere = applyPlain(Store.data, data, input, count, slots, generations, scales, deadlines,
-				generationOf, Store.Sources, now, mark)
+			dropped, slow, keptHere = applyPlain(Store.Motion, Store.Time, Store.Marks, Store.Flags, Store.Scales,
+				data, input, count, slots, generations, scales, deadlines, generationOf, Store.Sources, now, mark)
 		else
 			for item = 1, count do
 				deferred[item] = item
@@ -6556,7 +7135,7 @@ function Parallel.Apply(apply: Applier, mark: number, now: number, timeVersion: 
 			local item = deferred[index]
 			local projectile = projectiles[item]
 			local status, position, velocity, age, remaining, guard = Sweep.ReadOutputValues(data, item)
-			local flags = readu8(Store.data, slots[item] * STRIDE + S_FLAGS)
+			local flags = readu8(Store.Flags, slots[item])
 			local outcome = apply(projectile, status, position, velocity, age, remaining, guard,
 				band(flags, Store.Dirty) ~= 0, scales[item], batchTimeVersion, batchUniform)
 			local keep = false
@@ -6620,6 +7199,11 @@ function Parallel.TakeStats()
 	snapshot.WorkerMs = stats.WorkerMs / frames
 	stats.Parallel, stats.Resumed, stats.Serial, stats.Fallback, stats.Late, stats.Frames = 0, 0, 0, 0, 0, 0
 	stats.WorkerChecks, stats.WorkerSkipped = 0, 0
+	snapshot.WorkerReasons = table.clone(workerReasons)
+	table.clear(workerReasons)
+	for index = 1, 5 do
+		workerReasons[index] = 0
+	end
 	stats.SlowestWorkerMs, stats.WorkerMs, stats.AppliedFrames = 0, 0, 0
 	return snapshot
 end
@@ -6726,6 +7310,9 @@ return Parallel
 	API:
 	 Projectile.new(config) -> projectile
 	 Projectile.Burst(config, count) -> { projectile }
+	 Projectile.Compile(config) -> compiled   -- do the config work once...
+	 Projectile.Fire(compiled, origin, direction) -> projectile  -- ...then fire it cheaply
+	 Projectile.FireBurst(compiled, origin, direction, count) -> { projectile }
 	 Projectile.SetDebugRays(enabled)            -- default off; see debugRays below
 	 Projectile.SetDefaultMaxRealLifetime(seconds) -- default 60; see MaxRealLifetime below
 	 Projectile.SetDebugSync(enabled)            -- see Projectile/Replication.luau
@@ -6956,6 +7543,7 @@ local Occupancy = require(script.Occupancy)
 local Sweep = require(script.Sweep)
 local Parallel = require(script.Parallel)
 local Store = require(script.Store)
+local Spec = require(script.Spec)
 local Profile = require(script.Profile)
 local RewindHit = require(script.RewindHit)
 local Types = require(script.Types)
@@ -6969,6 +7557,17 @@ Projectile.__index = Projectile
 -- Live projectiles keep their per-frame fields in Store's buffer behind this
 -- metatable (fields read and write as usual); released ones get Projectile.
 local Live = Store.Metatable(Projectile)
+-- Per-projectile values an efficient handle only makes when first read.
+local LAZY: { [string]: () -> any } = {
+	OnHit = Signal.new,
+	OnDestroy = Signal.new,
+	_ignore = function()
+		return {}
+	end,
+	_rewindCache = function()
+		return {}
+	end,
+}
 
 -- The live projectile: its public/internal state plus the methods below.
 -- Declared as an intersection (not typeof(setmetatable(...))) so a projectile
@@ -6981,6 +7580,16 @@ type Methods = {
 	ClearBeamPrevious: (self: Projectile) -> (),
 }
 export type Projectile = Types.State & Methods
+
+-- A config prepared once by Projectile.Compile, fired with Projectile.Fire.
+export type Compiled = {
+	Config: Config, -- (a private copy; the fallback for shots that can't be efficient)
+	Efficient: boolean,
+	Settings: any,
+	Metatable: any,
+	Spread: number,
+	InitialScale: number,
+}
 
 local MIN_STEP_DT = ProjectileMotion.MinStepDt
 local MAX_SUBSTEPS = Sweep.MaxSubsteps -- shared with the parallel workers' copy of the loop
@@ -7056,10 +7665,59 @@ end
 -- Construction
 --------------------------------------------------------------------------------
 
+local createProjectile: (config: Config) -> Projectile
+
+-- (timed for the Stats tab's frame split: spawning runs wherever the caller
+-- does, usually between frames)
 function Projectile.new(config: Config): Projectile
+	local started = os.clock()
+	local self = createProjectile(config)
+	Profile.Add("Spawn", os.clock() - started)
+	Profile.Count("Spawned", 1)
+	return self
+end
+
+function createProjectile(config: Config): Projectile
 	local settings = Config.normalize(config, defaultMaxRealLifetime)
 	local homing = settings.Homing
 	nextId += 1
+
+	-- EFFICIENT (the default for plain shots): no table of its own, just a
+	-- handle on a Store record and a shared spec -- see Store.luau / Spec.luau.
+	-- Homing, beams and lag-compensated shots carry lots of per-projectile
+	-- state and step serially anyway, so they keep a full table, as does
+	-- anything with config.Efficient = false.
+	if config.Efficient ~= false and not homing and not settings.Beam and settings.RewindSeconds <= 0 then
+		local rayParams = Raycast.buildRayParams(settings.Source, settings.IgnoreInstances)
+		local _, metatable = Spec.Get(settings, rayParams, Projectile, LAZY)
+		local initial = {
+			Source = settings.Source,
+			TimeScale = settings.TimeScale,
+			Visualize = settings.Visualize,
+		}
+		local values = {
+			Id = nextId,
+			Position = settings.Origin,
+			Velocity = settings.Direction * settings.Speed,
+			Age = 0,
+			_simulationDebt = 0,
+			TimeScale = settings.TimeScale,
+			Dead = false,
+			_spawnRealTime = os.clock(),
+			_spawnStreamed = false,
+			_streamedSynced = false, -- (no homing target, no beam)
+			-- baseline for Replication.updateTimeScale, as below
+			_lastStreamedTimeScale = combinedTimeScale(initial :: any),
+			Visualize = settings.Visualize,
+			Source = settings.Source,
+		}
+		local self: Projectile = Store.Adopt({ _slot = 0 }, metatable, values)
+		table.insert(active, self)
+		table.insert(activeSlot, (self :: any)._slot)
+		Replication.spawnVisual(self)
+		Parallel.Offer(self)
+		return self
+	end
 
 	local state: Types.State = {
 		Id = nextId,
@@ -7186,6 +7844,82 @@ function Projectile.Burst(config: Config, count: number): { Projectile }
 		pellet.TargetPosition = nil
 		pellet.Direction = Math.coneDirection(baseDirection, spread)
 		table.insert(shots, Projectile.new(pellet))
+	end
+	return shots
+end
+
+--------------------------------------------------------------------------------
+-- Compiled configs
+--------------------------------------------------------------------------------
+
+-- Does everything Projectile.new does with a config ONCE -- normalizing it,
+-- its raycast params, finding its shared spec (Spec.luau) -- so firing it is
+-- just a buffer record and a handle (Projectile.Fire). For anything fired
+-- repeatedly with the same settings: a weapon, a spell cast's copies, a
+-- stress test. Origin / Direction / TargetPosition in `config` are ignored
+-- (each Fire gives its own). Source is baked in, so compile per shooter.
+-- Configs that can't be efficient (homing, beams, lag compensation,
+-- Efficient = false) still work: Fire falls back to Projectile.new.
+function Projectile.Compile(config: Config): Compiled
+	local copy = table.clone(config)
+	copy.Origin, copy.Direction, copy.TargetPosition = nil, nil, nil
+	local settings = Config.normalize(copy, defaultMaxRealLifetime)
+	local efficient = copy.Efficient ~= false and not settings.Homing and not settings.Beam
+		and settings.RewindSeconds <= 0
+	local metatable = nil
+	if efficient then
+		local rayParams = Raycast.buildRayParams(settings.Source, settings.IgnoreInstances)
+		local _, found = Spec.Get(settings, rayParams, Projectile, LAZY)
+		metatable = found
+	end
+	return table.freeze({
+		Config = copy, -- (never mutated: Fire clones it)
+		Efficient = efficient,
+		Settings = settings,
+		Metatable = metatable,
+		Spread = Config.spread(copy),
+		-- the combined scale a shot starts with, unless Source's changes
+		InitialScale = SafeMath.number(settings.TimeScale, 1, 0),
+	}) :: any
+end
+
+-- One projectile from a compiled config, from `origin` along `direction`.
+function Projectile.Fire(compiled: Compiled, origin: Vector3, direction: Vector3): Projectile
+	local started = os.clock()
+	local self: Projectile
+	if compiled.Efficient then
+		local settings = compiled.Settings
+		origin = SafeMath.vector(origin, Vector3.zero)
+		direction = SafeMath.unit(direction, Vector3.zAxis)
+		nextId += 1
+		local source = settings.Source
+		local ownScale = compiled.InitialScale
+		-- (combinedTimeScale, inline: the Source's scale is read live)
+		local sourceScale = SafeMath.number(source and source.TimeScale, 1, 0)
+		local lastScale = SafeMath.number(sourceScale * ownScale, 0, 0)
+		self = Store.AdoptFast({ _slot = 0 }, compiled.Metatable, origin, direction * settings.Speed, ownScale,
+			nextId, os.clock(), lastScale, settings.Visualize, source)
+		table.insert(active, self)
+		table.insert(activeSlot, (self :: any)._slot)
+		Replication.spawnVisual(self)
+		Parallel.Offer(self)
+	else
+		local config = table.clone(compiled.Config) :: any
+		config.Origin, config.Direction = origin, direction
+		self = createProjectile(config)
+	end
+	Profile.Add("Spawn", os.clock() - started)
+	Profile.Count("Spawned", 1)
+	return self
+end
+
+-- `count` projectiles from a compiled config, spread around `direction` by
+-- its Spread (like Projectile.Burst).
+function Projectile.FireBurst(compiled: Compiled, origin: Vector3, direction: Vector3, count: number): { Projectile }
+	local base = SafeMath.unit(direction, Vector3.zAxis)
+	local shots = {}
+	for _ = 1, math.floor(SafeMath.number(count, 0, 0, MAX_BURST_COUNT)) do
+		table.insert(shots, Projectile.Fire(compiled, origin, Math.coneDirection(base, compiled.Spread)))
 	end
 	return shots
 end
@@ -7785,7 +8519,9 @@ function Projectile.Destroy(self: Projectile, result: { Position: Vector3, Norma
 		return
 	end
 	self.Dead = true
-	self._beamJoinerWorldStop = kind == "world" and not self._beamBodyHit
+	if self.Beam then
+		self._beamJoinerWorldStop = kind == "world" and not self._beamBodyHit
+	end
 	local info: Types.DestroyInfo = {
 		Position = if result then SafeMath.vector(result.Position, self.Position) else self.Position,
 		Normal = if result then SafeMath.unit(result.Normal, Vector3.yAxis) else Vector3.yAxis,
@@ -7801,16 +8537,28 @@ function Projectile.Destroy(self: Projectile, result: { Position: Vector3, Norma
 	-- Exactly-once -- see the module doc comment's "Events" section. Every
 	-- removal path funnels through this one call, including natural expiry
 	-- (which the step loop below Destroy()s once Step returns false).
-	self.OnDestroy:Fire(info)
+	-- (peeked: an efficient projectile only has the signal if someone connected)
+	local onDestroy = Store.Peek(self, "OnDestroy")
+	if onDestroy then
+		onDestroy:Fire(info)
+	end
 
 	-- Defensive: drop heavy references so a projectile object that somehow
 	-- outlives removal from `active` (e.g. a caller retaining the returned
 	-- handle) doesn't keep entities/closures alive through it.
-	table.clear(self._ignore)
+	local ignore = Store.Peek(self, "_ignore")
+	if ignore then
+		table.clear(ignore)
+	end
 	self.HomingTarget = nil
 	self._beamPrevious = nil
-	self.OnHit:Destroy()
-	self.OnDestroy:Destroy()
+	local onHit = Store.Peek(self, "OnHit")
+	if onHit then
+		onHit:Destroy()
+	end
+	if onDestroy then
+		onDestroy:Destroy()
+	end
 end
 
 --------------------------------------------------------------------------------
@@ -7818,12 +8566,25 @@ end
 --------------------------------------------------------------------------------
 
 local readf64, readu8, band = buffer.readf64, buffer.readu8, bit32.band
-local STORE_STRIDE, STORE_MARK, STORE_FLAGS, STORE_DEAD = Store.Stride, Store.Mark, Store.Flags, Store.Dead
+local STORE_MARK_STRIDE, STORE_DEAD = Store.MarkStride, Store.Dead
+local readi32 = buffer.readi32
 local POSE_NEEDS = bit32.bor(Store.Visualize, Store.SpawnStreamed)
 local POSE_EITHER = bit32.bor(Store.Synced, Store.Beam)
 
+-- Frame split for the Stats tab: the wall time between our own handlers,
+-- i.e. what the rest of the frame costs (see the Heartbeat/PreSimulation
+-- handlers below).
+local dispatchEndedAt = 0
+local stepEndedAt = 0
+
 Heartbeat.Connect(function(globalDt: number)
 	phaseFrames += 1
+	local stepStartedAt = os.clock()
+	if dispatchEndedAt > 0 and stepEndedAt < dispatchEndedAt then
+		-- our dispatch -> this step: the parallel phase (workers), physics, and
+		-- every other script's simulation / Heartbeat handlers that ran first
+		Profile.Add("FrameSimulation", stepStartedAt - dispatchEndedAt)
+	end
 	local replicationStarted = os.clock()
 	Replication.flushHitBatch()
 	local replicationElapsed = os.clock() - replicationStarted
@@ -7845,12 +8606,12 @@ Heartbeat.Connect(function(globalDt: number)
 	-- Reads each projectile's Store record, not its table (see Store.luau).
 	for i = stepCount, 1, -1 do
 		local projectile = active[i]
-		local o = activeSlot[i] * STORE_STRIDE
+		local slot = activeSlot[i]
 		local alive
-		local mark = readf64(Store.data, o + STORE_MARK)
+		local mark = readi32(Store.Marks, slot * STORE_MARK_STRIDE)
 		if mark == stepMark then
 			-- (something earlier in this loop may have destroyed it since)
-			alive = band(readu8(Store.data, o + STORE_FLAGS), STORE_DEAD) == 0
+			alive = band(readu8(Store.Flags, slot), STORE_DEAD) == 0
 		elseif mark == -stepMark then
 			alive = false
 		else
@@ -7865,7 +8626,7 @@ Heartbeat.Connect(function(globalDt: number)
 			-- refreshes and immediate topology corrections after link refinement.
 			-- (queuePose's own condition -- Visualize and _spawnStreamed and
 			-- (_streamedSynced or Beam ~= nil) -- checked here to skip the call)
-			local flags = readu8(Store.data, o + STORE_FLAGS)
+			local flags = readu8(Store.Flags, slot)
 			if band(flags, POSE_NEEDS) == POSE_NEEDS and band(flags, POSE_EITHER) ~= 0 then
 				Replication.queuePose(projectile)
 			end
@@ -7877,7 +8638,8 @@ Heartbeat.Connect(function(globalDt: number)
 			activeSlot[last] = nil
 			local destroyStarted = os.clock()
 			projectile:Destroy(nil, nil)
-			Store.Release(projectile, Projectile)
+			-- (a full projectile goes back to a plain table; a handle keeps its metatable)
+			Store.Release(projectile, if getmetatable(projectile) == Live then Projectile else nil)
 			destroyTime += os.clock() - destroyStarted
 		end
 	end
@@ -7905,6 +8667,8 @@ Heartbeat.Connect(function(globalDt: number)
 	Replication.flushSpawnBatch()
 	Replication.flushMoveBatch()
 	recordPhase("Replication", replicationElapsed + os.clock() - flushStarted)
+	stepEndedAt = os.clock()
+	Profile.Add("FrameOurs", stepEndedAt - stepStartedAt)
 end, { Name = "ProjectileSystem.Step", Priority = 5 })
 
 -- Parallel movement dispatch: before physics, so the workers' parallel phase
@@ -7912,9 +8676,16 @@ end, { Name = "ProjectileSystem.Step", Priority = 5 })
 -- dilated the same way Heartbeat.Connect callbacks receive it).
 RunService.PreSimulation:Connect(function(dt: number)
 	local started = os.clock()
+	if stepEndedAt > 0 and stepEndedAt > dispatchEndedAt then
+		-- our last step -> this dispatch: replication, other scripts' callbacks,
+		-- and everything else the engine does between frames
+		Profile.Add("FrameBetween", started - stepEndedAt)
+	end
 	dispatchNow = started
 	Parallel.Dispatch(#active, dt * Heartbeat.GetGlobalTimeScale(), not debugRays)
-	dispatchElapsed = os.clock() - started
+	dispatchEndedAt = os.clock()
+	dispatchElapsed = dispatchEndedAt - started
+	Profile.Add("FrameOurs", dispatchElapsed)
 end)
 
 return Projectile
@@ -8352,6 +9123,11 @@ if not actor then
 		results.Name = "Results"
 		results.Parent = folder
 	end
+	if not folder:FindFirstChild("OccupancyHello") then
+		local hello = Instance.new("BindableEvent")
+		hello.Name = "OccupancyHello" -- a worker is listening: send it every shape so far
+		hello.Parent = folder
+	end
 	if not folder:FindFirstChildWhichIsA("Actor") then
 		for index = 1, WORKER_COUNT do
 			local workerActor = Instance.new("Actor")
@@ -8374,10 +9150,23 @@ local Shared = ReplicatedStorage:WaitForChild("Shared")
 local ChunkManager = require(Shared:WaitForChild("ChunkManager"))
 local projectileModule = (actor.Parent :: Instance).Parent:WaitForChild("Projectile")
 local Sweep = require(projectileModule:WaitForChild("Sweep"))
+-- (tells Occupancy it's a worker's copy: it takes the main thread's shape
+-- probes instead of running its own -- see Occupancy.ApplyShape)
+_G.__RelativityOccupancyWorker = true
 local Occupancy = require(projectileModule:WaitForChild("Occupancy"))
 local results = (actor.Parent :: Instance):WaitForChild("Results") :: BindableEvent
 
 local filters: { [number]: RaycastParams } = {}
+local filterIgnores: { [number]: { [Instance]: boolean } } = {} -- filter id -> its excluded instances (for Occupancy)
+
+actor:BindToMessage("OccupancyShape", function(part: BasePart, boxes: { Vector3 })
+	Occupancy.ApplyShape(part, boxes)
+end)
+-- now that it's bound, ask for every shape the main thread already sent
+-- (Actor messages sent before a handler is bound are dropped)
+task.defer(function()
+	((actor.Parent :: Instance):WaitForChild("OccupancyHello") :: BindableEvent):Fire(actor)
+end)
 local specs: { [number]: Sweep.MotionSpec } = {}
 
 -- Motion spec `id` (a projectile's per-shot constants, see Sweep.MotionSpec).
@@ -8398,6 +9187,11 @@ actor:BindToMessage("Filter", function(id: number, instances: { Instance }, igno
 	params.IgnoreWater = ignoreWater
 	params.CollisionGroup = group
 	filters[id] = params
+	local set = {}
+	for _, instance in instances do
+		set[instance] = true
+	end
+	filterIgnores[id] = set
 end)
 
 -- The main thread's chunk time scales and zones, replacing what we had.
@@ -8426,7 +9220,7 @@ end
 -- Same as Raycast.castMovement's decision: empty space is skipped, otherwise
 -- the engine cast with the projectile's filter. True when anything is hit.
 local function castHits(from: Vector3, displacement: Vector3, radius: number, filter: number): boolean
-	if Occupancy.SegmentClear(from, displacement, radius) then
+	if Occupancy.SegmentClear(from, displacement, radius, filterIgnores[filter]) then
 		return false
 	end
 	local params = filters[filter]
@@ -8452,7 +9246,10 @@ actor:BindToMessageParallel("Sweep", function(frame: number, input: buffer, coun
 	local ms = (os.clock() - started) * 1000 -- how long this batch took (Stats tab)
 	local occupancy = Occupancy.TakeStats()
 	task.synchronize()
-	results:Fire(workerId, frame, count, ms, result, occupancy.Checks, occupancy.Skipped)
+	results:Fire(workerId, frame, count, ms, result, occupancy.Checks, occupancy.Skipped, {
+		occupancy.NotReady, occupancy.TooWide, occupancy.OutsideTerrain, occupancy.Blocked, occupancy.BlockedMoving,
+		occupancy.DynamicParts, occupancy.LargestDynamic,
+	})
 end)
 -- =============================================================================
 -- END FILE: src/server/ProjectileWorkerBootstrap.server.luau

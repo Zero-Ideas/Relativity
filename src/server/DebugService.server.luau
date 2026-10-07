@@ -629,9 +629,22 @@ local function buildStats()
 		-- main thread (serial path) + every worker
 		RaycastChecks = occupancy.Checks + (parallel.WorkerChecks or 0),
 		RaycastsSkipped = occupancy.Skipped + (parallel.WorkerSkipped or 0),
+		-- why the rest weren't: not baked / too wide / outside terrain / near geometry / near a moving part
+		RaycastReasons = (function()
+			local reasons = parallel.WorkerReasons or { 0, 0, 0, 0, 0 }
+			return {
+				(reasons[1] or 0) + (occupancy.NotReady or 0),
+				(reasons[2] or 0) + (occupancy.TooWide or 0),
+				(reasons[3] or 0) + (occupancy.OutsideTerrain or 0),
+				(reasons[4] or 0) + (occupancy.Blocked or 0),
+				(reasons[5] or 0) + (occupancy.BlockedMoving or 0),
+			}
+		end)(),
 		OccupancyReady = occupancy.Ready,
 		OccupancyCells = occupancy.StaticCells,
 		OccupancyDynamic = occupancy.DynamicParts,
+		OccupancyWorkerDynamic = parallel.WorkerReasons and parallel.WorkerReasons[6] or 0,
+		OccupancyWorkerLargest = parallel.WorkerReasons and parallel.WorkerReasons[7],
 		ParallelSteps = parallel.Parallel,
 		ResumedSteps = parallel.Resumed,
 		SerialSteps = parallel.Serial,

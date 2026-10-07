@@ -78,9 +78,8 @@ local IN_AGE, IN_REMAINING = Sweep.InputAge, Sweep.InputRemaining
 local MIN_CAPACITY = 64
 local readf64, writef64, readf32, writef32, bufferCopy = buffer.readf64, buffer.writef64, buffer.readf32, buffer.writef32, buffer.copy
 local readu8, readu32, writeu8, band = buffer.readu8, buffer.readu32, buffer.writeu8, bit32.band
-local STRIDE = Store.Stride
-local S_POSITION, S_VELOCITY, S_AGE, S_DEBT = Store.Position, Store.Velocity, Store.Age, Store.Debt
-local S_SCALE, S_MARK, S_SOURCE, S_FLAGS = Store.TimeScale, Store.Mark, Store.Source, Store.Flags
+local S_MOTION, S_TIME, S_MARK, S_SCALE = Store.MotionStride, Store.TimeStride, Store.MarkStride, Store.ScaleStride
+local writei32 = buffer.writei32
 local DEAD_OR_DIRTY = bit32.bor(Store.Dead, Store.Dirty)
 local SWEEP_DONE = Sweep.Done
 local LIMIT = SafeMath.Limit
@@ -136,6 +135,8 @@ local deferred: { number } = {} -- scratch for Apply
 
 local stats = { Parallel = 0, Resumed = 0, Serial = 0, Fallback = 0, Late = 0, Frames = 0, SlowestWorkerMs = 0, WorkerMs = 0,
 	AppliedFrames = 0, WorkerChecks = 0, WorkerSkipped = 0 }
+-- workers' reasons a cast wasn't skipped: not ready, too wide, outside terrain, blocked, blocked by a moving part
+local workerReasons = { 0, 0, 0, 0, 0 }
 
 local function refreshWorkers()
 	if #workers > 0 then
@@ -156,7 +157,7 @@ local function refreshWorkers()
 		return
 	end
 	(event :: BindableEvent).Event:Connect(function(id: number, resultFrame: number, count: number, ms: number,
-		data: buffer, checks: number, skipped: number)
+		data: buffer, checks: number, skipped: number, reasons: { number }?)
 		local result = results[id]
 		if not result then
 			result = { Frame = 0, Count = 0, Ms = 0, Data = nil, Checks = 0, Skipped = 0 }
@@ -165,6 +166,14 @@ local function refreshWorkers()
 		result.Frame, result.Count, result.Ms, result.Data = resultFrame, count, ms, data
 		stats.WorkerChecks += checks
 		stats.WorkerSkipped += skipped
+		if reasons then
+			for index = 1, 5 do
+				workerReasons[index] += reasons[index] or 0
+			end
+			-- (6: that worker's moving-part count; the largest is kept)
+			workerReasons[6] = math.max(workerReasons[6] or 0, reasons[6] or 0)
+			workerReasons[7] = reasons[7] or workerReasons[7] -- (7: a worker's largest moving part, by name)
+		end
 	end)
 	table.sort(workers, function(a, b)
 		return a.Actor.Name < b.Actor.Name
@@ -177,16 +186,13 @@ end
 local filterByParams: { [RaycastParams]: number } = setmetatable({}, { __mode = "k" }) :: any
 
 local function filterFor(projectile: any): number?
-	local cached = projectile._filterId
-	if cached then
-		return if filterReady[cached] and filterReady[cached] <= frame then cached else nil
-	end
 	local params: RaycastParams = projectile._rayParams
 	-- params are shared between projectiles (Raycast.buildRayParams), so most
-	-- lookups end here, without reading FilterDescendantsInstances back
+	-- lookups end here, without reading FilterDescendantsInstances back (and
+	-- nothing is written to the projectile, which for an efficient one would
+	-- mean a per-projectile override table)
 	local known = filterByParams[params]
 	if known then
-		projectile._filterId = known
 		return if filterReady[known] <= frame then known else nil
 	end
 	local instances = params.FilterDescendantsInstances
@@ -210,7 +216,6 @@ local function filterFor(projectile: any): number?
 			worker.Actor:SendMessage("Filter", id, instances, params.IgnoreWater, params.CollisionGroup)
 		end
 	end
-	projectile._filterId = id
 	filterByParams[params] = id
 	return if filterReady[id] <= frame then id else nil
 end
@@ -327,10 +332,7 @@ local function eligible(projectile: any): (number?, number?, number?)
 	if not scale then
 		return nil, nil, nil
 	end
-	local filter = projectile._filterId
-	if not filter or filterReady[filter] > frame then
-		filter = filterFor(projectile)
-	end
+	local filter = filterFor(projectile)
 	return scale, filter, specFor(projectile)
 end
 
@@ -490,9 +492,9 @@ end
 -- its slot's packed record; the rest go into `deferred` (and released slots
 -- into `released`). Its own function, with typed buffers, so the native
 -- compiler specialises every buffer access. Returns dropped, deferred, kept.
-local function applyPlain(store: buffer, data: buffer, input: buffer, count: number, slots: { number },
-	generations: { number }, scales: { number }, deadlines: { number }, generationOf: { number },
-	sources: { any }, now: number, mark: number): (number, number, number)
+local function applyPlain(motion: buffer, times: buffer, marks: buffer, flagsColumn: buffer, scalesColumn: buffer,
+	data: buffer, input: buffer, count: number, slots: { number }, generations: { number }, scales: { number },
+	deadlines: { number }, generationOf: { number }, sources: { any }, now: number, mark: number): (number, number, number)
 	local dropped, slow, kept = 0, 0, 0
 	for item = 1, count do
 		local slot = slots[item]
@@ -502,15 +504,15 @@ local function applyPlain(store: buffer, data: buffer, input: buffer, count: num
 			released[dropped] = item
 			continue
 		end
-		local o = slot * STRIDE
 		local out = (item - 1) * OUT
-		local plain = readu8(data, out + OUT_STATUS) == SWEEP_DONE and band(readu8(store, o + S_FLAGS), DEAD_OR_DIRTY) == 0
+		local plain = readu8(data, out + OUT_STATUS) == SWEEP_DONE and band(readu8(flagsColumn, slot), DEAD_OR_DIRTY) == 0
 			and now < deadlines[item]
 		if plain then
 			-- its scale is still the one it was sent with (own * source's; anything
 			-- unusual goes to the serial code, which uses combinedTimeScale)
-			local own = readf64(store, o + S_SCALE)
-			local index = readu32(store, o + S_SOURCE)
+			local s = slot * S_SCALE
+			local own = readf64(scalesColumn, s)
+			local index = readu32(scalesColumn, s + 8)
 			local sourceScale: any = if index ~= 0 then sources[index].TimeScale else 1
 			plain = type(sourceScale) == "number" and sourceScale >= 0 and own >= 0 and sourceScale < LIMIT
 				and own < LIMIT and sourceScale * own == scales[item]
@@ -520,12 +522,13 @@ local function applyPlain(store: buffer, data: buffer, input: buffer, count: num
 			deferred[slow] = item
 			continue
 		end
-		-- position/velocity are float32 in the output, the record and the slot
-		bufferCopy(store, o + S_POSITION, data, out + OUT_POSITION, 24)
+		-- position/velocity are float32 in the output, the column and the slot
+		bufferCopy(motion, slot * S_MOTION, data, out + OUT_POSITION, 24)
 		local age = readf64(data, out + OUT_AGE)
 		local debt = readf64(data, out + OUT_REMAINING)
-		writef64(store, o + S_AGE, age)
-		writef64(store, o + S_DEBT, debt)
+		local t = slot * S_TIME
+		writef64(times, t, age)
+		writef64(times, t + 8, debt)
 		local i = (item - 1) * IN
 		bufferCopy(input, i + IN_MOTION, data, out + OUT_POSITION, 24)
 		writef64(input, i + IN_AGE, age)
@@ -533,11 +536,11 @@ local function applyPlain(store: buffer, data: buffer, input: buffer, count: num
 		local px, py, pz = readf32(data, out + OUT_POSITION), readf32(data, out + OUT_POSITION + 4),
 			readf32(data, out + OUT_POSITION + 8)
 		if abs(px) <= LIMIT and abs(py) <= LIMIT and abs(pz) <= LIMIT then
-			writef64(store, o + S_MARK, mark)
+			writei32(marks, slot * S_MARK, mark)
 			kept += 1
 		else
 			-- flew past SafeMath.Limit: dies in the step loop
-			writef64(store, o + S_MARK, -mark)
+			writei32(marks, slot * S_MARK, -mark)
 			dropped += 1
 			released[dropped] = item
 		end
@@ -591,8 +594,8 @@ function Parallel.Apply(apply: Applier, mark: number, now: number, timeVersion: 
 		-- Step, allocation) doesn't keep evicting this loop's working set.
 		local dropped, slow, keptHere = 0, 0, 0
 		if sameVersion then
-			dropped, slow, keptHere = applyPlain(Store.data, data, input, count, slots, generations, scales, deadlines,
-				generationOf, Store.Sources, now, mark)
+			dropped, slow, keptHere = applyPlain(Store.Motion, Store.Time, Store.Marks, Store.Flags, Store.Scales,
+				data, input, count, slots, generations, scales, deadlines, generationOf, Store.Sources, now, mark)
 		else
 			for item = 1, count do
 				deferred[item] = item
@@ -607,7 +610,7 @@ function Parallel.Apply(apply: Applier, mark: number, now: number, timeVersion: 
 			local item = deferred[index]
 			local projectile = projectiles[item]
 			local status, position, velocity, age, remaining, guard = Sweep.ReadOutputValues(data, item)
-			local flags = readu8(Store.data, slots[item] * STRIDE + S_FLAGS)
+			local flags = readu8(Store.Flags, slots[item])
 			local outcome = apply(projectile, status, position, velocity, age, remaining, guard,
 				band(flags, Store.Dirty) ~= 0, scales[item], batchTimeVersion, batchUniform)
 			local keep = false
@@ -671,6 +674,11 @@ function Parallel.TakeStats()
 	snapshot.WorkerMs = stats.WorkerMs / frames
 	stats.Parallel, stats.Resumed, stats.Serial, stats.Fallback, stats.Late, stats.Frames = 0, 0, 0, 0, 0, 0
 	stats.WorkerChecks, stats.WorkerSkipped = 0, 0
+	snapshot.WorkerReasons = table.clone(workerReasons)
+	table.clear(workerReasons)
+	for index = 1, 5 do
+		workerReasons[index] = 0
+	end
 	stats.SlowestWorkerMs, stats.WorkerMs, stats.AppliedFrames = 0, 0, 0
 	return snapshot
 end

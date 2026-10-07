@@ -35,6 +35,7 @@ SECTIONS = [
         "src/server/Projectile/RewindHit.luau",
         "src/server/Projectile/Replication.luau",
         "src/server/Projectile/Store.luau",
+        "src/server/Projectile/Spec.luau",
         "src/server/Projectile/Sweep.luau",
         "src/server/Projectile/Profile.luau",
         "src/server/Projectile/Parallel.luau",

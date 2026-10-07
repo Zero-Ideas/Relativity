@@ -63,6 +63,8 @@ local TERRAIN_AROUND_PARTS = 512 -- studs of terrain scanned beyond the map's pa
 local TERRAIN_DEFAULT_MIN = Vector3.new(-2048, -512, -2048) -- terrain-only maps
 local TERRAIN_DEFAULT_MAX = Vector3.new(2048, 1024, 2048)
 local REFINE_OVER = 32 -- studs: bigger non-box parts are baked by their real shape
+local REFINE_DIVISIONS = 16 -- a part is refined down to about 1/16 of its size (power-of-two pieces)
+local REFINE_MAX_PROBES = 6000 -- per part; past this the rest is kept whole
 local REFINE_SLICE = 0.004 -- seconds of shape probing per resumption
 
 -- Sweeps wider than this always raycast (the padding wouldn't cover them).
@@ -87,7 +89,15 @@ local FULL = buffer.create(MASK_BYTES)
 buffer.fill(FULL, 0, 255)
 masks[buffer.tostring(FULL)] = FULL
 local scratch = buffer.create(MASK_BYTES)
-local dynamic: { [number]: boolean } = {} -- coarse key -> something moving there this frame
+-- coarse key -> the padded boxes of whatever moves through that cell this
+-- frame, as (lo, hi, owner) triples; a fine voxel is only blocked if it
+-- overlaps one. `owner` is the part's top-level ancestor under workspace (a
+-- character, a model...): a query whose raycast filter excludes that owner
+-- ignores its boxes (see SegmentClear), so e.g. slow shots hanging around
+-- their own shooter still skip.
+local dynamic: { [number]: { any } } = {}
+local ownerOf: { [BasePart]: Instance } = {}
+local currentIgnore: { [Instance]: boolean }? = nil -- the running query's excluded instances
 local dynamicParts: { [BasePart]: boolean } = {}
 local staticMoves: { [BasePart]: number } = {}
 local watchedRoots: { [BasePart]: { BasePart } } = {} -- anchored root -> parts welded to it
@@ -97,7 +107,12 @@ local ready = false
 local hasTerrain = false
 local terrainMin, terrainMax = Vector3.zero, Vector3.zero
 
-local stats = { Checks = 0, Skipped = 0, Coarse = 0, StaticCells = 0, DistinctMasks = 1, DynamicParts = 0 }
+local stats = { Checks = 0, Skipped = 0, Coarse = 0, StaticCells = 0, DistinctMasks = 1, DynamicParts = 0,
+	-- why a check wasn't skipped (Stats tab)
+	NotReady = 0, TooWide = 0, OutsideTerrain = 0, Blocked = 0, BlockedMoving = 0,
+	LargestDynamic = nil :: string?, -- (diagnostic: the biggest moving part, by name)
+}
+local blockedByMoving = false -- set by fineOccupied when a moving part's cell is what blocked
 
 local function intern(mask: buffer): buffer
 	local contents = buffer.tostring(mask)
@@ -171,11 +186,68 @@ local function markStatic(lo: Vector3, hi: Vector3)
 	end
 end
 
-local function markDynamicBox(lo: Vector3, hi: Vector3)
+-- Marks many boxes at once (`boxes`: lo, hi pairs on the FINE grid, e.g.
+-- from refineShape). Each touched cell is edited in one private copy and
+-- interned once at the end -- marking them one by one through markStatic
+-- would intern (and keep forever) every intermediate state of every cell,
+-- which for a big mesh's ~10^5 voxels was gigabytes.
+local function markVoxels(boxes: { Vector3 })
+	local pending: { [number]: buffer } = {}
+	for index = 1, #boxes, 2 do
+		local lo, hi = boxes[index], boxes[index + 1]
+		local fx0, fy0, fz0 = math.round(lo.X / FINE), math.round(lo.Y / FINE), math.round(lo.Z / FINE)
+		local fx1, fy1, fz1 = math.round(hi.X / FINE) - 1, math.round(hi.Y / FINE) - 1, math.round(hi.Z / FINE) - 1
+		for cz = fz0 // DIV, fz1 // DIV do
+			local az, bz = max(fz0 - cz * DIV, 0), min(fz1 - cz * DIV, DIV - 1)
+			for cy = fy0 // DIV, fy1 // DIV do
+				local ay, by = max(fy0 - cy * DIV, 0), min(fy1 - cy * DIV, DIV - 1)
+				for cx = fx0 // DIV, fx1 // DIV do
+					local ax, bx = max(fx0 - cx * DIV, 0), min(fx1 - cx * DIV, DIV - 1)
+					local k = cellKey(cx, cy, cz)
+					local mask = pending[k]
+					if not mask then
+						local current = static[k]
+						if current == FULL then
+							continue
+						end
+						mask = buffer.create(MASK_BYTES)
+						if current then
+							buffer.copy(mask, 0, current, 0, MASK_BYTES)
+						end
+						pending[k] = mask
+					end
+					local row = lshift(lshift(1, bx - ax + 1) - 1, ax)
+					for fz = az, bz do
+						for fy = ay, by do
+							local offset = (fy + fz * DIV) * ROW_BYTES
+							writeu16(mask, offset, bor(readu16(mask, offset), row))
+						end
+					end
+				end
+			end
+		end
+	end
+	for k, mask in pending do
+		if not static[k] then
+			stats.StaticCells += 1
+		end
+		static[k] = intern(mask)
+	end
+end
+
+local function markDynamicBox(lo: Vector3, hi: Vector3, owner: Instance)
 	for cz = floor(lo.Z / COARSE), floor(hi.Z / COARSE) do
 		for cy = floor(lo.Y / COARSE), floor(hi.Y / COARSE) do
 			for cx = floor(lo.X / COARSE), floor(hi.X / COARSE) do
-				dynamic[cellKey(cx, cy, cz)] = true
+				local k = cellKey(cx, cy, cz)
+				local boxes = dynamic[k]
+				if not boxes then
+					boxes = {}
+					dynamic[k] = boxes
+				end
+				table.insert(boxes, lo)
+				table.insert(boxes, hi)
+				table.insert(boxes, owner)
 			end
 		end
 	end
@@ -191,17 +263,32 @@ local function refreshDynamic()
 	dynamicStamp = stamp
 	table.clear(dynamic)
 	local count = 0
+	local largest, largestSize = nil, 0
 	for part in dynamicParts do
 		if not part.Parent then
 			dynamicParts[part] = nil
 			continue
 		end
 		count += 1
+		local size = part.Size.Magnitude
+		if size > largestSize then
+			largest, largestSize = part, size
+		end
 		local reach = PAD + DYNAMIC_MARGIN + part.AssemblyLinearVelocity.Magnitude * DYNAMIC_LOOKAHEAD
 		local lo, hi = bounds(part, reach)
-		markDynamicBox(lo, hi)
+		local owner = ownerOf[part]
+		if not owner or not owner.Parent then
+			local node: Instance = part
+			while node.Parent and node.Parent ~= workspace do
+				node = node.Parent :: Instance
+			end
+			owner = node
+			ownerOf[part] = node
+		end
+		markDynamicBox(lo, hi, owner :: Instance)
 	end
 	stats.DynamicParts = count
+	stats.LargestDynamic = if largest then `{largest:GetFullName()} ({math.floor(largestSize)})` else nil
 end
 
 --------------------------------------------------------------------------------
@@ -224,36 +311,57 @@ local function boxShaped(part: BasePart): boolean
 	return part:IsA("Part") and (part :: Part).Shape == Enum.PartType.Block
 end
 
--- The FINE-voxel boxes (lo, hi pairs) of `part`'s real collision geometry,
--- each grown by PAD for the test (so marking them needs no further padding):
--- its box is split into octants on the voxel grid and a piece is kept only
--- if GetPartsInPart finds the part in it. Yields every REFINE_SLICE. nil if
--- the part left the world meanwhile.
+-- The boxes (lo, hi pairs on the FINE grid) covering `part`'s real
+-- collision geometry, each tested grown by PAD (so marking them needs no
+-- further padding): its box is split into octants and a piece is kept only
+-- if GetPartsInPart finds the part in it. Pieces stop at a power-of-two
+-- `leaf` near 1/REFINE_DIVISIONS of the part (so a 900-stud tree costs about
+-- what a 50-stud rock does), and past REFINE_MAX_PROBES whatever is left is
+-- kept whole (still safe, just coarser). Yields every REFINE_SLICE; nil if the
+-- part left the world meanwhile.
 local probe = Instance.new("Part")
 probe.Anchored = true
+
+local function leafFor(part: BasePart): number
+	local size = part.Size
+	local wanted = max(size.X, size.Y, size.Z) / REFINE_DIVISIONS
+	local leaf = FINE
+	while leaf < wanted and leaf < COARSE do
+		leaf *= 2
+	end
+	return leaf
+end
 
 local function refineShape(part: BasePart): { Vector3 }?
 	local params = OverlapParams.new()
 	params.FilterType = Enum.RaycastFilterType.Include
 	params.FilterDescendantsInstances = { part }
 	local grow = Vector3.one * (2 * PAD)
+	local leaf = leafFor(part)
 	local lo, hi = bounds(part, 0)
-	lo = Vector3.new(floor(lo.X / FINE) * FINE, floor(lo.Y / FINE) * FINE, floor(lo.Z / FINE) * FINE)
-	hi = Vector3.new(math.ceil(hi.X / FINE) * FINE, math.ceil(hi.Y / FINE) * FINE, math.ceil(hi.Z / FINE) * FINE)
+	lo = Vector3.new(floor(lo.X / leaf) * leaf, floor(lo.Y / leaf) * leaf, floor(lo.Z / leaf) * leaf)
+	hi = Vector3.new(math.ceil(hi.X / leaf) * leaf, math.ceil(hi.Y / leaf) * leaf, math.ceil(hi.Z / leaf) * leaf)
 	local boxes: { Vector3 } = {}
 	local stack: { Vector3 } = { lo, hi }
 	local sliceStarted = os.clock()
-	-- an axis range split in two on the voxel grid (one range if it's one voxel)
+	local probes = 0
+	-- an axis range split in two on the leaf grid (one range if it's one leaf)
 	local function halves(a: number, b: number): { number }
-		if b - a <= FINE then
+		if b - a <= leaf then
 			return { a, b }
 		end
-		local m = a + math.ceil((b - a) / FINE / 2) * FINE
+		local m = a + math.ceil((b - a) / leaf / 2) * leaf
 		return { a, m, m, b }
 	end
 	while #stack > 0 do
 		local nodeHi = table.remove(stack) :: Vector3
 		local nodeLo = table.remove(stack) :: Vector3
+		if probes >= REFINE_MAX_PROBES then
+			-- out of budget: keep the rest whole
+			table.insert(boxes, nodeLo)
+			table.insert(boxes, nodeHi)
+			continue
+		end
 		if os.clock() - sliceStarted > REFINE_SLICE then
 			task.wait()
 			sliceStarted = os.clock()
@@ -261,13 +369,14 @@ local function refineShape(part: BasePart): { Vector3 }?
 				return nil
 			end
 		end
+		probes += 1
 		probe.Size = nodeHi - nodeLo + grow
 		probe.CFrame = CFrame.new((nodeLo + nodeHi) * 0.5)
 		if #workspace:GetPartsInPart(probe, params) == 0 then
 			continue
 		end
 		local size = nodeHi - nodeLo
-		if size.X <= FINE and size.Y <= FINE and size.Z <= FINE then
+		if size.X <= leaf and size.Y <= leaf and size.Z <= leaf then
 			table.insert(boxes, nodeLo)
 			table.insert(boxes, nodeHi)
 			continue
@@ -283,6 +392,67 @@ local function refineShape(part: BasePart): { Vector3 }?
 		end
 	end
 	return boxes
+end
+
+-- Workers don't probe (that's the main thread's job, once): they keep a big
+-- shaped part dynamic until the main thread sends its boxes (ApplyShape).
+local isWorker = _G.__RelativityOccupancyWorker == true
+local shaped: { [BasePart]: boolean } = {} -- (worker) boxes already applied
+local watched: { [BasePart]: boolean } = {}
+
+-- (main) Every refined shape so far, so a worker that starts listening
+-- late (messages sent before an Actor binds its handler are dropped) still
+-- gets them all: each worker fires ProjectileActors.OccupancyHello once its
+-- handler is bound, and is sent the lot.
+local shapes: { [BasePart]: { Vector3 } } = {}
+
+local function actorsFolder(): Instance?
+	return game:GetService("ServerScriptService"):FindFirstChild("ProjectileActors", true)
+end
+
+-- (main) Sends a part's refined boxes to every projectile worker.
+local function broadcastShape(part: BasePart, boxes: { Vector3 })
+	shapes[part] = boxes
+	local folder = actorsFolder()
+	if not folder then
+		return
+	end
+	for _, actor in folder:GetChildren() do
+		if actor:IsA("Actor") then
+			local ok, err = pcall(function()
+				actor:SendMessage("OccupancyShape", part, boxes)
+			end)
+			if not ok then
+				warn(`[Projectile] occupancy: couldn't send {part:GetFullName()}'s shape ({#boxes // 2} boxes) to a worker: {err}`)
+			end
+		end
+	end
+end
+
+if not isWorker then
+	task.spawn(function()
+		local folder = actorsFolder()
+		while not folder do
+			task.wait(0.5)
+			folder = actorsFolder()
+		end
+		local function sendAll(actor: Actor)
+			for part, boxes in shapes do
+				if part.Parent then
+					actor:SendMessage("OccupancyShape", part, boxes)
+				end
+			end
+		end
+		local hello = (folder :: Instance):WaitForChild("OccupancyHello") :: BindableEvent
+		hello.Event:Connect(sendAll)
+		-- and once now, for any worker that said hello before we listened
+		-- (duplicates are harmless: ApplyShape just marks the same voxels)
+		for _, actor in (folder :: Instance):GetChildren() do
+			if actor:IsA("Actor") then
+				sendAll(actor)
+			end
+		end
+	end)
 end
 
 local queryWatched: { [BasePart]: boolean } = {}
@@ -373,21 +543,42 @@ function classify(part: BasePart)
 	end
 	local size = part.Size
 	if (size.X > REFINE_OVER or size.Y > REFINE_OVER or size.Z > REFINE_OVER) and not boxShaped(part) then
+		if isWorker then
+			if not shaped[part] then
+				makeDynamic(part) -- (conservative until the main thread's boxes arrive)
+			end
+			return
+		end
 		makeDynamic(part) -- (conservative while its shape is probed)
 		local boxes = refineShape(part)
 		if not boxes or not part.Parent then
 			return
 		end
-		local inset = Vector3.one * 0.01 -- (a voxel's far face would also mark its neighbour)
-		for index = 1, #boxes, 2 do
-			markStatic(boxes[index], boxes[index + 1] - inset)
-		end
+		markVoxels(boxes)
+		broadcastShape(part, boxes)
 	else
 		local lo, hi = bounds(part, PAD)
 		markStatic(lo, hi)
 	end
 	dynamicParts[part] = nil
-	watchStatic(part)
+	if not watched[part] then
+		watched[part] = true
+		watchStatic(part)
+	end
+end
+
+-- (worker) The main thread's refined boxes for a big shaped part.
+function Occupancy.ApplyShape(part: BasePart, boxes: { Vector3 })
+	if not part.Parent then
+		return
+	end
+	shaped[part] = true
+	markVoxels(boxes)
+	dynamicParts[part] = nil
+	if not watched[part] then
+		watched[part] = true
+		watchStatic(part)
+	end
 end
 
 -- A joint went away: its parts may now be loose, so stop trusting them as static.
@@ -407,8 +598,19 @@ end
 local function fineOccupied(fx: number, fy: number, fz: number): boolean
 	local cx, cy, cz = fx // DIV, fy // DIV, fz // DIV
 	local k = cellKey(cx, cy, cz)
-	if dynamic[k] then
-		return true
+	local moving = dynamic[k]
+	if moving then
+		local x0, y0, z0 = fx * FINE, fy * FINE, fz * FINE
+		local x1, y1, z1 = x0 + FINE, y0 + FINE, z0 + FINE
+		local ignore = currentIgnore
+		for index = 1, #moving, 3 do
+			local lo, hi = moving[index], moving[index + 1]
+			if x1 > lo.X and x0 < hi.X and y1 > lo.Y and y0 < hi.Y and z1 > lo.Z and z0 < hi.Z
+				and not (ignore and ignore[moving[index + 2]]) then
+				blockedByMoving = true
+				return true
+			end
+		end
 	end
 	local mask = static[k]
 	if not mask then
@@ -420,7 +622,7 @@ end
 
 local function coarseOccupied(cx: number, cy: number, cz: number): boolean
 	local k = cellKey(cx, cy, cz)
-	return dynamic[k] == true or static[k] ~= nil
+	return dynamic[k] ~= nil or static[k] ~= nil
 end
 
 -- Amanatides-Woo walk of every `size`-stud voxel the segment passes through;
@@ -472,18 +674,35 @@ end
 -- hits nothing, so the caller can skip its raycast. Conservative: any doubt
 -- (not baked yet, too wide, outside scanned terrain, anything near the path)
 -- returns false.
-function Occupancy.SegmentClear(origin: Vector3, displacement: Vector3, radius: number): boolean
+-- `ignore` (optional): instances the caller's raycast excludes (with their
+-- descendants); moving parts belonging to them don't block.
+function Occupancy.SegmentClear(origin: Vector3, displacement: Vector3, radius: number,
+	ignore: { [Instance]: boolean }?): boolean
 	stats.Checks += 1
-	if not ready or not Occupancy.Enabled or radius > Occupancy.MaxRadius then
+	if not ready or not Occupancy.Enabled then
+		stats.NotReady += 1
+		return false
+	end
+	if radius > Occupancy.MaxRadius then
+		stats.TooWide += 1
 		return false
 	end
 	if hasTerrain and not insideTerrainScan(origin, origin + displacement) then
+		stats.OutsideTerrain += 1
 		return false
 	end
 	refreshDynamic()
 	if walk(origin, displacement, COARSE, coarseOccupied) then
 		stats.Coarse += 1
-		if walk(origin, displacement, FINE, fineOccupied) then
+		blockedByMoving = false
+		currentIgnore = ignore
+		local blocked = walk(origin, displacement, FINE, fineOccupied)
+		currentIgnore = nil
+		if blocked then
+			stats.Blocked += 1
+			if blockedByMoving then
+				stats.BlockedMoving += 1
+			end
 			return false
 		end
 	end
@@ -496,6 +715,7 @@ function Occupancy.TakeStats()
 	local snapshot = table.clone(stats)
 	snapshot.Ready = ready
 	stats.Checks, stats.Skipped, stats.Coarse = 0, 0, 0
+	stats.NotReady, stats.TooWide, stats.OutsideTerrain, stats.Blocked, stats.BlockedMoving = 0, 0, 0, 0, 0
 	return snapshot
 end
 
@@ -585,6 +805,10 @@ workspace.DescendantRemoving:Connect(function(instance)
 		dynamicParts[instance] = nil
 		staticMoves[instance] = nil
 		queryWatched[instance] = nil
+		ownerOf[instance] = nil
+		shaped[instance] = nil
+		shapes[instance] = nil
+		watched[instance] = nil
 	elseif instance:IsA("JointInstance") or instance:IsA("WeldConstraint") then
 		jointRemoved(instance)
 	end

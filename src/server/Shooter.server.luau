@@ -488,22 +488,23 @@ VisualOffload.On("StressTestFire", function(data, player)
 	local serverOnly = typeof(data) == "table" and data.ServerOnly == true
 	local shooter = Entity.Get(character)
 
+	-- Compiled once per batch, fired per projectile (Projectile.Compile).
+	local compiled = Projectile.Compile({
+		Speed = 220,
+		Lifetime = 4,
+		Damage = 0, -- pure load test; never affects real gameplay/entities
+		Source = shooter,
+		IgnoreInstances = { character },
+		Visualize = not serverOnly,
+		VisualRange = 8000,
+		Visual = { Shape = "Ball", Size = Vector3.one * 0.4, Color = Color3.fromRGB(255, 140, 60) },
+		-- No Homing: plain straight bullets like the TimeBlaster's own shots
+		-- (homing projectiles step serially -- see Projectile/Parallel.luau).
+	})
+	local center = root.Position
 	for _ = 1, count do
 		local direction = randomDirection()
-		Projectile.new({
-			Origin = root.Position + direction * 3,
-			Direction = direction,
-			Speed = 220,
-			Lifetime = 4,
-			Damage = 0, -- pure load test; never affects real gameplay/entities
-			Source = shooter,
-			IgnoreInstances = { character },
-			Visualize = not serverOnly,
-			VisualRange = 8000,
-			Visual = { Shape = "Ball", Size = Vector3.one * 0.4, Color = Color3.fromRGB(255, 140, 60) },
-			-- No Homing: plain straight bullets like the TimeBlaster's own shots
-			-- (homing projectiles step serially -- see Projectile/Parallel.luau).
-		})
+		Projectile.Fire(compiled, center + direction * 3, direction)
 	end
 
 	print(`[Relativity] stress test: spawned {count}{if serverOnly then " server-only" else ""} projectiles for {player.Name}`)

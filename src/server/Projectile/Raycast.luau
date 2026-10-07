@@ -18,6 +18,7 @@ local SafeMath = require(Shared:WaitForChild("SafeMath"))
 local Replication = require(script.Parent.Replication)
 local Occupancy = require(script.Parent.Occupancy)
 local Types = require(script.Parent.Types)
+local Store = require(script.Parent.Store)
 
 type State = Types.State
 type Verdict = Types.Verdict
@@ -47,6 +48,15 @@ local MAX_SHARED_PARAMS = 1024
 local sharedParams: { [any]: any } = {}
 local sharedCount = 0
 local LEAF = newproxy() -- (trie key for a node's params; can't collide with an Instance)
+
+-- OnHit, if anyone connected (an efficient projectile only has the signal
+-- once someone has).
+local function fireHit(projectile: any, info: any)
+	local signal = Store.Peek(projectile, "OnHit")
+	if signal then
+		signal:Fire(info)
+	end
+end
 
 function Raycast.buildRayParams(source: Types.EntityLike?, ignoreInstances: { Instance }?): RaycastParams
 	local ignore: { Instance } = {}
@@ -166,7 +176,7 @@ function Raycast.resolveEntityHit(
 		return "fallthrough"
 	end
 
-	projectile.OnHit:Fire(Raycast.buildHitInfo(contact, entity, hurtbox))
+	fireHit(projectile, Raycast.buildHitInfo(contact, entity, hurtbox))
 	if projectile.PiercesLeft > 0 then
 		projectile.PiercesLeft -= 1
 		projectile.DamageMultiplier *= (1 - projectile.PierceFalloff)
@@ -246,7 +256,7 @@ function Raycast.resolveHit(projectile: State, contact: Types.Contact): (Verdict
 	if projectile.Penetration > 0 then
 		local exitPosition = attemptPenetration(projectile, contact)
 		if exitPosition then
-			projectile.OnHit:Fire(Raycast.buildHitInfo(contact, entity, nil))
+			fireHit(projectile, Raycast.buildHitInfo(contact, entity, nil))
 			projectile.Position = exitPosition
 			return "pass", nil
 		end
@@ -273,11 +283,11 @@ function Raycast.resolveHit(projectile: State, contact: Types.Contact): (Verdict
 		if onBounce then
 			task.spawn(onBounce, projectile, contact)
 		end
-		projectile.OnHit:Fire(Raycast.buildHitInfo(contact, entity, nil))
+		fireHit(projectile, Raycast.buildHitInfo(contact, entity, nil))
 		return "bounce", nil
 	end
 
-	projectile.OnHit:Fire(Raycast.buildHitInfo(contact, entity, nil))
+	fireHit(projectile, Raycast.buildHitInfo(contact, entity, nil))
 	return "destroy", "world"
 end
 

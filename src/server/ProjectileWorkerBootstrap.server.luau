@@ -32,6 +32,11 @@ if not actor then
 		results.Name = "Results"
 		results.Parent = folder
 	end
+	if not folder:FindFirstChild("OccupancyHello") then
+		local hello = Instance.new("BindableEvent")
+		hello.Name = "OccupancyHello" -- a worker is listening: send it every shape so far
+		hello.Parent = folder
+	end
 	if not folder:FindFirstChildWhichIsA("Actor") then
 		for index = 1, WORKER_COUNT do
 			local workerActor = Instance.new("Actor")
@@ -54,10 +59,23 @@ local Shared = ReplicatedStorage:WaitForChild("Shared")
 local ChunkManager = require(Shared:WaitForChild("ChunkManager"))
 local projectileModule = (actor.Parent :: Instance).Parent:WaitForChild("Projectile")
 local Sweep = require(projectileModule:WaitForChild("Sweep"))
+-- (tells Occupancy it's a worker's copy: it takes the main thread's shape
+-- probes instead of running its own -- see Occupancy.ApplyShape)
+_G.__RelativityOccupancyWorker = true
 local Occupancy = require(projectileModule:WaitForChild("Occupancy"))
 local results = (actor.Parent :: Instance):WaitForChild("Results") :: BindableEvent
 
 local filters: { [number]: RaycastParams } = {}
+local filterIgnores: { [number]: { [Instance]: boolean } } = {} -- filter id -> its excluded instances (for Occupancy)
+
+actor:BindToMessage("OccupancyShape", function(part: BasePart, boxes: { Vector3 })
+	Occupancy.ApplyShape(part, boxes)
+end)
+-- now that it's bound, ask for every shape the main thread already sent
+-- (Actor messages sent before a handler is bound are dropped)
+task.defer(function()
+	((actor.Parent :: Instance):WaitForChild("OccupancyHello") :: BindableEvent):Fire(actor)
+end)
 local specs: { [number]: Sweep.MotionSpec } = {}
 
 -- Motion spec `id` (a projectile's per-shot constants, see Sweep.MotionSpec).
@@ -78,6 +96,11 @@ actor:BindToMessage("Filter", function(id: number, instances: { Instance }, igno
 	params.IgnoreWater = ignoreWater
 	params.CollisionGroup = group
 	filters[id] = params
+	local set = {}
+	for _, instance in instances do
+		set[instance] = true
+	end
+	filterIgnores[id] = set
 end)
 
 -- The main thread's chunk time scales and zones, replacing what we had.
@@ -106,7 +129,7 @@ end
 -- Same as Raycast.castMovement's decision: empty space is skipped, otherwise
 -- the engine cast with the projectile's filter. True when anything is hit.
 local function castHits(from: Vector3, displacement: Vector3, radius: number, filter: number): boolean
-	if Occupancy.SegmentClear(from, displacement, radius) then
+	if Occupancy.SegmentClear(from, displacement, radius, filterIgnores[filter]) then
 		return false
 	end
 	local params = filters[filter]
@@ -132,5 +155,8 @@ actor:BindToMessageParallel("Sweep", function(frame: number, input: buffer, coun
 	local ms = (os.clock() - started) * 1000 -- how long this batch took (Stats tab)
 	local occupancy = Occupancy.TakeStats()
 	task.synchronize()
-	results:Fire(workerId, frame, count, ms, result, occupancy.Checks, occupancy.Skipped)
+	results:Fire(workerId, frame, count, ms, result, occupancy.Checks, occupancy.Skipped, {
+		occupancy.NotReady, occupancy.TooWide, occupancy.OutsideTerrain, occupancy.Blocked, occupancy.BlockedMoving,
+		occupancy.DynamicParts, occupancy.LargestDynamic,
+	})
 end)

@@ -92,6 +92,9 @@
 	API:
 	 Projectile.new(config) -> projectile
 	 Projectile.Burst(config, count) -> { projectile }
+	 Projectile.Compile(config) -> compiled   -- do the config work once...
+	 Projectile.Fire(compiled, origin, direction) -> projectile  -- ...then fire it cheaply
+	 Projectile.FireBurst(compiled, origin, direction, count) -> { projectile }
 	 Projectile.SetDebugRays(enabled)            -- default off; see debugRays below
 	 Projectile.SetDefaultMaxRealLifetime(seconds) -- default 60; see MaxRealLifetime below
 	 Projectile.SetDebugSync(enabled)            -- see Projectile/Replication.luau
@@ -322,6 +325,7 @@ local Occupancy = require(script.Occupancy)
 local Sweep = require(script.Sweep)
 local Parallel = require(script.Parallel)
 local Store = require(script.Store)
+local Spec = require(script.Spec)
 local Profile = require(script.Profile)
 local RewindHit = require(script.RewindHit)
 local Types = require(script.Types)
@@ -335,6 +339,17 @@ Projectile.__index = Projectile
 -- Live projectiles keep their per-frame fields in Store's buffer behind this
 -- metatable (fields read and write as usual); released ones get Projectile.
 local Live = Store.Metatable(Projectile)
+-- Per-projectile values an efficient handle only makes when first read.
+local LAZY: { [string]: () -> any } = {
+	OnHit = Signal.new,
+	OnDestroy = Signal.new,
+	_ignore = function()
+		return {}
+	end,
+	_rewindCache = function()
+		return {}
+	end,
+}
 
 -- The live projectile: its public/internal state plus the methods below.
 -- Declared as an intersection (not typeof(setmetatable(...))) so a projectile
@@ -347,6 +362,16 @@ type Methods = {
 	ClearBeamPrevious: (self: Projectile) -> (),
 }
 export type Projectile = Types.State & Methods
+
+-- A config prepared once by Projectile.Compile, fired with Projectile.Fire.
+export type Compiled = {
+	Config: Config, -- (a private copy; the fallback for shots that can't be efficient)
+	Efficient: boolean,
+	Settings: any,
+	Metatable: any,
+	Spread: number,
+	InitialScale: number,
+}
 
 local MIN_STEP_DT = ProjectileMotion.MinStepDt
 local MAX_SUBSTEPS = Sweep.MaxSubsteps -- shared with the parallel workers' copy of the loop
@@ -422,10 +447,59 @@ end
 -- Construction
 --------------------------------------------------------------------------------
 
+local createProjectile: (config: Config) -> Projectile
+
+-- (timed for the Stats tab's frame split: spawning runs wherever the caller
+-- does, usually between frames)
 function Projectile.new(config: Config): Projectile
+	local started = os.clock()
+	local self = createProjectile(config)
+	Profile.Add("Spawn", os.clock() - started)
+	Profile.Count("Spawned", 1)
+	return self
+end
+
+function createProjectile(config: Config): Projectile
 	local settings = Config.normalize(config, defaultMaxRealLifetime)
 	local homing = settings.Homing
 	nextId += 1
+
+	-- EFFICIENT (the default for plain shots): no table of its own, just a
+	-- handle on a Store record and a shared spec -- see Store.luau / Spec.luau.
+	-- Homing, beams and lag-compensated shots carry lots of per-projectile
+	-- state and step serially anyway, so they keep a full table, as does
+	-- anything with config.Efficient = false.
+	if config.Efficient ~= false and not homing and not settings.Beam and settings.RewindSeconds <= 0 then
+		local rayParams = Raycast.buildRayParams(settings.Source, settings.IgnoreInstances)
+		local _, metatable = Spec.Get(settings, rayParams, Projectile, LAZY)
+		local initial = {
+			Source = settings.Source,
+			TimeScale = settings.TimeScale,
+			Visualize = settings.Visualize,
+		}
+		local values = {
+			Id = nextId,
+			Position = settings.Origin,
+			Velocity = settings.Direction * settings.Speed,
+			Age = 0,
+			_simulationDebt = 0,
+			TimeScale = settings.TimeScale,
+			Dead = false,
+			_spawnRealTime = os.clock(),
+			_spawnStreamed = false,
+			_streamedSynced = false, -- (no homing target, no beam)
+			-- baseline for Replication.updateTimeScale, as below
+			_lastStreamedTimeScale = combinedTimeScale(initial :: any),
+			Visualize = settings.Visualize,
+			Source = settings.Source,
+		}
+		local self: Projectile = Store.Adopt({ _slot = 0 }, metatable, values)
+		table.insert(active, self)
+		table.insert(activeSlot, (self :: any)._slot)
+		Replication.spawnVisual(self)
+		Parallel.Offer(self)
+		return self
+	end
 
 	local state: Types.State = {
 		Id = nextId,
@@ -552,6 +626,82 @@ function Projectile.Burst(config: Config, count: number): { Projectile }
 		pellet.TargetPosition = nil
 		pellet.Direction = Math.coneDirection(baseDirection, spread)
 		table.insert(shots, Projectile.new(pellet))
+	end
+	return shots
+end
+
+--------------------------------------------------------------------------------
+-- Compiled configs
+--------------------------------------------------------------------------------
+
+-- Does everything Projectile.new does with a config ONCE -- normalizing it,
+-- its raycast params, finding its shared spec (Spec.luau) -- so firing it is
+-- just a buffer record and a handle (Projectile.Fire). For anything fired
+-- repeatedly with the same settings: a weapon, a spell cast's copies, a
+-- stress test. Origin / Direction / TargetPosition in `config` are ignored
+-- (each Fire gives its own). Source is baked in, so compile per shooter.
+-- Configs that can't be efficient (homing, beams, lag compensation,
+-- Efficient = false) still work: Fire falls back to Projectile.new.
+function Projectile.Compile(config: Config): Compiled
+	local copy = table.clone(config)
+	copy.Origin, copy.Direction, copy.TargetPosition = nil, nil, nil
+	local settings = Config.normalize(copy, defaultMaxRealLifetime)
+	local efficient = copy.Efficient ~= false and not settings.Homing and not settings.Beam
+		and settings.RewindSeconds <= 0
+	local metatable = nil
+	if efficient then
+		local rayParams = Raycast.buildRayParams(settings.Source, settings.IgnoreInstances)
+		local _, found = Spec.Get(settings, rayParams, Projectile, LAZY)
+		metatable = found
+	end
+	return table.freeze({
+		Config = copy, -- (never mutated: Fire clones it)
+		Efficient = efficient,
+		Settings = settings,
+		Metatable = metatable,
+		Spread = Config.spread(copy),
+		-- the combined scale a shot starts with, unless Source's changes
+		InitialScale = SafeMath.number(settings.TimeScale, 1, 0),
+	}) :: any
+end
+
+-- One projectile from a compiled config, from `origin` along `direction`.
+function Projectile.Fire(compiled: Compiled, origin: Vector3, direction: Vector3): Projectile
+	local started = os.clock()
+	local self: Projectile
+	if compiled.Efficient then
+		local settings = compiled.Settings
+		origin = SafeMath.vector(origin, Vector3.zero)
+		direction = SafeMath.unit(direction, Vector3.zAxis)
+		nextId += 1
+		local source = settings.Source
+		local ownScale = compiled.InitialScale
+		-- (combinedTimeScale, inline: the Source's scale is read live)
+		local sourceScale = SafeMath.number(source and source.TimeScale, 1, 0)
+		local lastScale = SafeMath.number(sourceScale * ownScale, 0, 0)
+		self = Store.AdoptFast({ _slot = 0 }, compiled.Metatable, origin, direction * settings.Speed, ownScale,
+			nextId, os.clock(), lastScale, settings.Visualize, source)
+		table.insert(active, self)
+		table.insert(activeSlot, (self :: any)._slot)
+		Replication.spawnVisual(self)
+		Parallel.Offer(self)
+	else
+		local config = table.clone(compiled.Config) :: any
+		config.Origin, config.Direction = origin, direction
+		self = createProjectile(config)
+	end
+	Profile.Add("Spawn", os.clock() - started)
+	Profile.Count("Spawned", 1)
+	return self
+end
+
+-- `count` projectiles from a compiled config, spread around `direction` by
+-- its Spread (like Projectile.Burst).
+function Projectile.FireBurst(compiled: Compiled, origin: Vector3, direction: Vector3, count: number): { Projectile }
+	local base = SafeMath.unit(direction, Vector3.zAxis)
+	local shots = {}
+	for _ = 1, math.floor(SafeMath.number(count, 0, 0, MAX_BURST_COUNT)) do
+		table.insert(shots, Projectile.Fire(compiled, origin, Math.coneDirection(base, compiled.Spread)))
 	end
 	return shots
 end
@@ -1151,7 +1301,9 @@ function Projectile.Destroy(self: Projectile, result: { Position: Vector3, Norma
 		return
 	end
 	self.Dead = true
-	self._beamJoinerWorldStop = kind == "world" and not self._beamBodyHit
+	if self.Beam then
+		self._beamJoinerWorldStop = kind == "world" and not self._beamBodyHit
+	end
 	local info: Types.DestroyInfo = {
 		Position = if result then SafeMath.vector(result.Position, self.Position) else self.Position,
 		Normal = if result then SafeMath.unit(result.Normal, Vector3.yAxis) else Vector3.yAxis,
@@ -1167,16 +1319,28 @@ function Projectile.Destroy(self: Projectile, result: { Position: Vector3, Norma
 	-- Exactly-once -- see the module doc comment's "Events" section. Every
 	-- removal path funnels through this one call, including natural expiry
 	-- (which the step loop below Destroy()s once Step returns false).
-	self.OnDestroy:Fire(info)
+	-- (peeked: an efficient projectile only has the signal if someone connected)
+	local onDestroy = Store.Peek(self, "OnDestroy")
+	if onDestroy then
+		onDestroy:Fire(info)
+	end
 
 	-- Defensive: drop heavy references so a projectile object that somehow
 	-- outlives removal from `active` (e.g. a caller retaining the returned
 	-- handle) doesn't keep entities/closures alive through it.
-	table.clear(self._ignore)
+	local ignore = Store.Peek(self, "_ignore")
+	if ignore then
+		table.clear(ignore)
+	end
 	self.HomingTarget = nil
 	self._beamPrevious = nil
-	self.OnHit:Destroy()
-	self.OnDestroy:Destroy()
+	local onHit = Store.Peek(self, "OnHit")
+	if onHit then
+		onHit:Destroy()
+	end
+	if onDestroy then
+		onDestroy:Destroy()
+	end
 end
 
 --------------------------------------------------------------------------------
@@ -1184,12 +1348,25 @@ end
 --------------------------------------------------------------------------------
 
 local readf64, readu8, band = buffer.readf64, buffer.readu8, bit32.band
-local STORE_STRIDE, STORE_MARK, STORE_FLAGS, STORE_DEAD = Store.Stride, Store.Mark, Store.Flags, Store.Dead
+local STORE_MARK_STRIDE, STORE_DEAD = Store.MarkStride, Store.Dead
+local readi32 = buffer.readi32
 local POSE_NEEDS = bit32.bor(Store.Visualize, Store.SpawnStreamed)
 local POSE_EITHER = bit32.bor(Store.Synced, Store.Beam)
 
+-- Frame split for the Stats tab: the wall time between our own handlers,
+-- i.e. what the rest of the frame costs (see the Heartbeat/PreSimulation
+-- handlers below).
+local dispatchEndedAt = 0
+local stepEndedAt = 0
+
 Heartbeat.Connect(function(globalDt: number)
 	phaseFrames += 1
+	local stepStartedAt = os.clock()
+	if dispatchEndedAt > 0 and stepEndedAt < dispatchEndedAt then
+		-- our dispatch -> this step: the parallel phase (workers), physics, and
+		-- every other script's simulation / Heartbeat handlers that ran first
+		Profile.Add("FrameSimulation", stepStartedAt - dispatchEndedAt)
+	end
 	local replicationStarted = os.clock()
 	Replication.flushHitBatch()
 	local replicationElapsed = os.clock() - replicationStarted
@@ -1211,12 +1388,12 @@ Heartbeat.Connect(function(globalDt: number)
 	-- Reads each projectile's Store record, not its table (see Store.luau).
 	for i = stepCount, 1, -1 do
 		local projectile = active[i]
-		local o = activeSlot[i] * STORE_STRIDE
+		local slot = activeSlot[i]
 		local alive
-		local mark = readf64(Store.data, o + STORE_MARK)
+		local mark = readi32(Store.Marks, slot * STORE_MARK_STRIDE)
 		if mark == stepMark then
 			-- (something earlier in this loop may have destroyed it since)
-			alive = band(readu8(Store.data, o + STORE_FLAGS), STORE_DEAD) == 0
+			alive = band(readu8(Store.Flags, slot), STORE_DEAD) == 0
 		elseif mark == -stepMark then
 			alive = false
 		else
@@ -1231,7 +1408,7 @@ Heartbeat.Connect(function(globalDt: number)
 			-- refreshes and immediate topology corrections after link refinement.
 			-- (queuePose's own condition -- Visualize and _spawnStreamed and
 			-- (_streamedSynced or Beam ~= nil) -- checked here to skip the call)
-			local flags = readu8(Store.data, o + STORE_FLAGS)
+			local flags = readu8(Store.Flags, slot)
 			if band(flags, POSE_NEEDS) == POSE_NEEDS and band(flags, POSE_EITHER) ~= 0 then
 				Replication.queuePose(projectile)
 			end
@@ -1243,7 +1420,8 @@ Heartbeat.Connect(function(globalDt: number)
 			activeSlot[last] = nil
 			local destroyStarted = os.clock()
 			projectile:Destroy(nil, nil)
-			Store.Release(projectile, Projectile)
+			-- (a full projectile goes back to a plain table; a handle keeps its metatable)
+			Store.Release(projectile, if getmetatable(projectile) == Live then Projectile else nil)
 			destroyTime += os.clock() - destroyStarted
 		end
 	end
@@ -1271,6 +1449,8 @@ Heartbeat.Connect(function(globalDt: number)
 	Replication.flushSpawnBatch()
 	Replication.flushMoveBatch()
 	recordPhase("Replication", replicationElapsed + os.clock() - flushStarted)
+	stepEndedAt = os.clock()
+	Profile.Add("FrameOurs", stepEndedAt - stepStartedAt)
 end, { Name = "ProjectileSystem.Step", Priority = 5 })
 
 -- Parallel movement dispatch: before physics, so the workers' parallel phase
@@ -1278,9 +1458,16 @@ end, { Name = "ProjectileSystem.Step", Priority = 5 })
 -- dilated the same way Heartbeat.Connect callbacks receive it).
 RunService.PreSimulation:Connect(function(dt: number)
 	local started = os.clock()
+	if stepEndedAt > 0 and stepEndedAt > dispatchEndedAt then
+		-- our last step -> this dispatch: replication, other scripts' callbacks,
+		-- and everything else the engine does between frames
+		Profile.Add("FrameBetween", started - stepEndedAt)
+	end
 	dispatchNow = started
 	Parallel.Dispatch(#active, dt * Heartbeat.GetGlobalTimeScale(), not debugRays)
-	dispatchElapsed = os.clock() - started
+	dispatchEndedAt = os.clock()
+	dispatchElapsed = dispatchEndedAt - started
+	Profile.Add("FrameOurs", dispatchElapsed)
 end)
 
 return Projectile
