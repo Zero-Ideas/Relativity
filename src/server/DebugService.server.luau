@@ -30,6 +30,7 @@
 local Players = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local RunService = game:GetService("RunService")
+local DebugStream = require(script.Parent.DebugStream)
 local ServerStorage = game:GetService("ServerStorage")
 local StarterPack = game:GetService("StarterPack")
 local Stats = game:GetService("Stats")
@@ -674,9 +675,14 @@ local function onFrame(dt: number)
 		return
 	end
 	sinceSend = 0
-	if next(subscribers) then
+	local streaming = DebugStream.IsConnected()
+	if next(subscribers) or streaming then
 		local payload = buildStats()
 		payload.ReceiveKbps, payload.ReceiveApprox = inboundRate()
+		if streaming then
+			-- (the local logging server: tools/stats_server.py)
+			DebugStream.Send("stats", payload)
+		end
 		for player in subscribers do
 			-- each recipient gets its own server-measured ping
 			payload.PingMs = player:GetNetworkPing() * 1000
@@ -698,6 +704,7 @@ end
 -- The frame counter runs only while someone is subscribed or watching.
 local function refreshTicker()
 	local needed = next(subscribers) ~= nil or next(watchers) ~= nil or next(chunkWatchers) ~= nil
+		or DebugStream.IsConnected()
 	if needed and not frameConnection then
 		frames, frameTime, worstFrame, sinceSend = 0, 0, 0, 0
 		frameConnection = RunService.Heartbeat:Connect(onFrame)
@@ -746,4 +753,13 @@ Players.PlayerRemoving:Connect(function(player)
 	watchers[player] = nil
 	chunkWatchers[player] = nil
 	refreshTicker()
+end)
+
+-- The local logging stream (DebugStream) can connect at any time: keep the
+-- stats ticker in step with it.
+task.spawn(function()
+	while true do
+		task.wait(2)
+		refreshTicker()
+	end
 end)

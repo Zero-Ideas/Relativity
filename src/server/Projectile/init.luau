@@ -380,7 +380,7 @@ export type Compiled = {
 local MIN_STEP_DT = ProjectileMotion.MinStepDt
 local MAX_SUBSTEPS = Sweep.MaxSubsteps -- shared with the parallel workers' copy of the loop
 -- Homing re-aims once per substep, so cap how far one substep can turn.
-local MAX_HOMING_TURN_STEP = math.rad(5)
+local MAX_HOMING_TURN_STEP = Sweep.MaxHomingTurnStep -- (shared with the workers)
 -- Projectile.Burst never creates more than this many pellets in one call.
 local MAX_BURST_COUNT = 10000
 
@@ -1164,7 +1164,7 @@ local function fastScale(projectile: Projectile): number
 end
 
 local function parallelScale(projectile: Projectile): number?
-	if projectile.Dead or projectile.Homing or projectile.RewindSeconds > 0 or debugRays then
+	if projectile.Dead or projectile.RewindSeconds > 0 or debugRays then
 		return nil
 	end
 	if dispatchNow - projectile._spawnRealTime >= projectile.MaxRealLifetime then
@@ -1191,14 +1191,14 @@ Parallel.SetEligibility(parallelScale)
 -- values (see Parallel.Apply), so a result costs no tables.
 local function applySweep(self: Projectile, globalDt: number, status: number, position: Vector3,
 	velocity: Vector3, age: number, remaining: number, guard: number, dirty: boolean, fromScale: number,
-	timeVersion: number, uniform: boolean, contact: Parallel.WorkerContact?): boolean
+	timeVersion: number, uniform: boolean, contact: Parallel.WorkerContact?, homingTimers: { number }?): boolean
 	if self.Dead then
 		return false
 	end
 	if os.clock() - self._spawnRealTime >= self.MaxRealLifetime then
 		return false
 	end
-	if dirty or self.Homing or self.RewindSeconds > 0
+	if dirty or self.RewindSeconds > 0
 		or combinedTimeScale(self) ~= fromScale or ChunkManager.GetTimeVersion() ~= timeVersion then
 		counted.Fallback += 1
 		local started = os.clock()
@@ -1213,6 +1213,10 @@ local function applySweep(self: Projectile, globalDt: number, status: number, po
 	end
 	Replication.updateTimeScale(self, fromScale)
 	self.Position, self.Velocity, self.Age = position, velocity, age
+	if homingTimers and self.Homing then
+		-- (the worker steered it: its homing timers as of where it stopped)
+		self.HomingDelay, self._acquireTimer, self.ReacquireTimer = homingTimers[1], homingTimers[2], homingTimers[3]
+	end
 	if status == Sweep.Expired then
 		return false
 	elseif status == Sweep.Contact then
@@ -1240,9 +1244,9 @@ local PARALLEL_DROP, PARALLEL_REFRESH = Parallel.Drop, Parallel.Refresh
 
 local function applySwept(self: Projectile, status: number, position: Vector3, velocity: Vector3,
 	age: number, remaining: number, guard: number, dirty: boolean, fromScale: number, timeVersion: number,
-	uniform: boolean, contact: Parallel.WorkerContact?): number
+	uniform: boolean, contact: Parallel.WorkerContact?, homingTimers: { number }?): number
 	if applySweep(self, applyDt, status, position, velocity, age, remaining, guard, dirty, fromScale,
-		timeVersion, uniform, contact) then
+		timeVersion, uniform, contact, homingTimers) then
 		self._sweepMark = stepMark
 		return PARALLEL_REFRESH
 	end

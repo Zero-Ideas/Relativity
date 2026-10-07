@@ -18,6 +18,7 @@ local IN, OUT = Sweep.InputStride, Sweep.OutputStride
 local IN_MOTION, IN_AGE, IN_REMAINING = Sweep.InputMotion, Sweep.InputAge, Sweep.InputRemaining
 local OUT_STATUS, OUT_POSITION, OUT_AGE, OUT_REMAINING = Sweep.OutStatus, Sweep.OutPosition, Sweep.OutAge, Sweep.OutRemaining
 local S_MOTION, S_TIME, S_MARK, S_SCALE = Store.MotionStride, Store.TimeStride, Store.MarkStride, Store.ScaleStride
+local S_HOMING, HOMING_OUT = Store.HomingStride, Sweep.HomingOutStride
 local DEAD_OR_DIRTY = bit32.bor(Store.Dead, Store.Dirty)
 local SWEEP_DONE = Sweep.Done
 local LIMIT = SafeMath.Limit
@@ -27,7 +28,8 @@ local LIMIT = SafeMath.Limit
 return function(motion: buffer, times: buffer, marks: buffer, flagsColumn: buffer, scalesColumn: buffer,
 	data: buffer, input: buffer, count: number, slots: { number }, generations: { number }, scales: { number },
 	deadlines: { number }, generationOf: { number }, sources: { any }, now: number, mark: number,
-	released: { number }, deferred: { number }): (number, number, number)
+	released: { number }, deferred: { number }, homing: { boolean }?, homingOut: buffer?,
+	homingTimers: buffer): (number, number, number)
 	local dropped, slow, kept = 0, 0, 0
 	for item = 1, count do
 		local slot = slots[item]
@@ -62,6 +64,10 @@ return function(motion: buffer, times: buffer, marks: buffer, flagsColumn: buffe
 		local t = slot * S_TIME
 		buffer.writef64(times, t, age)
 		buffer.writef64(times, t + 8, debt)
+		if homing and homing[item] and homingOut then
+			-- (a homing item's timers, as the worker left them)
+			buffer.copy(homingTimers, slot * S_HOMING, homingOut, (item - 1) * HOMING_OUT, 24)
+		end
 		local i = (item - 1) * IN
 		buffer.copy(input, i + IN_MOTION, data, out + OUT_POSITION, 24)
 		buffer.writef64(input, i + IN_AGE, age)

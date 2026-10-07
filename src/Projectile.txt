@@ -26,16 +26,16 @@
 --     src/server/Projectile/Homing.luau (154 lines)
 --     src/server/Projectile/RewindHit.luau (144 lines)
 --     src/server/Projectile/Replication.luau (579 lines)
---     src/server/Projectile/Store.luau (504 lines)
+--     src/server/Projectile/Store.luau (516 lines)
 --     src/server/Projectile/Spec.luau (124 lines)
---     src/server/Projectile/Sweep.luau (227 lines)
+--     src/server/Projectile/Sweep.luau (385 lines)
 --     src/server/Projectile/Profile.luau (67 lines)
---     src/server/Projectile/ApplyPass.luau (83 lines)
---     src/server/Projectile/Parallel.luau (840 lines)
---     src/server/Projectile/init.luau (1542 lines)
+--     src/server/Projectile/ApplyPass.luau (89 lines)
+--     src/server/Projectile/Parallel.luau (1074 lines)
+--     src/server/Projectile/init.luau (1546 lines)
 --     src/server/Projectile/BeamProjectileHandler.luau (351 lines)
 --     src/server/ProjectileQuota.luau (41 lines)
---     src/server/ProjectileWorkerBootstrap.server.luau (181 lines)
+--     src/server/ProjectileWorkerBootstrap.server.luau (183 lines)
 --   Client prediction and visuals
 --     src/shared/ProjectileClient/Types.luau (79 lines)
 --     src/shared/ProjectileClient/Prediction.luau (147 lines)
@@ -5672,6 +5672,9 @@ return Replication
 	  Scales  16 B  TimeScale f64 (its OWN scale; non-numbers are stored as 1,
 	                which is what combinedTimeScale made of them anyway),
 	                Source u32 (index into a refcounted source list, 0: none)
+	  Homing  24 B  HomingDelay, _acquireTimer, ReacquireTimer (f64; homing's
+	                timers, so a homing projectile's worker result is applied
+	                straight from buffers too)
 	  Cold    32 B  Id, _spawnRealTime, _lastStreamedTimeScale, _parallelState
 	                (f64 each; touched at spawn / death / repack, not per frame)
 	The buffers are replaced when they grow, so read Store.Motion etc. afresh
@@ -5701,9 +5704,10 @@ return Replication
 local Store = {}
 
 -- column strides (bytes per slot)
-local MOTION, TIME, MARKS, SCALES, COLD = 24, 16, 4, 16, 32
+local MOTION, TIME, MARKS, SCALES, COLD, HOMING = 24, 16, 4, 16, 32, 24
 Store.MotionStride, Store.TimeStride, Store.MarkStride, Store.ScaleStride = MOTION, TIME, MARKS, SCALES
 Store.ColdStride = COLD -- (Id 0, _spawnRealTime 8, _lastStreamedTimeScale 16, _parallelState 24)
+Store.HomingStride = HOMING -- (HomingDelay 0, _acquireTimer 8, ReacquireTimer 16)
 
 local DEAD, DIRTY, SPAWN_STREAMED, SYNCED, VISUALIZE, BEAM = 1, 2, 4, 8, 16, 32
 Store.Dead, Store.Dirty, Store.SpawnStreamed, Store.Synced, Store.Visualize, Store.Beam =
@@ -5721,6 +5725,7 @@ Store.Marks = buffer.create(capacity * MARKS)
 Store.Flags = buffer.create(capacity)
 Store.Scales = buffer.create(capacity * SCALES)
 Store.Cold = buffer.create(capacity * COLD)
+Store.HomingTimers = buffer.create(capacity * HOMING)
 Store.Generation = {} :: { number } -- [slot] = times released
 local used = 0 -- slots ever handed out
 local free: { number } = {}
@@ -5736,9 +5741,10 @@ local HOT: { [string]: number } = {
 	Position = 1, Velocity = 2, Age = 3, _simulationDebt = 4, TimeScale = 5,
 	Dead = 6, _spawnStreamed = 7, _streamedSynced = 8, _sweepMark = 9,
 	Id = 10, _spawnRealTime = 11, _lastStreamedTimeScale = 12, _parallelState = 13,
+	HomingDelay = 14, _acquireTimer = 15, ReacquireTimer = 16,
 }
 Store.HotFields = HOT
-local KIND_COUNT = 13
+local KIND_COUNT = 16
 local MOTION_LAST = 6 -- kinds 1..6 mark the record Dirty when written
 
 local NAN = 0 / 0
@@ -5784,9 +5790,11 @@ local function read(slot: number, kind: number): any
 		return readf64(Store.Cold, slot * COLD + 8)
 	elseif kind == 12 then
 		return readf64(Store.Cold, slot * COLD + 16)
+	elseif kind == 13 then
+		local state = readf64(Store.Cold, slot * COLD + 24)
+		return if state == 0 then nil else state
 	end
-	local state = readf64(Store.Cold, slot * COLD + 24)
-	return if state == 0 then nil else state
+	return readf64(Store.HomingTimers, slot * HOMING + (kind - 14) * 8)
 end
 
 local function write(slot: number, kind: number, value: any)
@@ -5815,8 +5823,10 @@ local function write(slot: number, kind: number, value: any)
 		writef64(Store.Cold, slot * COLD + 8, tonumber(value) or 0)
 	elseif kind == 12 then
 		writef64(Store.Cold, slot * COLD + 16, tonumber(value) or 1)
-	else
+	elseif kind == 13 then
 		writef64(Store.Cold, slot * COLD + 24, tonumber(value) or 0)
+	else
+		writef64(Store.HomingTimers, slot * HOMING + (kind - 14) * 8, tonumber(value) or 0)
 	end
 	if kind <= MOTION_LAST then
 		flag(slot, DIRTY, true)
@@ -5842,6 +5852,7 @@ local function allocate(): number
 			Store.Flags = grow(Store.Flags, 1)
 			Store.Scales = grow(Store.Scales, SCALES)
 			Store.Cold = grow(Store.Cold, COLD)
+			Store.HomingTimers = grow(Store.HomingTimers, HOMING)
 			capacity *= 2
 		end
 		Store.Generation[slot] = 0
@@ -5852,6 +5863,7 @@ local function allocate(): number
 	writeu8(Store.Flags, slot, 0)
 	buffer.fill(Store.Scales, slot * SCALES, 0, SCALES)
 	buffer.fill(Store.Cold, slot * COLD, 0, COLD)
+	buffer.fill(Store.HomingTimers, slot * HOMING, 0, HOMING)
 	return slot
 end
 
@@ -6314,6 +6326,7 @@ return Spec
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local Shared = ReplicatedStorage:WaitForChild("Shared")
 local ProjectileMotion = require(Shared:WaitForChild("ProjectileMotion"))
+local Math = require(script.Parent.Math)
 local Planner = require(Shared:WaitForChild("ProjectileStepPlanner"))
 
 local Sweep = {}
@@ -6338,7 +6351,8 @@ Sweep.InputRemaining = 40
 Sweep.OutStatus, Sweep.OutGuard, Sweep.OutPosition, Sweep.OutVelocity, Sweep.OutAge, Sweep.OutRemaining =
 	0, 1, 4, 16, 28, 36
 
--- A projectile's per-shot motion constants, as the workers keep them.
+-- A projectile's per-shot motion constants, as the workers keep them (plus
+-- its homing constants, when it homes).
 export type MotionSpec = {
 	Acceleration: number | Vector3,
 	Direction: Vector3?,
@@ -6347,7 +6361,67 @@ export type MotionSpec = {
 	MaxSpeed: number,
 	Radius: number,
 	Lifetime: number,
+	TurnRate: number?, -- rad/s; nil: no homing
+	AutoAcquire: boolean?, -- searches for targets itself (AcquireRadius / TargetTag(s))
+	Retarget: boolean?, -- re-checks for the nearest target (Retarget and not Permalock)
+	-- target searches on the worker (WorkerSearch: no custom Filter): the
+	-- frame's target list is matched by TagMask (0: any entity) within
+	-- AcquireRadius (nil: unbounded); timers reset like Homing.update's
+	WorkerSearch: boolean?,
+	TagMask: number?,
+	AcquireRadius: number?,
+	AcquireInterval: number?,
+	ReacquireRate: number?,
 }
+
+-- This frame's homing targets for the workers (Parallel.Dispatch): every
+-- eligible entity's position and tag bits.
+export type HomingFrame = { Positions: { Vector3 }, Bits: { number } }
+
+-- Homing steers at most this many radians per substep (Projectile.Step uses
+-- the same cap, so worker and serial substeps match).
+Sweep.MaxHomingTurnStep = math.rad(5)
+
+-- Per-frame homing state, in a separate buffer per batch (only homing items
+-- use it): flags u8 (HOMING, TARGET_POSITION: the target exists and has a
+-- position, HAS_TARGET: HomingTarget is set, EXPLICIT: it's the config's own
+-- Target), the index of its own Source in the frame's target list u32 at 4
+-- (0: none; never picked), target position 3 x f32 at 8, HomingDelay f64 at
+-- 24, _acquireTimer f64 at 32, ReacquireTimer f64 at 40. The worker hands back
+-- the three timers and a target change f64 (0: unchanged, -1: none found, >0:
+-- the frame target list index it picked) -- 32 bytes per item.
+Sweep.HomingInStride, Sweep.HomingOutStride = 48, 32
+Sweep.HomingFlag, Sweep.HomingTargetPosition, Sweep.HomingHasTarget, Sweep.HomingExplicit = 1, 2, 4, 8
+local HOMING_IN, HOMING_OUT = 48, 32
+
+-- The nearest of the frame's targets matching `mask` within `radius` of
+-- `position`, skipping `exclude` (Homing.acquireTarget's rule, distance <=
+-- best). 0 if none.
+local function searchTarget(frame: HomingFrame, position: Vector3, radius: number?, mask: number, exclude: number): number
+	local best, bestDistance = 0, radius or math.huge
+	local positions, bits = frame.Positions, frame.Bits
+	for index = 1, #positions do
+		if index ~= exclude and (mask == 0 or bit32.band(bits[index], mask) ~= 0) then
+			local distance = (positions[index] - position).Magnitude
+			if distance <= bestDistance then
+				best, bestDistance = index, distance
+			end
+		end
+	end
+	return best
+end
+
+-- A homing item's timers where its frame ended (or was handed back), and
+-- its target change.
+local function writeTimers(homingOut: buffer?, item: number, d: number, a: number, r: number, change: number)
+	if homingOut then
+		local h = (item - 1) * HOMING_OUT
+		buffer.writef64(homingOut, h, d)
+		buffer.writef64(homingOut, h + 8, a)
+		buffer.writef64(homingOut, h + 16, r)
+		buffer.writef64(homingOut, h + 24, change)
+	end
+end
 
 local writef64, readf64 = buffer.writef64, buffer.readf64
 local writef32, readf32, writeu8, readu8 = buffer.writef32, buffer.readf32, buffer.writeu8, buffer.readu8
@@ -6377,6 +6451,7 @@ end
 
 -- The motion spec of `p` (its per-shot constants; see MotionSpec).
 function Sweep.SpecOf(p: any): MotionSpec
+	local homing = p.Homing
 	return {
 		Acceleration = p.Acceleration or 0,
 		Direction = p.AccelerationDirection,
@@ -6385,6 +6460,14 @@ function Sweep.SpecOf(p: any): MotionSpec
 		MaxSpeed = p.MaxSpeed,
 		Radius = p.Radius,
 		Lifetime = p.Lifetime,
+		TurnRate = homing and homing.TurnRate,
+		AutoAcquire = homing and (homing.AcquireRadius ~= nil or homing.TargetTag ~= nil or homing.TargetTags ~= nil),
+		Retarget = homing and (homing.Retarget and not homing.Permalock),
+		WorkerSearch = homing and p.Filter == nil,
+		AcquireRadius = homing and homing.AcquireRadius,
+		AcquireInterval = homing and homing.AcquireInterval,
+		ReacquireRate = homing and homing.ReacquireRate,
+		-- (TagMask is filled in by Parallel, which owns the tag bits)
 	}
 end
 
@@ -6445,7 +6528,10 @@ function Sweep.Run(
 	specs: { [number]: MotionSpec },
 	castHits: (Vector3, Vector3, number, number) -> any,
 	hasEntities: (Vector3) -> boolean,
-	onContact: ((item: number, from: Vector3, displacement: Vector3, hit: any) -> ())?
+	onContact: ((item: number, from: Vector3, displacement: Vector3, hit: any) -> ())?,
+	homingIn: buffer?,
+	homingOut: buffer?,
+	homingFrame: HomingFrame?
 )
 	local o = (item - 1) * IN
 	local filter = readu32(input, o + 4)
@@ -6462,13 +6548,39 @@ function Sweep.Run(
 	local acceleration, direction, gravity = spec.Acceleration, spec.Direction, spec.Gravity
 	local minSpeed, maxSpeed, radius, lifetime = spec.MinSpeed, spec.MaxSpeed, spec.Radius, spec.Lifetime
 
-	-- Mirrors Projectile.Step's loop (no homing: maxDt is unbounded; no
-	-- rewind: no lag-compensated entity check).
+	-- Homing (Homing.update, per substep): steering toward the target's
+	-- position this frame. A target search due mid-frame is made here, from
+	-- the frame's target list (WorkerSearch); a config with a custom Filter
+	-- hands the substep back for the main thread to search instead.
+	local turnRate = spec.TurnRate
+	local homingFlags = 0
+	local targetPosition = Vector3.zero
+	local delay, acquireTimer, reacquireTimer = 0, 0, 0
+	local exclude = 0
+	if homingIn and turnRate then
+		local h = (item - 1) * HOMING_IN
+		homingFlags = readu8(homingIn, h)
+		if homingFlags ~= 0 then
+			exclude = readu32(homingIn, h + 4)
+			targetPosition = readVector32(homingIn, h + 8)
+			delay, acquireTimer, reacquireTimer = readf64(homingIn, h + 24), readf64(homingIn, h + 32), readf64(homingIn, h + 40)
+		end
+	end
+	local homing = homingFlags ~= 0
+	local hasTargetPosition = bit32.btest(homingFlags, 2)
+	local hasTarget = bit32.btest(homingFlags, 4)
+	local explicit = bit32.btest(homingFlags, 8)
+	local targetChange = 0
+	local workerSearch = homing and spec.WorkerSearch == true and homingFrame ~= nil
+
+	-- Mirrors Projectile.Step's loop (no rewind: no lag-compensated entity
+	-- check).
 	local guard = 0
 	while remaining > MIN_STEP_DT and guard < MAX_SUBSTEPS do
 		guard += 1
 		local lifeRemaining = lifetime - age
 		if lifeRemaining <= MIN_STEP_DT then
+			if homing then writeTimers(homingOut, item, delay, acquireTimer, reacquireTimer, targetChange) end
 			Sweep.WriteOutput(output, item, EXPIRED, position, velocity, age, remaining, guard)
 			return
 		end
@@ -6480,10 +6592,65 @@ function Sweep.Run(
 			break
 		end
 		local highRes = hasEntities(sample)
+		local maxDt = if homing and hasTarget and (turnRate :: number) > 0
+			then Sweep.MaxHomingTurnStep / (turnRate :: number)
+			else math.huge
 		local stepDt = Planner.StepDt(position, velocity, accelerationVector, chunkScale, remaining, lifeRemaining,
-			highRes, uniformTime, math.huge)
+			highRes, uniformTime, maxDt)
 		if stepDt <= 0 then
 			break
+		end
+
+		-- (what this substep starts from, for handing it back untouched)
+		local startVelocity, startDelay, startAcquire, startReacquire = velocity, delay, acquireTimer, reacquireTimer
+		if homing then
+			if delay > 0 then
+				delay -= stepDt
+			else
+				local searchDue = false
+				if not hasTargetPosition then
+					if spec.AutoAcquire then
+						if acquireTimer - stepDt <= 0 then
+							searchDue = true
+						else
+							acquireTimer -= stepDt
+						end
+					end
+				elseif spec.Retarget and not explicit then
+					if reacquireTimer - stepDt <= 0 then
+						searchDue = true
+					else
+						reacquireTimer -= stepDt
+					end
+				end
+				if searchDue then
+					if not workerSearch then
+						-- the main thread searches (a custom Filter): hand this substep back
+						writeTimers(homingOut, item, startDelay, startAcquire, startReacquire, targetChange)
+						Sweep.WriteOutput(output, item, CONTACT, position, startVelocity, age, remaining, guard - 1)
+						return
+					end
+					-- (as Homing.update: reset the timer, then search from here)
+					if hasTargetPosition then
+						reacquireTimer = spec.ReacquireRate :: number
+					else
+						acquireTimer = (spec.AcquireInterval :: number) * (0.5 + math.random())
+					end
+					local found = searchTarget(homingFrame :: HomingFrame, position, spec.AcquireRadius, spec.TagMask or 0, exclude)
+					if found > 0 then
+						targetChange = found
+						targetPosition = (homingFrame :: HomingFrame).Positions[found]
+						hasTargetPosition, hasTarget, explicit = true, true, false
+					else
+						targetChange = -1
+						hasTargetPosition, hasTarget, explicit = false, false, false
+					end
+				end
+				if hasTargetPosition then
+					local speed = velocity.Magnitude
+					velocity = Math.rotateTowards(velocity, targetPosition - position, (turnRate :: number) * stepDt) * speed
+				end
+			end
 		end
 
 		local endVelocity, movementVelocity = ProjectileMotion.Integrate(velocity, acceleration, direction, gravity,
@@ -6496,7 +6663,8 @@ function Sweep.Run(
 			if onContact and hit ~= true then
 				onContact(item, position, displacement, hit)
 			end
-			Sweep.WriteOutput(output, item, CONTACT, position, velocity, age, remaining, guard - 1)
+			writeTimers(homingOut, item, startDelay, startAcquire, startReacquire, targetChange)
+			Sweep.WriteOutput(output, item, CONTACT, position, startVelocity, age, remaining, guard - 1)
 			return
 		end
 		velocity = endVelocity
@@ -6504,10 +6672,12 @@ function Sweep.Run(
 		age += stepDt
 		remaining -= stepDt / chunkScale
 		if age >= lifetime - MIN_STEP_DT then
+			if homing then writeTimers(homingOut, item, delay, acquireTimer, reacquireTimer, targetChange) end
 			Sweep.WriteOutput(output, item, EXPIRED, position, velocity, age, remaining, guard)
 			return
 		end
 	end
+	if homing then writeTimers(homingOut, item, delay, acquireTimer, reacquireTimer, targetChange) end
 	Sweep.WriteOutput(output, item, DONE, position, velocity, age, remaining, guard)
 end
 
@@ -6613,6 +6783,7 @@ local IN, OUT = Sweep.InputStride, Sweep.OutputStride
 local IN_MOTION, IN_AGE, IN_REMAINING = Sweep.InputMotion, Sweep.InputAge, Sweep.InputRemaining
 local OUT_STATUS, OUT_POSITION, OUT_AGE, OUT_REMAINING = Sweep.OutStatus, Sweep.OutPosition, Sweep.OutAge, Sweep.OutRemaining
 local S_MOTION, S_TIME, S_MARK, S_SCALE = Store.MotionStride, Store.TimeStride, Store.MarkStride, Store.ScaleStride
+local S_HOMING, HOMING_OUT = Store.HomingStride, Sweep.HomingOutStride
 local DEAD_OR_DIRTY = bit32.bor(Store.Dead, Store.Dirty)
 local SWEEP_DONE = Sweep.Done
 local LIMIT = SafeMath.Limit
@@ -6622,7 +6793,8 @@ local LIMIT = SafeMath.Limit
 return function(motion: buffer, times: buffer, marks: buffer, flagsColumn: buffer, scalesColumn: buffer,
 	data: buffer, input: buffer, count: number, slots: { number }, generations: { number }, scales: { number },
 	deadlines: { number }, generationOf: { number }, sources: { any }, now: number, mark: number,
-	released: { number }, deferred: { number }): (number, number, number)
+	released: { number }, deferred: { number }, homing: { boolean }?, homingOut: buffer?,
+	homingTimers: buffer): (number, number, number)
 	local dropped, slow, kept = 0, 0, 0
 	for item = 1, count do
 		local slot = slots[item]
@@ -6657,6 +6829,10 @@ return function(motion: buffer, times: buffer, marks: buffer, flagsColumn: buffe
 		local t = slot * S_TIME
 		buffer.writef64(times, t, age)
 		buffer.writef64(times, t + 8, debt)
+		if homing and homing[item] and homingOut then
+			-- (a homing item's timers, as the worker left them)
+			buffer.copy(homingTimers, slot * S_HOMING, homingOut, (item - 1) * HOMING_OUT, 24)
+		end
 		local i = (item - 1) * IN
 		buffer.copy(input, i + IN_MOTION, data, out + OUT_POSITION, 24)
 		buffer.writef64(input, i + IN_AGE, age)
@@ -6740,6 +6916,76 @@ local ChunkManager = require(Shared:WaitForChild("ChunkManager"))
 local Sweep = require(script.Parent.Sweep)
 local Store = require(script.Parent.Store)
 local ApplyPass = require(script.Parent.ApplyPass)
+local Homing = require(script.Parent.Homing)
+local Replication = require(script.Parent.Replication)
+local Entity = require(Shared:WaitForChild("Entity"))
+
+-- Homing target tags -> a bit each (a spec's TagMask; 0 means any entity).
+local tagBits: { [string]: number } = {}
+local tagCount = 0
+local function tagMaskOf(homing: any): number
+	local tags = homing and (homing.TargetTags or (homing.TargetTag and { homing.TargetTag }))
+	if not tags then
+		return 0
+	end
+	local mask = 0
+	for _, tag in tags do
+		local bitValue = tagBits[tag]
+		if not bitValue then
+			if tagCount >= 30 then
+				return -1 -- (too many distinct tags: never matches on a worker)
+			end
+			tagCount += 1
+			bitValue = bit32.lshift(1, tagCount - 1)
+			tagBits[tag] = bitValue
+		end
+		mask = bit32.bor(mask, bitValue)
+	end
+	return mask
+end
+
+-- This frame's homing targets (built at dispatch while anything homes): the
+-- entities, their positions and tag bits for the workers, and entity -> index.
+local frameTargets: { any } = {}
+local frameTargetIndex: { [any]: number } = {}
+local homingFrame: Sweep.HomingFrame = { Positions = {}, Bits = {} }
+
+local function buildHomingFrame()
+	table.clear(frameTargets)
+	table.clear(frameTargetIndex)
+	table.clear(homingFrame.Positions)
+	table.clear(homingFrame.Bits)
+	for _, entity in Entity.GetAll() do
+		if entity.IsDestroyed then
+			continue
+		end
+		local bits = 0
+		for tag, bitValue in tagBits do
+			if entity:HasTag(tag) then
+				bits = bit32.bor(bits, bitValue)
+			end
+		end
+		local index = #frameTargets + 1
+		frameTargets[index] = entity
+		frameTargetIndex[entity] = index
+		homingFrame.Positions[index] = entity:GetPosition()
+		homingFrame.Bits[index] = bits
+	end
+end
+
+-- target -> its position this dispatch (many projectiles can hunt one target)
+local goalCache: { [any]: Vector3 | false } = {}
+local function goalOf(target: any): Vector3?
+	if target == nil then
+		return nil
+	end
+	local cached = goalCache[target]
+	if cached == nil then
+		cached = Homing.targetPosition(target) or false
+		goalCache[target] = cached
+	end
+	return cached or nil
+end
 local Profile = require(script.Parent.Profile)
 local SafeMath = require(Shared:WaitForChild("SafeMath"))
 
@@ -6773,7 +7019,8 @@ local abs = math.abs
 
 type Worker = { Actor: Actor, Id: number }
 -- A worker's latest result, as fired through ProjectileActors.Results.
-type Result = { Frame: number, Count: number, Ms: number, Data: buffer?, Checks: number, Skipped: number, Contacts: any }
+type Result = { Frame: number, Count: number, Ms: number, Data: buffer?, Checks: number, Skipped: number, Contacts: any,
+	HomingOut: buffer? }
 local results: { [number]: Result } = {} -- worker id -> latest
 
 -- Receives a result Apply can't take directly and says what happens to its
@@ -6783,7 +7030,7 @@ local results: { [number]: Result } = {} -- worker id -> latest
 -- and uniform-time flag.
 export type Applier = (projectile: any, status: number, position: Vector3, velocity: Vector3, age: number,
 	remaining: number, guard: number, dirty: boolean, fromScale: number, timeVersion: number,
-	uniform: boolean, contact: WorkerContact?) -> number
+	uniform: boolean, contact: WorkerContact?, homingTimers: { number }?) -> number
 
 -- A worker's contact for a result that stopped at one: the segment it cast
 -- and what it hit, so the serial code can resolve it without casting again.
@@ -6801,6 +7048,14 @@ type Batch = {
 	Generation: { number }, -- Store.Generation[slot] when packed (a mismatch: released since)
 	Scale: { number },
 	Deadline: { number }, -- os.clock() past which MaxRealLifetime is up
+	Homing: { boolean }, -- the item homes (its state goes in HomingIn each dispatch)
+	-- (cached at pack, for dispatch: its Homing table, Source, and whether a
+	-- custom Filter keeps its target searches on the main thread)
+	HomingConfig: { any },
+	HomingSource: { any },
+	HomingMainSearch: { boolean },
+	HomingCount: number,
+	HomingIn: buffer?,
 }
 
 local workers: { Worker } = {}
@@ -6824,6 +7079,7 @@ local scaleOf: (any) -> number? = function()
 end
 local released: { number } = {} -- scratch for Apply
 local deferred: { number } = {} -- scratch for Apply
+local homingTimers: { number } = { 0, 0, 0 } -- scratch for Apply
 
 local stats = { Parallel = 0, Resumed = 0, Serial = 0, Fallback = 0, Late = 0, Frames = 0, SlowestWorkerMs = 0, WorkerMs = 0,
 	AppliedFrames = 0, WorkerChecks = 0, WorkerSkipped = 0 }
@@ -6870,14 +7126,15 @@ local function refreshWorkers(): boolean
 		resultsConnected = true
 		local resultsEvent = event :: BindableEvent
 		resultsEvent.Event:Connect(function(id: number, resultFrame: number, count: number, ms: number,
-			data: buffer, checks: number, skipped: number, reasons: { number }?, contacts: any)
+			data: buffer, checks: number, skipped: number, reasons: { number }?, contacts: any, homingOut: buffer?)
 			local result = results[id]
 			if not result then
-				result = { Frame = 0, Count = 0, Ms = 0, Data = nil, Checks = 0, Skipped = 0, Contacts = nil }
+				result = { Frame = 0, Count = 0, Ms = 0, Data = nil, Checks = 0, Skipped = 0, Contacts = nil, HomingOut = nil }
 				results[id] = result
 			end
 			result.Frame, result.Count, result.Ms, result.Data = resultFrame, count, ms, data
 			result.Contacts = contacts
+			result.HomingOut = homingOut
 			stats.WorkerChecks += checks
 			stats.WorkerSkipped += skipped
 			if reasons then
@@ -6971,11 +7228,20 @@ end
 local function newBatch(): Batch
 	return {
 		Count = 0, Sent = 0, Capacity = MIN_CAPACITY, Input = buffer.create(Sweep.InputSize(MIN_CAPACITY)),
-		Projectiles = {}, Slot = {}, Generation = {}, Scale = {}, Deadline = {},
+		Projectiles = {}, Slot = {}, Generation = {}, Scale = {}, Deadline = {}, Homing = {}, HomingCount = 0, HomingIn = nil,
+		HomingConfig = {}, HomingSource = {}, HomingMainSearch = {},
 	}
 end
 
 -- Resizes a batch's input buffer, keeping its records.
+local function setHoming(batch: Batch, item: number, homes: boolean)
+	local was = batch.Homing[item] == true
+	if was ~= homes then
+		batch.HomingCount += if homes then 1 else -1
+	end
+	batch.Homing[item] = homes
+end
+
 local function resize(batch: Batch, capacity: number)
 	local input = buffer.create(Sweep.InputSize(capacity))
 	bufferCopy(input, 0, batch.Input, 0, batch.Count * IN)
@@ -6990,6 +7256,11 @@ local function pack(batch: Batch, item: number, projectile: any, filter: number,
 	batch.Generation[item] = Store.Generation[slot]
 	batch.Scale[item] = scale
 	batch.Deadline[item] = projectile._spawnRealTime + projectile.MaxRealLifetime
+	local homing = projectile.Homing
+	setHoming(batch, item, homing ~= nil)
+	batch.HomingConfig[item] = homing
+	batch.HomingSource[item] = if homing then projectile.Source else nil
+	batch.HomingMainSearch[item] = homing ~= nil and projectile.Filter ~= nil
 	-- (remaining holds the carried debt until dispatch adds the frame's budget)
 	Sweep.WriteInput(batch.Input, item, spec, filter, projectile, projectile._simulationDebt)
 	Store.ClearDirty(slot)
@@ -6999,12 +7270,21 @@ end
 -- Sweep.MotionSpec), by value; new ids are sent to every worker and become
 -- usable next frame. nil if not usable yet (or the values can't be keys).
 local NIL = newproxy()
-local values = table.create(7) -- scratch
+local values = table.create(15) -- scratch
 local function lookupSpec(projectile: any): number?
 	local node = specIds
 	values[1], values[2], values[3] = projectile.Acceleration or 0, projectile.AccelerationDirection, projectile.Gravity or 0
 	values[4], values[5], values[6], values[7] = projectile.MinSpeed, projectile.MaxSpeed, projectile.Radius, projectile.Lifetime
-	for index = 1, 7 do
+	local homing = projectile.Homing
+	values[8] = homing and homing.TurnRate
+	values[9] = homing and (homing.AcquireRadius ~= nil or homing.TargetTag ~= nil or homing.TargetTags ~= nil)
+	values[10] = homing and (homing.Retarget and not homing.Permalock)
+	values[11] = homing and projectile.Filter == nil
+	values[12] = homing and homing.AcquireRadius
+	values[13] = homing and homing.AcquireInterval
+	values[14] = homing and homing.ReacquireRate
+	values[15] = homing and tagMaskOf(homing)
+	for index = 1, 15 do
 		local value = values[index]
 		if value == nil then
 			value = NIL
@@ -7013,7 +7293,7 @@ local function lookupSpec(projectile: any): number?
 		end
 		local nextNode = node[value]
 		if not nextNode then
-			if index == 7 then
+			if index == 15 then
 				if nextSpecId >= MAX_SPECS then
 					return nil
 				end
@@ -7021,6 +7301,7 @@ local function lookupSpec(projectile: any): number?
 				nextNode = nextSpecId
 				specReady[nextNode] = frame + 1
 				local spec = Sweep.SpecOf(projectile)
+				spec.TagMask = values[15]
 				for _, worker in workers do
 					worker.Actor:SendMessage("Motion", nextNode, spec)
 				end
@@ -7101,6 +7382,12 @@ local function release(batch: Batch, item: number)
 		batch.Scale[item] = batch.Scale[last]
 		batch.Deadline[item] = batch.Deadline[last]
 	end
+	-- (the released item's flag goes, the last item's moves into its place)
+	setHoming(batch, item, batch.Homing[last] == true)
+	setHoming(batch, last, false)
+	batch.HomingConfig[item], batch.HomingSource[item], batch.HomingMainSearch[item] =
+		batch.HomingConfig[last], batch.HomingSource[last], batch.HomingMainSearch[last]
+	batch.HomingConfig[last], batch.HomingSource[last], batch.HomingMainSearch[last] = nil, nil, nil
 	projectiles[last] = nil
 	batch.Count = last - 1
 end
@@ -7111,7 +7398,11 @@ local function releaseBatch(batch: Batch)
 		projectiles[item]._parallelState = nil
 		projectiles[item] = nil
 	end
-	batch.Count, batch.Sent = 0, 0
+	table.clear(batch.Homing)
+	table.clear(batch.HomingConfig)
+	table.clear(batch.HomingSource)
+	table.clear(batch.HomingMainSearch)
+	batch.Count, batch.Sent, batch.HomingCount = 0, 0, 0
 end
 
 -- Empties every slot and the queue (parallel movement paused or off).
@@ -7170,6 +7461,7 @@ function Parallel.PackNew(projectile: any, position: Vector3, velocity: Vector3,
 	batch.Generation[item] = Store.Generation[slot]
 	batch.Scale[item] = scale
 	batch.Deadline[item] = deadline
+	setHoming(batch, item, false)
 	-- (remaining holds the carried debt -- none yet -- until dispatch adds the budget)
 	Sweep.WriteInputValues(batch.Input, item, spec, filter, position, velocity, 0, 0)
 	projectile._parallelState = SLOTTED
@@ -7239,6 +7531,7 @@ local function fastAcquire(projectile: any, batch: Batch, now: number): boolean
 	batch.Generation[item] = Store.Generation[slot]
 	batch.Scale[item] = scale
 	batch.Deadline[item] = deadline
+	setHoming(batch, item, false)
 	local t = slot * S_TIME
 	local o = (item - 1) * IN
 	local input = batch.Input
@@ -7336,6 +7629,94 @@ function Parallel.Dispatch(activeCount: number, globalDt: number, allowed: boole
 		end
 	end
 
+	local homingStarted = clock()
+	-- this frame's homing state for every homing item: its target's position
+	-- (fixed for the frame -- entities only move during physics; looked up
+	-- once per target), its Source's index in the frame's target list, its
+	-- flags and its timers (copied from Store). Target searches happen on the
+	-- workers, from the frame's target list; a config with a custom Filter
+	-- searches here instead, for any search due during this frame's budget.
+	local HOMING_IN = Sweep.HomingInStride
+	local S_HOMING = Store.HomingStride
+	table.clear(goalCache)
+	local anyHoming = false
+	for w = 1, workerCount do
+		if batches[w].HomingCount > 0 then
+			anyHoming = true
+			break
+		end
+	end
+	if anyHoming then
+		buildHomingFrame()
+	end
+	for w = 1, workerCount do
+		local batch = batches[w]
+		if batch.HomingCount <= 0 then
+			continue
+		end
+		local homingIn = batch.HomingIn
+		if not homingIn or buffer.len(homingIn) < batch.Capacity * HOMING_IN then
+			homingIn = buffer.create(batch.Capacity * HOMING_IN)
+			batch.HomingIn = homingIn
+		end
+		local homingFlags, projectiles, slots, input = batch.Homing, batch.Projectiles, batch.Slot, batch.Input
+		local configs, sources, mainSearch = batch.HomingConfig, batch.HomingSource, batch.HomingMainSearch
+		for item = 1, batch.Count do
+			local h = (item - 1) * HOMING_IN
+			if not homingFlags[item] then
+				buffer.writeu8(homingIn, h, 0)
+				continue
+			end
+			local projectile = projectiles[item]
+			local homing = configs[item]
+			local target = rawget(projectile, "HomingTarget")
+			local goal = goalOf(target)
+			local timers = slots[item] * S_HOMING
+			local homingTimers = Store.HomingTimers
+			if mainSearch[item] and homing and buffer.readf64(homingTimers, timers) <= 0 then
+				local budget = readf64(input, (item - 1) * IN + IN_REMAINING) -- (already scaled)
+				local searched = false
+				if not goal then
+					if (homing.AcquireRadius or homing.TargetTag or homing.TargetTags)
+						and buffer.readf64(homingTimers, timers + 8) <= budget then
+						projectile._acquireTimer = homing.AcquireInterval * (0.5 + math.random())
+						searched = true
+					end
+				elseif not homing.Permalock and homing.Retarget and target ~= homing.Target
+					and buffer.readf64(homingTimers, timers + 16) <= budget then
+					projectile.ReacquireTimer = homing.ReacquireRate
+					searched = true
+				end
+				if searched then
+					local searchStarted = clock()
+					target = Homing.acquireTarget(projectile, homing, projectile.Position)
+					Profile.Add("HomingSearch", clock() - searchStarted)
+					Profile.Count("HomingSearches", 1)
+					rawset(projectile, "HomingTarget", target)
+					goal = goalOf(target)
+					-- (a new target can switch its continuous pose stream on or off)
+					Replication.updateSyncState(projectile)
+				end
+			end
+			local flags = Sweep.HomingFlag
+			if goal then
+				flags += Sweep.HomingTargetPosition
+				buffer.writef32(homingIn, h + 8, goal.X)
+				buffer.writef32(homingIn, h + 12, goal.Y)
+				buffer.writef32(homingIn, h + 16, goal.Z)
+			end
+			if target ~= nil then
+				flags += Sweep.HomingHasTarget
+				if homing and target == homing.Target then
+					flags += Sweep.HomingExplicit
+				end
+			end
+			buffer.writeu8(homingIn, h, flags)
+			buffer.writeu32(homingIn, h + 4, frameTargetIndex[sources[item]] or 0)
+			bufferCopy(homingIn, h + 24, homingTimers, timers, 24)
+		end
+	end
+	Profile.Add("HomingDispatch", clock() - homingStarted)
 	local sendStarted = clock()
 	local keys = entityChunkKeys()
 	local slots = 0
@@ -7346,7 +7727,9 @@ function Parallel.Dispatch(activeCount: number, globalDt: number, allowed: boole
 		if count > 0 then
 			batch.Sent = count
 			inFlight = true
-			workers[w].Actor:SendMessage("Sweep", frame, batch.Input, count, batchUniform, keys)
+			local homes = batch.HomingCount > 0
+			workers[w].Actor:SendMessage("Sweep", frame, batch.Input, count, batchUniform, keys,
+				if homes then batch.HomingIn else nil, if homes then homingFrame else nil)
 		end
 	end
 	stats.Frames += 1
@@ -7412,7 +7795,8 @@ function Parallel.Apply(apply: Applier, mark: number, now: number, timeVersion: 
 		if sameVersion then
 			dropped, slow, keptHere = ApplyPass(Store.Motion, Store.Time, Store.Marks, Store.Flags, Store.Scales,
 				data, input, count, slots, generations, scales, deadlines, generationOf, Store.Sources, now, mark,
-				released, deferred)
+				released, deferred, if batch.HomingCount > 0 then batch.Homing else nil, result.HomingOut,
+				Store.HomingTimers)
 		else
 			for item = 1, count do
 				deferred[item] = item
@@ -7429,6 +7813,25 @@ function Parallel.Apply(apply: Applier, mark: number, now: number, timeVersion: 
 		local contactItems = contacts and contacts.Item
 		local nextContact = 1
 		result.Contacts = nil
+		local homingOut = result.HomingOut
+		result.HomingOut = nil
+		local homingItems = batch.Homing
+		if homingOut and batch.HomingCount > 0 then
+			-- targets the workers searched for (Sweep: -1 none found, >0 an index
+			-- into this frame's target list), before the serial pass resumes any
+			local HOMING_OUT = Sweep.HomingOutStride
+			for item = 1, count do
+				if homingItems[item] and generationOf[slots[item]] == generations[item] then
+					local change = readf64(homingOut, (item - 1) * HOMING_OUT + 24)
+					if change ~= 0 then
+						local projectile = projectiles[item]
+						rawset(projectile, "HomingTarget", if change > 0 then frameTargets[change] else nil)
+						Replication.updateSyncState(projectile)
+						Profile.Count("HomingSearches", 1)
+					end
+				end
+			end
+		end
 		for index = 1, slow do
 			local item = deferred[index]
 			local projectile = projectiles[item]
@@ -7447,8 +7850,15 @@ function Parallel.Apply(apply: Applier, mark: number, now: number, timeVersion: 
 					}
 				end
 			end
+			local timers: { number }? = nil
+			if homingOut and homingItems[item] then
+				local h = (item - 1) * Sweep.HomingOutStride
+				homingTimers[1], homingTimers[2], homingTimers[3] =
+					readf64(homingOut, h), readf64(homingOut, h + 8), readf64(homingOut, h + 16)
+				timers = homingTimers
+			end
 			local outcome = apply(projectile, status, position, velocity, age, remaining, guard,
-				band(flags, Store.Dirty) ~= 0, scales[item], batchTimeVersion, batchUniform, contact)
+				band(flags, Store.Dirty) ~= 0, scales[item], batchTimeVersion, batchUniform, contact, timers)
 			local keep = false
 			if outcome == REFRESH and not projectile.Dead then
 				local repackStarted = clock()
@@ -7912,7 +8322,7 @@ export type Compiled = {
 local MIN_STEP_DT = ProjectileMotion.MinStepDt
 local MAX_SUBSTEPS = Sweep.MaxSubsteps -- shared with the parallel workers' copy of the loop
 -- Homing re-aims once per substep, so cap how far one substep can turn.
-local MAX_HOMING_TURN_STEP = math.rad(5)
+local MAX_HOMING_TURN_STEP = Sweep.MaxHomingTurnStep -- (shared with the workers)
 -- Projectile.Burst never creates more than this many pellets in one call.
 local MAX_BURST_COUNT = 10000
 
@@ -8696,7 +9106,7 @@ local function fastScale(projectile: Projectile): number
 end
 
 local function parallelScale(projectile: Projectile): number?
-	if projectile.Dead or projectile.Homing or projectile.RewindSeconds > 0 or debugRays then
+	if projectile.Dead or projectile.RewindSeconds > 0 or debugRays then
 		return nil
 	end
 	if dispatchNow - projectile._spawnRealTime >= projectile.MaxRealLifetime then
@@ -8723,14 +9133,14 @@ Parallel.SetEligibility(parallelScale)
 -- values (see Parallel.Apply), so a result costs no tables.
 local function applySweep(self: Projectile, globalDt: number, status: number, position: Vector3,
 	velocity: Vector3, age: number, remaining: number, guard: number, dirty: boolean, fromScale: number,
-	timeVersion: number, uniform: boolean, contact: Parallel.WorkerContact?): boolean
+	timeVersion: number, uniform: boolean, contact: Parallel.WorkerContact?, homingTimers: { number }?): boolean
 	if self.Dead then
 		return false
 	end
 	if os.clock() - self._spawnRealTime >= self.MaxRealLifetime then
 		return false
 	end
-	if dirty or self.Homing or self.RewindSeconds > 0
+	if dirty or self.RewindSeconds > 0
 		or combinedTimeScale(self) ~= fromScale or ChunkManager.GetTimeVersion() ~= timeVersion then
 		counted.Fallback += 1
 		local started = os.clock()
@@ -8745,6 +9155,10 @@ local function applySweep(self: Projectile, globalDt: number, status: number, po
 	end
 	Replication.updateTimeScale(self, fromScale)
 	self.Position, self.Velocity, self.Age = position, velocity, age
+	if homingTimers and self.Homing then
+		-- (the worker steered it: its homing timers as of where it stopped)
+		self.HomingDelay, self._acquireTimer, self.ReacquireTimer = homingTimers[1], homingTimers[2], homingTimers[3]
+	end
 	if status == Sweep.Expired then
 		return false
 	elseif status == Sweep.Contact then
@@ -8772,9 +9186,9 @@ local PARALLEL_DROP, PARALLEL_REFRESH = Parallel.Drop, Parallel.Refresh
 
 local function applySwept(self: Projectile, status: number, position: Vector3, velocity: Vector3,
 	age: number, remaining: number, guard: number, dirty: boolean, fromScale: number, timeVersion: number,
-	uniform: boolean, contact: Parallel.WorkerContact?): number
+	uniform: boolean, contact: Parallel.WorkerContact?, homingTimers: { number }?): number
 	if applySweep(self, applyDt, status, position, velocity, age, remaining, guard, dirty, fromScale,
-		timeVersion, uniform, contact) then
+		timeVersion, uniform, contact, homingTimers) then
 		self._sweepMark = stepMark
 		return PARALLEL_REFRESH
 	end
@@ -9645,7 +10059,8 @@ local function onContact(item: number, from: Vector3, displacement: Vector3, hit
 		hit.Instance, hit.Position, hit.Normal, hit.Distance
 end
 
-actor:BindToMessageParallel("Sweep", function(frame: number, input: buffer, count: number, uniformTime: boolean, entityKeys: { Vector3 })
+actor:BindToMessageParallel("Sweep", function(frame: number, input: buffer, count: number, uniformTime: boolean,
+	entityKeys: { Vector3 }, homingIn: buffer?, homingFrame: Sweep.HomingFrame?)
 	local started = os.clock()
 	table.clear(entityChunks)
 	for _, key in entityKeys do
@@ -9655,8 +10070,9 @@ actor:BindToMessageParallel("Sweep", function(frame: number, input: buffer, coun
 	for _, column in contacts do
 		table.clear(column)
 	end
+	local homingOut = if homingIn then buffer.create(count * Sweep.HomingOutStride) else nil
 	for item = 1, count do
-		Sweep.Run(input, item, result, uniformTime, specs, castHits, hasEntities, onContact)
+		Sweep.Run(input, item, result, uniformTime, specs, castHits, hasEntities, onContact, homingIn, homingOut, homingFrame)
 	end
 	local ms = (os.clock() - started) * 1000 -- how long this batch took (Stats tab)
 	local occupancy = Occupancy.TakeStats()
@@ -9664,7 +10080,7 @@ actor:BindToMessageParallel("Sweep", function(frame: number, input: buffer, coun
 	results:Fire(workerId, frame, count, ms, result, occupancy.Checks, occupancy.Skipped, {
 		occupancy.NotReady, occupancy.TooWide, occupancy.OutsideTerrain, occupancy.Blocked, occupancy.BlockedMoving,
 		occupancy.DynamicParts, occupancy.LargestDynamic,
-	}, contacts)
+	}, contacts, homingOut)
 end)
 -- =============================================================================
 -- END FILE: src/server/ProjectileWorkerBootstrap.server.luau

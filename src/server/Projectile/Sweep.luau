@@ -27,6 +27,7 @@
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local Shared = ReplicatedStorage:WaitForChild("Shared")
 local ProjectileMotion = require(Shared:WaitForChild("ProjectileMotion"))
+local Math = require(script.Parent.Math)
 local Planner = require(Shared:WaitForChild("ProjectileStepPlanner"))
 
 local Sweep = {}
@@ -51,7 +52,8 @@ Sweep.InputRemaining = 40
 Sweep.OutStatus, Sweep.OutGuard, Sweep.OutPosition, Sweep.OutVelocity, Sweep.OutAge, Sweep.OutRemaining =
 	0, 1, 4, 16, 28, 36
 
--- A projectile's per-shot motion constants, as the workers keep them.
+-- A projectile's per-shot motion constants, as the workers keep them (plus
+-- its homing constants, when it homes).
 export type MotionSpec = {
 	Acceleration: number | Vector3,
 	Direction: Vector3?,
@@ -60,7 +62,67 @@ export type MotionSpec = {
 	MaxSpeed: number,
 	Radius: number,
 	Lifetime: number,
+	TurnRate: number?, -- rad/s; nil: no homing
+	AutoAcquire: boolean?, -- searches for targets itself (AcquireRadius / TargetTag(s))
+	Retarget: boolean?, -- re-checks for the nearest target (Retarget and not Permalock)
+	-- target searches on the worker (WorkerSearch: no custom Filter): the
+	-- frame's target list is matched by TagMask (0: any entity) within
+	-- AcquireRadius (nil: unbounded); timers reset like Homing.update's
+	WorkerSearch: boolean?,
+	TagMask: number?,
+	AcquireRadius: number?,
+	AcquireInterval: number?,
+	ReacquireRate: number?,
 }
+
+-- This frame's homing targets for the workers (Parallel.Dispatch): every
+-- eligible entity's position and tag bits.
+export type HomingFrame = { Positions: { Vector3 }, Bits: { number } }
+
+-- Homing steers at most this many radians per substep (Projectile.Step uses
+-- the same cap, so worker and serial substeps match).
+Sweep.MaxHomingTurnStep = math.rad(5)
+
+-- Per-frame homing state, in a separate buffer per batch (only homing items
+-- use it): flags u8 (HOMING, TARGET_POSITION: the target exists and has a
+-- position, HAS_TARGET: HomingTarget is set, EXPLICIT: it's the config's own
+-- Target), the index of its own Source in the frame's target list u32 at 4
+-- (0: none; never picked), target position 3 x f32 at 8, HomingDelay f64 at
+-- 24, _acquireTimer f64 at 32, ReacquireTimer f64 at 40. The worker hands back
+-- the three timers and a target change f64 (0: unchanged, -1: none found, >0:
+-- the frame target list index it picked) -- 32 bytes per item.
+Sweep.HomingInStride, Sweep.HomingOutStride = 48, 32
+Sweep.HomingFlag, Sweep.HomingTargetPosition, Sweep.HomingHasTarget, Sweep.HomingExplicit = 1, 2, 4, 8
+local HOMING_IN, HOMING_OUT = 48, 32
+
+-- The nearest of the frame's targets matching `mask` within `radius` of
+-- `position`, skipping `exclude` (Homing.acquireTarget's rule, distance <=
+-- best). 0 if none.
+local function searchTarget(frame: HomingFrame, position: Vector3, radius: number?, mask: number, exclude: number): number
+	local best, bestDistance = 0, radius or math.huge
+	local positions, bits = frame.Positions, frame.Bits
+	for index = 1, #positions do
+		if index ~= exclude and (mask == 0 or bit32.band(bits[index], mask) ~= 0) then
+			local distance = (positions[index] - position).Magnitude
+			if distance <= bestDistance then
+				best, bestDistance = index, distance
+			end
+		end
+	end
+	return best
+end
+
+-- A homing item's timers where its frame ended (or was handed back), and
+-- its target change.
+local function writeTimers(homingOut: buffer?, item: number, d: number, a: number, r: number, change: number)
+	if homingOut then
+		local h = (item - 1) * HOMING_OUT
+		buffer.writef64(homingOut, h, d)
+		buffer.writef64(homingOut, h + 8, a)
+		buffer.writef64(homingOut, h + 16, r)
+		buffer.writef64(homingOut, h + 24, change)
+	end
+end
 
 local writef64, readf64 = buffer.writef64, buffer.readf64
 local writef32, readf32, writeu8, readu8 = buffer.writef32, buffer.readf32, buffer.writeu8, buffer.readu8
@@ -90,6 +152,7 @@ end
 
 -- The motion spec of `p` (its per-shot constants; see MotionSpec).
 function Sweep.SpecOf(p: any): MotionSpec
+	local homing = p.Homing
 	return {
 		Acceleration = p.Acceleration or 0,
 		Direction = p.AccelerationDirection,
@@ -98,6 +161,14 @@ function Sweep.SpecOf(p: any): MotionSpec
 		MaxSpeed = p.MaxSpeed,
 		Radius = p.Radius,
 		Lifetime = p.Lifetime,
+		TurnRate = homing and homing.TurnRate,
+		AutoAcquire = homing and (homing.AcquireRadius ~= nil or homing.TargetTag ~= nil or homing.TargetTags ~= nil),
+		Retarget = homing and (homing.Retarget and not homing.Permalock),
+		WorkerSearch = homing and p.Filter == nil,
+		AcquireRadius = homing and homing.AcquireRadius,
+		AcquireInterval = homing and homing.AcquireInterval,
+		ReacquireRate = homing and homing.ReacquireRate,
+		-- (TagMask is filled in by Parallel, which owns the tag bits)
 	}
 end
 
@@ -158,7 +229,10 @@ function Sweep.Run(
 	specs: { [number]: MotionSpec },
 	castHits: (Vector3, Vector3, number, number) -> any,
 	hasEntities: (Vector3) -> boolean,
-	onContact: ((item: number, from: Vector3, displacement: Vector3, hit: any) -> ())?
+	onContact: ((item: number, from: Vector3, displacement: Vector3, hit: any) -> ())?,
+	homingIn: buffer?,
+	homingOut: buffer?,
+	homingFrame: HomingFrame?
 )
 	local o = (item - 1) * IN
 	local filter = readu32(input, o + 4)
@@ -175,13 +249,39 @@ function Sweep.Run(
 	local acceleration, direction, gravity = spec.Acceleration, spec.Direction, spec.Gravity
 	local minSpeed, maxSpeed, radius, lifetime = spec.MinSpeed, spec.MaxSpeed, spec.Radius, spec.Lifetime
 
-	-- Mirrors Projectile.Step's loop (no homing: maxDt is unbounded; no
-	-- rewind: no lag-compensated entity check).
+	-- Homing (Homing.update, per substep): steering toward the target's
+	-- position this frame. A target search due mid-frame is made here, from
+	-- the frame's target list (WorkerSearch); a config with a custom Filter
+	-- hands the substep back for the main thread to search instead.
+	local turnRate = spec.TurnRate
+	local homingFlags = 0
+	local targetPosition = Vector3.zero
+	local delay, acquireTimer, reacquireTimer = 0, 0, 0
+	local exclude = 0
+	if homingIn and turnRate then
+		local h = (item - 1) * HOMING_IN
+		homingFlags = readu8(homingIn, h)
+		if homingFlags ~= 0 then
+			exclude = readu32(homingIn, h + 4)
+			targetPosition = readVector32(homingIn, h + 8)
+			delay, acquireTimer, reacquireTimer = readf64(homingIn, h + 24), readf64(homingIn, h + 32), readf64(homingIn, h + 40)
+		end
+	end
+	local homing = homingFlags ~= 0
+	local hasTargetPosition = bit32.btest(homingFlags, 2)
+	local hasTarget = bit32.btest(homingFlags, 4)
+	local explicit = bit32.btest(homingFlags, 8)
+	local targetChange = 0
+	local workerSearch = homing and spec.WorkerSearch == true and homingFrame ~= nil
+
+	-- Mirrors Projectile.Step's loop (no rewind: no lag-compensated entity
+	-- check).
 	local guard = 0
 	while remaining > MIN_STEP_DT and guard < MAX_SUBSTEPS do
 		guard += 1
 		local lifeRemaining = lifetime - age
 		if lifeRemaining <= MIN_STEP_DT then
+			if homing then writeTimers(homingOut, item, delay, acquireTimer, reacquireTimer, targetChange) end
 			Sweep.WriteOutput(output, item, EXPIRED, position, velocity, age, remaining, guard)
 			return
 		end
@@ -193,10 +293,65 @@ function Sweep.Run(
 			break
 		end
 		local highRes = hasEntities(sample)
+		local maxDt = if homing and hasTarget and (turnRate :: number) > 0
+			then Sweep.MaxHomingTurnStep / (turnRate :: number)
+			else math.huge
 		local stepDt = Planner.StepDt(position, velocity, accelerationVector, chunkScale, remaining, lifeRemaining,
-			highRes, uniformTime, math.huge)
+			highRes, uniformTime, maxDt)
 		if stepDt <= 0 then
 			break
+		end
+
+		-- (what this substep starts from, for handing it back untouched)
+		local startVelocity, startDelay, startAcquire, startReacquire = velocity, delay, acquireTimer, reacquireTimer
+		if homing then
+			if delay > 0 then
+				delay -= stepDt
+			else
+				local searchDue = false
+				if not hasTargetPosition then
+					if spec.AutoAcquire then
+						if acquireTimer - stepDt <= 0 then
+							searchDue = true
+						else
+							acquireTimer -= stepDt
+						end
+					end
+				elseif spec.Retarget and not explicit then
+					if reacquireTimer - stepDt <= 0 then
+						searchDue = true
+					else
+						reacquireTimer -= stepDt
+					end
+				end
+				if searchDue then
+					if not workerSearch then
+						-- the main thread searches (a custom Filter): hand this substep back
+						writeTimers(homingOut, item, startDelay, startAcquire, startReacquire, targetChange)
+						Sweep.WriteOutput(output, item, CONTACT, position, startVelocity, age, remaining, guard - 1)
+						return
+					end
+					-- (as Homing.update: reset the timer, then search from here)
+					if hasTargetPosition then
+						reacquireTimer = spec.ReacquireRate :: number
+					else
+						acquireTimer = (spec.AcquireInterval :: number) * (0.5 + math.random())
+					end
+					local found = searchTarget(homingFrame :: HomingFrame, position, spec.AcquireRadius, spec.TagMask or 0, exclude)
+					if found > 0 then
+						targetChange = found
+						targetPosition = (homingFrame :: HomingFrame).Positions[found]
+						hasTargetPosition, hasTarget, explicit = true, true, false
+					else
+						targetChange = -1
+						hasTargetPosition, hasTarget, explicit = false, false, false
+					end
+				end
+				if hasTargetPosition then
+					local speed = velocity.Magnitude
+					velocity = Math.rotateTowards(velocity, targetPosition - position, (turnRate :: number) * stepDt) * speed
+				end
+			end
 		end
 
 		local endVelocity, movementVelocity = ProjectileMotion.Integrate(velocity, acceleration, direction, gravity,
@@ -209,7 +364,8 @@ function Sweep.Run(
 			if onContact and hit ~= true then
 				onContact(item, position, displacement, hit)
 			end
-			Sweep.WriteOutput(output, item, CONTACT, position, velocity, age, remaining, guard - 1)
+			writeTimers(homingOut, item, startDelay, startAcquire, startReacquire, targetChange)
+			Sweep.WriteOutput(output, item, CONTACT, position, startVelocity, age, remaining, guard - 1)
 			return
 		end
 		velocity = endVelocity
@@ -217,10 +373,12 @@ function Sweep.Run(
 		age += stepDt
 		remaining -= stepDt / chunkScale
 		if age >= lifetime - MIN_STEP_DT then
+			if homing then writeTimers(homingOut, item, delay, acquireTimer, reacquireTimer, targetChange) end
 			Sweep.WriteOutput(output, item, EXPIRED, position, velocity, age, remaining, guard)
 			return
 		end
 	end
+	if homing then writeTimers(homingOut, item, delay, acquireTimer, reacquireTimer, targetChange) end
 	Sweep.WriteOutput(output, item, DONE, position, velocity, age, remaining, guard)
 end
 

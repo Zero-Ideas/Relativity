@@ -158,7 +158,8 @@ local function onContact(item: number, from: Vector3, displacement: Vector3, hit
 		hit.Instance, hit.Position, hit.Normal, hit.Distance
 end
 
-actor:BindToMessageParallel("Sweep", function(frame: number, input: buffer, count: number, uniformTime: boolean, entityKeys: { Vector3 })
+actor:BindToMessageParallel("Sweep", function(frame: number, input: buffer, count: number, uniformTime: boolean,
+	entityKeys: { Vector3 }, homingIn: buffer?, homingFrame: Sweep.HomingFrame?)
 	local started = os.clock()
 	table.clear(entityChunks)
 	for _, key in entityKeys do
@@ -168,8 +169,9 @@ actor:BindToMessageParallel("Sweep", function(frame: number, input: buffer, coun
 	for _, column in contacts do
 		table.clear(column)
 	end
+	local homingOut = if homingIn then buffer.create(count * Sweep.HomingOutStride) else nil
 	for item = 1, count do
-		Sweep.Run(input, item, result, uniformTime, specs, castHits, hasEntities, onContact)
+		Sweep.Run(input, item, result, uniformTime, specs, castHits, hasEntities, onContact, homingIn, homingOut, homingFrame)
 	end
 	local ms = (os.clock() - started) * 1000 -- how long this batch took (Stats tab)
 	local occupancy = Occupancy.TakeStats()
@@ -177,5 +179,5 @@ actor:BindToMessageParallel("Sweep", function(frame: number, input: buffer, coun
 	results:Fire(workerId, frame, count, ms, result, occupancy.Checks, occupancy.Skipped, {
 		occupancy.NotReady, occupancy.TooWide, occupancy.OutsideTerrain, occupancy.Blocked, occupancy.BlockedMoving,
 		occupancy.DynamicParts, occupancy.LargestDynamic,
-	}, contacts)
+	}, contacts, homingOut)
 end)

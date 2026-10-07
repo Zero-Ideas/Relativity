@@ -66,6 +66,7 @@ local Shared = ReplicatedStorage:WaitForChild("Shared")
 local Heartbeat = require(Shared.Heartbeat)
 local Entity = require(Shared.Entity)
 local Projectile = require(script.Parent.Projectile)
+local DebugStream = require(script.Parent.DebugStream)
 local ProjectileQuota = require(script.Parent.ProjectileQuota)
 local SafeMath = require(Shared.SafeMath)
 local VisualOffload = require(Shared.VisualOffload)
@@ -465,16 +466,7 @@ local function randomDirection(): Vector3
 	return Vector3.new(r * math.cos(theta), z, r * math.sin(theta))
 end
 
-VisualOffload.On("StressTestFire", function(data, player)
-	if not player or not RunService:IsStudio() then
-		return
-	end
-
-	local now = os.clock()
-	if lastStressTest[player] and now - lastStressTest[player] < STRESS_COOLDOWN then
-		return
-	end
-	lastStressTest[player] = now
+local function runStressTest(data: any, player: Player)
 
 	local character = player.Character
 	local root = character and (character.PrimaryPart or character:FindFirstChild("HumanoidRootPart"))
@@ -486,6 +478,8 @@ VisualOffload.On("StressTestFire", function(data, player)
 	local count = math.floor(num(requestedCount, 500, 1, MAX_STRESS_COUNT))
 	-- server-only: simulated in full but never replicated, so no client load
 	local serverOnly = typeof(data) == "table" and data.ServerOnly == true
+	-- homing variant (H / Shift+H): the same shots, hunting Enemy-tagged entities
+	local homing = typeof(data) == "table" and data.Homing == true
 	local shooter = Entity.Get(character)
 
 	-- Compiled once per batch, fired per projectile (Projectile.Compile).
@@ -498,8 +492,16 @@ VisualOffload.On("StressTestFire", function(data, player)
 		Visualize = not serverOnly,
 		VisualRange = 8000,
 		Visual = { Shape = "Ball", Size = Vector3.one * 0.4, Color = Color3.fromRGB(255, 140, 60) },
-		-- No Homing: plain straight bullets like the TimeBlaster's own shots
-		-- (homing projectiles step serially -- see Projectile/Parallel.luau).
+		-- Plain straight bullets like the TimeBlaster's own shots, unless the
+		-- homing variant asked for the TimeBlaster's homing settings.
+		Homing = if homing then {
+			AcquireRadius = 150,
+			TargetTags = { "Enemy" },
+			Retarget = true,
+			ReacquireRate = 0.3,
+			TurnRate = math.rad(140),
+			Delay = 0.05,
+		} else nil,
 	})
 	local center = root.Position
 	for _ = 1, count do
@@ -507,7 +509,7 @@ VisualOffload.On("StressTestFire", function(data, player)
 		Projectile.Fire(compiled, center + direction * 3, direction)
 	end
 
-	print(`[Relativity] stress test: spawned {count}{if serverOnly then " server-only" else ""} projectiles for {player.Name}`)
+	print(`[Relativity] stress test: spawned {count}{if serverOnly then " server-only" else ""}{if homing then " homing" else ""} projectiles for {player.Name}`)
 
 	-- Real frame-cost data while the batch is in flight (Heartbeat.GetStats() is
 	-- shared module state, so this reads the actual live loop -- not a
@@ -521,6 +523,27 @@ VisualOffload.On("StressTestFire", function(data, player)
 			)
 		end
 	end)
+end
+
+VisualOffload.On("StressTestFire", function(data, player)
+	if not player or not RunService:IsStudio() then
+		return
+	end
+	local now = os.clock()
+	if lastStressTest[player] and now - lastStressTest[player] < STRESS_COOLDOWN then
+		return
+	end
+	lastStressTest[player] = now
+	runStressTest(data, player)
+end)
+
+-- The local logging server can fire the same batches (tools/send_command.py
+-- stress ...), for the first player in the game.
+DebugStream.OnCommand("stress", function(message)
+	local player = Players:GetPlayers()[1]
+	if player then
+		runStressTest(message, player)
+	end
 end)
 
 Players.PlayerRemoving:Connect(function(player)

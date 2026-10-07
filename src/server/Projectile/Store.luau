@@ -27,6 +27,9 @@
 	  Scales  16 B  TimeScale f64 (its OWN scale; non-numbers are stored as 1,
 	                which is what combinedTimeScale made of them anyway),
 	                Source u32 (index into a refcounted source list, 0: none)
+	  Homing  24 B  HomingDelay, _acquireTimer, ReacquireTimer (f64; homing's
+	                timers, so a homing projectile's worker result is applied
+	                straight from buffers too)
 	  Cold    32 B  Id, _spawnRealTime, _lastStreamedTimeScale, _parallelState
 	                (f64 each; touched at spawn / death / repack, not per frame)
 	The buffers are replaced when they grow, so read Store.Motion etc. afresh
@@ -56,9 +59,10 @@
 local Store = {}
 
 -- column strides (bytes per slot)
-local MOTION, TIME, MARKS, SCALES, COLD = 24, 16, 4, 16, 32
+local MOTION, TIME, MARKS, SCALES, COLD, HOMING = 24, 16, 4, 16, 32, 24
 Store.MotionStride, Store.TimeStride, Store.MarkStride, Store.ScaleStride = MOTION, TIME, MARKS, SCALES
 Store.ColdStride = COLD -- (Id 0, _spawnRealTime 8, _lastStreamedTimeScale 16, _parallelState 24)
+Store.HomingStride = HOMING -- (HomingDelay 0, _acquireTimer 8, ReacquireTimer 16)
 
 local DEAD, DIRTY, SPAWN_STREAMED, SYNCED, VISUALIZE, BEAM = 1, 2, 4, 8, 16, 32
 Store.Dead, Store.Dirty, Store.SpawnStreamed, Store.Synced, Store.Visualize, Store.Beam =
@@ -76,6 +80,7 @@ Store.Marks = buffer.create(capacity * MARKS)
 Store.Flags = buffer.create(capacity)
 Store.Scales = buffer.create(capacity * SCALES)
 Store.Cold = buffer.create(capacity * COLD)
+Store.HomingTimers = buffer.create(capacity * HOMING)
 Store.Generation = {} :: { number } -- [slot] = times released
 local used = 0 -- slots ever handed out
 local free: { number } = {}
@@ -91,9 +96,10 @@ local HOT: { [string]: number } = {
 	Position = 1, Velocity = 2, Age = 3, _simulationDebt = 4, TimeScale = 5,
 	Dead = 6, _spawnStreamed = 7, _streamedSynced = 8, _sweepMark = 9,
 	Id = 10, _spawnRealTime = 11, _lastStreamedTimeScale = 12, _parallelState = 13,
+	HomingDelay = 14, _acquireTimer = 15, ReacquireTimer = 16,
 }
 Store.HotFields = HOT
-local KIND_COUNT = 13
+local KIND_COUNT = 16
 local MOTION_LAST = 6 -- kinds 1..6 mark the record Dirty when written
 
 local NAN = 0 / 0
@@ -139,9 +145,11 @@ local function read(slot: number, kind: number): any
 		return readf64(Store.Cold, slot * COLD + 8)
 	elseif kind == 12 then
 		return readf64(Store.Cold, slot * COLD + 16)
+	elseif kind == 13 then
+		local state = readf64(Store.Cold, slot * COLD + 24)
+		return if state == 0 then nil else state
 	end
-	local state = readf64(Store.Cold, slot * COLD + 24)
-	return if state == 0 then nil else state
+	return readf64(Store.HomingTimers, slot * HOMING + (kind - 14) * 8)
 end
 
 local function write(slot: number, kind: number, value: any)
@@ -170,8 +178,10 @@ local function write(slot: number, kind: number, value: any)
 		writef64(Store.Cold, slot * COLD + 8, tonumber(value) or 0)
 	elseif kind == 12 then
 		writef64(Store.Cold, slot * COLD + 16, tonumber(value) or 1)
-	else
+	elseif kind == 13 then
 		writef64(Store.Cold, slot * COLD + 24, tonumber(value) or 0)
+	else
+		writef64(Store.HomingTimers, slot * HOMING + (kind - 14) * 8, tonumber(value) or 0)
 	end
 	if kind <= MOTION_LAST then
 		flag(slot, DIRTY, true)
@@ -197,6 +207,7 @@ local function allocate(): number
 			Store.Flags = grow(Store.Flags, 1)
 			Store.Scales = grow(Store.Scales, SCALES)
 			Store.Cold = grow(Store.Cold, COLD)
+			Store.HomingTimers = grow(Store.HomingTimers, HOMING)
 			capacity *= 2
 		end
 		Store.Generation[slot] = 0
@@ -207,6 +218,7 @@ local function allocate(): number
 	writeu8(Store.Flags, slot, 0)
 	buffer.fill(Store.Scales, slot * SCALES, 0, SCALES)
 	buffer.fill(Store.Cold, slot * COLD, 0, COLD)
+	buffer.fill(Store.HomingTimers, slot * HOMING, 0, HOMING)
 	return slot
 end
 

@@ -93,6 +93,13 @@ local function stressTest(serverOnly: boolean?)
 	VisualOffload.Fire("StressTestFire", { Count = STRESS_TEST_COUNT, ServerOnly = serverOnly == true })
 end
 
+-- H / Shift+H: the same, but homing shots (they hunt Enemy-tagged entities,
+-- e.g. the test dummy) -- fewer, since homing steps serially.
+local HOMING_STRESS_COUNT = 2000
+local function homingStressTest(serverOnly: boolean?)
+	VisualOffload.Fire("StressTestFire", { Count = HOMING_STRESS_COUNT, ServerOnly = serverOnly == true, Homing = true })
+end
+
 function ShooterController.start()
 	if inputConnection then
 		return
@@ -114,6 +121,8 @@ function ShooterController.start()
 			VisualOffload.Fire("SetProjectileDebug", debugRays)
 		elseif input.KeyCode == Enum.KeyCode.N then
 			stressTest(UserInputService:IsKeyDown(Enum.KeyCode.LeftShift) or UserInputService:IsKeyDown(Enum.KeyCode.RightShift))
+		elseif input.KeyCode == Enum.KeyCode.H then
+			homingStressTest(UserInputService:IsKeyDown(Enum.KeyCode.LeftShift) or UserInputService:IsKeyDown(Enum.KeyCode.RightShift))
 		elseif input.KeyCode == Enum.KeyCode.R then
 			reload()
 		elseif input.KeyCode == Enum.KeyCode.V then
