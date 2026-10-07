@@ -15,7 +15,7 @@
 	 - Debris: cubes of the struck material thrown steeply (70-80 degrees)
 	   out of the blast, simulated here (gravity, a bounce or two off whatever
 	   they hit, then rest and fade), on the local time scale.
-
+	--
 	Crater.Spawn(surface: RaycastResult, blastRadius, intensity, lowDetail?)
 ]]
 
