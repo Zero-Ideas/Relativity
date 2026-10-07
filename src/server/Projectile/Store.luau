@@ -238,15 +238,11 @@ function Store.Release(state: any, metatable: any)
 	if not slot then
 		return
 	end
-	local values = {}
-	for key, kind in HOT do
-		values[key] = read(slot, kind)
-	end
 	dropSource(readu32(Store.data, slot * STRIDE + SOURCE))
 	setmetatable(state, metatable)
 	rawset(state, "_slot", nil)
-	for key, value in values do
-		rawset(state, key, value)
+	for key, kind in HOT do
+		rawset(state, key, read(slot, kind))
 	end
 	Store.Generation[slot] += 1
 	table.insert(free, slot)

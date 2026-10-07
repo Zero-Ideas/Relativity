@@ -21,15 +21,15 @@
 --     src/server/Projectile/Types.luau (239 lines)
 --     src/server/Projectile/Config.luau (192 lines)
 --     src/server/Projectile/Math.luau (71 lines)
---     src/server/Projectile/Raycast.luau (254 lines)
+--     src/server/Projectile/Raycast.luau (284 lines)
 --     src/server/Projectile/Occupancy.luau (516 lines)
 --     src/server/Projectile/Homing.luau (150 lines)
 --     src/server/Projectile/RewindHit.luau (144 lines)
 --     src/server/Projectile/Replication.luau (579 lines)
---     src/server/Projectile/Store.luau (279 lines)
+--     src/server/Projectile/Store.luau (275 lines)
 --     src/server/Projectile/Sweep.luau (221 lines)
---     src/server/Projectile/Profile.luau (54 lines)
---     src/server/Projectile/Parallel.luau (594 lines)
+--     src/server/Projectile/Profile.luau (67 lines)
+--     src/server/Projectile/Parallel.luau (614 lines)
 --     src/server/Projectile/init.luau (1286 lines)
 --     src/server/Projectile/BeamProjectileHandler.luau (338 lines)
 --     src/server/ProjectileQuota.luau (41 lines)
@@ -3601,9 +3601,17 @@ local BOUNCE_CLEARANCE = 0.05
 -- adding pierced entities instead of the current position-nudge approach),
 -- mutating `ignore` in place won't take effect -- FilterDescendantsInstances
 -- would need reassigning.
+-- Shared params by content: nothing writes to a projectile's _rayParams, so
+-- every projectile ignoring the same instances (a burst, a stress test, one
+-- player's shots) uses one RaycastParams instead of building its own. Keyed
+-- by a trie of the ignored instances; reset when it grows past
+-- MAX_SHARED_PARAMS (dead characters), which only costs a rebuild.
+local MAX_SHARED_PARAMS = 1024
+local sharedParams: { [any]: any } = {}
+local sharedCount = 0
+local LEAF = newproxy() -- (trie key for a node's params; can't collide with an Instance)
+
 function Raycast.buildRayParams(source: Types.EntityLike?, ignoreInstances: { Instance }?): RaycastParams
-	local params = RaycastParams.new()
-	params.FilterType = Enum.RaycastFilterType.Exclude
 	local ignore: { Instance } = {}
 	local sourceInstance = source and source.Instance
 	if sourceInstance then
@@ -3617,8 +3625,30 @@ function Raycast.buildRayParams(source: Types.EntityLike?, ignoreInstances: { In
 	if ignoreInstances then
 		table.move(ignoreInstances, 1, #ignoreInstances, #ignore + 1, ignore)
 	end
+	local node = sharedParams
+	for _, instance in ignore do
+		local nextNode = node[instance]
+		if not nextNode then
+			nextNode = {}
+			node[instance] = nextNode
+		end
+		node = nextNode
+	end
+	local shared = node[LEAF]
+	if shared then
+		return shared
+	end
+	local params = RaycastParams.new()
+	params.FilterType = Enum.RaycastFilterType.Exclude
 	params.FilterDescendantsInstances = ignore
 	params.IgnoreWater = true
+	sharedCount += 1
+	if sharedCount > MAX_SHARED_PARAMS then
+		table.clear(sharedParams)
+		sharedCount = 0
+		return params
+	end
+	node[LEAF] = params
 	return params
 end
 
@@ -5479,15 +5509,11 @@ function Store.Release(state: any, metatable: any)
 	if not slot then
 		return
 	end
-	local values = {}
-	for key, kind in HOT do
-		values[key] = read(slot, kind)
-	end
 	dropSource(readu32(Store.data, slot * STRIDE + SOURCE))
 	setmetatable(state, metatable)
 	rawset(state, "_slot", nil)
-	for key, value in values do
-		rawset(state, key, value)
+	for key, kind in HOT do
+		rawset(state, key, read(slot, kind))
 	end
 	Store.Generation[slot] += 1
 	table.insert(free, slot)
@@ -5784,9 +5810,19 @@ function Profile.Count(name: string, n: number)
 	counts[name] = (counts[name] or 0) + n
 end
 
+-- Lua heap at the last frame, and how much the garbage collector freed
+-- since the last Take (heap drops between frames).
+local lastHeap = gcinfo()
+local freedKB = 0
+
 -- One server frame passed (called once per projectile Heartbeat step).
 function Profile.Frame()
 	frames += 1
+	local heap = gcinfo()
+	if heap < lastHeap then
+		freedKB += lastHeap - heap
+	end
+	lastHeap = heap
 end
 
 -- { [section] = average ms per frame, [count] = average per frame } since
@@ -5800,6 +5836,9 @@ function Profile.Take(): { [string]: number }
 	for name, n in counts do
 		result[name] = n / count
 	end
+	result.HeapMB = lastHeap / 1024
+	result.GcFreedMB = freedKB / 1024 / count
+	freedKB = 0
 	table.clear(totals)
 	table.clear(counts)
 	frames = 0
@@ -5971,12 +6010,21 @@ end
 -- Filter id for a projectile's movement RaycastParams, by content (beam
 -- samples rebuild identical params per packet). New ids are sent to every
 -- worker and become usable next frame.
+local filterByParams: { [RaycastParams]: number } = setmetatable({}, { __mode = "k" }) :: any
+
 local function filterFor(projectile: any): number?
 	local cached = projectile._filterId
 	if cached then
 		return if filterReady[cached] and filterReady[cached] <= frame then cached else nil
 	end
 	local params: RaycastParams = projectile._rayParams
+	-- params are shared between projectiles (Raycast.buildRayParams), so most
+	-- lookups end here, without reading FilterDescendantsInstances back
+	local known = filterByParams[params]
+	if known then
+		projectile._filterId = known
+		return if filterReady[known] <= frame then known else nil
+	end
 	local instances = params.FilterDescendantsInstances
 	local node = filterIds
 	for _, instance in instances do
@@ -5999,6 +6047,7 @@ local function filterFor(projectile: any): number?
 		end
 	end
 	projectile._filterId = id
+	filterByParams[params] = id
 	return if filterReady[id] <= frame then id else nil
 end
 
@@ -6260,6 +6309,7 @@ end
 function Parallel.Apply(apply: Applier, mark: number, now: number, timeVersion: number)
 	local clock = os.clock
 	local decodeTime, loopTime, slowTime, releaseTime, releases, kept = 0, 0, 0, 0, 0, 0
+	local readTime, transferred = 0, 0
 	local slowest, total, any = 0, 0, false
 	local sameVersion = timeVersion == batchTimeVersion
 	for w, batch in batches do
@@ -6279,7 +6329,13 @@ function Parallel.Apply(apply: Applier, mark: number, now: number, timeVersion: 
 		local decodeStarted = clock()
 		local ms = tonumber(outputTable.ms) or 0
 		slowest, total, any = math.max(slowest, ms), total + ms, true
-		local data = buffer.fromstring(outputTable.data :: string)
+		-- (timed in two parts: copying the string out of the SharedTable, then
+		-- into a buffer -- see the Stats tab's decode line)
+		local text = outputTable.data :: string
+		local readDone = clock()
+		local data = buffer.fromstring(text)
+		readTime += readDone - decodeStarted
+		transferred += #text
 		local input = batch.Input
 		local projectiles, slots, generations, scales, deadlines =
 			batch.Projectiles, batch.Slot, batch.Generation, batch.Scale, batch.Deadline
@@ -6375,6 +6431,9 @@ function Parallel.Apply(apply: Applier, mark: number, now: number, timeVersion: 
 	end
 	stats.Parallel += kept
 	Profile.Add("ApplyDecode", decodeTime)
+	Profile.Add("DecodeRead", readTime)
+	Profile.Add("DecodeBuffer", decodeTime - readTime)
+	Profile.Count("TransferKB", transferred / 1024)
 	Profile.Add("ApplyLoop", loopTime - slowTime)
 	Profile.Add("ApplySlow", slowTime)
 	Profile.Add("ApplyRelease", releaseTime)

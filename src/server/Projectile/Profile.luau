@@ -29,9 +29,19 @@ function Profile.Count(name: string, n: number)
 	counts[name] = (counts[name] or 0) + n
 end
 
+-- Lua heap at the last frame, and how much the garbage collector freed
+-- since the last Take (heap drops between frames).
+local lastHeap = gcinfo()
+local freedKB = 0
+
 -- One server frame passed (called once per projectile Heartbeat step).
 function Profile.Frame()
 	frames += 1
+	local heap = gcinfo()
+	if heap < lastHeap then
+		freedKB += lastHeap - heap
+	end
+	lastHeap = heap
 end
 
 -- { [section] = average ms per frame, [count] = average per frame } since
@@ -45,6 +55,9 @@ function Profile.Take(): { [string]: number }
 	for name, n in counts do
 		result[name] = n / count
 	end
+	result.HeapMB = lastHeap / 1024
+	result.GcFreedMB = freedKB / 1024 / count
+	freedKB = 0
 	table.clear(totals)
 	table.clear(counts)
 	frames = 0

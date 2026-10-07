@@ -155,12 +155,21 @@ end
 -- Filter id for a projectile's movement RaycastParams, by content (beam
 -- samples rebuild identical params per packet). New ids are sent to every
 -- worker and become usable next frame.
+local filterByParams: { [RaycastParams]: number } = setmetatable({}, { __mode = "k" }) :: any
+
 local function filterFor(projectile: any): number?
 	local cached = projectile._filterId
 	if cached then
 		return if filterReady[cached] and filterReady[cached] <= frame then cached else nil
 	end
 	local params: RaycastParams = projectile._rayParams
+	-- params are shared between projectiles (Raycast.buildRayParams), so most
+	-- lookups end here, without reading FilterDescendantsInstances back
+	local known = filterByParams[params]
+	if known then
+		projectile._filterId = known
+		return if filterReady[known] <= frame then known else nil
+	end
 	local instances = params.FilterDescendantsInstances
 	local node = filterIds
 	for _, instance in instances do
@@ -183,6 +192,7 @@ local function filterFor(projectile: any): number?
 		end
 	end
 	projectile._filterId = id
+	filterByParams[params] = id
 	return if filterReady[id] <= frame then id else nil
 end
 
@@ -444,6 +454,7 @@ end
 function Parallel.Apply(apply: Applier, mark: number, now: number, timeVersion: number)
 	local clock = os.clock
 	local decodeTime, loopTime, slowTime, releaseTime, releases, kept = 0, 0, 0, 0, 0, 0
+	local readTime, transferred = 0, 0
 	local slowest, total, any = 0, 0, false
 	local sameVersion = timeVersion == batchTimeVersion
 	for w, batch in batches do
@@ -463,7 +474,13 @@ function Parallel.Apply(apply: Applier, mark: number, now: number, timeVersion: 
 		local decodeStarted = clock()
 		local ms = tonumber(outputTable.ms) or 0
 		slowest, total, any = math.max(slowest, ms), total + ms, true
-		local data = buffer.fromstring(outputTable.data :: string)
+		-- (timed in two parts: copying the string out of the SharedTable, then
+		-- into a buffer -- see the Stats tab's decode line)
+		local text = outputTable.data :: string
+		local readDone = clock()
+		local data = buffer.fromstring(text)
+		readTime += readDone - decodeStarted
+		transferred += #text
 		local input = batch.Input
 		local projectiles, slots, generations, scales, deadlines =
 			batch.Projectiles, batch.Slot, batch.Generation, batch.Scale, batch.Deadline
@@ -559,6 +576,9 @@ function Parallel.Apply(apply: Applier, mark: number, now: number, timeVersion: 
 	end
 	stats.Parallel += kept
 	Profile.Add("ApplyDecode", decodeTime)
+	Profile.Add("DecodeRead", readTime)
+	Profile.Add("DecodeBuffer", decodeTime - readTime)
+	Profile.Count("TransferKB", transferred / 1024)
 	Profile.Add("ApplyLoop", loopTime - slowTime)
 	Profile.Add("ApplySlow", slowTime)
 	Profile.Add("ApplyRelease", releaseTime)

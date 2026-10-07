@@ -38,9 +38,17 @@ local BOUNCE_CLEARANCE = 0.05
 -- adding pierced entities instead of the current position-nudge approach),
 -- mutating `ignore` in place won't take effect -- FilterDescendantsInstances
 -- would need reassigning.
+-- Shared params by content: nothing writes to a projectile's _rayParams, so
+-- every projectile ignoring the same instances (a burst, a stress test, one
+-- player's shots) uses one RaycastParams instead of building its own. Keyed
+-- by a trie of the ignored instances; reset when it grows past
+-- MAX_SHARED_PARAMS (dead characters), which only costs a rebuild.
+local MAX_SHARED_PARAMS = 1024
+local sharedParams: { [any]: any } = {}
+local sharedCount = 0
+local LEAF = newproxy() -- (trie key for a node's params; can't collide with an Instance)
+
 function Raycast.buildRayParams(source: Types.EntityLike?, ignoreInstances: { Instance }?): RaycastParams
-	local params = RaycastParams.new()
-	params.FilterType = Enum.RaycastFilterType.Exclude
 	local ignore: { Instance } = {}
 	local sourceInstance = source and source.Instance
 	if sourceInstance then
@@ -54,8 +62,30 @@ function Raycast.buildRayParams(source: Types.EntityLike?, ignoreInstances: { In
 	if ignoreInstances then
 		table.move(ignoreInstances, 1, #ignoreInstances, #ignore + 1, ignore)
 	end
+	local node = sharedParams
+	for _, instance in ignore do
+		local nextNode = node[instance]
+		if not nextNode then
+			nextNode = {}
+			node[instance] = nextNode
+		end
+		node = nextNode
+	end
+	local shared = node[LEAF]
+	if shared then
+		return shared
+	end
+	local params = RaycastParams.new()
+	params.FilterType = Enum.RaycastFilterType.Exclude
 	params.FilterDescendantsInstances = ignore
 	params.IgnoreWater = true
+	sharedCount += 1
+	if sharedCount > MAX_SHARED_PARAMS then
+		table.clear(sharedParams)
+		sharedCount = 0
+		return params
+	end
+	node[LEAF] = params
 	return params
 end
 
