@@ -14,10 +14,11 @@
 	same state it would have without the split.
 
 	Also defines the packed layouts both sides use:
-	  input  (INPUT_SLOTS f64): index, filter, position, velocity,
-	         acceleration (kind + value), acceleration direction (flag +
-	         vector), gravity (kind + value), min/max speed, radius, age,
-	         lifetime, remaining
+	  input  (48 bytes): motion spec id u32, filter id u32, position 3 x f32,
+	         velocity 3 x f32 (Vector3s are float32: exact), age f64,
+	         remaining f64. The per-shot constants (acceleration and its
+	         direction, gravity, min/max speed, radius, lifetime) are a
+	         MotionSpec the workers are sent once and keep, like filters.
 	  output (OUTPUT_BYTES): status u8, guard u8, position 3 x f32, velocity
 	         3 x f32 (both are Vector3s, float32 already: exact), age f64,
 	         remaining f64
@@ -39,52 +40,35 @@ local MIN_STEP_DT = ProjectileMotion.MinStepDt
 local MAX_SUBSTEPS = Sweep.MaxSubsteps
 local DONE, CONTACT, EXPIRED = Sweep.Done, Sweep.Contact, Sweep.Expired
 
-Sweep.InputSlots = 26
-local IN, OUT = Sweep.InputSlots * 8, 44
+local IN, OUT = 48, 44
 
 -- Byte strides and offsets Parallel's persistent slots update in place.
 Sweep.InputStride, Sweep.OutputStride = IN, OUT
-Sweep.InputMotion = 16 -- position then velocity, 6 x f64
+Sweep.InputMotion = 8 -- position then velocity, 6 x f32 (same layout as the output's)
+Sweep.InputAge = 32
+Sweep.InputRemaining = 40
 -- output offsets
 Sweep.OutStatus, Sweep.OutGuard, Sweep.OutPosition, Sweep.OutVelocity, Sweep.OutAge, Sweep.OutRemaining =
 	0, 1, 4, 16, 28, 36
-Sweep.InputAge = 184
-Sweep.InputRemaining = 200
+
+-- A projectile's per-shot motion constants, as the workers keep them.
+export type MotionSpec = {
+	Acceleration: number | Vector3,
+	Direction: Vector3?,
+	Gravity: number | Vector3,
+	MinSpeed: number,
+	MaxSpeed: number,
+	Radius: number,
+	Lifetime: number,
+}
 
 local writef64, readf64 = buffer.writef64, buffer.readf64
 local writef32, readf32, writeu8, readu8 = buffer.writef32, buffer.readf32, buffer.writeu8, buffer.readu8
+local writeu32, readu32 = buffer.writeu32, buffer.readu32
 
 --------------------------------------------------------------------------------
 -- Packing
 --------------------------------------------------------------------------------
-
-local function writeVector(b: buffer, offset: number, v: Vector3)
-	writef64(b, offset, v.X)
-	writef64(b, offset + 8, v.Y)
-	writef64(b, offset + 16, v.Z)
-end
-
-local function readVector(b: buffer, offset: number): Vector3
-	return Vector3.new(readf64(b, offset), readf64(b, offset + 8), readf64(b, offset + 16))
-end
-
--- number-or-Vector3 (Acceleration / Gravity): kind slot then 3 value slots
-local function writeScalarOrVector(b: buffer, offset: number, value: any)
-	if typeof(value) == "Vector3" then
-		writef64(b, offset, 1)
-		writeVector(b, offset + 8, value)
-	else
-		writef64(b, offset, 0)
-		writef64(b, offset + 8, value or 0)
-	end
-end
-
-local function readScalarOrVector(b: buffer, offset: number): any
-	if readf64(b, offset) == 1 then
-		return readVector(b, offset + 8)
-	end
-	return readf64(b, offset + 8)
-end
 
 function Sweep.InputSize(count: number): number
 	return count * IN
@@ -92,27 +76,6 @@ end
 
 function Sweep.OutputSize(count: number): number
 	return count * OUT
-end
-
-function Sweep.WriteInput(b: buffer, item: number, index: number, filter: number, p: any, remaining: number)
-	local o = (item - 1) * IN
-	writef64(b, o, index)
-	writef64(b, o + 8, filter)
-	writeVector(b, o + 16, p.Position)
-	writeVector(b, o + 40, p.Velocity)
-	writeScalarOrVector(b, o + 64, p.Acceleration)
-	local direction = p.AccelerationDirection
-	writef64(b, o + 96, if direction then 1 else 0)
-	if direction then
-		writeVector(b, o + 104, direction)
-	end
-	writeScalarOrVector(b, o + 128, p.Gravity)
-	writef64(b, o + 160, p.MinSpeed)
-	writef64(b, o + 168, p.MaxSpeed)
-	writef64(b, o + 176, p.Radius)
-	writef64(b, o + 184, p.Age)
-	writef64(b, o + 192, p.Lifetime)
-	writef64(b, o + 200, remaining)
 end
 
 local function writeVector32(b: buffer, offset: number, v: Vector3)
@@ -123,6 +86,29 @@ end
 
 local function readVector32(b: buffer, offset: number): Vector3
 	return Vector3.new(readf32(b, offset), readf32(b, offset + 4), readf32(b, offset + 8))
+end
+
+-- The motion spec of `p` (its per-shot constants; see MotionSpec).
+function Sweep.SpecOf(p: any): MotionSpec
+	return {
+		Acceleration = p.Acceleration or 0,
+		Direction = p.AccelerationDirection,
+		Gravity = p.Gravity or 0,
+		MinSpeed = p.MinSpeed,
+		MaxSpeed = p.MaxSpeed,
+		Radius = p.Radius,
+		Lifetime = p.Lifetime,
+	}
+end
+
+function Sweep.WriteInput(b: buffer, item: number, spec: number, filter: number, p: any, remaining: number)
+	local o = (item - 1) * IN
+	writeu32(b, o, spec)
+	writeu32(b, o + 4, filter)
+	writeVector32(b, o + 8, p.Position)
+	writeVector32(b, o + 20, p.Velocity)
+	writef64(b, o + 32, p.Age)
+	writef64(b, o + 40, remaining)
 end
 
 function Sweep.WriteOutput(b: buffer, item: number, status: number, position: Vector3, velocity: Vector3, age: number, remaining: number, guard: number)
@@ -147,32 +133,34 @@ end
 -- The loop
 --------------------------------------------------------------------------------
 
--- Runs one packed projectile and writes its result. `castHits(from,
--- displacement, radius, filter)` is the worker's movement cast (occupancy skip
--- + Raycast/Spherecast); `hasEntities(position)` its mirror of
+-- Runs one packed projectile and writes its result. `specs` are the motion
+-- specs this worker has been sent; `castHits(from, displacement, radius,
+-- filter)` is the worker's movement cast (occupancy skip +
+-- Raycast/Spherecast); `hasEntities(position)` its mirror of
 -- Raycast.chunkHasEntities.
 function Sweep.Run(
 	input: buffer,
 	item: number,
 	output: buffer,
 	uniformTime: boolean,
+	specs: { [number]: MotionSpec },
 	castHits: (Vector3, Vector3, number, number) -> boolean,
 	hasEntities: (Vector3) -> boolean
 )
 	local o = (item - 1) * IN
-	local index = readf64(input, o)
-	local filter = readf64(input, o + 8)
-	local position = readVector(input, o + 16)
-	local velocity = readVector(input, o + 40)
-	local acceleration = readScalarOrVector(input, o + 64)
-	local direction: Vector3? = if readf64(input, o + 96) == 1 then readVector(input, o + 104) else nil
-	local gravity = readScalarOrVector(input, o + 128)
-	local minSpeed = readf64(input, o + 160)
-	local maxSpeed = readf64(input, o + 168)
-	local radius = readf64(input, o + 176)
-	local age = readf64(input, o + 184)
-	local lifetime = readf64(input, o + 192)
-	local remaining = readf64(input, o + 200)
+	local filter = readu32(input, o + 4)
+	local position = readVector32(input, o + 8)
+	local velocity = readVector32(input, o + 20)
+	local age = readf64(input, o + 32)
+	local remaining = readf64(input, o + 40)
+	local spec = specs[readu32(input, o)]
+	if not spec then
+		-- unknown spec: hand the whole frame to the serial path
+		Sweep.WriteOutput(output, item, CONTACT, position, velocity, age, remaining, 0)
+		return
+	end
+	local acceleration, direction, gravity = spec.Acceleration, spec.Direction, spec.Gravity
+	local minSpeed, maxSpeed, radius, lifetime = spec.MinSpeed, spec.MaxSpeed, spec.Radius, spec.Lifetime
 
 	-- Mirrors Projectile.Step's loop (no homing: maxDt is unbounded; no
 	-- rewind: no lag-compensated entity check).

@@ -58,6 +58,13 @@ local Occupancy = require(projectileModule:WaitForChild("Occupancy"))
 local output = SharedTableRegistry:GetSharedTable(`RelativityProjectileSweep{workerId}`)
 
 local filters: { [number]: RaycastParams } = {}
+local specs: { [number]: Sweep.MotionSpec } = {}
+
+-- Motion spec `id` (a projectile's per-shot constants, see Sweep.MotionSpec).
+-- Like filters, only used from the frame after it's sent.
+actor:BindToMessageParallel("Motion", function(id: number, spec: Sweep.MotionSpec)
+	specs[id] = spec
+end)
 local entityChunks: { [Vector3]: boolean } = {}
 
 -- Raycast filter `id` (a projectile's movement RaycastParams, by content).
@@ -120,7 +127,7 @@ actor:BindToMessageParallel("Sweep", function(frame: number, input: buffer, coun
 	end
 	local result = buffer.create(Sweep.OutputSize(count))
 	for item = 1, count do
-		Sweep.Run(input, item, result, uniformTime, castHits, hasEntities)
+		Sweep.Run(input, item, result, uniformTime, specs, castHits, hasEntities)
 	end
 	output.data = buffer.tostring(result)
 	output.count = count

@@ -117,6 +117,10 @@ local sentTimeVersion = -1
 local filterIds: { [any]: any } = {} -- instance trie -> { [flags]: id }
 local filterReady: { [number]: number } = {} -- id -> first frame workers have it
 local nextFilterId = 0
+local specIds: { [any]: any } = {} -- trie of motion-spec values -> id
+local specReady: { [number]: number } = {} -- id -> first frame workers have it
+local nextSpecId = 0
+local MAX_SPECS = 65535 -- past this many distinct specs, new ones just step serially
 local batches: { Batch } = {}
 local batchUniform = true
 local batchTimeVersion = 0
@@ -246,32 +250,73 @@ local function resize(batch: Batch, capacity: number)
 end
 
 -- Packs `projectile` into slot `item` (new or reused) with its current state.
-local function pack(batch: Batch, item: number, projectile: any, filter: number, scale: number)
+local function pack(batch: Batch, item: number, projectile: any, filter: number, spec: number, scale: number)
 	local slot = projectile._slot
 	batch.Projectiles[item] = projectile
 	batch.Slot[item] = slot
 	batch.Generation[item] = Store.Generation[slot]
 	batch.Scale[item] = scale
 	batch.Deadline[item] = projectile._spawnRealTime + projectile.MaxRealLifetime
-	-- remaining is written at each dispatch
-	Sweep.WriteInput(batch.Input, item, item, filter, projectile, 0)
+	-- (remaining holds the carried debt until dispatch adds the frame's budget)
+	Sweep.WriteInput(batch.Input, item, spec, filter, projectile, projectile._simulationDebt)
 	Store.ClearDirty(slot)
 end
 
--- Its scale and filter id if it may have a slot right now, else nil.
-local function eligible(projectile: any): (number?, number?)
+-- Motion spec id for a projectile's per-shot constants (see
+-- Sweep.MotionSpec), by value; new ids are sent to every worker and become
+-- usable next frame. nil if not usable yet (or the values can't be keys).
+local NIL = newproxy()
+local values = table.create(7) -- scratch
+local function specFor(projectile: any): number?
+	local node = specIds
+	values[1], values[2], values[3] = projectile.Acceleration or 0, projectile.AccelerationDirection, projectile.Gravity or 0
+	values[4], values[5], values[6], values[7] = projectile.MinSpeed, projectile.MaxSpeed, projectile.Radius, projectile.Lifetime
+	for index = 1, 7 do
+		local value = values[index]
+		if value == nil then
+			value = NIL
+		elseif value ~= value then
+			return nil -- NaN can't be a key; the serial path deals with it
+		end
+		local nextNode = node[value]
+		if not nextNode then
+			if index == 7 then
+				if nextSpecId >= MAX_SPECS then
+					return nil
+				end
+				nextSpecId += 1
+				nextNode = nextSpecId
+				specReady[nextNode] = frame + 1
+				local spec = Sweep.SpecOf(projectile)
+				for _, worker in workers do
+					worker.Actor:SendMessage("Motion", nextNode, spec)
+				end
+			else
+				nextNode = {}
+			end
+			node[value] = nextNode
+		end
+		node = nextNode
+	end
+	local id = node :: any
+	return if specReady[id] <= frame then id else nil
+end
+
+-- Its scale, filter id and motion spec id if it may have a slot right now,
+-- else nil.
+local function eligible(projectile: any): (number?, number?, number?)
 	if not projectile._slot then
-		return nil, nil -- (released: it's gone)
+		return nil, nil, nil -- (released: it's gone)
 	end
 	local scale = scaleOf(projectile)
 	if not scale then
-		return nil, nil
+		return nil, nil, nil
 	end
 	local filter = projectile._filterId
 	if not filter or filterReady[filter] > frame then
 		filter = filterFor(projectile)
 	end
-	return scale, filter
+	return scale, filter, specFor(projectile)
 end
 
 -- Swap-removes slot `item`.
@@ -283,7 +328,6 @@ local function release(batch: Batch, item: number)
 		local input = batch.Input
 		local o = (item - 1) * IN
 		bufferCopy(input, o, input, (last - 1) * IN, IN)
-		writef64(input, o, item) -- (the record's index slot)
 		projectiles[item] = projectiles[last]
 		batch.Slot[item] = batch.Slot[last]
 		batch.Generation[item] = batch.Generation[last]
@@ -371,8 +415,8 @@ function Parallel.Dispatch(activeCount: number, globalDt: number, allowed: boole
 		if projectile.Dead then
 			continue
 		end
-		local scale, filter = eligible(projectile)
-		if not scale or not filter then
+		local scale, filter, spec = eligible(projectile)
+		if not scale or not filter or not spec then
 			continue
 		end
 		local batch = batches[1]
@@ -386,21 +430,22 @@ function Parallel.Dispatch(activeCount: number, globalDt: number, allowed: boole
 			resize(batch, batch.Capacity * 2)
 		end
 		batch.Count = item
-		pack(batch, item, projectile, filter, scale)
+		pack(batch, item, projectile, filter, spec, scale)
 		projectile._parallelState = SLOTTED
 		acquired += 1
 	end
 	table.clear(queue)
 
-	-- this frame's step budget for every slot
+	-- this frame's step budget for every slot: its record's remaining field
+	-- holds the carried debt (written by pack and Apply), so this is a
+	-- sequential pass over each batch
 	local loopStarted = clock()
-	local store = Store.data
 	for w = 1, workerCount do
 		local batch = batches[w]
-		local input, slots, scales = batch.Input, batch.Slot, batch.Scale
+		local input, scales = batch.Input, batch.Scale
 		for item = 1, batch.Count do
-			local debt = readf64(store, slots[item] * STRIDE + S_DEBT)
-			writef64(input, (item - 1) * IN + IN_REMAINING, globalDt * scales[item] + debt)
+			local o = (item - 1) * IN + IN_REMAINING
+			writef64(input, o, globalDt * scales[item] + readf64(input, o))
 		end
 	end
 
@@ -425,23 +470,64 @@ function Parallel.Dispatch(activeCount: number, globalDt: number, allowed: boole
 	Profile.Count("Acquired", acquired)
 end
 
--- The current scale of the projectile in Store record `o` (its own scale
--- times its source's), or nil when anything is unusual -- then the serial
--- code decides (combinedTimeScale).
-local function storeScale(store: buffer, o: number): number?
-	local own = readf64(store, o + S_SCALE)
-	local index = readu32(store, o + S_SOURCE)
-	local sourceScale: any = 1
-	if index ~= 0 then
-		sourceScale = Store.Sources[index].TimeScale
-	end
-	if type(sourceScale) == "number" and sourceScale >= 0 and own >= 0 and sourceScale < LIMIT and own < LIMIT then
-		local scale = sourceScale * own
-		if scale < LIMIT then
-			return scale
+-- Pass 1 of Apply: every result that is a plain "moved, hit nothing" for a
+-- projectile nothing touched is written straight into its Store record and
+-- its slot's packed record; the rest go into `deferred` (and released slots
+-- into `released`). Its own function, with typed buffers, so the native
+-- compiler specialises every buffer access. Returns dropped, deferred, kept.
+local function applyPlain(store: buffer, data: buffer, input: buffer, count: number, slots: { number },
+	generations: { number }, scales: { number }, deadlines: { number }, generationOf: { number },
+	sources: { any }, now: number, mark: number): (number, number, number)
+	local dropped, slow, kept = 0, 0, 0
+	for item = 1, count do
+		local slot = slots[item]
+		if generationOf[slot] ~= generations[item] then
+			-- released since (the step loop dropped it): nothing to apply
+			dropped += 1
+			released[dropped] = item
+			continue
+		end
+		local o = slot * STRIDE
+		local out = (item - 1) * OUT
+		local plain = readu8(data, out + OUT_STATUS) == SWEEP_DONE and band(readu8(store, o + S_FLAGS), DEAD_OR_DIRTY) == 0
+			and now < deadlines[item]
+		if plain then
+			-- its scale is still the one it was sent with (own * source's; anything
+			-- unusual goes to the serial code, which uses combinedTimeScale)
+			local own = readf64(store, o + S_SCALE)
+			local index = readu32(store, o + S_SOURCE)
+			local sourceScale: any = if index ~= 0 then sources[index].TimeScale else 1
+			plain = type(sourceScale) == "number" and sourceScale >= 0 and own >= 0 and sourceScale < LIMIT
+				and own < LIMIT and sourceScale * own == scales[item]
+		end
+		if not plain then
+			slow += 1
+			deferred[slow] = item
+			continue
+		end
+		-- position/velocity are float32 in the output, the record and the slot
+		bufferCopy(store, o + S_POSITION, data, out + OUT_POSITION, 24)
+		local age = readf64(data, out + OUT_AGE)
+		local debt = readf64(data, out + OUT_REMAINING)
+		writef64(store, o + S_AGE, age)
+		writef64(store, o + S_DEBT, debt)
+		local i = (item - 1) * IN
+		bufferCopy(input, i + IN_MOTION, data, out + OUT_POSITION, 24)
+		writef64(input, i + IN_AGE, age)
+		writef64(input, i + IN_REMAINING, debt) -- (dispatch adds next frame's budget)
+		local px, py, pz = readf32(data, out + OUT_POSITION), readf32(data, out + OUT_POSITION + 4),
+			readf32(data, out + OUT_POSITION + 8)
+		if abs(px) <= LIMIT and abs(py) <= LIMIT and abs(pz) <= LIMIT then
+			writef64(store, o + S_MARK, mark)
+			kept += 1
+		else
+			-- flew past SafeMath.Limit: dies in the step loop
+			writef64(store, o + S_MARK, -mark)
+			dropped += 1
+			released[dropped] = item
 		end
 	end
-	return nil
+	return dropped, slow, kept
 end
 
 -- Applies this frame's results. `mark` is the step loop's frame mark (written
@@ -487,54 +573,21 @@ function Parallel.Apply(apply: Applier, mark: number, now: number, timeVersion: 
 		local generationOf = Store.Generation
 		local loopStarted = clock()
 		decodeTime += loopStarted - decodeStarted
-		local dropped, slow = 0, 0
 		table.clear(released)
 		-- Pass 1, buffers only: every plain result for an untouched projectile.
 		-- The rest are deferred to pass 2, so the serial code (raycasts,
 		-- Step, allocation) doesn't keep evicting this loop's working set.
-		local store = Store.data
-		for item = 1, count do
-			local slot = slots[item]
-			if generationOf[slot] ~= generations[item] then
-				-- released since (the step loop dropped it): nothing to apply
-				dropped += 1
-				released[dropped] = item
-				continue
+		local dropped, slow, keptHere = 0, 0, 0
+		if sameVersion then
+			dropped, slow, keptHere = applyPlain(Store.data, data, input, count, slots, generations, scales, deadlines,
+				generationOf, Store.Sources, now, mark)
+		else
+			for item = 1, count do
+				deferred[item] = item
 			end
-			local o = slot * STRIDE
-			local out = (item - 1) * OUT
-			if readu8(data, out + OUT_STATUS) ~= SWEEP_DONE or band(readu8(store, o + S_FLAGS), DEAD_OR_DIRTY) ~= 0
-				or not sameVersion or not (now < deadlines[item]) or storeScale(store, o) ~= scales[item] then
-				slow += 1
-				deferred[slow] = item
-				continue
-			end
-			-- position/velocity are float32 in both the output and the record
-			bufferCopy(store, o + S_POSITION, data, out + OUT_POSITION, 24)
-			local age = readf64(data, out + OUT_AGE)
-			writef64(store, o + S_AGE, age)
-			writef64(store, o + S_DEBT, readf64(data, out + OUT_REMAINING))
-			local px, py, pz = readf32(data, out + OUT_POSITION), readf32(data, out + OUT_POSITION + 4),
-				readf32(data, out + OUT_POSITION + 8)
-			-- and the slot's packed record (f64) for next frame
-			local i = (item - 1) * IN + IN_MOTION
-			writef64(input, i, px)
-			writef64(input, i + 8, py)
-			writef64(input, i + 16, pz)
-			writef64(input, i + 24, readf32(data, out + OUT_VELOCITY))
-			writef64(input, i + 32, readf32(data, out + OUT_VELOCITY + 4))
-			writef64(input, i + 40, readf32(data, out + OUT_VELOCITY + 8))
-			writef64(input, (item - 1) * IN + IN_AGE, age)
-			if abs(px) <= LIMIT and abs(py) <= LIMIT and abs(pz) <= LIMIT then
-				writef64(store, o + S_MARK, mark)
-				kept += 1
-			else
-				-- flew past SafeMath.Limit: dies in the step loop
-				writef64(store, o + S_MARK, -mark)
-				dropped += 1
-				released[dropped] = item
-			end
+			slow = count
 		end
+		kept += keptHere
 
 		-- Pass 2: the serial code finishes the rest.
 		local slowStarted = clock()
@@ -547,9 +600,9 @@ function Parallel.Apply(apply: Applier, mark: number, now: number, timeVersion: 
 				band(flags, Store.Dirty) ~= 0, scales[item], batchTimeVersion, batchUniform)
 			local keep = false
 			if outcome == REFRESH and not projectile.Dead then
-				local scale, filter = eligible(projectile)
-				if scale and filter then
-					pack(batch, item, projectile, filter, scale)
+				local scale, filter, spec = eligible(projectile)
+				if scale and filter and spec then
+					pack(batch, item, projectile, filter, spec, scale)
 					keep = true
 				end
 			end

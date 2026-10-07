@@ -27,13 +27,13 @@
 --     src/server/Projectile/RewindHit.luau (144 lines)
 --     src/server/Projectile/Replication.luau (579 lines)
 --     src/server/Projectile/Store.luau (275 lines)
---     src/server/Projectile/Sweep.luau (221 lines)
+--     src/server/Projectile/Sweep.luau (209 lines)
 --     src/server/Projectile/Profile.luau (67 lines)
---     src/server/Projectile/Parallel.luau (614 lines)
+--     src/server/Projectile/Parallel.luau (667 lines)
 --     src/server/Projectile/init.luau (1286 lines)
 --     src/server/Projectile/BeamProjectileHandler.luau (338 lines)
 --     src/server/ProjectileQuota.luau (41 lines)
---     src/server/ProjectileWorkerBootstrap.server.luau (129 lines)
+--     src/server/ProjectileWorkerBootstrap.server.luau (136 lines)
 --   Client prediction and visuals
 --     src/shared/ProjectileClient/Types.luau (79 lines)
 --     src/shared/ProjectileClient/Prediction.luau (147 lines)
@@ -5567,10 +5567,11 @@ return Store
 	same state it would have without the split.
 
 	Also defines the packed layouts both sides use:
-	  input  (INPUT_SLOTS f64): index, filter, position, velocity,
-	         acceleration (kind + value), acceleration direction (flag +
-	         vector), gravity (kind + value), min/max speed, radius, age,
-	         lifetime, remaining
+	  input  (48 bytes): motion spec id u32, filter id u32, position 3 x f32,
+	         velocity 3 x f32 (Vector3s are float32: exact), age f64,
+	         remaining f64. The per-shot constants (acceleration and its
+	         direction, gravity, min/max speed, radius, lifetime) are a
+	         MotionSpec the workers are sent once and keep, like filters.
 	  output (OUTPUT_BYTES): status u8, guard u8, position 3 x f32, velocity
 	         3 x f32 (both are Vector3s, float32 already: exact), age f64,
 	         remaining f64
@@ -5592,52 +5593,35 @@ local MIN_STEP_DT = ProjectileMotion.MinStepDt
 local MAX_SUBSTEPS = Sweep.MaxSubsteps
 local DONE, CONTACT, EXPIRED = Sweep.Done, Sweep.Contact, Sweep.Expired
 
-Sweep.InputSlots = 26
-local IN, OUT = Sweep.InputSlots * 8, 44
+local IN, OUT = 48, 44
 
 -- Byte strides and offsets Parallel's persistent slots update in place.
 Sweep.InputStride, Sweep.OutputStride = IN, OUT
-Sweep.InputMotion = 16 -- position then velocity, 6 x f64
+Sweep.InputMotion = 8 -- position then velocity, 6 x f32 (same layout as the output's)
+Sweep.InputAge = 32
+Sweep.InputRemaining = 40
 -- output offsets
 Sweep.OutStatus, Sweep.OutGuard, Sweep.OutPosition, Sweep.OutVelocity, Sweep.OutAge, Sweep.OutRemaining =
 	0, 1, 4, 16, 28, 36
-Sweep.InputAge = 184
-Sweep.InputRemaining = 200
+
+-- A projectile's per-shot motion constants, as the workers keep them.
+export type MotionSpec = {
+	Acceleration: number | Vector3,
+	Direction: Vector3?,
+	Gravity: number | Vector3,
+	MinSpeed: number,
+	MaxSpeed: number,
+	Radius: number,
+	Lifetime: number,
+}
 
 local writef64, readf64 = buffer.writef64, buffer.readf64
 local writef32, readf32, writeu8, readu8 = buffer.writef32, buffer.readf32, buffer.writeu8, buffer.readu8
+local writeu32, readu32 = buffer.writeu32, buffer.readu32
 
 --------------------------------------------------------------------------------
 -- Packing
 --------------------------------------------------------------------------------
-
-local function writeVector(b: buffer, offset: number, v: Vector3)
-	writef64(b, offset, v.X)
-	writef64(b, offset + 8, v.Y)
-	writef64(b, offset + 16, v.Z)
-end
-
-local function readVector(b: buffer, offset: number): Vector3
-	return Vector3.new(readf64(b, offset), readf64(b, offset + 8), readf64(b, offset + 16))
-end
-
--- number-or-Vector3 (Acceleration / Gravity): kind slot then 3 value slots
-local function writeScalarOrVector(b: buffer, offset: number, value: any)
-	if typeof(value) == "Vector3" then
-		writef64(b, offset, 1)
-		writeVector(b, offset + 8, value)
-	else
-		writef64(b, offset, 0)
-		writef64(b, offset + 8, value or 0)
-	end
-end
-
-local function readScalarOrVector(b: buffer, offset: number): any
-	if readf64(b, offset) == 1 then
-		return readVector(b, offset + 8)
-	end
-	return readf64(b, offset + 8)
-end
 
 function Sweep.InputSize(count: number): number
 	return count * IN
@@ -5645,27 +5629,6 @@ end
 
 function Sweep.OutputSize(count: number): number
 	return count * OUT
-end
-
-function Sweep.WriteInput(b: buffer, item: number, index: number, filter: number, p: any, remaining: number)
-	local o = (item - 1) * IN
-	writef64(b, o, index)
-	writef64(b, o + 8, filter)
-	writeVector(b, o + 16, p.Position)
-	writeVector(b, o + 40, p.Velocity)
-	writeScalarOrVector(b, o + 64, p.Acceleration)
-	local direction = p.AccelerationDirection
-	writef64(b, o + 96, if direction then 1 else 0)
-	if direction then
-		writeVector(b, o + 104, direction)
-	end
-	writeScalarOrVector(b, o + 128, p.Gravity)
-	writef64(b, o + 160, p.MinSpeed)
-	writef64(b, o + 168, p.MaxSpeed)
-	writef64(b, o + 176, p.Radius)
-	writef64(b, o + 184, p.Age)
-	writef64(b, o + 192, p.Lifetime)
-	writef64(b, o + 200, remaining)
 end
 
 local function writeVector32(b: buffer, offset: number, v: Vector3)
@@ -5676,6 +5639,29 @@ end
 
 local function readVector32(b: buffer, offset: number): Vector3
 	return Vector3.new(readf32(b, offset), readf32(b, offset + 4), readf32(b, offset + 8))
+end
+
+-- The motion spec of `p` (its per-shot constants; see MotionSpec).
+function Sweep.SpecOf(p: any): MotionSpec
+	return {
+		Acceleration = p.Acceleration or 0,
+		Direction = p.AccelerationDirection,
+		Gravity = p.Gravity or 0,
+		MinSpeed = p.MinSpeed,
+		MaxSpeed = p.MaxSpeed,
+		Radius = p.Radius,
+		Lifetime = p.Lifetime,
+	}
+end
+
+function Sweep.WriteInput(b: buffer, item: number, spec: number, filter: number, p: any, remaining: number)
+	local o = (item - 1) * IN
+	writeu32(b, o, spec)
+	writeu32(b, o + 4, filter)
+	writeVector32(b, o + 8, p.Position)
+	writeVector32(b, o + 20, p.Velocity)
+	writef64(b, o + 32, p.Age)
+	writef64(b, o + 40, remaining)
 end
 
 function Sweep.WriteOutput(b: buffer, item: number, status: number, position: Vector3, velocity: Vector3, age: number, remaining: number, guard: number)
@@ -5700,32 +5686,34 @@ end
 -- The loop
 --------------------------------------------------------------------------------
 
--- Runs one packed projectile and writes its result. `castHits(from,
--- displacement, radius, filter)` is the worker's movement cast (occupancy skip
--- + Raycast/Spherecast); `hasEntities(position)` its mirror of
+-- Runs one packed projectile and writes its result. `specs` are the motion
+-- specs this worker has been sent; `castHits(from, displacement, radius,
+-- filter)` is the worker's movement cast (occupancy skip +
+-- Raycast/Spherecast); `hasEntities(position)` its mirror of
 -- Raycast.chunkHasEntities.
 function Sweep.Run(
 	input: buffer,
 	item: number,
 	output: buffer,
 	uniformTime: boolean,
+	specs: { [number]: MotionSpec },
 	castHits: (Vector3, Vector3, number, number) -> boolean,
 	hasEntities: (Vector3) -> boolean
 )
 	local o = (item - 1) * IN
-	local index = readf64(input, o)
-	local filter = readf64(input, o + 8)
-	local position = readVector(input, o + 16)
-	local velocity = readVector(input, o + 40)
-	local acceleration = readScalarOrVector(input, o + 64)
-	local direction: Vector3? = if readf64(input, o + 96) == 1 then readVector(input, o + 104) else nil
-	local gravity = readScalarOrVector(input, o + 128)
-	local minSpeed = readf64(input, o + 160)
-	local maxSpeed = readf64(input, o + 168)
-	local radius = readf64(input, o + 176)
-	local age = readf64(input, o + 184)
-	local lifetime = readf64(input, o + 192)
-	local remaining = readf64(input, o + 200)
+	local filter = readu32(input, o + 4)
+	local position = readVector32(input, o + 8)
+	local velocity = readVector32(input, o + 20)
+	local age = readf64(input, o + 32)
+	local remaining = readf64(input, o + 40)
+	local spec = specs[readu32(input, o)]
+	if not spec then
+		-- unknown spec: hand the whole frame to the serial path
+		Sweep.WriteOutput(output, item, CONTACT, position, velocity, age, remaining, 0)
+		return
+	end
+	local acceleration, direction, gravity = spec.Acceleration, spec.Direction, spec.Gravity
+	local minSpeed, maxSpeed, radius, lifetime = spec.MinSpeed, spec.MaxSpeed, spec.Radius, spec.Lifetime
 
 	-- Mirrors Projectile.Step's loop (no homing: maxDt is unbounded; no
 	-- rewind: no lag-compensated entity check).
@@ -5972,6 +5960,10 @@ local sentTimeVersion = -1
 local filterIds: { [any]: any } = {} -- instance trie -> { [flags]: id }
 local filterReady: { [number]: number } = {} -- id -> first frame workers have it
 local nextFilterId = 0
+local specIds: { [any]: any } = {} -- trie of motion-spec values -> id
+local specReady: { [number]: number } = {} -- id -> first frame workers have it
+local nextSpecId = 0
+local MAX_SPECS = 65535 -- past this many distinct specs, new ones just step serially
 local batches: { Batch } = {}
 local batchUniform = true
 local batchTimeVersion = 0
@@ -6101,32 +6093,73 @@ local function resize(batch: Batch, capacity: number)
 end
 
 -- Packs `projectile` into slot `item` (new or reused) with its current state.
-local function pack(batch: Batch, item: number, projectile: any, filter: number, scale: number)
+local function pack(batch: Batch, item: number, projectile: any, filter: number, spec: number, scale: number)
 	local slot = projectile._slot
 	batch.Projectiles[item] = projectile
 	batch.Slot[item] = slot
 	batch.Generation[item] = Store.Generation[slot]
 	batch.Scale[item] = scale
 	batch.Deadline[item] = projectile._spawnRealTime + projectile.MaxRealLifetime
-	-- remaining is written at each dispatch
-	Sweep.WriteInput(batch.Input, item, item, filter, projectile, 0)
+	-- (remaining holds the carried debt until dispatch adds the frame's budget)
+	Sweep.WriteInput(batch.Input, item, spec, filter, projectile, projectile._simulationDebt)
 	Store.ClearDirty(slot)
 end
 
--- Its scale and filter id if it may have a slot right now, else nil.
-local function eligible(projectile: any): (number?, number?)
+-- Motion spec id for a projectile's per-shot constants (see
+-- Sweep.MotionSpec), by value; new ids are sent to every worker and become
+-- usable next frame. nil if not usable yet (or the values can't be keys).
+local NIL = newproxy()
+local values = table.create(7) -- scratch
+local function specFor(projectile: any): number?
+	local node = specIds
+	values[1], values[2], values[3] = projectile.Acceleration or 0, projectile.AccelerationDirection, projectile.Gravity or 0
+	values[4], values[5], values[6], values[7] = projectile.MinSpeed, projectile.MaxSpeed, projectile.Radius, projectile.Lifetime
+	for index = 1, 7 do
+		local value = values[index]
+		if value == nil then
+			value = NIL
+		elseif value ~= value then
+			return nil -- NaN can't be a key; the serial path deals with it
+		end
+		local nextNode = node[value]
+		if not nextNode then
+			if index == 7 then
+				if nextSpecId >= MAX_SPECS then
+					return nil
+				end
+				nextSpecId += 1
+				nextNode = nextSpecId
+				specReady[nextNode] = frame + 1
+				local spec = Sweep.SpecOf(projectile)
+				for _, worker in workers do
+					worker.Actor:SendMessage("Motion", nextNode, spec)
+				end
+			else
+				nextNode = {}
+			end
+			node[value] = nextNode
+		end
+		node = nextNode
+	end
+	local id = node :: any
+	return if specReady[id] <= frame then id else nil
+end
+
+-- Its scale, filter id and motion spec id if it may have a slot right now,
+-- else nil.
+local function eligible(projectile: any): (number?, number?, number?)
 	if not projectile._slot then
-		return nil, nil -- (released: it's gone)
+		return nil, nil, nil -- (released: it's gone)
 	end
 	local scale = scaleOf(projectile)
 	if not scale then
-		return nil, nil
+		return nil, nil, nil
 	end
 	local filter = projectile._filterId
 	if not filter or filterReady[filter] > frame then
 		filter = filterFor(projectile)
 	end
-	return scale, filter
+	return scale, filter, specFor(projectile)
 end
 
 -- Swap-removes slot `item`.
@@ -6138,7 +6171,6 @@ local function release(batch: Batch, item: number)
 		local input = batch.Input
 		local o = (item - 1) * IN
 		bufferCopy(input, o, input, (last - 1) * IN, IN)
-		writef64(input, o, item) -- (the record's index slot)
 		projectiles[item] = projectiles[last]
 		batch.Slot[item] = batch.Slot[last]
 		batch.Generation[item] = batch.Generation[last]
@@ -6226,8 +6258,8 @@ function Parallel.Dispatch(activeCount: number, globalDt: number, allowed: boole
 		if projectile.Dead then
 			continue
 		end
-		local scale, filter = eligible(projectile)
-		if not scale or not filter then
+		local scale, filter, spec = eligible(projectile)
+		if not scale or not filter or not spec then
 			continue
 		end
 		local batch = batches[1]
@@ -6241,21 +6273,22 @@ function Parallel.Dispatch(activeCount: number, globalDt: number, allowed: boole
 			resize(batch, batch.Capacity * 2)
 		end
 		batch.Count = item
-		pack(batch, item, projectile, filter, scale)
+		pack(batch, item, projectile, filter, spec, scale)
 		projectile._parallelState = SLOTTED
 		acquired += 1
 	end
 	table.clear(queue)
 
-	-- this frame's step budget for every slot
+	-- this frame's step budget for every slot: its record's remaining field
+	-- holds the carried debt (written by pack and Apply), so this is a
+	-- sequential pass over each batch
 	local loopStarted = clock()
-	local store = Store.data
 	for w = 1, workerCount do
 		local batch = batches[w]
-		local input, slots, scales = batch.Input, batch.Slot, batch.Scale
+		local input, scales = batch.Input, batch.Scale
 		for item = 1, batch.Count do
-			local debt = readf64(store, slots[item] * STRIDE + S_DEBT)
-			writef64(input, (item - 1) * IN + IN_REMAINING, globalDt * scales[item] + debt)
+			local o = (item - 1) * IN + IN_REMAINING
+			writef64(input, o, globalDt * scales[item] + readf64(input, o))
 		end
 	end
 
@@ -6280,23 +6313,64 @@ function Parallel.Dispatch(activeCount: number, globalDt: number, allowed: boole
 	Profile.Count("Acquired", acquired)
 end
 
--- The current scale of the projectile in Store record `o` (its own scale
--- times its source's), or nil when anything is unusual -- then the serial
--- code decides (combinedTimeScale).
-local function storeScale(store: buffer, o: number): number?
-	local own = readf64(store, o + S_SCALE)
-	local index = readu32(store, o + S_SOURCE)
-	local sourceScale: any = 1
-	if index ~= 0 then
-		sourceScale = Store.Sources[index].TimeScale
-	end
-	if type(sourceScale) == "number" and sourceScale >= 0 and own >= 0 and sourceScale < LIMIT and own < LIMIT then
-		local scale = sourceScale * own
-		if scale < LIMIT then
-			return scale
+-- Pass 1 of Apply: every result that is a plain "moved, hit nothing" for a
+-- projectile nothing touched is written straight into its Store record and
+-- its slot's packed record; the rest go into `deferred` (and released slots
+-- into `released`). Its own function, with typed buffers, so the native
+-- compiler specialises every buffer access. Returns dropped, deferred, kept.
+local function applyPlain(store: buffer, data: buffer, input: buffer, count: number, slots: { number },
+	generations: { number }, scales: { number }, deadlines: { number }, generationOf: { number },
+	sources: { any }, now: number, mark: number): (number, number, number)
+	local dropped, slow, kept = 0, 0, 0
+	for item = 1, count do
+		local slot = slots[item]
+		if generationOf[slot] ~= generations[item] then
+			-- released since (the step loop dropped it): nothing to apply
+			dropped += 1
+			released[dropped] = item
+			continue
+		end
+		local o = slot * STRIDE
+		local out = (item - 1) * OUT
+		local plain = readu8(data, out + OUT_STATUS) == SWEEP_DONE and band(readu8(store, o + S_FLAGS), DEAD_OR_DIRTY) == 0
+			and now < deadlines[item]
+		if plain then
+			-- its scale is still the one it was sent with (own * source's; anything
+			-- unusual goes to the serial code, which uses combinedTimeScale)
+			local own = readf64(store, o + S_SCALE)
+			local index = readu32(store, o + S_SOURCE)
+			local sourceScale: any = if index ~= 0 then sources[index].TimeScale else 1
+			plain = type(sourceScale) == "number" and sourceScale >= 0 and own >= 0 and sourceScale < LIMIT
+				and own < LIMIT and sourceScale * own == scales[item]
+		end
+		if not plain then
+			slow += 1
+			deferred[slow] = item
+			continue
+		end
+		-- position/velocity are float32 in the output, the record and the slot
+		bufferCopy(store, o + S_POSITION, data, out + OUT_POSITION, 24)
+		local age = readf64(data, out + OUT_AGE)
+		local debt = readf64(data, out + OUT_REMAINING)
+		writef64(store, o + S_AGE, age)
+		writef64(store, o + S_DEBT, debt)
+		local i = (item - 1) * IN
+		bufferCopy(input, i + IN_MOTION, data, out + OUT_POSITION, 24)
+		writef64(input, i + IN_AGE, age)
+		writef64(input, i + IN_REMAINING, debt) -- (dispatch adds next frame's budget)
+		local px, py, pz = readf32(data, out + OUT_POSITION), readf32(data, out + OUT_POSITION + 4),
+			readf32(data, out + OUT_POSITION + 8)
+		if abs(px) <= LIMIT and abs(py) <= LIMIT and abs(pz) <= LIMIT then
+			writef64(store, o + S_MARK, mark)
+			kept += 1
+		else
+			-- flew past SafeMath.Limit: dies in the step loop
+			writef64(store, o + S_MARK, -mark)
+			dropped += 1
+			released[dropped] = item
 		end
 	end
-	return nil
+	return dropped, slow, kept
 end
 
 -- Applies this frame's results. `mark` is the step loop's frame mark (written
@@ -6342,54 +6416,21 @@ function Parallel.Apply(apply: Applier, mark: number, now: number, timeVersion: 
 		local generationOf = Store.Generation
 		local loopStarted = clock()
 		decodeTime += loopStarted - decodeStarted
-		local dropped, slow = 0, 0
 		table.clear(released)
 		-- Pass 1, buffers only: every plain result for an untouched projectile.
 		-- The rest are deferred to pass 2, so the serial code (raycasts,
 		-- Step, allocation) doesn't keep evicting this loop's working set.
-		local store = Store.data
-		for item = 1, count do
-			local slot = slots[item]
-			if generationOf[slot] ~= generations[item] then
-				-- released since (the step loop dropped it): nothing to apply
-				dropped += 1
-				released[dropped] = item
-				continue
+		local dropped, slow, keptHere = 0, 0, 0
+		if sameVersion then
+			dropped, slow, keptHere = applyPlain(Store.data, data, input, count, slots, generations, scales, deadlines,
+				generationOf, Store.Sources, now, mark)
+		else
+			for item = 1, count do
+				deferred[item] = item
 			end
-			local o = slot * STRIDE
-			local out = (item - 1) * OUT
-			if readu8(data, out + OUT_STATUS) ~= SWEEP_DONE or band(readu8(store, o + S_FLAGS), DEAD_OR_DIRTY) ~= 0
-				or not sameVersion or not (now < deadlines[item]) or storeScale(store, o) ~= scales[item] then
-				slow += 1
-				deferred[slow] = item
-				continue
-			end
-			-- position/velocity are float32 in both the output and the record
-			bufferCopy(store, o + S_POSITION, data, out + OUT_POSITION, 24)
-			local age = readf64(data, out + OUT_AGE)
-			writef64(store, o + S_AGE, age)
-			writef64(store, o + S_DEBT, readf64(data, out + OUT_REMAINING))
-			local px, py, pz = readf32(data, out + OUT_POSITION), readf32(data, out + OUT_POSITION + 4),
-				readf32(data, out + OUT_POSITION + 8)
-			-- and the slot's packed record (f64) for next frame
-			local i = (item - 1) * IN + IN_MOTION
-			writef64(input, i, px)
-			writef64(input, i + 8, py)
-			writef64(input, i + 16, pz)
-			writef64(input, i + 24, readf32(data, out + OUT_VELOCITY))
-			writef64(input, i + 32, readf32(data, out + OUT_VELOCITY + 4))
-			writef64(input, i + 40, readf32(data, out + OUT_VELOCITY + 8))
-			writef64(input, (item - 1) * IN + IN_AGE, age)
-			if abs(px) <= LIMIT and abs(py) <= LIMIT and abs(pz) <= LIMIT then
-				writef64(store, o + S_MARK, mark)
-				kept += 1
-			else
-				-- flew past SafeMath.Limit: dies in the step loop
-				writef64(store, o + S_MARK, -mark)
-				dropped += 1
-				released[dropped] = item
-			end
+			slow = count
 		end
+		kept += keptHere
 
 		-- Pass 2: the serial code finishes the rest.
 		local slowStarted = clock()
@@ -6402,9 +6443,9 @@ function Parallel.Apply(apply: Applier, mark: number, now: number, timeVersion: 
 				band(flags, Store.Dirty) ~= 0, scales[item], batchTimeVersion, batchUniform)
 			local keep = false
 			if outcome == REFRESH and not projectile.Dead then
-				local scale, filter = eligible(projectile)
-				if scale and filter then
-					pack(batch, item, projectile, filter, scale)
+				local scale, filter, spec = eligible(projectile)
+				if scale and filter and spec then
+					pack(batch, item, projectile, filter, spec, scale)
 					keep = true
 				end
 			end
@@ -8220,6 +8261,13 @@ local Occupancy = require(projectileModule:WaitForChild("Occupancy"))
 local output = SharedTableRegistry:GetSharedTable(`RelativityProjectileSweep{workerId}`)
 
 local filters: { [number]: RaycastParams } = {}
+local specs: { [number]: Sweep.MotionSpec } = {}
+
+-- Motion spec `id` (a projectile's per-shot constants, see Sweep.MotionSpec).
+-- Like filters, only used from the frame after it's sent.
+actor:BindToMessageParallel("Motion", function(id: number, spec: Sweep.MotionSpec)
+	specs[id] = spec
+end)
 local entityChunks: { [Vector3]: boolean } = {}
 
 -- Raycast filter `id` (a projectile's movement RaycastParams, by content).
@@ -8282,7 +8330,7 @@ actor:BindToMessageParallel("Sweep", function(frame: number, input: buffer, coun
 	end
 	local result = buffer.create(Sweep.OutputSize(count))
 	for item = 1, count do
-		Sweep.Run(input, item, result, uniformTime, castHits, hasEntities)
+		Sweep.Run(input, item, result, uniformTime, specs, castHits, hasEntities)
 	end
 	output.data = buffer.tostring(result)
 	output.count = count
