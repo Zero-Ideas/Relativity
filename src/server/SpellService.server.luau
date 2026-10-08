@@ -106,14 +106,14 @@ local function coolingDown(player: Player, slot: number?): boolean
 	return previous ~= nil and os.clock() - previous < CAST_INTERVAL
 end
 
-local function markCast(player: Player, slot: number?)
+local function markCast(player: Player, slot: number?, manaSpent: number)
 	if not slot then return end
 	local deadlines = lastCast[player]
 	if not deadlines then deadlines = {}; lastCast[player] = deadlines end
 	deadlines[slot] = os.clock()
 	local deadline = workspace:GetServerTimeNow() + CAST_INTERVAL
 	player:SetAttribute("SpellCooldownEndsAt" .. slot, deadline)
-	feedback:FireClient(player, { Accepted = true, Slot = slot, EndsAt = deadline })
+	feedback:FireClient(player, { Accepted = true, Slot = slot, EndsAt = deadline, ManaSpent = manaSpent })
 end
 
 -- Settles a charge that prepaid `paid` mana: pays the rest of its cost at
@@ -460,7 +460,9 @@ local function circleBegin(player: Player)
 	lastCircleBegin[player] = now
 	circleOpen[player] = true
 	local aim = liveAim[player]
-	VisualOffload.Fire("SpellCircle", { Phase = "Begin", Caster = character, Spec = spec, Target = aim and aim.position })
+	local compiled = compiledFor(record)
+	VisualOffload.Fire("SpellCircle", { Phase = "Begin", Caster = character, Spec = spec, Target = aim and aim.position,
+		ManaCost = if compiled then compiled.manaCost else 0 })
 end
 
 local function circleClose(player: Player, phase: string)
@@ -512,7 +514,7 @@ local function fireFrozen(player: Player, target: Vector3): boolean
 	end
 	table.remove(queue :: { FrozenSpell }, 1)
 	player:SetAttribute("SpellFrozenSlot", if queue and queue[1] then queue[1].slot else nil)
-	markCast(player, entry.slot)
+	markCast(player, entry.slot, entry.compiled.manaCost * SpellRunes.ChargeEnergyMultiplier(charge))
 	VisualOffload.Fire("SpellCircle", { Phase = "FireFrozen", Caster = character, Target = target })
 	-- launch once the circle has reassembled on clients (SpellCircleVFX)
 	local origin = entry.origin
@@ -732,7 +734,7 @@ local function castSpell(player: Player, rawTarget: any): boolean
 	chargePaid[player] = nil
 	if not settled then return false end
 	charge = settled
-	markCast(player, SpellStore.GetActiveSlot(player))
+	markCast(player, SpellStore.GetActiveSlot(player), compiled.manaCost * SpellRunes.ChargeEnergyMultiplier(charge))
 
 	local head = character:FindFirstChild("Head")
 	local origin = if head and head:IsA("BasePart") then head.Position else root.Position
@@ -764,6 +766,7 @@ local function castSpell(player: Player, rawTarget: any): boolean
 		Target = targetPoint,
 		Charge = charge,
 		Sustain = SpellRunes.HasSustain(compiled),
+		ManaSpent = compiled.manaCost * SpellRunes.ChargeEnergyMultiplier(charge),
 	})
 	return true
 end

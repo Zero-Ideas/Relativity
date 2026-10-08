@@ -81,14 +81,15 @@ local function refreshCards()
 					if object:IsA("TextLabel") then object.ZIndex = 8 end
 					if object:IsA("GuiButton") then object.ZIndex = 10 end
 				end
-				preview = SpellCardPreview.new(card)
+				preview = SpellCardPreview.new(card, true)
 				slot.previews[card] = preview
 			end
-			preview:SetGraph(record.graph)
+			preview:SetSpell(record)
+			preview:SetSelected(selected)
 			local deadline = player:GetAttribute("SpellCooldownEndsAt" .. index) or 0
 			if deadline > workspace:GetServerTimeNow() and preview.Deadline ~= deadline then preview:Cooldown(deadline, false) end
 			local outline = card:FindFirstChild("OverlayStroke")
-			if outline and outline:IsA("UIStroke") then outline.Color = if selected then Color3.new(1, 1, 1) else Color3.new(0, 0, 0) end
+			if outline and outline:IsA("UIStroke") then outline.Enabled = false end
 			local title, caption = card:FindFirstChild("TopText"), card:FindFirstChild("BtmText")
 			if title and title:IsA("TextLabel") then title.Text = record.name end
 			if caption and caption:IsA("TextLabel") then caption.Text = if selected then "Active spell" else "Select spell" end
@@ -206,7 +207,7 @@ function Hud.start()
 	SpellEditor.StateChanged:Connect(refreshCards)
 	SpellEditor.SpellFired:Connect(function(data)
 		local slot = slots[data.Slot]
-		if slot then for _, preview in slot.previews do preview:Cooldown(data.EndsAt, true) end end
+		if slot then for _, preview in slot.previews do preview:Cooldown(data.EndsAt, true, data.ManaSpent) end end
 	end)
 	player.CharacterAdded:Connect(bindCharacter)
 	player.CharacterRemoving:Connect(function() disconnect(characterConnections); humanoid = nil; refreshStats() end)

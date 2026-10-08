@@ -9,13 +9,15 @@ local Shared = ReplicatedStorage:WaitForChild("Shared")
 local Compiler = require(Shared.SpellCompiler)
 local Layout = require(Shared.SpellCircleLayout)
 local Circles = require(script.Parent.SpellCircleVFX)
+local Decoration = require(script.Parent.SpellCardDecoration)
+local Tooltip = require(script.Parent.SpellTooltip)
 local Preview = {}
 Preview.__index = Preview
 local active: { [any]: boolean } = {}
 local connection: RBXScriptConnection? = nil
 local RELEASE = 0.22
 
-function Preview.new(parent: GuiObject): any
+function Preview.new(parent: GuiObject, decorated: boolean?): any
 	local frame = Instance.new("Frame")
 	frame.Name = "SpellCirclePreview"
 	frame.BackgroundColor3 = Color3.new(0, 0, 0)
@@ -50,7 +52,21 @@ function Preview.new(parent: GuiObject): any
 	timer.ZIndex = 7
 	timer.Visible = false
 	timer.Parent = frame
-	return setmetatable({ Frame = frame, Canvas = canvas, Timer = timer, Resize = resize, Deadline = 0, FireAt = nil }, Preview)
+	local self = setmetatable({ Frame = frame, Canvas = canvas, Timer = timer, Resize = resize, Deadline = 0, FireAt = nil,
+		Decoration = if decorated then Decoration.new(parent) else nil, Selected = false }, Preview)
+	self.TooltipCleanup = Tooltip.Bind(parent, function() return self.Spell end)
+	return self
+end
+
+function Preview.SetSpell(self: any, record: any?)
+	self.Spell = record
+	self:SetGraph(if record and not record.invalid then record.graph else nil)
+	Tooltip.Refresh(self.Frame.Parent)
+end
+
+function Preview.SetSelected(self: any, selected: boolean)
+	self.Selected = selected
+	if self.Decoration then self.Decoration:Update(self.ManaCost, selected) end
 end
 
 function Preview.SetProgress(self: any, progress: number, visible: number)
@@ -74,6 +90,8 @@ function Preview.SetGraph(self: any, graph: any?)
 	end
 	self.Builder = nil
 	local compiled = graph and Compiler.Compile(graph)
+	self.ManaCost = if compiled then compiled.manaCost else nil
+	if self.Decoration then self.Decoration:Update(self.ManaCost, self.Selected) end
 	if not compiled then self.Frame.Visible = false; return end
 	self.Frame.Visible = true
 	self.Builder = Circles.BuildPreview(self.Canvas, Layout.Build(compiled))
@@ -106,11 +124,12 @@ function Preview.Step(self: any, now: number): boolean
 	return remaining > 0
 end
 
-function Preview.Cooldown(self: any, deadline: number, fired: boolean)
+function Preview.Cooldown(self: any, deadline: number, fired: boolean, manaSpent: number?)
 	local now = workspace:GetServerTimeNow()
 	self.Deadline = deadline
 	self.FireAt = if fired then now else nil
 	self.RedrawAt = now + (if fired then RELEASE else 0)
+	if fired and self.Decoration then self.Decoration:Flash(manaSpent or self.ManaCost or 0) end
 	self:Step(now)
 	if deadline <= now then return end
 	active[self] = true
@@ -125,6 +144,8 @@ end
 function Preview.Destroy(self: any)
 	active[self] = nil
 	self.Resize:Disconnect()
+	self.TooltipCleanup()
+	if self.Decoration then self.Decoration:Destroy() end
 	self.Frame:Destroy()
 end
 

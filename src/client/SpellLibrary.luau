@@ -37,6 +37,7 @@ local ReGuiLoader = require(script.Parent.ReGuiLoader)
 local ReGuiLive = require(script.Parent.ReGuiLive)
 local SpellEditor = require(script.Parent.SpellAssemblerGui)
 local SpellCardPreview = require(script.Parent.SpellCardPreview)
+local SpellTooltip = require(script.Parent.SpellTooltip)
 local Notifications = require(script.Parent.Notifications)
 
 local player = Players.LocalPlayer
@@ -283,9 +284,6 @@ local function buildBar(canvas: any): Bar
 		frame.BackgroundColor3 = Color3.fromRGB(14, 14, 20)
 		frame.Size = UDim2.fromOffset(BOX_W, BOX_H)
 		frame.Parent = row
-		local corner = Instance.new("UICorner")
-		corner.CornerRadius = UDim.new(0, 6)
-		corner.Parent = frame
 		local stroke = Instance.new("UIStroke")
 		stroke.ApplyStrokeMode = Enum.ApplyStrokeMode.Border
 		stroke.Thickness = 1.5
@@ -303,7 +301,7 @@ local function buildBar(canvas: any): Bar
 		local name = Instance.new("TextLabel")
 		name.BackgroundTransparency = 1
 		name.AnchorPoint = Vector2.new(0.5, 1)
-		name.Position = UDim2.new(0.5, 0, 1, -3)
+		name.Position = UDim2.new(0.5, 0, 1, -10)
 		name.Size = UDim2.new(1, -6, 0, 14)
 		name.Font = Enum.Font.GothamBold
 		name.TextSize = 11
@@ -311,7 +309,8 @@ local function buildBar(canvas: any): Bar
 		name.TextTruncate = Enum.TextTruncate.AtEnd
 		name.ZIndex = 8
 		name.Parent = frame
-		local circle = SpellCardPreview.new(frame)
+		local circle = SpellCardPreview.new(frame, true)
+		circle.Frame.Position = UDim2.fromScale(0.5, 0.43)
 		frame.Activated:Connect(function()
 			clickBox(slot)
 		end)
@@ -325,11 +324,13 @@ local function updateBars(state: any)
 	for _, bar in bars do
 		for slot, box in bar.boxes do
 			local record = state.slots and state.slots[tostring(slot)]
-			box.preview:SetGraph(if record and not record.invalid then record.graph else nil)
+			box.preview:SetSpell(record)
 			box.name.Text = if record then record.name else "Empty"
 			box.name.TextColor3 = if record then Color3.fromRGB(235, 235, 240) else Color3.fromRGB(120, 120, 130)
 			local pickedBox = held and held.kind == "slot" and held.slot == slot
 			local target = held ~= nil and not pickedBox
+			box.preview:SetSelected(pickedBox or state.activeSlot == slot)
+			box.stroke.Enabled = not record or target
 			box.stroke.Color = if pickedBox then Color3.new(1, 1, 1)
 				elseif target then Color3.fromRGB(120, 170, 255)
 				elseif state.activeSlot == slot then Color3.fromRGB(200, 200, 210)
@@ -341,7 +342,7 @@ end
 
 -- A spell's circle (clickable) for a list row.
 local rowIcons: { [Instance]: any } = setmetatable({}, { __mode = "k" }) :: any
-local function rowIcon(row: any, graph: any, onClick: () -> ())
+local function rowIcon(row: any, record: any, onClick: () -> ())
 	local label = row:Label({ Text = "" })
 	pcall(function()
 		label.AutomaticSize = Enum.AutomaticSize.None
@@ -350,13 +351,13 @@ local function rowIcon(row: any, graph: any, onClick: () -> ())
 	local retained = rowIcons[label]
 	if retained then
 		retained.onClick = onClick
-		retained.circle:SetGraph(graph)
+		retained.circle:SetSpell(record)
 		return
 	end
 	local circle = SpellCardPreview.new(label)
 	circle.Frame.Size = UDim2.fromScale(1, 1)
 	circle.Frame.Position = UDim2.fromScale(0.5, 0.5)
-	circle:SetGraph(graph)
+	circle:SetSpell(record)
 	local button = Instance.new("TextButton")
 	button.BackgroundTransparency = 1
 	button.Text = ""
@@ -496,9 +497,9 @@ local function spellRow(parent: any, state: any, spell: any)
 	local picked = heldRef() == ref
 	local row = canvas:Row()
 	if not spell.invalid then
-		rowIcon(row, spell.graph, function() pickSpell(ref, spell.name, spell.graph, spell.id) end)
+		rowIcon(row, spell, function() pickSpell(ref, spell.name, spell.graph, spell.id) end)
 	end
-	row:SmallButton({
+	local nameButton = row:SmallButton({
 		Text = (if picked then "▶ " else "") .. spell.name,
 		Callback = function()
 			if not spell.invalid then
@@ -506,6 +507,7 @@ local function spellRow(parent: any, state: any, spell: any)
 			end
 		end,
 	})
+	SpellTooltip.Bind(nameButton, function() return spell end)
 	local slot = slotOf(state, ref)
 	row:Label({ Text = (if spell.invalid then "doesn't compile" else describe(spell.graph)) .. (if slot then ` · box {slot}` else "") })
 	local actions = canvas:Row()
@@ -648,17 +650,19 @@ local function renderEncyclopedia(section: ReGuiLive.Section, state: any, ownedO
 			end
 			for _, spell in spells do
 				local ref = "e:" .. spell.Id
+				local tooltipRecord = { name = spell.Name, graph = spell.Graph, encyclopedia = spell.Id }
 				local owned = Encyclopedia.IsOwned(spell.Id, state.owned)
 				local row = inner:Row({ LiveKey = "spell:" .. spell.Id })
-				rowIcon(row, spell.Graph, function()
+				rowIcon(row, tooltipRecord, function()
 					if owned then pickSpell(ref, spell.Name, spell.Graph) else showPreview(spell.Name, spell.Graph) end
 				end)
-				row:SmallButton({
+				local nameButton = row:SmallButton({
 					Text = (if heldRef() == ref then "▶ " else "") .. spell.Name,
 					Callback = function()
 						if owned then pickSpell(ref, spell.Name, spell.Graph) else showPreview(spell.Name, spell.Graph) end
 					end,
 				})
+				SpellTooltip.Bind(nameButton, function() return tooltipRecord end)
 				local slot = slotOf(state, ref)
 				row:Label({
 					Text = describe(spell.Graph) .. (if slot then ` · box {slot}` else "")

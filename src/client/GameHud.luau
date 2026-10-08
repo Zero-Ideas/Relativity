@@ -26,6 +26,7 @@ local ContextActionService = game:GetService("ContextActionService")
 
 local SpellEditor = require(script.Parent.SpellAssemblerGui)
 local SpellCardPreview = require(script.Parent.SpellCardPreview)
+local SpellCardDecoration = require(script.Parent.SpellCardDecoration)
 local PartyClient = require(script.Parent.PartyClient)
 local PartyWindow = require(script.Parent.PartyWindow)
 
@@ -35,7 +36,7 @@ local FONT = Enum.Font.GothamBold
 local TEXT = Color3.fromRGB(240, 240, 240)
 local BAR_WIDTH = 320
 local BAR_HEIGHT = 5
-local CARD_W, CARD_H, CARD_GAP, CARD_LIFT = 84, 104, 10, 8
+local CARD_W, CARD_H, CARD_GAP, CARD_LIFT = 84, 84, 10, 8
 local PANEL_W = 260
 local SLOT_COUNT = 5
 local SLOT_ACTION = "GameHudSpellSlots"
@@ -207,11 +208,14 @@ end
 -- One card per saved spell, in slot order, numbered 1..n: never an empty
 -- card. Key k (or clicking card k) selects the k-th saved spell; selecting
 -- the selected one again deselects it. With no spells, a hint shows instead.
-type Card = { holder: Frame, card: Frame, stroke: UIStroke, key: TextLabel, name: TextLabel, preview: any }
+type Card = { holder: Frame, card: Frame, stroke: UIStroke, key: TextLabel, preview: any }
 local cards: { Card } = {}
 local cardSlots: { number } = {} -- card index -> spell slot
 local cardRow: Frame? = nil
 local noSpellsHint: TextLabel? = nil
+local equippedHeading: Frame? = nil
+local equippedName: TextLabel? = nil
+local equippedUnderline: Frame? = nil
 
 local function selectCard(index: number)
 	local slot = cardSlots[index]
@@ -234,7 +238,6 @@ local function createCard(index: number, row: Frame): Card
 		Position = UDim2.fromOffset(0, CARD_LIFT),
 		Size = UDim2.fromOffset(CARD_W, CARD_H),
 	}, holder)
-	corner(card, UDim.new(0, 6))
 	local stroke = make("UIStroke", { Color = Color3.fromRGB(90, 90, 95), Thickness = 1.5 }, card)
 	local key = label({
 		Name = "Key",
@@ -243,16 +246,6 @@ local function createCard(index: number, row: Frame): Card
 		Text = tostring(index),
 		TextSize = 12,
 		TextColor3 = Color3.fromRGB(180, 180, 180),
-		ZIndex = 8,
-	}, card)
-	local name = label({
-		Name = "SpellName",
-		AnchorPoint = Vector2.new(0.5, 1),
-		Position = UDim2.new(0.5, 0, 1, -4),
-		Size = UDim2.new(1, -8, 0, 16),
-		TextSize = 12,
-		TextTruncate = Enum.TextTruncate.AtEnd,
-		TextXAlignment = Enum.TextXAlignment.Center,
 		ZIndex = 8,
 	}, card)
 	local button = make("TextButton", {
@@ -265,7 +258,10 @@ local function createCard(index: number, row: Frame): Card
 	button.Activated:Connect(function()
 		selectCard(index)
 	end)
-	return { holder = holder, card = card, stroke = stroke, key = key, name = name, preview = SpellCardPreview.new(card) }
+	local preview = SpellCardPreview.new(card, true)
+	preview.Frame.Size = UDim2.fromScale(0.82, 0.82)
+	preview.Frame.Position = UDim2.fromScale(0.5, 0.5)
+	return { holder = holder, card = card, stroke = stroke, key = key, preview = preview }
 end
 
 local function refreshCards()
@@ -295,16 +291,24 @@ local function refreshCards()
 	end
 
 	local selectedSlot = SpellEditor.GetSelectedSlot()
+	if equippedHeading then
+		equippedHeading.Visible = false
+		equippedHeading.Size = UDim2.fromOffset(math.clamp(row.Size.X.Offset, 180, 420), 32)
+	end
 	local now = workspace:GetServerTimeNow()
 	for index, card in cards do
 		local slot = cardSlots[index]
 		local record = state.slots[slot] or state.slots[tostring(slot)]
 		local selected = selectedSlot == slot
 		card.card.Position = UDim2.fromOffset(0, if selected then 0 else CARD_LIFT)
-		card.stroke.Color = if selected then Color3.new(1, 1, 1) else Color3.fromRGB(90, 90, 95)
-		card.stroke.Thickness = if selected then 2.5 else 1.5
-		card.preview:SetGraph(record.graph)
-		card.name.Text = record.name
+		card.stroke.Enabled = false
+		card.preview:SetSpell(record)
+		card.preview:SetSelected(selected)
+		if selected and equippedHeading and equippedName and equippedUnderline then
+			equippedHeading.Visible = true
+			equippedName.Text = record.name
+			equippedUnderline.BackgroundColor3 = SpellCardDecoration.GetColor(card.preview.ManaCost or 0)
+		end
 		-- (cooldowns belong to slots: a card now showing another slot follows
 		-- that slot's cooldown)
 		local deadline = player:GetAttribute("SpellCooldownEndsAt" .. slot) or 0
@@ -328,6 +332,39 @@ local function buildCards(screen: ScreenGui)
 		Padding = UDim.new(0, CARD_GAP),
 	}, row)
 	cardRow = row
+	local heading = make("Frame", {
+		Name = "EquippedSpellHeading",
+		AnchorPoint = Vector2.new(0.5, 1),
+		Position = UDim2.new(0.5, 0, 1, -(CARD_H + CARD_LIFT + 24)),
+		Size = UDim2.fromOffset(320, 32),
+		BackgroundTransparency = 1,
+		Visible = false,
+	}, screen)
+	equippedHeading = heading
+	equippedName = label({
+		Name = "SpellName",
+		Size = UDim2.new(1, -12, 0, 22),
+		Position = UDim2.fromOffset(6, 0),
+		Text = "",
+		TextSize = 16,
+		TextTruncate = Enum.TextTruncate.AtEnd,
+		TextXAlignment = Enum.TextXAlignment.Center,
+	}, heading)
+	local underline = make("Frame", {
+		Name = "TierUnderline",
+		Position = UDim2.fromOffset(0, 27),
+		Size = UDim2.new(1, 0, 0, 1),
+		BorderSizePixel = 0,
+	}, heading)
+	equippedUnderline = underline
+	make("UIGradient", {
+		Transparency = NumberSequence.new({
+			NumberSequenceKeypoint.new(0, 1),
+			NumberSequenceKeypoint.new(0.35, 0),
+			NumberSequenceKeypoint.new(0.65, 0),
+			NumberSequenceKeypoint.new(1, 1),
+		}),
+	}, underline)
 	noSpellsHint = label({
 		Name = "NoSpells",
 		AnchorPoint = Vector2.new(0.5, 1),
@@ -844,7 +881,7 @@ function GameHud.start()
 		local index = table.find(cardSlots, data.Slot)
 		local card = index and cards[index]
 		if card then
-			card.preview:Cooldown(data.EndsAt, true)
+			card.preview:Cooldown(data.EndsAt, true, data.ManaSpent)
 		end
 	end)
 	SpellEditor.ManaShort:Connect(function()

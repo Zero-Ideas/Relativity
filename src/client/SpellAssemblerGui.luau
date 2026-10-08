@@ -938,7 +938,7 @@ local function buildChargeBar()
 	screen.Enabled = false
 	local frame = Instance.new("Frame")
 	frame.AnchorPoint = Vector2.new(0.5, 1)
-	frame.Position = UDim2.new(0.5, 0, 1, -130)
+	frame.Position = UDim2.new(0.5, 0, 1, -170)
 	frame.Size = UDim2.fromOffset(240, 10)
 	frame.BackgroundColor3 = Color3.fromRGB(20, 22, 30)
 	frame.BackgroundTransparency = 0.2
@@ -1031,7 +1031,7 @@ function SpellAssemblerGui.Cast()
 		startChargeBar()
 		local character = player.Character
 		if character and activeCache.spec then
-			SpellCircleVFX.Begin(character, activeCache.spec, player:GetMouse().Hit.Position, true)
+			SpellCircleVFX.Begin(character, activeCache.spec, player:GetMouse().Hit.Position, true, compiled.manaCost)
 		end
 		return
 	end
@@ -1040,6 +1040,8 @@ function SpellAssemblerGui.Cast()
 	sendCast(mouse.Hit.Position)
 	local character = player.Character
 	if character and activeCache.spec then
+		local compiled = activeCache.compiled
+		if compiled then require(script.Parent.SpellCastGlint).Play(character, compiled.manaCost, mouse.Hit.Position) end
 		SpellCircleVFX.Cast(character, activeCache.spec, 1, mouse.Hit.Position, true, true)
 	end
 end

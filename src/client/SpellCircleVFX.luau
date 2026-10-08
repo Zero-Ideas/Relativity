@@ -35,6 +35,7 @@ local VisualOffload = require(Shared.VisualOffload)
 local Heartbeat = require(Shared.Heartbeat)
 local ChunkManager = require(Shared.ChunkManager)
 local SpellRunes = require(Shared.SpellRunes)
+local CastGlint = require(script.Parent.SpellCastGlint)
 
 local SpellCircleVFX = {}
 
@@ -959,7 +960,8 @@ end
 --------------------------------------------------------------------------------
 
 -- Starts drawing a charging circle for `caster` (replacing one in progress).
-function SpellCircleVFX.Begin(caster: Model, spec: any, target: Vector3?, isLocal: boolean?)
+function SpellCircleVFX.Begin(caster: Model, spec: any, target: Vector3?, isLocal: boolean?, manaCost: number?)
+	if manaCost then CastGlint.Play(caster, manaCost, target) end
 	local previous = current[caster]
 	if previous then
 		previous.State, previous.StateAge = "cancel", 0
@@ -1154,8 +1156,9 @@ VisualOffload.On("SpellCircle", function(data)
 	end
 	local target = if typeof(data.Target) == "Vector3" then data.Target else nil
 	if data.Phase == "Begin" then
-		SpellCircleVFX.Begin(caster, data.Spec, target)
+		SpellCircleVFX.Begin(caster, data.Spec, target, false, if typeof(data.ManaCost) == "number" then data.ManaCost else nil)
 	elseif data.Phase == "Cast" then
+		if data.Sustain == true and typeof(data.ManaSpent) == "number" then CastGlint.Play(caster, data.ManaSpent, target) end
 		SpellCircleVFX.Cast(caster, data.Spec, if typeof(data.Charge) == "number" then data.Charge else 1, target, data.Sustain == true)
 	elseif data.Phase == "Cancel" then
 		SpellCircleVFX.Cancel(caster)
