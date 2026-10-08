@@ -59,7 +59,9 @@ local function registerCharacter(player: Player, character: Model)
 	-- it's created.
 	local humanoid = character:FindFirstChildOfClass("Humanoid") or character:WaitForChild("Humanoid", 5)
 	if humanoid and humanoid:IsA("Humanoid") then
-		PlayerDefaults.Apply(humanoid, true)
+		if not PlayerDefaults.Apply(humanoid, true) then
+			PlayerDefaults.ApplyGameHealth(humanoid) -- (1000, not Roblox's 100)
+		end
 	end
 
 	local entity = Entity.new(character, {

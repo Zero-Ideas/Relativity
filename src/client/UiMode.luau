@@ -7,11 +7,13 @@
 
 	Either way Roblox's Backpack stays hidden and spells cast without a Tool.
 	Topbar icons:
-	  Region  (left, first) -- where the server is (server/ServerRegion)
+	  Region  (left, first) -- where the server is (server/ServerRegion);
+	                     opens the server browser (ServerBrowser.luau)
 	  Menu    (left)  -- dropdown: show/hide the party panel
-	  Party   (left)  -- the Party window (PartyWindow: Invite, Parties and
-	                     Whitelist tabs)
-	  Spells  (left)  -- opens/closes the spell assembler
+	  Party   (left)  -- the Party window (PartyWindow: Invite, Parties,
+	                     Friends and Settings tabs)
+	  Spells  (left)  -- the Spells window (SpellLibrary: loadout, library,
+	                     encyclopedia; Edit / New spell open the editor)
 	  Bell    (left)  -- the Messages window (Notifications.luau); a new
 	                     actionable notification (invite, join request) while
 	                     it's closed badges and rings the bell and plays a ping
@@ -29,6 +31,8 @@ local Icon = require(ReplicatedStorage:WaitForChild("Packages"):WaitForChild("To
 local MainHud = require(script.Parent.MainHud)
 local GameHud = require(script.Parent.GameHud)
 local PartyWindow = require(script.Parent.PartyWindow)
+local ServerBrowser = require(script.Parent.ServerBrowser)
+local SpellLibrary = require(script.Parent.SpellLibrary)
 local Notifications = require(script.Parent.Notifications)
 local DebugPanel = require(script.Parent.DebugPanel)
 local SpellAssemblerGui = require(script.Parent.SpellAssemblerGui)
@@ -86,8 +90,10 @@ function UiMode.Set(newMode: Mode)
 end
 
 local function buildTopbar()
-	-- Server region (first, display only): from server/ServerRegion
-	local region = Icon.new():setName("ServerRegion"):lock()
+	-- Server region (first): from server/ServerRegion; opens the server
+	-- browser (join another server, or the best one in a region)
+	local region = Icon.new():setName("ServerRegion"):oneClick()
+	region.selected:Connect(ServerBrowser.Toggle)
 	local function refreshRegion()
 		local text = ReplicatedStorage:GetAttribute("ServerRegion")
 		region:setLabel("🌐 " .. (if typeof(text) == "string" then text else "Locating…"))
@@ -115,7 +121,7 @@ local function buildTopbar()
 	-- Spell assembler
 	local spells = Icon.new():setName("Spells"):setLabel("Spells"):oneClick()
 	spells.selected:Connect(function()
-		SpellAssemblerGui.Toggle()
+		SpellLibrary.Toggle() -- (its Edit / New spell open the editor)
 	end)
 
 	-- Notification centre: badged with how many arrived since it was last

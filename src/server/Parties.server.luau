@@ -28,8 +28,9 @@
 	    ("RequestInvite", dummy)        have a dummy invite you
 	    ("SetPublic", boolean)          (leader) open / close the party
 	    ("JoinParty", player)           join that player's party (straight
-	                                    in if a whitelist allows it, else a
-	                                    join request) -- see Whitelists
+	                                    in if its leader's friends list and
+	                                    settings allow it, else a join
+	                                    request) -- see Friends
 	    ("Leave") ("Kick", member)
 	  server -> client:
 	    ("Invite", inviter, expiresAt) ("JoinRequest", requester, expiresAt)
@@ -39,7 +40,9 @@
 	    ("Notice", text) ("WhitelistChanged")
 	RemoteFunction "PartyQuery": ("Parties") -> { Friends, Public } for the
 	Parties tab; ("Whitelist") and ("WhitelistAdd" | "WhitelistRemove" |
-	"WhitelistTrust", userId, trusted?) -> { Entries, Ok?, Message? }.
+	"WhitelistTrust", userId, trusted?) -> { Entries, Ok?, Message? } for
+	the friends list; ("Settings") and ("SetSetting", name, value) ->
+	settings (see Friends).
 	Any member may invite; only the leader kicks, answers join requests and
 	sets the party public. Joining a party leaves the one you were in. A
 	party lasts while it has a Player in it.
@@ -379,19 +382,23 @@ local function kick(leader: Player, target: any)
 end
 
 --------------------------------------------------------------------------------
--- Whitelists ("friends")
+-- Friends
 --------------------------------------------------------------------------------
--- Each player keeps a whitelist of users (by UserId, saved across sessions).
--- Being on someone's whitelist lets you straight into their party:
---   * whitelisted by the leader of a public party -> "Join" (no request)
---   * whitelisted by every player in a party      -> "Join", even if private
---   * Trusted by anyone in a party                -> "Join", even if private;
---     Trusted by someone in no party -> "Join" makes a party with them
+-- Each player keeps a friends list (by UserId; any friend can be marked
+-- Trusted) and two settings, saved across sessions. Only the party LEADER's
+-- list and settings count:
+--   * AllowTrustedJoin (default on): a Trusted friend can "Join" your party
+--     at any time, private or public; if you're in no party, joining makes
+--     one with you as its leader.
+--   * AllowFriendsJoin (default on): any friend can "Join" your party while
+--     it's public.
 -- Everyone else asks to join a public party (the leader answers).
 
-local MAX_WHITELIST = 200
-type WhitelistEntry = { name: string, trusted: boolean }
-local whitelists: { [Player]: { [string]: WhitelistEntry } } = {}
+local MAX_FRIENDS = 200
+local SETTING_DEFAULTS = { AllowTrustedJoin = true, AllowFriendsJoin = true }
+type FriendEntry = { name: string, trusted: boolean }
+type FriendData = { friends: { [string]: FriendEntry }, settings: { [string]: boolean } }
+local friendData: { [Player]: FriendData } = {}
 local whitelistStore: DataStore? = nil
 do
 	local ok, store = pcall(function()
@@ -401,16 +408,24 @@ do
 end
 local saveQueued: { [Player]: boolean } = {}
 
-local function whitelistOf(owner: Player): { [string]: WhitelistEntry }
-	local list = whitelists[owner]
-	if not list then
-		list = {}
-		whitelists[owner] = list
+local function dataOf(owner: Player): FriendData
+	local data = friendData[owner]
+	if not data then
+		data = { friends = {}, settings = table.clone(SETTING_DEFAULTS) }
+		friendData[owner] = data
 	end
-	return list
+	return data
 end
 
--- (owner's whitelist has user, user's entry is trusted)
+local function whitelistOf(owner: Player): { [string]: FriendEntry }
+	return dataOf(owner).friends
+end
+
+local function setting(owner: Player, name: string): boolean
+	return dataOf(owner).settings[name] == true
+end
+
+-- (owner has user as a friend, and as a Trusted one)
 local function allows(owner: Instance, user: Player): (boolean, boolean)
 	if not owner:IsA("Player") or owner == user then
 		return false, false
@@ -419,15 +434,20 @@ local function allows(owner: Instance, user: Player): (boolean, boolean)
 	return entry ~= nil, entry ~= nil and entry.trusted
 end
 
+local function savePayload(owner: Player): any
+	local data = friendData[owner]
+	return data and { Friends = data.friends, Settings = data.settings }
+end
+
 local function saveWhitelist(owner: Player)
 	if not whitelistStore or saveQueued[owner] then return end
 	saveQueued[owner] = true
 	task.delay(2, function()
 		saveQueued[owner] = nil
-		local list = whitelists[owner]
-		if list and whitelistStore then
+		local payload = savePayload(owner)
+		if payload and whitelistStore then
 			pcall(function()
-				(whitelistStore :: DataStore):SetAsync(`user_{owner.UserId}`, list)
+				(whitelistStore :: DataStore):SetAsync(`user_{owner.UserId}`, payload)
 			end)
 		end
 	end)
@@ -435,14 +455,23 @@ end
 
 local function loadWhitelist(owner: Player)
 	if not whitelistStore then return end
-	local ok, data = pcall(function()
+	local ok, saved = pcall(function()
 		return (whitelistStore :: DataStore):GetAsync(`user_{owner.UserId}`)
 	end)
-	if ok and typeof(data) == "table" and owner.Parent == Players then
-		local list = whitelistOf(owner)
-		for key, entry in data do
-			if typeof(key) == "string" and typeof(entry) == "table" and list[key] == nil then
-				list[key] = { name = tostring(entry.name or key), trusted = entry.trusted == true }
+	if ok and typeof(saved) == "table" and owner.Parent == Players then
+		local data = dataOf(owner)
+		-- (older saves were just the friends map)
+		local friends = if typeof(saved.Friends) == "table" then saved.Friends else saved
+		for key, entry in friends do
+			if typeof(key) == "string" and tonumber(key) and typeof(entry) == "table" and data.friends[key] == nil then
+				data.friends[key] = { name = tostring(entry.name or key), trusted = entry.trusted == true }
+			end
+		end
+		if typeof(saved.Settings) == "table" then
+			for name in SETTING_DEFAULTS do
+				if typeof(saved.Settings[name]) == "boolean" then
+					data.settings[name] = saved.Settings[name]
+				end
 			end
 		end
 		remote:FireAllClients("WhitelistChanged")
@@ -451,24 +480,22 @@ end
 
 -- Whether `user` may join party `id` straight away (see the rules above).
 local function canJoinNow(user: Player, id: string): boolean
-	local members = membersOf(id)
-	local players = 0
-	local allWhitelist = true
-	for _, member in members do
-		if member:IsA("Player") then
-			players += 1
-			local listed, trusted = allows(member, user)
-			if trusted then
-				return true
-			end
-			allWhitelist = allWhitelist and listed
-		end
+	local leader = leaderOf(id)
+	if not leader or not leader:IsA("Player") then
+		return false
 	end
-	if players > 0 and allWhitelist then
+	local friend, trusted = allows(leader, user)
+	if trusted and setting(leader, "AllowTrustedJoin") then
 		return true
 	end
-	local leader = leaderOf(id)
-	return leader ~= nil and leader:GetAttribute("PartyPublic") == true and (allows(leader, user))
+	return friend and leader:GetAttribute("PartyPublic") == true and setting(leader, "AllowFriendsJoin")
+end
+
+-- Whether `user` may "Join" `target` while target is in no party (making
+-- one, led by target).
+local function canStartWith(user: Player, target: Player): boolean
+	local _, trusted = allows(target, user)
+	return trusted and setting(target, "AllowTrustedJoin")
 end
 
 -- "Join" on a party (through any of its members), or on someone in no party
@@ -485,10 +512,8 @@ local function joinParty(user: Player, target: any)
 		end
 		return
 	end
-	local _, trusted = allows(target, user)
-	if trusted then
-		local newId = ensureParty(target)
-		addMember(newId, user)
+	if canStartWith(user, target) then
+		addMember(ensureParty(target), user) -- (target leads the new party)
 	else
 		notice(user, `{target.DisplayName} isn't in a party.`)
 	end
@@ -527,7 +552,7 @@ local function listParties(user: Player): { Friends: { PartyInfo }, Public: { Pa
 				seen[id] = true
 				table.insert(friends, describe(user, id, other))
 			end
-		elseif trusted and not mine then
+		elseif trusted and not mine and canStartWith(user, other) then
 			table.insert(friends, {
 				Target = other,
 				Leader = other.DisplayName,
@@ -579,8 +604,8 @@ local function changeWhitelist(owner: Player, action: string, userId: any, value
 		if list[key] then return true, nil end
 		local count = 0
 		for _ in list do count += 1 end
-		if count >= MAX_WHITELIST then
-			return false, `Your whitelist is full ({MAX_WHITELIST}).`
+		if count >= MAX_FRIENDS then
+			return false, `Your friends list is full ({MAX_FRIENDS}).`
 		end
 		local inServer = Players:GetPlayerByUserId(userId)
 		local name = if inServer then inServer.Name else nil
@@ -597,7 +622,7 @@ local function changeWhitelist(owner: Player, action: string, userId: any, value
 		list[key] = nil
 	elseif action == "WhitelistTrust" then
 		local entry = list[key]
-		if not entry then return false, "They aren't on your whitelist." end
+		if not entry then return false, "They aren't on your friends list." end
 		if entry.trusted == (value == true) then return true, nil end -- (no change)
 		entry.trusted = value == true
 	else
@@ -626,6 +651,16 @@ query.OnServerInvoke = function(player: Player, action: any, a: any, b: any): an
 	elseif action == "WhitelistAdd" or action == "WhitelistRemove" or action == "WhitelistTrust" then
 		local ok, err = changeWhitelist(player, action, a, b)
 		return { Ok = ok, Message = err, Entries = whitelistView(player) }
+	elseif action == "Settings" then
+		return table.clone(dataOf(player).settings)
+	elseif action == "SetSetting" then
+		local settings = dataOf(player).settings
+		if typeof(a) == "string" and SETTING_DEFAULTS[a] ~= nil and typeof(b) == "boolean" and settings[a] ~= b then
+			settings[a] = b
+			saveWhitelist(player)
+			remote:FireAllClients("WhitelistChanged") -- (others' Join buttons may change)
+		end
+		return table.clone(settings)
 	end
 	return nil
 end
@@ -666,13 +701,13 @@ end)
 
 Players.PlayerRemoving:Connect(function(player)
 	leave(player)
-	if whitelists[player] and whitelistStore then
-		local list = whitelists[player]
+	local payload = savePayload(player)
+	if payload and whitelistStore then
 		pcall(function()
-			(whitelistStore :: DataStore):SetAsync(`user_{player.UserId}`, list)
+			(whitelistStore :: DataStore):SetAsync(`user_{player.UserId}`, payload)
 		end)
 	end
-	whitelists[player] = nil
+	friendData[player] = nil
 	saveQueued[player] = nil
 	lastQuery[player] = nil
 	invites[player] = nil

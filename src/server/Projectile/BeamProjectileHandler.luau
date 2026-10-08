@@ -321,9 +321,17 @@ Heartbeat.Connect(function(globalDt: number)
 		local channel = channels[index]
 		local player, character = channel.Player, channel.Character
 		local humanoid = character:FindFirstChildOfClass("Humanoid")
-		local tool = character:FindFirstChild("SpellAssembler")
+		-- spells cast without a Tool now: a channel only ends early if another
+		-- weapon is taken out (same rule as SpellService.canCastSpells)
+		local otherTool = false
+		for _, child in character:GetChildren() do
+			if child:IsA("Tool") and child.Name ~= "SpellAssembler" then
+				otherTool = true
+				break
+			end
+		end
 		if channel.Remaining <= 1e-8 or not player.Parent or player.Character ~= character
-			or not humanoid or humanoid.Health <= 0 or not tool or not tool:IsA("Tool")
+			or not humanoid or humanoid.Health <= 0 or otherTool
 			or now - (lastInput[player] or 0) > INPUT_TIMEOUT or now - channel.Started >= 60 then
 			table.remove(channels, index)
 			continue

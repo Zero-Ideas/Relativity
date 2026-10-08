@@ -8,7 +8,8 @@
 	and the edited values just wait. PlayerManager applies them to each
 	character as it spawns (while on), and to every living character whenever
 	they or the switch change -- switching off restores the game's own
-	defaults (StarterPlayer's walk speed / jump settings, 100 max health).
+	defaults (StarterPlayer's walk speed / jump settings, GAME_MAX_HEALTH =
+	1000 max health, which every character also spawns with while off).
 	Per server: a new server starts OFF at DEFAULTS.
 
 	Movement bases are also written to the Humanoid as attributes
@@ -27,13 +28,14 @@ local PlayerDefaults = {}
 
 export type Stats = { MaxHealth: number, WalkSpeed: number, JumpPower: number }
 
-local DEFAULTS: Stats = { MaxHealth = 100, WalkSpeed = 16, JumpPower = 50 }
+local GAME_MAX_HEALTH = 1000 -- the game's own max health (Roblox's is 100)
+local DEFAULTS: Stats = { MaxHealth = GAME_MAX_HEALTH, WalkSpeed = 16, JumpPower = 50 }
 local LIMITS = {
 	MaxHealth = { 1, 1_000_000 },
 	WalkSpeed = { 0, 500 },
 	JumpPower = { 0, 1000 },
 }
-local GAME_MAX_HEALTH = 100 -- Roblox's own default, restored when forcing stops
+PlayerDefaults.GameMaxHealth = GAME_MAX_HEALTH
 
 local current: Stats = table.clone(DEFAULTS)
 local enabled = false
@@ -124,8 +126,13 @@ function PlayerDefaults.Apply(humanoid: Humanoid, fresh: boolean): (number?, num
 	return stats.WalkSpeed, stats.JumpPower
 end
 
+-- A new spawn while forcing is off: the game's own max health, full.
+function PlayerDefaults.ApplyGameHealth(humanoid: Humanoid)
+	setHealth(humanoid, GAME_MAX_HEALTH, true)
+end
+
 -- Forcing was switched off: puts a living character back on the game's own
--- defaults (StarterPlayer's movement settings, Roblox's 100 max health).
+-- defaults (StarterPlayer's movement settings, GAME_MAX_HEALTH max health).
 -- Returns the movement base it set (walk speed, jump power-or-height).
 function PlayerDefaults.Restore(humanoid: Humanoid): (number, number)
 	setHealth(humanoid, GAME_MAX_HEALTH, false)

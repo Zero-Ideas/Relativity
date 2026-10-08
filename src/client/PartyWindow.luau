@@ -1,21 +1,25 @@
 --!strict
 --[[
 	The Party window (ReGui; the topbar's Party button, the party panel's
-	"+" and "Find party"), with three tabs:
+	"+" and "Find party"), with four tabs:
 
 	  Invite    -- your party (make / leave, public switch for the leader)
 	               and everyone else: Invite, Request to join (public
 	               parties), and for test dummies Request an invite. Party
 	               members say "in party"; requests waiting for an answer
 	               show as text instead of their button.
-	  Parties   -- "Friends' parties" (parties of people who whitelisted
-	               you, and people who trust you but are in no party) kept
+	  Parties   -- "Friends' parties" (parties of people who have you as a
+	               friend, and people who trust you but are in no party) kept
 	               apart from the other public parties. "Join" goes straight
-	               in when a whitelist allows it; otherwise "Request to join".
-	  Whitelist -- add people by UserId or from this server; each one can be
-	               marked Trusted. (Rules: server/Parties, "Whitelists".)
+	               in when the leader's friends list and settings allow it;
+	               otherwise "Request to join".
+	  Friends   -- add people by UserId or from this server; each one can be
+	               marked Trusted.
+	  Settings  -- whether Trusted friends may auto-join a party with you,
+	               and whether friends may auto-join your public party.
+	               (Rules: server/Parties, "Friends".)
 
-	The window rebuilds itself when party state or anyone's whitelist
+	The window rebuilds itself when party state or anyone's friends list
 	changes, keeping its place, size and tab.
 ]]
 
@@ -166,7 +170,7 @@ local function buildParties(tab: any, parties: any)
 	local public = if parties then parties.Public else {}
 	tab:Separator({ Text = `Friends' parties ({#friends})` })
 	if #friends == 0 then
-		tab:Label({ Text = "No one who whitelisted you is in a party." })
+		tab:Label({ Text = "None of the people who added you as a friend are in a party." })
 	end
 	for _, info in friends do
 		partyRow(tab, info)
@@ -188,11 +192,11 @@ local function changeWhitelist(action: string, userId: number, value: boolean?)
 	end)
 end
 
-local function buildWhitelist(tab: any, whitelist: any)
+local function buildFriends(tab: any, whitelist: any)
 	local help = tab:Label({
-		Text = "Whitelisted players can join your public party without asking. "
-			.. "Trusted ones can join you any time -- even a private party, or "
-			.. "with no party (it makes one).",
+		Text = "Friends can join your public party without asking, and "
+			.. "Trusted friends can join you any time -- even a private party, "
+			.. "or with no party (it makes one, led by you). See Settings.",
 	})
 	wrap(help)
 	local entries = if whitelist then whitelist.Entries else {}
@@ -202,14 +206,15 @@ local function buildWhitelist(tab: any, whitelist: any)
 	end
 
 	local add = tab:Row()
-	add:InputText({
+	local input = add:InputText({
 		Label = "",
 		Placeholder = "UserId",
-		Value = whitelistInput,
 		Callback = function(_, text: string)
 			whitelistInput = text
 		end,
 	})
+	-- (ReGui doesn't show a starting Value by itself)
+	pcall(function() input:SetValue(whitelistInput) end)
 	add:SmallButton({
 		Text = "Add",
 		Callback = function()
@@ -227,23 +232,9 @@ local function buildWhitelist(tab: any, whitelist: any)
 		tab:Label({ Text = whitelistMessage })
 	end
 
-	tab:Separator({ Text = "In this server" })
-	local any = false
-	for _, other in Players:GetPlayers() do
-		if other ~= player and not listed[other.UserId] then
-			any = true
-			local row = tab:Row()
-			row:Label({ Text = `{other.DisplayName} (@{other.Name})` })
-			row:SmallButton({ Text = "Whitelist", Callback = function() changeWhitelist("WhitelistAdd", other.UserId) end })
-		end
-	end
-	if not any then
-		tab:Label({ Text = "Everyone here is already on it." })
-	end
-
-	tab:Separator({ Text = `Your whitelist ({#entries})` })
+	tab:Separator({ Text = `Your friends ({#entries})` })
 	if #entries == 0 then
-		tab:Label({ Text = "Empty." })
+		tab:Label({ Text = "None yet." })
 	end
 	for _, entry in entries do
 		local row = tab:Row()
@@ -260,13 +251,50 @@ local function buildWhitelist(tab: any, whitelist: any)
 		})
 		row:SmallButton({ Text = "Remove", Callback = function() changeWhitelist("WhitelistRemove", entry.UserId) end })
 	end
+
+	tab:Separator({ Text = "In this server" })
+	local any = false
+	for _, other in Players:GetPlayers() do
+		if other ~= player and not listed[other.UserId] then
+			any = true
+			local row = tab:Row()
+			row:Label({ Text = `{other.DisplayName} (@{other.Name})` })
+			row:SmallButton({ Text = "Add friend", Callback = function() changeWhitelist("WhitelistAdd", other.UserId) end })
+		end
+	end
+	if not any then
+		tab:Label({ Text = "Everyone here is already your friend." })
+	end
+end
+
+local SETTINGS = {
+	{ "AllowTrustedJoin", "Allow trusted friends to auto-join a party with you" },
+	{ "AllowFriendsJoin", "Allow friends to automatically join your public party" },
+}
+
+local function buildSettings(tab: any, settings: any)
+	for _, info in SETTINGS do
+		local name = info[1]
+		local current = settings ~= nil and settings[name] == true
+		tab:Checkbox({
+			Label = info[2],
+			Value = current,
+			-- (ReGui runs this on creation too: only act on a real change)
+			Callback = function(_, value: boolean)
+				if value ~= current then
+					current = value
+					task.spawn(PartyClient.Query, "SetSetting", name, value)
+				end
+			end,
+		})
+	end
 end
 
 --------------------------------------------------------------------------------
 -- Window
 --------------------------------------------------------------------------------
 
-local function build(ReGui: any, parties: any, whitelist: any)
+local function build(ReGui: any, parties: any, whitelist: any, settings: any)
 	removeWindow()
 	local created: any
 	created = ReGui:TabsWindow({
@@ -285,11 +313,14 @@ local function build(ReGui: any, parties: any, whitelist: any)
 	})
 	window = created
 	local frame = created.WindowFrame
-	frame.AnchorPoint = Vector2.new(1, 1)
-	frame.Position = if geometry then geometry.position else UDim2.new(1, -16, 1, -250)
+	-- (top-left anchor, which ReGui's resize handle assumes: placed in the
+	-- bottom-right by its size instead)
+	frame.Position = if geometry then geometry.position
+		else UDim2.new(1, -16 - frame.Size.X.Offset, 1, -250 - frame.Size.Y.Offset)
 	buildInvite(created:CreateTab({ Name = "Invite" }))
 	buildParties(created:CreateTab({ Name = "Parties" }), parties)
-	buildWhitelist(created:CreateTab({ Name = "Whitelist" }), whitelist)
+	buildFriends(created:CreateTab({ Name = "Friends" }), whitelist)
+	buildSettings(created:CreateTab({ Name = "Settings" }), settings)
 	pcall(function()
 		created.WindowTabSelector:SetActiveTab(activeTab)
 	end)
@@ -311,8 +342,9 @@ function refresh()
 			queued = false
 			local parties = PartyClient.Query("Parties")
 			local whitelist = PartyClient.Query("Whitelist")
+			local settings = PartyClient.Query("Settings")
 			if ReGui and open then
-				build(ReGui, parties, whitelist)
+				build(ReGui, parties, whitelist, settings)
 			end
 		until not queued or not open
 		building = false

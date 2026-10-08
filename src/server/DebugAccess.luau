@@ -11,10 +11,10 @@
 	    (SetPublic), and the panel's Kill button doesn't affect them.
 	  * any single player can have tabs taken away (SetPlayerTab) by someone
 	    who outranks them -- listed or not, Admin and Defaults included;
-	  * everyone else: allowed when a listed player has made the panel public,
-	    or on a local Studio server -- and then only the tabs listed players
-	    have made public (CanUseTab; Stats and Dummies by default). Studio
-	    servers get every tab.
+	  * everyone else: allowed while the panel is public (the default; a
+	    listed player can close it), or on a local Studio server -- and then
+	    only the tabs listed players have made public (CanUseTab; Stats and
+	    Dummies by default). Studio servers get every tab.
 
 	Clients learn their standing from attributes: Player "DebugListed",
 	"DebugRank" and "DebugDeniedTabs" (comma-separated), and
@@ -68,7 +68,9 @@ local DENIED_ATTRIBUTE = "DebugDeniedTabs"
 local denied: { [Player]: { [string]: boolean } } = {}
 
 local cache: { [Player]: boolean } = {}
-local public = false
+-- Open to every player by default (their public tabs only); a listed
+-- player can close it from the Admin tab.
+local public = true
 
 -- On the allowlist (owner / group rank / UserIds), regardless of Studio or
 -- the public switch.

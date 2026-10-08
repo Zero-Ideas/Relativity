@@ -5,6 +5,7 @@
 local Players = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local TextService = game:GetService("TextService")
+local HttpService = game:GetService("HttpService")
 
 local Shared = ReplicatedStorage:WaitForChild("Shared")
 local Entity = require(Shared:WaitForChild("Entity"))
@@ -32,6 +33,13 @@ command.Parent = remoteFolder
 local cast = remoteFolder:FindFirstChild("SpellCast") or Instance.new("RemoteEvent")
 cast.Name = "SpellCast"
 cast.Parent = remoteFolder
+
+-- Spell sharing (client/SpellLibrary): ("Offer", shareId, from, name,
+-- expiresAt) to the recipient, ("Answer", recipient, accepted, name) back to
+-- the sharer.
+local shareRemote = remoteFolder:FindFirstChild("SpellShare") or Instance.new("RemoteEvent")
+shareRemote.Name = "SpellShare"
+shareRemote.Parent = remoteFolder
 
 local feedback = remoteFolder:FindFirstChild("SpellFeedback") or Instance.new("RemoteEvent")
 feedback.Name = "SpellFeedback"
@@ -180,6 +188,156 @@ local function filterName(player: Player, raw: any): (string?, string?)
 	return truncateCharacters(filtered, 24), nil
 end
 
+-- Shared spells waiting for an answer: shares[recipient][shareId].
+local SHARE_LIFETIME = 60
+type Share = { from: Player, name: string, graph: any, expiry: number }
+local shares: { [Player]: { [string]: Share } } = {}
+
+local function refOf(payload: any): string?
+	local ref = payload.ref
+	return if typeof(ref) == "string" and #ref <= 80 then ref else nil
+end
+
+local function textOf(value: any, maximum: number): string?
+	return if typeof(value) == "string" and #value <= maximum then value else nil
+end
+
+-- Commands that don't take a hotbar slot. Returns nil for the others.
+local function handleLibraryCommand(player: Player, action: string, payload: any)
+	local function done(ok: boolean, err: string?, state: any?, success: string)
+		return response(ok, state or SpellStore.GetState(player), nil, if ok then (err or success) else err)
+	end
+	if action == "SaveSpell" then
+		-- a library spell: payload.id overwrites it, none adds a new one
+		local compiled, errors, normalized = SpellCompiler.Compile(payload.graph)
+		if not compiled or not normalized then
+			return response(false, SpellStore.GetState(player), errors, "The circle is invalid.")
+		end
+		local name, nameError = filterName(player, payload.name or normalized.name)
+		if not name then
+			return response(false, SpellStore.GetState(player), nil, nameError)
+		end
+		normalized.name = name
+		local ok, err, state, id = SpellStore.SaveSpell(player, textOf(payload.id, 64), name, normalized)
+		local result = done(ok, err, state, "Spell saved to your library.")
+		result.id = id
+		return result
+	elseif action == "DeleteSpell" then
+		local id = textOf(payload.id, 64)
+		if not id then return response(false, SpellStore.GetState(player), nil, "Unknown spell.") end
+		local ok, err, state = SpellStore.DeleteSpell(player, id)
+		return done(ok, err, state, "Spell deleted.")
+	elseif action == "Equip" then
+		local slot, ref = integerSlot(payload.slot), refOf(payload)
+		if not slot or not ref then return response(false, SpellStore.GetState(player), nil, "Pick a slot from 1 to 5.") end
+		local ok, err, state = SpellStore.Equip(player, slot, ref)
+		return done(ok, err, state, `Put on slot {slot}.`)
+	elseif action == "MoveSlot" then
+		local slot = integerSlot(payload.slot)
+		if not slot or (payload.direction ~= -1 and payload.direction ~= 1) then
+			return response(false, SpellStore.GetState(player), nil, "Can't move that.")
+		end
+		local ok, err, state = SpellStore.MoveSlot(player, slot, payload.direction)
+		return done(ok, err, state, "Moved.")
+	elseif action == "SwapSlots" then
+		local a, b = integerSlot(payload.slot), integerSlot(payload.other)
+		if not a or not b then return response(false, SpellStore.GetState(player), nil, "Pick two slots.") end
+		local ok, err, state = SpellStore.SwapSlots(player, a, b)
+		return done(ok, err, state, "Swapped.")
+	elseif action == "CreateFolder" then
+		local raw = textOf(payload.name, 200)
+		if not raw then return response(false, SpellStore.GetState(player), nil, "Name the folder.") end
+		local name, nameError = filterName(player, raw)
+		if not name then return response(false, SpellStore.GetState(player), nil, nameError) end
+		local ok, err, state = SpellStore.CreateFolder(player, name)
+		return done(ok, err, state, `Made folder "{name}".`)
+	elseif action == "DeleteFolder" then
+		local name = textOf(payload.name, 200)
+		if not name then return response(false, SpellStore.GetState(player), nil, "Unknown folder.") end
+		local ok, err, state = SpellStore.DeleteFolder(player, name)
+		return done(ok, err, state, "Folder deleted (its spells are now unfiled).")
+	elseif action == "MoveToFolder" then
+		local id = textOf(payload.id, 64)
+		local folder = if payload.folder == nil then nil else textOf(payload.folder, 200)
+		if not id or (payload.folder ~= nil and not folder) then
+			return response(false, SpellStore.GetState(player), nil, "Can't move that.")
+		end
+		local ok, err, state = SpellStore.MoveToFolder(player, id, folder)
+		return done(ok, err, state, if folder then `Moved to "{folder}".` else "Moved to Unfiled.")
+	elseif action == "SaveLoadout" or action == "LoadLoadout" or action == "DeleteLoadout" then
+		local raw = textOf(payload.name, 200)
+		if not raw then return response(false, SpellStore.GetState(player), nil, "Name the loadout.") end
+		if action == "SaveLoadout" then
+			local name, nameError = filterName(player, raw)
+			if not name then return response(false, SpellStore.GetState(player), nil, nameError) end
+			local ok, err, state = SpellStore.SaveLoadout(player, name)
+			return done(ok, err, state, `Saved loadout "{name}".`)
+		elseif action == "LoadLoadout" then
+			BeamHandler.Stop(player)
+			local ok, err, state = SpellStore.LoadLoadout(player, raw)
+			return done(ok, err, state, `Loaded "{raw}".`)
+		end
+		local ok, err, state = SpellStore.DeleteLoadout(player, raw)
+		return done(ok, err, state, "Loadout deleted.")
+	elseif action == "Purchase" then
+		local id = textOf(payload.id, 64)
+		if not id then return response(false, SpellStore.GetState(player), nil, "Unknown spell.") end
+		local ok, err, state = SpellStore.Purchase(player, id)
+		return done(ok, err, state, "Purchased.")
+	elseif action == "ShareSpell" then
+		-- offer one of your spells to another player in this server
+		local id, target = textOf(payload.id, 64), payload.target
+		local record = id and SpellStore.GetLibrarySpell(player, id)
+		if not record or record.invalid then
+			return response(false, SpellStore.GetState(player), nil, "Pick a working spell from your library.")
+		end
+		if typeof(target) ~= "Instance" or not target:IsA("Player") or target == player or target.Parent ~= Players then
+			return response(false, SpellStore.GetState(player), nil, "Pick someone in this server.")
+		end
+		local pending = shares[target]
+		if not pending then
+			pending = {}
+			shares[target] = pending
+		end
+		for _, share in pending do
+			if share.from == player and share.expiry > os.clock() then
+				return response(false, SpellStore.GetState(player), nil, `{target.DisplayName} hasn't answered your last share yet.`)
+			end
+		end
+		local shareId = HttpService:GenerateGUID(false)
+		pending[shareId] = { from = player, name = record.name, graph = record.graph, expiry = os.clock() + SHARE_LIFETIME }
+		shareRemote:FireClient(target, "Offer", shareId, player, record.name, workspace:GetServerTimeNow() + SHARE_LIFETIME)
+		task.delay(SHARE_LIFETIME, function()
+			if shares[target] then shares[target][shareId] = nil end
+		end)
+		return response(true, SpellStore.GetState(player), nil, `Offered "{record.name}" to {target.DisplayName}.`)
+	elseif action == "AcceptShare" or action == "DeclineShare" then
+		local shareId = textOf(payload.shareId, 64)
+		local pending = shares[player]
+		local share = shareId and pending and pending[shareId]
+		if not share then
+			return response(false, SpellStore.GetState(player), nil, "That share has expired.")
+		end
+		(pending :: any)[shareId] = nil
+		local from = share.from
+		if action == "DeclineShare" or share.expiry < os.clock() then
+			if from.Parent == Players then shareRemote:FireClient(from, "Answer", player, false, share.name) end
+			return response(true, SpellStore.GetState(player), nil, "Declined.")
+		end
+		-- (its name was filtered for its maker: filter it again for you)
+		local name = share.name
+		local ok, filtered = pcall(function()
+			local result = TextService:FilterStringAsync(share.name, from.UserId)
+			return result:GetNonChatStringForUserAsync(player.UserId)
+		end)
+		name = if ok and typeof(filtered) == "string" and filtered ~= "" then filtered else "Shared spell"
+		local saved, err, state = SpellStore.SaveSpell(player, nil, truncateCharacters(name, 24), share.graph)
+		if saved and from.Parent == Players then shareRemote:FireClient(from, "Answer", player, true, share.name) end
+		return done(saved, err, state, `Added "{name}" to your library.`)
+	end
+	return nil
+end
+
 local function handleCommand(player: Player, action: any, payload: any)
 	if typeof(action) ~= "string" then
 		return response(false, nil, nil, "Invalid spell command.")
@@ -201,6 +359,10 @@ local function handleCommand(player: Player, action: any, payload: any)
 	if typeof(payload) ~= "table" then
 		return response(false, SpellStore.GetState(player), nil, "Invalid spell command payload.")
 	end
+	local libraryResult = handleLibraryCommand(player, action, payload)
+	if libraryResult then
+		return libraryResult
+	end
 	local slot = integerSlot(payload.slot)
 	if not slot then
 		return response(false, SpellStore.GetState(player), nil, "Choose a card slot from 1 to 5.")
@@ -220,7 +382,7 @@ local function handleCommand(player: Player, action: any, payload: any)
 		return response(ok, state or SpellStore.GetState(player), nil, err or "Spell card saved.")
 	elseif action == "DeleteCard" then
 		local ok, err, state = SpellStore.DeleteSlot(player, slot)
-		return response(ok, state or SpellStore.GetState(player), nil, err or "Spell card deleted.")
+		return response(ok, state or SpellStore.GetState(player), nil, err or "Taken off the hotbar (it's still in your library).")
 	elseif action == "SetActive" then
 		BeamHandler.Stop(player)
 		local ok, err, state = SpellStore.SetActive(player, slot)
@@ -630,6 +792,7 @@ Players.PlayerRemoving:Connect(function(player)
 	frozenSpells[player] = nil
 	aimSubscribers[player] = nil
 	lastAimRelay[player] = nil
+	shares[player] = nil
 end)
 
 print("[Relativity] spell service online")

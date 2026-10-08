@@ -107,8 +107,9 @@ function rebuild()
 				end,
 			})
 			local frame = window.WindowFrame
-			frame.AnchorPoint = Vector2.new(1, 0)
-			frame.Position = lastPosition or UDim2.new(1, -16, 0, 70)
+			-- (top-left anchor, which ReGui's resize handle assumes: placed at
+			-- the right edge by its width instead)
+			frame.Position = lastPosition or UDim2.new(1, -16 - frame.Size.X.Offset, 0, 70)
 			-- interactable ones (buttons, not expired) get their own area on
 			-- top; everything else is a line in the text box below it
 			local actionable, plain = {}, {}

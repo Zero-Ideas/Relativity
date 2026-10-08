@@ -15,6 +15,7 @@ if legacy and legacy:IsA("Script") then legacy.Disabled = true end
 
 local Resources = {}
 Resources.Settings = table.freeze({
+	HealthRegen = 10, -- HP per second, passive (scaled by the player's time)
 	MaxMana = 1000, ManaRegen = 25,
 	MaxStamina = 1000, StaminaRegen = 25,
 	SprintDrain = 15, SprintMultiplier = 1.6,
@@ -116,6 +117,11 @@ RunService.Heartbeat:Connect(function(dt: number)
 		end
 		local scaledDt = interval * entity:GetEffectiveTimeScale()
 		if scaledDt <= 0 then continue end
+		-- passive health regen (the place's StarterCharacterScripts "Health"
+		-- script turns Roblox's own off)
+		if humanoid.Health < humanoid.MaxHealth then
+			entity:Heal(settings.HealthRegen * scaledDt)
+		end
 		local root = character and character:FindFirstChild("HumanoidRootPart")
 		local moving = root and root:IsA("BasePart") and (root.AssemblyLinearVelocity * Vector3.new(1, 0, 1)).Magnitude > 0.5
 		local draining = player:GetAttribute("Sprinting") == true and moving

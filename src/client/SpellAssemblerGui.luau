@@ -61,9 +61,11 @@ feedbackRemote.OnClientEvent:Connect(function(data)
 	cooldownDeadlines[data.Slot] = data.EndsAt
 	if data.Accepted then firedEvent:Fire(data) end
 end)
+local lastCastAt = -math.huge -- (keeps the live cursor streaming after a cast)
 local function sendCast(target: Vector3)
 	local slot = SpellAssemblerGui.GetSelectedSlot()
 	if slot then cooldownDeadlines[slot] = workspace:GetServerTimeNow() + CAST_COOLDOWN end
+	lastCastAt = os.clock()
 	castRemote:FireServer(target)
 end
 local started = false
@@ -78,6 +80,7 @@ local LEFT_RANGE = Vector2.new(200, 480)
 local RIGHT_RANGE = Vector2.new(240, 520)
 local SINK_ACTION = "SpellEditorSinkMovement"
 local AIM_SEND_INTERVAL = 0.05 -- live cursor for Stream/Sustain re-aiming
+local AIM_AFTER_CAST = 6 -- seconds the cursor keeps streaming after a cast
 local SINK_KEYS = {
 	Enum.KeyCode.W, Enum.KeyCode.A, Enum.KeyCode.S, Enum.KeyCode.D, Enum.KeyCode.Space,
 	Enum.KeyCode.Up, Enum.KeyCode.Down, Enum.KeyCode.Left, Enum.KeyCode.Right,
@@ -125,6 +128,11 @@ local problems: any = nil
 
 local serverState: any = { slots = {}, activeSlot = nil }
 local selectedSlot = 1
+-- Editing a library spell (SpellLibrary's Edit / New spell) instead of a
+-- hotbar slot: Save writes to that library spell, or adds a new one when
+-- `libraryMode` is on without an id. Picking a slot leaves this mode.
+local libraryMode = false
+local editingSpellId: string? = nil
 local savedSignature: string? = nil
 local savingCard = false
 local hasLoadedCards = false
@@ -196,12 +204,13 @@ local function updateTopBar()
 		local record = slotRecord(slot)
 		local active = (pendingActiveSlot or serverState.activeSlot) == slot
 		button.Text = `{slot}  {if record then record.name else "Empty"}{if active then "  ◆" else ""}`
-		button.BackgroundColor3 = if selectedSlot == slot then Colors.accent:Lerp(Colors.panel, 0.45) else Colors.panel2
+		button.BackgroundColor3 = if selectedSlot == slot and not libraryMode then Colors.accent:Lerp(Colors.panel, 0.45) else Colors.panel2
 		button.TextColor3 = if record then Colors.text else Colors.muted
 	end
 	if saveButton then
 		local available = serverState.available == true
-		saveButton.Text = if savingCard then "Saving…" elseif not available then "Save unavailable" elseif dirty then `Save to {selectedSlot} •` else "Saved"
+		local target = if libraryMode then "library" else tostring(selectedSlot)
+		saveButton.Text = if savingCard then "Saving…" elseif not available then "Save unavailable" elseif dirty then `Save to {target} •` else "Saved"
 		saveButton.BackgroundColor3 = if compiledOk and dirty and available and not savingCard then Color3.fromRGB(58, 128, 86) else Colors.panel3
 		saveButton.AutoButtonColor = compiledOk and available and not savingCard
 	end
@@ -301,6 +310,25 @@ local function saveCard(): boolean
 	setStatus("Saving…", nil, true)
 	savingCard = true
 	updateTopBar()
+	if libraryMode then
+		-- a library spell (not a hotbar slot): saved back to it, or added
+		local result = invoke("SaveSpell", { id = editingSpellId, name = currentName(), graph = doc.graph })
+		savingCard = false
+		if result.state then serverState = result.state end
+		if result.ok then
+			editingSpellId = result.id or editingSpellId
+			for _, spell in serverState.library or {} do
+				if spell.id == editingSpellId then
+					doc:load(spell.graph)
+					if nameBox then nameBox.Text = spell.name end
+				end
+			end
+			savedSignature = signature()
+		end
+		applyServerResult(result)
+		refresh()
+		return result.ok == true
+	end
 	local result = invoke("SaveCard", { slot = selectedSlot, name = currentName(), graph = doc.graph })
 	savingCard = false
 	-- Apply the authoritative state BEFORE reading the saved record. Loading
@@ -337,6 +365,7 @@ end
 
 local function loadSlot(slot: number)
 	selectedSlot = slot
+	libraryMode, editingSpellId = false, nil
 	local record = slotRecord(slot)
 	if record and record.invalid then
 		savedSignature = nil
@@ -1040,6 +1069,7 @@ function SpellAssemblerGui.FireFrozen()
 	if not character or not frozenSlot or SpellAssemblerGui.GetCooldownRemaining(frozenSlot) > 0 or not canCast() then return end
 	local target = player:GetMouse().Hit.Position
 	cooldownDeadlines[frozenSlot] = workspace:GetServerTimeNow() + CAST_COOLDOWN
+	lastCastAt = os.clock()
 	channelRemote:FireServer("FireFrozen", target)
 	SpellCircleVFX.FireFrozen(character, target)
 end
@@ -1084,7 +1114,10 @@ local function startAimStream()
 	local mouse = player:GetMouse()
 	local elapsed, last, sinceSend = 0, nil, 0
 	aimConnection = game:GetService("RunService").Heartbeat:Connect(function(dt)
-		if not canCast() or (not holdingCast and not charging) then return end
+		-- while charging / channelling, and for a while after each cast: a
+		-- Stream's later copies and a released beam re-aim at the live cursor
+		local recent = os.clock() - lastCastAt < AIM_AFTER_CAST
+		if not canCast() or (not holdingCast and not charging and not recent) then return end
 		elapsed += dt
 		sinceSend += dt
 		if elapsed < AIM_SEND_INTERVAL or visible then return end
@@ -1148,6 +1181,51 @@ end
 
 function SpellAssemblerGui.GetState(): any
 	return serverState
+end
+
+-- Runs a spell command (SpellService) and applies the state it returns
+-- (StateChanged fires). Yields; returns the server's response.
+function SpellAssemblerGui.Command(action: string, payload: any?): any
+	local result = invoke(action, payload)
+	if result.state then serverState = result.state end
+	updateTopBar()
+	return result
+end
+
+-- Opens the editor on a library spell; Save writes back to it.
+function SpellAssemblerGui.EditSpell(id: string)
+	local spell = nil
+	for _, candidate in serverState.library or {} do
+		if candidate.id == id then
+			spell = candidate
+		end
+	end
+	if not spell then return end
+	SpellAssemblerGui.Open()
+	libraryMode, editingSpellId = true, id
+	if spell.invalid then
+		savedSignature = nil
+		setStatus(spell.error or "This spell no longer compiles; its saved data has been preserved.", false, true)
+		updateTopBar()
+		return
+	end
+	doc:load(spell.graph)
+	if nameBox then nameBox.Text = spell.name end
+	if board then
+		board.selection = nil
+		board:frameAll()
+	end
+	savedSignature = signature()
+	setStatus(`Editing "{spell.name}" from your library.`)
+	refresh()
+end
+
+-- Opens the editor on a fresh circle; Save adds it to the library.
+function SpellAssemblerGui.NewLibrarySpell()
+	SpellAssemblerGui.Open()
+	libraryMode, editingSpellId = true, nil
+	newSpell()
+	setStatus("New spell: Save adds it to your library.")
 end
 
 function SpellAssemblerGui.GetSelectedSlot(): number?
