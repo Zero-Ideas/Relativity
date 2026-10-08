@@ -60,7 +60,7 @@ Panels.Toolbox = Toolbox
 
 -- Which categories start open (the rest are a click away); kept for the session.
 local collapsed: { [string]: boolean } = {
-	Targeting = true, Sensor = true, Logic = true, Vector = true, Branch = true, Modifier = true, Trigger = true,
+	Targeting = true, Sensor = true, Logic = true, List = true, Vector = true, Branch = true, Modifier = true, Trigger = true,
 }
 local zonesOpen = true
 
@@ -89,7 +89,8 @@ function Toolbox.new(parent: Frame, hooks: any)
 		TextSize = 13,
 		TextXAlignment = Enum.TextXAlignment.Left,
 	}, parent)
-	Theme.corner(search, 8)
+	Theme.corner(search)
+	Theme.field(search)
 	Theme.make("UIPadding", { PaddingLeft = UDim.new(0, 10) }, search)
 	search:GetPropertyChangedSignal("Text"):Connect(function()
 		self:filter(search.Text)
@@ -107,7 +108,8 @@ function Toolbox.new(parent: Frame, hooks: any)
 		BackgroundColor3 = Colors.panel2,
 		BorderSizePixel = 0,
 	}, parent)
-	Theme.corner(info, 8)
+	Theme.corner(info)
+	Theme.glass(info, "card")
 	Theme.padding(info, 8)
 	self.infoTitle = Theme.label(info, "Runes", 13, { Font = Theme.FontBold, Size = UDim2.new(1, 0, 0, 18) })
 	self.infoBody = Theme.label(info, HINT, 11, {
@@ -445,7 +447,8 @@ function Inspector:numberParam(rune: any, param: any)
 		TextColor3 = Colors.text,
 		TextSize = 13,
 	}, row)
-	Theme.corner(box, 6)
+	Theme.corner(box)
+	Theme.field(box)
 	local plus = Theme.button(row, "+", { Position = UDim2.new(1, -26, 0, 0), Size = UDim2.fromOffset(26, 24), BackgroundColor3 = Colors.panel2 })
 	minus.Activated:Connect(function() commit(value - step) end)
 	plus.Activated:Connect(function() commit(value + step) end)
@@ -515,7 +518,8 @@ function Inspector:enumParam(rune: any, param: any)
 		end)
 		if open then
 			local list = Theme.make("Frame", { BackgroundColor3 = Colors.panel2, AutomaticSize = Enum.AutomaticSize.Y, Size = UDim2.new(1, 0, 0, 0), LayoutOrder = self:nextOrder() }, self.scroll)
-			Theme.corner(list, 6)
+			Theme.corner(list)
+			Theme.glass(list, "card")
 			Theme.padding(list, 4)
 			Theme.make("UIGridLayout", { CellSize = UDim2.new(0.5, -2, 0, 26), CellPadding = UDim2.fromOffset(4, 3), SortOrder = Enum.SortOrder.LayoutOrder }, list)
 			for index, option in options do
@@ -597,7 +601,7 @@ function Inspector:showRune(rune: any, context: any)
 	local color = Board.categoryColor(def)
 	local doc = self.hooks.doc()
 	self:header(def.Glyph or "•", def.Name, `{categoryNoun(def)} · {table.concat(def.Zones, " / ")} zone`, color, {
-		{ "🗑", self.hooks.delete, Color3.fromRGB(110, 40, 58) },
+		{ "🗑", self.hooks.delete, Colors.bad:Lerp(Colors.panel, 0.6) },
 		{ if rune.locked then "🔒" else "🔓", function()
 			self.hooks.edit(function() rune.locked = if rune.locked then nil else true end)
 		end },
@@ -625,8 +629,20 @@ function Inspector:showRune(rune: any, context: any)
 		elseif estimate.text and estimate.text ~= "" then
 			table.insert(tags, { estimate.text, Colors.good })
 		end
+		if estimate.cost and estimate.cost > 0 then
+			local per = if estimate.perBody then " per body" else ""
+			table.insert(tags, { `costs {math.floor(estimate.cost + 0.5)}{per}`, SpellRunes.PortColors.flow })
+			if estimate.fed and estimate.fed < 0.995 then
+				table.insert(tags, { `⚠ {math.floor(estimate.fed * 100 + 0.5)}% fed`, Colors.warn })
+			elseif not estimate.perBody and estimate.wasted and estimate.wasted >= 1 then
+				table.insert(tags, { `{math.floor(estimate.wasted + 0.5)} wasted`, Colors.muted })
+			end
+		end
 		if #tags > 0 then
 			self:chips(tags)
+		end
+		if estimate.fed and estimate.fed < 0.995 then
+			self:text(`Only {math.floor((estimate.energy or 0) + 0.5)} energy reaches it but what it's set to do costs {math.floor(estimate.cost + 0.5)}{if estimate.perBody then " per body" else ""}, so it does {math.floor(estimate.fed * 100 + 0.5)}% of it. Give it more mana or ask for less.`, 11, Colors.warn)
 		end
 	end
 
@@ -672,7 +688,7 @@ function Inspector:showZone(zone: any)
 	local kind = SpellRunes.Zones[zone.kind]
 	local inside = #self.hooks.doc():runesInZone(zone)
 	self:header((kind :: any).Glyph or "▢", `{zone.kind} zone`, `{inside} rune{if inside == 1 then "" else "s"} · {zone.w} × {zone.h}`, kind.Color, {
-		{ "🗑", self.hooks.delete, Color3.fromRGB(110, 40, 58) },
+		{ "🗑", self.hooks.delete, Colors.bad:Lerp(Colors.panel, 0.6) },
 		{ if zone.locked then "🔒" else "🔓", function()
 			self.hooks.edit(function() zone.locked = if zone.locked then nil else true end)
 		end },
@@ -694,7 +710,8 @@ function Inspector:showZone(zone: any)
 		TextXAlignment = Enum.TextXAlignment.Left,
 		LayoutOrder = self:nextOrder(),
 	}, self.scroll)
-	Theme.corner(box, 6)
+	Theme.corner(box)
+	Theme.field(box)
 	Theme.make("UIPadding", { PaddingLeft = UDim.new(0, 10) }, box)
 	box.FocusLost:Connect(function()
 		local text = string.sub(box.Text, 1, 32)
@@ -731,7 +748,7 @@ function Inspector:showWire(wire: any)
 	local toPort = toDef and SpellRunes.FindPort(toDef.Inputs, wire.toPort)
 	local color = if fromPort then SpellRunes.PortColors[fromPort.Type] else Colors.text
 	self:header("→", "Wire", if fromPort then `carries {fromPort.Type}` else "", color, {
-		{ "🗑", self.hooks.delete, Color3.fromRGB(110, 40, 58) },
+		{ "🗑", self.hooks.delete, Colors.bad:Lerp(Colors.panel, 0.6) },
 	})
 	self:text(`{if fromDef then fromDef.Name else wire.from} · {if fromPort then fromPort.Label else wire.fromPort}`, 13)
 	self:text("  ↓", 13, Colors.muted)
@@ -840,12 +857,12 @@ function Problems.new(parent: Frame, hooks: any)
 		Position = UDim2.new(0, 12, 1, -12),
 		Size = UDim2.new(0.5, 0, 0, 34),
 		BackgroundColor3 = Colors.panel,
-		BackgroundTransparency = 0.05,
 		BorderSizePixel = 0,
 		Active = true,
 		ZIndex = 10,
 	}, parent)
-	Theme.corner(frame, 8)
+	Theme.corner(frame)
+	Theme.glass(frame, "panel", true)
 	self.stroke = Theme.stroke(frame, Colors.line, 1, 0.3)
 	Theme.make("UISizeConstraint", { MaxSize = Vector2.new(520, 260), MinSize = Vector2.new(240, 34) }, frame)
 	self.frame = frame

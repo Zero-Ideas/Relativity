@@ -70,6 +70,7 @@ local DebugStream = require(script.Parent.DebugStream)
 local ProjectileQuota = require(script.Parent.ProjectileQuota)
 local SafeMath = require(Shared.SafeMath)
 local VisualOffload = require(Shared.VisualOffload)
+local DroneRig = require(Shared.DroneRig)
 local Weapons = require(script.Parent.Weapons)
 local WeaponsShared = require(script.Parent.Weapons.Shared)
 
@@ -182,13 +183,18 @@ local function findEquippedWeapon(character: Model): (Tool?, Weapons.WeaponDef?)
 	return nil, nil
 end
 
--- Where a shot spawns from: the equipped weapon's own "Tip" Attachment if
+-- Where a shot spawns from: a drone weapon's drone (see DroneRig), else the
+-- equipped weapon's own "Tip" Attachment if
 -- it has one (searched recursively, so it can live under a muzzle model
 -- nested inside the Tool), else the character's Head, else the root part
 -- (only reachable if a character somehow has no Head at all). Entirely
 -- server-resolved from the server's own scene graph -- never trusts
 -- anything client-sent, unlike the old client-supplied Origin this replaces.
 local function resolveMuzzleOrigin(tool: Tool, character: Model, root: BasePart): Vector3
+	-- a drone weapon isn't held: its drone fires (shared/DroneRig)
+	if DroneRig.IsDroneTool(tool) then
+		return DroneRig.Hover(root.CFrame)
+	end
 	local tip = tool:FindFirstChild(TIP_ATTACHMENT_NAME, true)
 	if tip and tip:IsA("Attachment") then
 		return tip.WorldPosition

@@ -10,24 +10,34 @@
 	flow runes shape when and where the rest runs: Delay waits, Repeat runs it
 	several times, For Each once per entity of a list, Wait Until polls a
 	condition, Conjure Circle moves it to a new circle somewhere else, Store
-	writes the caster's memory. A Vessel gives the energy form: Orb, Bullet
-	and Beam fire projectiles (Projectile.luau), Explosion is an instant area
-	blast, Barrier and Time Field raise things in the world, Force and Blink
-	move bodies (server/SpellWorld), Body Effect works on one (server/
-	SpellBody). Sustain emits overlapping Beam packets from live aim, sharing
-	the cast's energy over its duration. Quantity multiplies a projectile into
-	a Fan, Ring or Stream of copies sharing the energy; each Stream copy
-	re-aims from the caster's live hand/cursor (see CastRequest.live), and so
-	does every part of a cast that runs later (Delay, Repeat...).
+	writes memory, Invoke runs another of the caster's spells from here (with
+	this moment's Here / aim / targets and the values handed to it). A Vessel
+	gives the energy form: Orb, Bullet and Beam fire projectiles
+	(Projectile.luau), Explosion and Smite hit instantly, Barrier and Time
+	Field raise things in the world, Force and Blink move bodies (server/
+	SpellWorld), Body Effect works on them (server/SpellBody). Sustain emits
+	overlapping Beam packets from live aim, sharing the cast's energy over
+	its duration. Quantity multiplies a projectile into a Fan, Ring or Stream
+	of copies sharing the energy; each Stream copy re-aims from the caster's
+	live hand/cursor (see CastRequest.live), and so does every part of a cast
+	that runs later (Delay, Repeat...).
 
-	Values (sensors/logic/vectors) are evaluated on demand and memoized per
-	evaluation context. A context is one moment in the world: the cast itself,
-	a trigger firing (where Here is the vessel's position and Struck Entity is
-	what set it off), one Repeat or For Each round, the end of a Delay, a
-	conjured circle. Each context starts with a fresh memo (it senses the
-	world anew) and inherits its parent's `vars`: the values flow runes and
-	triggers output about their moment (a trigger's impact point, a Repeat's
-	index, For Each's entity), so anything downstream can read them.
+	Settings: every rune's number / bool params can be wired. settings()
+	resolves them for one context: the wire's value (clamped to the param's
+	range) where one is plugged in, else the value set on the rune.
+	Non-damaging vessels do exactly what their settings say and charge the
+	energy that reaches them for it (SpellRunes costs); fed less, they do
+	proportionally less.
+
+	Values (sensors/logic/vectors/lists) are evaluated on demand and memoized
+	per evaluation context. A context is one moment in the world: the cast
+	itself, a trigger firing (where Here is the vessel's position and Struck
+	Entity is what set it off), one Repeat or For Each round, the end of a
+	Delay, a conjured circle, an invoked spell. Each context starts with a
+	fresh memo (it senses the world anew) and inherits its parent's `vars`:
+	the values flow runes and triggers output about their moment, so
+	anything downstream can read them. Filter and Pick judge each item of a
+	list in a child context whose vars hold that Item.
 
 	Triggers reserve their Share of each copy's energy when it is fired and
 	release it at most once: On Impact / On Expire ride the projectile's
@@ -35,7 +45,8 @@
 	Proximity are polled by one Heartbeat loop.
 
 	Every cast has a budget (SpellRunes.Budget): flow steps, vessels fired,
-	parts waiting to run later, and how long after the cast they may run.
+	parts waiting to run later, how long after the cast they may run, and
+	how deep Invoke may nest.
 ]]
 
 local Players = game:GetService("Players")
@@ -47,7 +58,6 @@ local Entity = require(Shared:WaitForChild("Entity"))
 local VisualOffload = require(Shared:WaitForChild("VisualOffload"))
 local Heartbeat = require(Shared:WaitForChild("Heartbeat"))
 local SpellRunes = require(Shared:WaitForChild("SpellRunes"))
-local SpellCompiler = require(Shared:WaitForChild("SpellCompiler"))
 local SpellCircleLayout = require(Shared:WaitForChild("SpellCircleLayout"))
 local StatusEffectSys = require(Shared:WaitForChild("StatusEffectSys"))
 local Ragdoll = require(script.Parent:WaitForChild("Ragdoll"))
@@ -65,10 +75,10 @@ local CONJURE_SPAWN_OFFSET = 1 -- studs in front of a conjured circle
 local PROXIMITY_CHECK_INTERVAL = 0.05 -- real seconds between proximity scans
 local VISUAL_RANGE = 800
 local SUSTAIN_INTERVAL = BeamHandler.Interval
-local PIERCE_FALLOFF = 0.15
-local PUSH_LIFT, PULL_LIFT = 0.45, 0.2 -- upward share mixed into Force Push / Pull
+local LOOSE_PART_WEIGHT = 0.25 -- a loose part costs this share of a body to shove
 
--- One cast, shared by every context it spawns: its budget and clock.
+-- One cast, shared by every context it spawns: its budget, clock and
+-- private memory ("This cast" Store / Recall).
 export type CastInfo = {
 	player: Player,
 	started: number, -- os.clock at the cast
@@ -76,6 +86,7 @@ export type CastInfo = {
 	vessels: number,
 	pending: number,
 	dead: boolean,
+	memory: { [string]: any },
 }
 
 export type Context = {
@@ -94,8 +105,8 @@ export type Context = {
 	memo: { [string]: any },
 	vars: { [string]: any }, -- outputs of flow runes / triggers upstream (inherits the parent's)
 	cast: CastInfo,
-	-- Cast time only: the caster's current (origin, cursor), for Stream copies
-	-- and parts that run later.
+	-- The caster's current (head, cursor), for Stream copies, parts that run
+	-- later and Locate's aim.
 	live: (() -> (Vector3?, Vector3?))?,
 	-- A conjured circle: live re-aiming keeps firing from it, not your hand.
 	fixedOrigin: boolean?,
@@ -105,9 +116,6 @@ export type Context = {
 	-- slicing and beam subdivision (1 when nothing was split). Explosions
 	-- shrink with it -- see explode().
 	energyScale: number?,
-	-- Size multiplier (Size rune) of the vessel whose trigger created this
-	-- context; an Explosion it fires scales its radius by it.
-	sizeScale: number?,
 	-- Normal of the surface whose hit fired this context's trigger (On
 	-- Impact into geometry or an entity); explosions orient their visual to it.
 	surfaceNormal: Vector3?,
@@ -116,6 +124,9 @@ export type Context = {
 	copyMultiplier: number?,
 	-- The conjured circle this part runs from (Wait Until keeps it showing).
 	conjureId: number?,
+	-- Invoke: how deep this spell runs inside others, and what it was handed.
+	depth: number?,
+	args: { point: Vector3?, entity: any?, number: number? }?,
 }
 
 local rng = Random.new()
@@ -150,6 +161,10 @@ local function asList(value: any): { any }
 	return if typeof(value) == "table" then value else {}
 end
 
+local function flat(vector: Vector3): Vector3
+	return Vector3.new(vector.X, 0, vector.Z)
+end
+
 local function matchesFilter(caster: any, entity: any, filter: string): boolean
 	if filter == "Any" then
 		return true
@@ -174,14 +189,17 @@ local function nearestEntity(from: Vector3, radius: number, filter: string, cast
 	return best
 end
 
--- Caster memory (Store / Recall), per player for the session.
+-- Caster memory (Store / Recall "Yours"), per player for the session.
 local memory: { [Player]: { [string]: any } } = {}
 
-local function memoryOf(player: Player): { [string]: any }
-	local slots = memory[player]
+local function memoryOf(ctx: Context, scope: string): { [string]: any }
+	if scope == "This cast" then
+		return ctx.cast.memory
+	end
+	local slots = memory[ctx.player]
 	if not slots then
 		slots = {}
-		memory[player] = slots
+		memory[ctx.player] = slots
 	end
 	return slots
 end
@@ -210,8 +228,38 @@ local function number(value: any): number
 	return if typeof(value) == "number" and value == value then value else 0
 end
 
--- A per-rune table cached for this context (one Scan / Raycast feeds all of
--- its outputs from the same result).
+-- Rune `id`'s settings in this context: each number / bool param from its
+-- wire when one is plugged in (clamped to the param's range), else the value
+-- set on the rune. Cached per context.
+local function settings(compiled: any, ctx: Context, id: string): { [string]: any }
+	local key = id .. "@"
+	local cached = ctx.memo[key]
+	if cached then
+		return cached
+	end
+	local rune = compiled.runes[id]
+	local def = SpellRunes.Runes[rune.rune]
+	local portOf = SpellRunes.PortOf[rune.rune]
+	local links = compiled.inputs[id]
+	local resolved = rune.params
+	local copied = false
+	for _, param in def.Params do
+		local port = portOf[param.Name]
+		local link = port and links[port] and links[port][1]
+		if link then
+			if not copied then
+				resolved = table.clone(rune.params)
+				copied = true
+			end
+			resolved[param.Name] = SpellRunes.ClampParam(param, evaluate(compiled, ctx, link.from, link.port))
+		end
+	end
+	ctx.memo[key] = resolved
+	return resolved
+end
+
+-- A per-rune table cached for this context (one Scan / Raycast / Locate
+-- feeds all of its outputs from the same result).
 local function memoRune(ctx: Context, id: string, build: () -> any): any
 	local key = id .. "#"
 	local cached = ctx.memo[key]
@@ -224,9 +272,9 @@ end
 
 -- Facing axes: X right, Y up, Z forward along the context's (level) heading.
 local function facingBasis(ctx: Context): CFrame
-	local forward = Vector3.new(ctx.heading.X, 0, ctx.heading.Z)
+	local forward = flat(ctx.heading)
 	if forward.Magnitude < 1e-3 then
-		forward = (ctx.character and ctx.character.Parent and ctx.character:GetPivot().LookVector or Vector3.zAxis) * Vector3.new(1, 0, 1)
+		forward = flat(if ctx.character and ctx.character.Parent then ctx.character:GetPivot().LookVector else Vector3.zAxis)
 		if forward.Magnitude < 1e-3 then
 			forward = Vector3.zAxis
 		end
@@ -238,6 +286,17 @@ local function facingToWorld(ctx: Context, local_: Vector3): Vector3
 	local basis = facingBasis(ctx)
 	-- (CFrame.lookAt looks down -Z: forward is LookVector, right RightVector)
 	return basis.RightVector * local_.X + Vector3.yAxis * local_.Y + basis.LookVector * local_.Z
+end
+
+-- The way the caster is aiming now (head to cursor).
+local function casterAim(ctx: Context): Vector3
+	local head, cursor
+	if ctx.live then
+		head, cursor = ctx.live()
+	end
+	head = head or (if alive(ctx.caster) then ctx.caster:GetPosition() else ctx.origin)
+	local offset = (cursor or ctx.cursorPoint) - (head :: Vector3)
+	return if offset.Magnitude > 1e-3 then offset.Unit else ctx.heading
 end
 
 -- Where this part of the circle aims when nothing is wired: the For Each /
@@ -337,12 +396,25 @@ local SORTS: { [string]: (any, any, Vector3) -> boolean } = {
 
 local function scanArea(compiled: any, ctx: Context, id: string): { any }
 	return memoRune(ctx, id, function()
-		local params = compiled.runes[id].params
+		local params = settings(compiled, ctx, id)
 		local from = asPoint(input(compiled, ctx, id, "from")) or ctx.origin
+		local coneDir: Vector3? = nil
+		local coneCos = -1
+		if params.Cone < 360 then
+			local toward = asPoint(input(compiled, ctx, id, "dir")) or ctx.heading
+			coneDir = if toward.Magnitude > 1e-3 then toward.Unit else ctx.heading
+			coneCos = math.cos(math.rad(params.Cone / 2))
+		end
 		local found = {}
 		for _, entity in ChunkManager.GetEntitiesInRadius(from, params.Radius) do
 			if not alive(entity) then
 				continue
+			end
+			if coneDir then
+				local offset = entity:GetPosition() - from
+				if offset.Magnitude > 1e-3 and offset.Unit:Dot(coneDir) < coneCos then
+					continue
+				end
 			end
 			if entity == ctx.caster then
 				if params.Self then
@@ -370,7 +442,7 @@ end
 
 local function castRay(compiled: any, ctx: Context, id: string): any
 	return memoRune(ctx, id, function()
-		local params = compiled.runes[id].params
+		local params = settings(compiled, ctx, id)
 		local from = asPoint(input(compiled, ctx, id, "from")) or ctx.origin
 		local direction = asPoint(input(compiled, ctx, id, "dir"))
 		direction = if direction and direction.Magnitude > 1e-3 then direction.Unit else -Vector3.yAxis
@@ -390,7 +462,54 @@ local function castRay(compiled: any, ctx: Context, id: string): any
 	end)
 end
 
-local function vecMath(op: string, a: Vector3, b: Vector3, n: number): Vector3
+-- Locate: a point (and basis) relative to From along the chosen axes.
+local function locate(compiled: any, ctx: Context, id: string): any
+	return memoRune(ctx, id, function()
+		local params = settings(compiled, ctx, id)
+		local reference = if wired(compiled, id, "from") then input(compiled, ctx, id, "from") else ctx.caster
+		local base = asPoint(reference) or ctx.origin
+		local up = Vector3.yAxis
+		local forward: Vector3
+		local toward = asPoint(input(compiled, ctx, id, "dir"))
+		local basis = params.Basis
+		if toward and toward.Magnitude > 1e-3 then
+			forward = toward
+		elseif basis == "Body" then
+			local entity = if isEntity(reference) and alive(reference) then reference else ctx.caster
+			local root: BasePart? = if alive(entity) then entity._root else nil
+			forward = if root then root.CFrame.LookVector else ctx.heading
+		elseif basis == "Heading" then
+			forward = ctx.heading
+		elseif basis == "Surface" then
+			up = ctx.surfaceNormal or Vector3.yAxis
+			forward = ctx.heading - up * ctx.heading:Dot(up)
+		else
+			forward = casterAim(ctx)
+		end
+		if basis == "Level aim" and not toward then
+			forward = flat(forward)
+		end
+		if forward.Magnitude < 1e-3 then
+			forward = flat(ctx.heading)
+			if forward.Magnitude < 1e-3 then
+				forward = Vector3.zAxis
+			end
+		end
+		forward = forward.Unit
+		local right = forward:Cross(up)
+		if right.Magnitude < 1e-3 then
+			right = forward:Cross(Vector3.zAxis)
+		end
+		right = right.Unit
+		local point = base + forward * params.Forward + up * params.Up + right * params.Right
+		if params.Ground then
+			point = SpellWorld.Ground(point, 200) or point
+		end
+		return { point = point, forward = forward, up = up, right = right }
+	end)
+end
+
+local function vecMath(op: string, a: Vector3, b: Vector3, n: number, hasB: boolean): Vector3
 	if op == "A+B" then
 		return a + b
 	elseif op == "A−B" then
@@ -406,28 +525,57 @@ local function vecMath(op: string, a: Vector3, b: Vector3, n: number): Vector3
 	elseif op == "Cross" then
 		return a:Cross(b)
 	elseif op == "Rotate" then
-		return CFrame.Angles(0, math.rad(n), 0) * a
+		local axis = if hasB and b.Magnitude > 1e-6 then b.Unit else Vector3.yAxis
+		return CFrame.fromAxisAngle(axis, math.rad(n)) * a
+	elseif op == "Reflect" then
+		if b.Magnitude < 1e-6 then
+			return a
+		end
+		local normal = b.Unit
+		return a - 2 * a:Dot(normal) * normal
+	elseif op == "Project" then
+		if b.Magnitude < 1e-6 then
+			return Vector3.zero
+		end
+		local axis = b.Unit
+		return axis * a:Dot(axis)
 	end
 	return a
 end
 
+-- Filter / Pick: judges each living entity of the list in a child context
+-- whose vars hold it as Item; `judge` reads the rune's condition / score.
+local function eachItem(compiled: any, ctx: Context, id: string, judge: (probe: Context, entity: any) -> ())
+	local seen = {}
+	for _, entity in asList(input(compiled, ctx, id, "list")) do
+		if alive(entity) and not seen[entity] then
+			seen[entity] = true
+			local probe = table.clone(ctx)
+			probe.memo = {}
+			probe.vars = setmetatable({ [id] = { item = entity } }, { __index = ctx.vars }) :: any
+			judge(probe, entity)
+		end
+	end
+end
+
 local function compute(compiled: any, ctx: Context, id: string, port: string): any
 	local rune = compiled.runes[id]
-	local params = rune.params
 	local kind = rune.rune
 	local def = SpellRunes.Runes[kind]
-	-- flow runes and triggers: what they recorded about their moment
-	if def.Pass or def.Category == "Trigger" then
+	-- flow runes, triggers and per-item outputs: what they recorded
+	local portDef = SpellRunes.FindPort(def.Outputs, port)
+	if def.Pass or def.Category == "Trigger" or (portDef and portDef.Scoped) then
 		local bag = ctx.vars[id]
 		return if bag then bag[port] else nil
 	end
+	local params = settings(compiled, ctx, id)
 	if kind == "Caster" then
 		return ctx.caster
 	elseif kind == "Cursor" then
 		if port == "point" then return ctx.cursorPoint end
 		return if alive(ctx.cursorEntity) then ctx.cursorEntity else nil
 	elseif kind == "Target" then
-		-- Aim: its input, else the mouse (at cast time) / the trigger's focus.
+		-- Aim: its input, else the current target, else the mouse.
 		local point = asPoint(input(compiled, ctx, id, "point"))
 		if point then return point end
 		return defaultTarget(ctx) or ctx.cursorPoint
@@ -437,6 +585,12 @@ local function compute(compiled: any, ctx: Context, id: string, port: string): a
 		return ctx.origin
 	elseif kind == "Struck" then
 		return if alive(ctx.struck) then ctx.struck else nil
+	elseif kind == "Given" then
+		local args = ctx.args
+		if port == "invoked" then return (ctx.depth or 0) > 0 end
+		if not args then return nil end
+		if port == "entity" then return if alive(args.entity) then args.entity else nil end
+		return (args :: any)[port]
 	elseif kind == "Nearest" then
 		local from = asPoint(input(compiled, ctx, id, "from")) or ctx.origin
 		return nearestEntity(from, params.Radius, params.Filter, ctx.caster)
@@ -478,17 +632,28 @@ local function compute(compiled: any, ctx: Context, id: string, port: string): a
 		if port == "elapsed" then return os.clock() - ctx.cast.started end
 		return ctx.flight or 0
 	elseif kind == "Recall" then
-		local slot = memoryOf(ctx.player)[params.Slot]
+		local slot = memoryOf(ctx, params.Scope)[params.Slot]
 		if port == "set" then return slot ~= nil end
 		if not slot then return nil end
 		if port == "entity" then return if alive(slot.entity) then slot.entity else nil end
+		if port == "list" then
+			local living = {}
+			for _, entity in slot.list or {} do
+				if alive(entity) then table.insert(living, entity) end
+			end
+			return living
+		end
 		return slot[port]
 	elseif kind == "Number" then
 		return params.Value
 	elseif kind == "Math" then
 		return MATH[params.Op](number(input(compiled, ctx, id, "a")), number(input(compiled, ctx, id, "b")))
 	elseif kind == "Func" then
-		local result = FUNC[params.Op](number(input(compiled, ctx, id, "a")))
+		local value = number(input(compiled, ctx, id, "a"))
+		if params.Op == "clamp" then
+			return math.clamp(value, math.min(params.Min, params.Max), math.max(params.Min, params.Max))
+		end
+		local result = FUNC[params.Op](value)
 		return if result == result then result else 0
 	elseif kind == "Compare" then
 		return COMPARE[params.Op](number(input(compiled, ctx, id, "a")), number(input(compiled, ctx, id, "b")))
@@ -515,6 +680,69 @@ local function compute(compiled: any, ctx: Context, id: string, port: string): a
 			return rng:NextNumber() * 100 < params.Chance
 		end
 		return rng:NextUnitVector()
+	elseif kind == "Filter" then
+		local kept = memoRune(ctx, id, function()
+			local list = {}
+			eachItem(compiled, ctx, id, function(probe, entity)
+				if input(compiled, probe, id, "cond") == true then
+					table.insert(list, entity)
+				end
+			end)
+			return list
+		end)
+		return if port == "list" then kept else #kept
+	elseif kind == "Pick" then
+		local best = memoRune(ctx, id, function()
+			local result: { entity: any, value: number? } = { entity = nil, value = nil }
+			local highest = params.Mode == "Highest"
+			eachItem(compiled, ctx, id, function(probe, entity)
+				local score = input(compiled, probe, id, "key")
+				if typeof(score) ~= "number" or score ~= score then
+					return
+				end
+				if result.value == nil or (if highest then score > result.value else score < result.value) then
+					result.entity, result.value = entity, score
+				end
+			end)
+			return result
+		end)
+		return if port == "entity" then best.entity else best.value
+	elseif kind == "ListItem" then
+		local list = {}
+		for _, entity in asList(input(compiled, ctx, id, "list")) do
+			if alive(entity) then table.insert(list, entity) end
+		end
+		if port == "count" then return #list end
+		if #list == 0 then return nil end
+		if port == "random" then return list[rng:NextInteger(1, #list)] end
+		local index = params.Index
+		if index < 0 then index = #list + 1 + index end
+		return list[index]
+	elseif kind == "Combine" then
+		local combined = memoRune(ctx, id, function()
+			local a, b = asList(input(compiled, ctx, id, "a")), asList(input(compiled, ctx, id, "b"))
+			local inB = {}
+			for _, entity in b do inB[entity] = true end
+			local result, seen = {}, {}
+			local function add(entity: any)
+				if alive(entity) and not seen[entity] then
+					seen[entity] = true
+					table.insert(result, entity)
+				end
+			end
+			for _, entity in a do
+				if params.Op == "Both" or (params.Op == "Common") == (inB[entity] == true) then
+					add(entity)
+				end
+			end
+			if params.Op == "Both" then
+				for _, entity in b do add(entity) end
+			end
+			return result
+		end)
+		return if port == "list" then combined else #combined
+	elseif kind == "Locate" then
+		return locate(compiled, ctx, id)[port]
 	elseif kind == "Vector" then
 		local vector = Vector3.new(number(input(compiled, ctx, id, "x")), number(input(compiled, ctx, id, "y")), number(input(compiled, ctx, id, "z")))
 		return if params.Space == "Facing" then facingToWorld(ctx, vector) else vector
@@ -528,8 +756,10 @@ local function compute(compiled: any, ctx: Context, id: string, port: string): a
 		return point + (by :: Vector3)
 	elseif kind == "VecMath" then
 		local a = asPoint(input(compiled, ctx, id, "a")) or Vector3.zero
-		local b = asPoint(input(compiled, ctx, id, "b")) or Vector3.zero
-		local result = vecMath(params.Op, a, b, number(input(compiled, ctx, id, "n")))
+		local bValue = asPoint(input(compiled, ctx, id, "b"))
+		local b = bValue or Vector3.zero
+		if port == "dot" then return a:Dot(b) end
+		local result = vecMath(params.Op, a, b, number(input(compiled, ctx, id, "n")), bValue ~= nil)
 		if port == "length" then return result.Magnitude end
 		return result
 	elseif kind == "Direction" then
@@ -704,12 +934,12 @@ type Watch = {
 	compiled: any,
 	ctx: Context,
 	trigger: string,
+	params: { [string]: any }, -- the trigger's settings, read when the vessel fired
 	energy: number,
 	element: string?,
 	nextCheck: number,
 	nominal: number, -- energy this trigger would carry if nothing were split
 	scale: number, -- the launching shot's energyScale
-	sizeScale: number, -- the launching vessel's Size multiplier
 	pulses: number, -- On Timer pulses already fired
 }
 local watches: { Watch } = {}
@@ -732,11 +962,27 @@ local function triggerScale(watch: Watch, energy: number): number
 	return watch.scale * split
 end
 
+local function newWatch(projectile: any, compiled: any, ctx: Context, triggerId: string, energy: number, element: string?, scale: number): Watch
+	return {
+		projectile = projectile,
+		compiled = compiled,
+		ctx = ctx,
+		trigger = triggerId,
+		params = settings(compiled, ctx, triggerId),
+		energy = energy,
+		element = element,
+		nextCheck = 0,
+		nominal = energy,
+		scale = scale,
+		pulses = 0,
+	}
+end
+
 -- Runs the sub-circle hanging off a trigger from eventPoint. heading is the
 -- vessel's travel direction at that moment; On Impact reflects it off the
 -- surface so what it fires ricochets unless aimed. The trigger's outputs
 -- (Point, Surface, Struck, Pulse) are what it saw.
-local function fireTrigger(compiled: any, parent: Context, triggerId: string, energy: number, element: string?, eventPoint: Vector3, heading: Vector3, normal: Vector3?, struck: any?, energyScale: number?, sizeScale: number?, flight: number?, pulse: number?)
+local function fireTrigger(compiled: any, parent: Context, triggerId: string, energy: number, element: string?, eventPoint: Vector3, heading: Vector3, normal: Vector3?, struck: any?, energyScale: number?, flight: number?, pulse: number?)
 	if normal and compiled.runes[triggerId].rune == "OnImpact" then
 		heading = heading - 2 * heading:Dot(normal) * normal
 	end
@@ -751,7 +997,6 @@ local function fireTrigger(compiled: any, parent: Context, triggerId: string, en
 	ctx.copyMultiplier = nil
 	ctx.spawnOffset = TRIGGER_SPAWN_OFFSET
 	ctx.energyScale = energyScale or 1
-	ctx.sizeScale = sizeScale or 1
 	ctx.surfaceNormal = normal
 	ctx.flight = flight or 0
 	ctx.conjureId = nil
@@ -764,69 +1009,74 @@ local function fireTrigger(compiled: any, parent: Context, triggerId: string, en
 	runFlow(compiled, ctx, triggerId, "out", energy, element)
 end
 
--- Stats for one vessel after its modifiers. Evaluated once per firing, so a
--- Stream's later copies reuse the cast-time Homing lock.
-local function vesselStats(compiled: any, ctx: Context, id: string): any
+-- Flight stats for one projectile vessel after its modifiers (their
+-- settings resolved in this context), and the energy fraction the
+-- modifiers take. Evaluated once per firing, so a Stream's later copies
+-- reuse the cast-time Homing lock.
+local function vesselStats(compiled: any, ctx: Context, id: string): (any, number)
 	local base = SpellRunes.Vessels[compiled.runes[id].rune]
-	local tables = SpellRunes.ModifierTables
 	local stats = {
 		speed = base.Speed,
 		radius = base.Radius,
 		lifetime = base.Lifetime,
-		range = base.Range,
 		scale = base.Scale or 1,
 		gravity = 0,
 		bounces = 0,
+		restitution = 0.7,
 		pierces = 0,
+		falloff = 0.15,
 		homing = nil :: any,
 		quantity = nil :: any,
 		sustain = nil :: number?,
 	}
+	local modCost = 0
 	for _, modId in compiled.vessels[id].mods do
-		local mod = compiled.runes[modId]
-		local params = mod.params
-		local level = params.Level
-		local kind = mod.rune
-		if kind == "Speed" and stats.speed then
-			stats.speed *= tables.Speed[level]
+		local kind = compiled.runes[modId].rune
+		local p = settings(compiled, ctx, modId)
+		modCost += SpellRunes.ModifierCost(kind, p)
+		if kind == "Speed" then
+			stats.speed *= p.Factor
 		elseif kind == "Size" then
-			stats.radius *= tables.Size[level]
-			stats.scale *= tables.Size[level]
+			stats.radius *= p.Factor
+			stats.scale *= p.Factor
 		elseif kind == "Gravity" then
-			stats.gravity = tables.Gravity[level]
+			stats.gravity = p.Pull
 		elseif kind == "Bounce" then
-			stats.bounces = level
+			stats.bounces = p.Count
+			stats.restitution = p.Bounciness
 		elseif kind == "Pierce" then
-			stats.pierces = level
+			stats.pierces = p.Count
+			stats.falloff = p.Falloff / 100
 		elseif kind == "Range" then
-			if stats.lifetime then stats.lifetime *= tables.Range[level] end
-			if stats.range then stats.range *= tables.Range[level] end
+			stats.lifetime *= p.Factor
 		elseif kind == "Quantity" then
 			-- over the chain's Quantity limit (SpellCompiler): one copy
 			if not (compiled.noQuantity and compiled.noQuantity[id]) then
-				stats.quantity = params
+				stats.quantity = p
 			end
 		elseif kind == "Sustain" then
-			stats.sustain = tables.Sustain[level]
+			stats.sustain = p.Seconds
 		elseif kind == "Homing" then
 			local lock = input(compiled, ctx, modId, "entity")
 			stats.homing = {
 				lock = if alive(lock) and lock ~= ctx.caster then lock else nil,
-				radius = tables.HomingRadius[level],
-				filter = params.Filter,
-				turnRate = math.rad(tables.HomingTurn[level]),
+				radius = p.Radius,
+				filter = p.Filter,
+				turnRate = math.rad(p.Turn),
 			}
 		end
 	end
-	return stats
+	return stats, math.min(modCost, SpellRunes.MaxModifierCost)
 end
 
--- Aim: whatever is wired into the vessel's Aim port, else the For Each /
--- trigger target, else the cursor (at cast time), else straight ahead.
-local function aimDirection(compiled: any, ctx: Context, id: string): Vector3
+-- Aim from `from` (default Here): whatever is wired into the vessel's Aim
+-- port, else the For Each / trigger target, else the cursor (at cast time),
+-- else straight ahead.
+local function aimDirection(compiled: any, ctx: Context, id: string, from: Vector3?): Vector3
+	local origin = from or ctx.origin
 	local aim = asPoint(input(compiled, ctx, id, "aim")) or defaultTarget(ctx)
-	if aim and (aim - ctx.origin).Magnitude > 1e-3 then
-		return (aim - ctx.origin).Unit
+	if aim and (aim - origin).Magnitude > 1e-3 then
+		return (aim - origin).Unit
 	end
 	return ctx.heading
 end
@@ -868,6 +1118,7 @@ type Shot = {
 	impact: number, -- damage per damage-energy (element x vessel)
 	channelId: number?,
 	energyScale: number, -- see Context.energyScale
+	spawn: Vector3?, -- the From input: where it launches (else Here + spawnOffset)
 }
 
 -- All flying vessels use the same swept-radius simulation and trigger pipeline.
@@ -888,21 +1139,23 @@ local function launch(shot: Shot, direction: Vector3)
 		TurnRate = stats.homing.turnRate,
 		Delay = if shot.vessel == "Beam" then 0 else 0.05,
 	}
+	local ignore = SpellWorld.SpellIgnore(ctx.player, caster)
+	table.insert(ignore, 1, ctx.character)
 	local projectile = (if shot.vessel == "Beam" then BeamHandler.Launch else Projectile.new)({
-		Origin = ctx.origin + direction * ctx.spawnOffset,
+		Origin = shot.spawn or (ctx.origin + direction * ctx.spawnOffset),
 		Direction = direction,
 		Speed = stats.speed,
 		Radius = stats.radius,
 		Lifetime = stats.lifetime,
 		Gravity = stats.gravity,
 		Bounces = stats.bounces,
-		Restitution = 0.7,
+		Restitution = stats.restitution,
 		MaxPierces = stats.pierces,
-		PierceFalloff = PIERCE_FALLOFF,
+		PierceFalloff = stats.falloff,
 		Damage = shot.damageEnergy * shot.impact,
 		Source = caster,
-		-- (the caster's own barriers let their magic through)
-		IgnoreInstances = { ctx.character, SpellWorld.BarrierFolder(ctx.player) },
+		-- (barriers that let this caster's magic through)
+		IgnoreInstances = ignore,
 		Filter = function(entity)
 			return entity ~= caster and not entity.IsDestroyed and entity.Health > 0
 		end,
@@ -927,7 +1180,7 @@ local function launch(shot: Shot, direction: Vector3)
 				lastStruck = hit.Entity
 				strike(ctx, hit.Entity, projectile.Damage * multiplier, hit.Hurtbox, hit.CFrame.Position, element, damageEnergy * multiplier)
 			else
-				-- (someone else's barrier: it takes the hit)
+				-- (a barrier that stops this caster's magic: it takes the hit)
 				SpellWorld.DamagePart(hit.Part, projectile.Damage * multiplier)
 			end
 		end)
@@ -935,19 +1188,10 @@ local function launch(shot: Shot, direction: Vector3)
 		for _, triggerId in shot.info.triggers do
 			local trigger = compiled.runes[triggerId]
 			local nominal = shot.perCopy * trigger.params.Share / 100
-			local watch: Watch = {
-				projectile = projectile,
-				compiled = compiled,
-				ctx = ctx,
-				trigger = triggerId,
-				energy = if triggerAmounts then (triggerAmounts[triggerId] or 0) else nominal,
-				element = element,
-				nextCheck = 0,
-				nominal = nominal,
-				scale = shot.energyScale,
-				sizeScale = shot.stats.scale or 1,
-				pulses = 0,
-			}
+			local watch = newWatch(projectile, compiled, ctx, triggerId, nominal, element, shot.energyScale)
+			if triggerAmounts then
+				watch.energy = triggerAmounts[triggerId] or 0
+			end
 			table.insert(boundWatches, watch)
 			if trigger.rune == "OnImpact" or trigger.rune == "OnExpire" then
 				table.insert(destroyTriggers, watch)
@@ -966,9 +1210,9 @@ local function launch(shot: Shot, direction: Vector3)
 				local heading = headingOf(projectile, ctx.heading)
 				local flight = projectile.Age
 				if kind == "OnImpact" and (result.Kind == "entity" or result.Kind == "world") then
-					fireTrigger(compiled, ctx, watch.trigger, watch.energy, element, result.Position, heading, result.Normal, if result.Kind == "entity" then lastStruck else nil, triggerScale(watch, watch.energy), watch.sizeScale, flight)
+					fireTrigger(compiled, ctx, watch.trigger, watch.energy, element, result.Position, heading, result.Normal, if result.Kind == "entity" then lastStruck else nil, triggerScale(watch, watch.energy), flight)
 				elseif kind == "OnExpire" and result.Kind == nil then
-					fireTrigger(compiled, ctx, watch.trigger, watch.energy, element, result.Position, heading, nil, nil, triggerScale(watch, watch.energy), watch.sizeScale, flight)
+					fireTrigger(compiled, ctx, watch.trigger, watch.energy, element, result.Position, heading, nil, nil, triggerScale(watch, watch.energy), flight)
 				end
 			end
 		end)
@@ -993,24 +1237,13 @@ local function emitSustain(parent: Shot, index: number, share: number, channelId
 	local shot = table.clone(parent)
 	shot.channelId = channelId
 	shot.ctx = liveContext(shot.ctx)
+	shot.spawn = asPoint(input(shot.compiled, shot.ctx, shot.id, "from"))
 	shot.perCopy *= share
 	shot.damageEnergy *= share
 	shot.energyScale *= share
-	local directions = spreadDirections(aimDirection(shot.compiled, shot.ctx, shot.id), shot.stats.quantity)
+	local directions = spreadDirections(aimDirection(shot.compiled, shot.ctx, shot.id, shot.spawn), shot.stats.quantity)
 	launch(shot, directions[index])
 end
-
--- Explosion: damages every living entity (never the caster) in the radius,
--- full at the centre down to half at the edge, then broadcasts the blast for
--- the client-side visual. Radius = base (3) x its own Size rune x the Size of
--- the vessel that triggered it (a big fireball makes a big blast), at full
--- energy; a blast fed a split share of it (a Sustain packet's slice, a
--- subdivided beamlet) shrinks with the cube root of that share, so a pulse
--- beam's impact is a big blast while a sustained beam leaves small ones
--- wherever it hits. Centre: the At input, else the For Each entity, else
--- Here -- which at cast time is your hand, so a cast-time blast goes to the
--- cursor instead (clamped to MaxCastRange). Barriers in reach take the hit too.
-local MIN_EXPLOSION_SCALE = 0.2 -- smallest radius fraction a split blast keeps
 
 -- Fling: a blast whose power at a target (centre damage x falloff) reaches
 -- FLING_MIN_POWER ragdolls it (the Stun effect) and launches it away from the
@@ -1098,8 +1331,7 @@ local function fling(entity: any, center: Vector3, power: number)
 	if alive(entity) then
 		StatusEffectSys:ApplyEffect(entity, "Stun", ragdollTime)
 	end
-	local away = entity:GetPosition() - center
-	away = Vector3.new(away.X, 0, away.Z)
+	local away = flat(entity:GetPosition() - center)
 	local direction = (if away.Magnitude > 1e-3 then away.Unit else Vector3.zero) + Vector3.new(0, FLING_UPWARD, 0)
 	local velocity = direction.Unit * math.clamp(power * FLING_SPEED_PER_POWER, FLING_MIN_SPEED, FLING_MAX_SPEED)
 	-- random tumble axis; up to +-30% jitter on the power-scaled spin rate
@@ -1135,73 +1367,6 @@ local function placement(compiled: any, ctx: Context, id: string, maxRange: numb
 	return point :: Vector3
 end
 
-local function explode(shot: Shot)
-	local ctx = shot.ctx
-	local base = SpellRunes.Vessels.Explosion
-	local center = placement(shot.compiled, ctx, shot.id, base.MaxCastRange)
-	local maxRadius = shot.stats.radius * (ctx.sizeScale or 1)
-	local radius = maxRadius * math.clamp(shot.energyScale ^ (1 / 3), MIN_EXPLOSION_SCALE, 1)
-	for _, entity in ChunkManager.GetEntitiesInRadius(center, radius) do
-		if entity ~= ctx.caster and alive(entity) then
-			local position = entity:GetPosition()
-			local falloff = 1 - 0.5 * math.clamp((position - center).Magnitude / radius, 0, 1)
-			local power = shot.damageEnergy * shot.impact * falloff
-			strike(ctx, entity, power, "Body", position, shot.element, shot.damageEnergy * falloff)
-			if power >= FLING_MIN_POWER and Entity.CanDamage(ctx.caster, entity) then
-				fling(entity, center, power)
-			end
-		end
-	end
-	SpellWorld.DamageInRadius(center, radius, shot.damageEnergy * shot.impact)
-	VisualOffload.Fire("SpellExplosion", {
-		Position = center,
-		Radius = radius,
-		Color = SpellRunes.Elements[shot.element].Color,
-		Power = shot.damageEnergy * shot.impact, -- centre damage; drives ExplosionVFX
-		-- the struck surface, so the visual sits on walls/ceilings/slopes
-		Normal = if ctx.isCast then nil else ctx.surfaceNormal,
-	})
-end
-
--- Triggers on a barrier / time field: On Timer and On Proximity are polled
--- like a projectile's, On Expire fires when it breaks or fades.
-local function watchThing(compiled: any, ctx: Context, id: string, thing: any, perCopy: number, element: string?)
-	local info = compiled.vessels[id]
-	local onEnd = {}
-	for _, triggerId in info.triggers do
-		local trigger = compiled.runes[triggerId]
-		local nominal = perCopy * trigger.params.Share / 100
-		local watch: Watch = {
-			projectile = thing,
-			compiled = compiled,
-			ctx = ctx,
-			trigger = triggerId,
-			energy = nominal,
-			element = element,
-			nextCheck = 0,
-			nominal = nominal,
-			scale = ctx.energyScale or 1,
-			sizeScale = 1,
-			pulses = 0,
-		}
-		if trigger.rune == "OnExpire" then
-			table.insert(onEnd, watch)
-		else
-			table.insert(watches, watch)
-		end
-	end
-	if #onEnd > 0 then
-		thing.OnDestroy:Connect(function(result)
-			if result.Kind == "removed" then
-				return -- (its caster left)
-			end
-			for _, watch in onEnd do
-				fireTrigger(compiled, ctx, watch.trigger, watch.energy, element, result.Position, ctx.heading, nil, nil, triggerScale(watch, watch.energy), 1, thing.Age)
-			end
-		end)
-	end
-end
-
 -- The body a Force / Body Effect works on when nothing is wired: the For
 -- Each entity, else you at cast time, else whoever set off the trigger.
 local function defaultBody(ctx: Context): any?
@@ -1214,87 +1379,264 @@ local function defaultBody(ctx: Context): any?
 	return if alive(ctx.struck) then ctx.struck else nil
 end
 
--- Barrier, Time Field, Force, Blink and Body Effect: energy that isn't damage.
+-- Who a Smite hits when nothing is wired: the For Each entity, else
+-- whoever set off the trigger, else what's under the crosshair at cast time.
+local function defaultVictim(ctx: Context): any?
+	if alive(ctx.subject) then
+		return ctx.subject
+	elseif alive(ctx.struck) then
+		return ctx.struck
+	end
+	return if ctx.isCast and alive(ctx.cursorEntity) then ctx.cursorEntity else nil
+end
+
+-- The living entities a vessel's Target input names (a list or one), each
+-- once; unwired, `fallback`.
+local function targetsOf(compiled: any, ctx: Context, id: string, fallback: any?): { any }
+	local result, seen = {}, {}
+	local source = if wired(compiled, id, "target") then asList(input(compiled, ctx, id, "target")) else { fallback }
+	for _, entity in source do
+		if alive(entity) and not seen[entity] then
+			seen[entity] = true
+			table.insert(result, entity)
+		end
+	end
+	return result
+end
+
+-- Explosion: damages every living entity (never the caster) within Radius,
+-- full at the centre down to Edge at the rim, then broadcasts the blast for
+-- the client-side visual. Radius beyond the free size costs a share of the
+-- energy (SpellRunes.ExplosionCost); a blast fed a split share of its
+-- nominal energy (a Sustain packet's slice, a subdivided beamlet) shrinks
+-- with the cube root of that share. Barriers in reach that stop the
+-- caster's magic take the hit too.
+local MIN_EXPLOSION_SCALE = 0.2 -- smallest radius fraction a split blast keeps
+
+local function explode(shot: Shot)
+	local ctx = shot.ctx
+	local params = settings(shot.compiled, ctx, shot.id)
+	local center = placement(shot.compiled, ctx, shot.id, SpellRunes.Vessels.Explosion.MaxCastRange)
+	local radius = params.Radius * math.clamp(shot.energyScale ^ (1 / 3), MIN_EXPLOSION_SCALE, 1)
+	local damageEnergy = shot.damageEnergy * (1 - SpellRunes.ExplosionCost(params.Radius))
+	local edge = params.Edge / 100
+	for _, entity in ChunkManager.GetEntitiesInRadius(center, radius) do
+		if entity ~= ctx.caster and alive(entity) then
+			local position = entity:GetPosition()
+			local falloff = 1 - (1 - edge) * math.clamp((position - center).Magnitude / radius, 0, 1)
+			local power = damageEnergy * shot.impact * falloff
+			strike(ctx, entity, power, "Body", position, shot.element, damageEnergy * falloff)
+			if params.Fling and power >= FLING_MIN_POWER and Entity.CanDamage(ctx.caster, entity) then
+				fling(entity, center, power)
+			end
+		end
+	end
+	SpellWorld.DamageInRadius(center, radius, damageEnergy * shot.impact, ctx.player, ctx.caster)
+	VisualOffload.Fire("SpellExplosion", {
+		Position = center,
+		Radius = radius,
+		Color = SpellRunes.Elements[shot.element].Color,
+		Power = damageEnergy * shot.impact, -- centre damage; drives ExplosionVFX
+		-- the struck surface, so the visual sits on walls/ceilings/slopes
+		Normal = if ctx.isCast then nil else ctx.surfaceNormal,
+	})
+end
+
+-- Smite: an instant bolt from From to each target within Range (and in
+-- sight, when Sight is on), sharing the energy. A barrier that stops the
+-- caster's magic stops the bolt and takes the hit.
+local SMITE_SIGHT_TRIES = 4
+
+local function smite(shot: Shot)
+	local ctx = shot.ctx
+	local params = settings(shot.compiled, ctx, shot.id)
+	local from = asPoint(input(shot.compiled, ctx, shot.id, "from")) or ctx.origin
+	local color = SpellRunes.Elements[shot.element].Color
+	local hits: { { entity: any, position: Vector3 } } = {}
+	local blocked: { { part: BasePart, position: Vector3 } } = {}
+	for _, target in targetsOf(shot.compiled, ctx, shot.id, defaultVictim(ctx)) do
+		if target == ctx.caster then
+			continue
+		end
+		local position = target:GetPosition()
+		local offset = position - from
+		if offset.Magnitude > params.Range then
+			continue
+		end
+		if params.Sight and offset.Magnitude > 1e-3 then
+			local exclude: { Instance } = SpellWorld.SpellIgnore(ctx.player, ctx.caster)
+			table.insert(exclude, ctx.character)
+			local rayParams = RaycastParams.new()
+			rayParams.FilterType = Enum.RaycastFilterType.Exclude
+			rayParams.IgnoreWater = true
+			local clear = false
+			for _ = 1, SMITE_SIGHT_TRIES do
+				rayParams.FilterDescendantsInstances = exclude
+				local result = workspace:Raycast(from, offset, rayParams)
+				if not result then
+					clear = true
+					break
+				end
+				local hitEntity = Entity.Get(result.Instance)
+				if hitEntity == target then
+					clear = true
+					break
+				elseif hitEntity and hitEntity.Instance then
+					table.insert(exclude, hitEntity.Instance) -- (bolts pass other bodies)
+				else
+					if SpellWorld.BarrierOf(result.Instance) then
+						table.insert(blocked, { part = result.Instance :: BasePart, position = result.Position })
+					end
+					break
+				end
+			end
+			if not clear then
+				continue
+			end
+		end
+		table.insert(hits, { entity = target, position = position })
+	end
+	local count = #hits + #blocked
+	if count == 0 then
+		SpellWorld.Visual({ Kind = "Smite", From = from, To = from + ctx.heading * 3, Color = color, Fizzle = true })
+		return
+	end
+	local each = shot.damageEnergy / count
+	for _, hit in hits do
+		strike(ctx, hit.entity, each * shot.impact, "Body", hit.position, shot.element, each)
+		SpellWorld.Visual({ Kind = "Smite", From = from, To = hit.position, Color = color })
+	end
+	for _, hit in blocked do
+		SpellWorld.DamagePart(hit.part, each * shot.impact)
+		SpellWorld.Visual({ Kind = "Smite", From = from, To = hit.position, Color = color })
+	end
+end
+
+-- Triggers on a barrier / time field: On Timer and On Proximity are polled
+-- like a projectile's, On Expire fires when it breaks or fades.
+local function watchThing(compiled: any, ctx: Context, id: string, thing: any, perCopy: number, element: string?)
+	local info = compiled.vessels[id]
+	local onEnd = {}
+	for _, triggerId in info.triggers do
+		local trigger = compiled.runes[triggerId]
+		local watch = newWatch(thing, compiled, ctx, triggerId, perCopy * trigger.params.Share / 100, element, ctx.energyScale or 1)
+		if trigger.rune == "OnExpire" then
+			table.insert(onEnd, watch)
+		else
+			table.insert(watches, watch)
+		end
+	end
+	if #onEnd > 0 then
+		thing.OnDestroy:Connect(function(result)
+			if result.Kind == "removed" then
+				return -- (its caster left)
+			end
+			for _, watch in onEnd do
+				fireTrigger(compiled, ctx, watch.trigger, watch.energy, element, result.Position, ctx.heading, nil, nil, triggerScale(watch, watch.energy), thing.Age)
+			end
+		end)
+	end
+end
+
+local function fedBy(energy: number, cost: number): number
+	return if cost > 0 then math.clamp(energy / cost, 0, 1) else 1
+end
+
+-- Barrier, Time Field, Force, Blink and Body Effect: magic that does what
+-- its settings say, paid for by the energy that reaches it.
 local function fireUtility(compiled: any, ctx: Context, id: string, energy: number, element: string?)
 	local rune = compiled.runes[id]
-	local params = rune.params
+	local p = settings(compiled, ctx, id)
 	local info = compiled.vessels[id]
-	local size, range = SpellCompiler.ModifierScales(info.mods, compiled.runes)
-	local perCopy = energy * (1 - math.min(info.modCost, 1))
-	local own = perCopy * (1 - info.triggerShare) -- what the vessel itself spends
+	local own = energy * (1 - info.triggerShare) -- what the vessel itself spends
 	local look = (element and SpellRunes.Elements[element]) or SpellRunes.Raw
 	local kind = rune.rune
 	local base = SpellRunes.Vessels[kind]
+	local costs = SpellRunes.Costs
 
 	if kind == "Barrier" then
 		local at = placement(compiled, ctx, id, base.MaxCastRange)
-		local facing = at - ctx.origin
+		local follow = input(compiled, ctx, id, "follow")
+		local fed = fedBy(own, SpellRunes.BarrierCost(p))
 		local thing = SpellWorld.CreateBarrier({
 			player = ctx.player,
-			character = ctx.character,
+			caster = ctx.caster,
 			position = at,
-			facing = if Vector3.new(facing.X, 0, facing.Z).Magnitude > 0.5 then facing else ctx.heading,
-			shape = params.Shape,
-			size = size,
-			duration = params.Duration * range,
-			health = math.max(own * base.HealthPerEnergy, base.MinHealth),
+			face = asPoint(input(compiled, ctx, id, "face")) or ctx.origin,
+			fallbackFacing = -ctx.heading,
+			shape = p.Shape,
+			size = Vector3.new(p.Width, p.Height, p.Depth),
+			tilt = p.Tilt,
+			anchor = p.Anchor,
+			ground = p.Ground,
+			rise = p.Rise,
+			health = p.Health * fed,
+			duration = p.Duration * fed,
+			pass = p.Pass,
+			blocks = p.Blocks,
+			follow = if alive(follow) then follow else nil,
 			color = look.Color,
 		})
-		watchThing(compiled, ctx, id, thing, perCopy, element)
+		watchThing(compiled, ctx, id, thing, energy, element)
 	elseif kind == "TimeField" then
 		local at = placement(compiled, ctx, id, base.MaxCastRange)
+		local follow = input(compiled, ctx, id, "follow")
+		local fed = fedBy(own, SpellRunes.FieldCost(p))
 		local thing = SpellWorld.CreateTimeField({
 			player = ctx.player,
 			position = at,
-			radius = math.min(base.Radius + own * base.RadiusPerEnergy, base.MaxRadius) * size,
-			scale = params.Scale,
-			duration = params.Duration * range,
+			radius = p.Radius,
+			scale = p.Scale,
+			duration = p.Duration * fed,
+			follow = if alive(follow) then follow else nil,
 			color = look.Color,
 		})
-		watchThing(compiled, ctx, id, thing, perCopy, element)
+		watchThing(compiled, ctx, id, thing, energy, element)
 	elseif kind == "Force" then
-		local radius = params.Radius * size
-		local targets = {}
+		local center = asPoint(input(compiled, ctx, id, "center")) or ctx.origin
+		local targets = targetsOf(compiled, ctx, id, if p.Radius > 0 then nil else defaultBody(ctx))
 		local parts = {}
-		if radius > 0 then
-			for _, entity in ChunkManager.GetEntitiesInRadius(ctx.origin, radius) do
-				if entity ~= ctx.caster and alive(entity) then
+		if p.Radius > 0 then
+			local seen = {}
+			for _, target in targets do seen[target] = true end
+			for _, entity in ChunkManager.GetEntitiesInRadius(center, p.Radius) do
+				if entity ~= ctx.caster and alive(entity) and not seen[entity] then
+					seen[entity] = true
 					table.insert(targets, entity)
 				end
 			end
-			parts = SpellWorld.LooseParts(ctx.origin, radius)
-		else
-			local target = input(compiled, ctx, id, "target")
-			if not alive(target) then
-				target = if wired(compiled, id, "target") then nil else defaultBody(ctx)
-			end
-			if target then
-				table.insert(targets, target)
-			end
+			parts = SpellWorld.LooseParts(center, p.Radius)
 		end
-		local share = own / math.max(#targets, 1)
-		local speed = math.min(share * base.SpeedPerEnergy, base.MaxSpeed)
+		local bodies = #targets + #parts * LOOSE_PART_WEIGHT
+		local fed = fedBy(own / math.max(bodies, 1), SpellRunes.ForceCost(p))
+		local speed = p.Speed * fed
 		local along = asPoint(input(compiled, ctx, id, "dir"))
+		local alongDir = if along and along.Magnitude > 1e-3 then along.Unit else ctx.heading
 		local function directionFor(position: Vector3): Vector3
-			if params.Mode == "Up" then
+			if p.Mode == "Up" then
 				return Vector3.yAxis
-			elseif params.Mode == "Push" or params.Mode == "Pull" then
-				-- level away from / toward Here, lifted a little so bodies leave
-				-- the ground instead of being ground into it
-				local away = position - ctx.origin
-				local flat = Vector3.new(away.X, 0, away.Z)
-				local level = if flat.Magnitude > 1e-3 then flat.Unit else Vector3.new(ctx.heading.X, 0, ctx.heading.Z)
+			elseif p.Mode == "Away" or p.Mode == "Toward" then
+				local level = flat(position - center)
 				if level.Magnitude < 1e-3 then
-					return Vector3.yAxis
+					return if p.Mode == "Away" then Vector3.yAxis else Vector3.zero
 				end
-				level = level.Unit
-				return if params.Mode == "Push" then (level + Vector3.new(0, PUSH_LIFT, 0)).Unit else (-level + Vector3.new(0, PULL_LIFT, 0)).Unit
+				level = level.Unit * (if p.Mode == "Away" then 1 else -1)
+				return (level + Vector3.new(0, p.Lift, 0)).Unit
 			end
-			return if along and along.Magnitude > 1e-3 then along.Unit else ctx.heading
+			return alongDir
 		end
 		local shoved = {}
 		for _, target in targets do
-			SpellWorld.Push(target, directionFor(target:GetPosition()) * speed, params.Ragdoll)
+			SpellWorld.Drive(target, {
+				velocity = directionFor(target:GetPosition()) * speed,
+				ragdoll = p.Ragdoll,
+				replace = p.Replace,
+				duration = p.Duration,
+				mode = p.Mode,
+				center = center,
+				speed = speed,
+				lift = p.Lift,
+			})
 			if target.Instance then
 				table.insert(shoved, target.Instance)
 			end
@@ -1304,31 +1646,39 @@ local function fireUtility(compiled: any, ctx: Context, id: string, energy: numb
 		end
 		SpellWorld.Visual({
 			Kind = "Force",
-			Position = ctx.origin,
-			Radius = radius,
-			Direction = directionFor(ctx.origin + ctx.heading),
-			Mode = params.Mode,
+			Position = center,
+			Radius = p.Radius,
+			Direction = if p.Mode == "Along" then alongDir else directionFor(center + ctx.heading),
+			Mode = p.Mode,
 			Targets = shoved,
 			Color = look.Color,
 		})
 	elseif kind == "Blink" then
-		local who = input(compiled, ctx, id, "who")
+		local who = if wired(compiled, id, "who") then input(compiled, ctx, id, "who") else ctx.caster
 		if not alive(who) then
-			who = if wired(compiled, id, "who") then nil else ctx.caster
+			return
 		end
 		local to = asPoint(input(compiled, ctx, id, "to")) or defaultPlace(ctx)
-		local reach = math.min(own * base.StudsPerEnergy * range, base.MaxDistance)
-		local from, landed = SpellWorld.Blink(who, to :: Vector3, reach, params.Momentum)
+		local reach = math.min(p.Distance, own / costs.BlinkStud)
+		local from, landed = SpellWorld.Blink(who, to :: Vector3, reach, p.Momentum)
 		if from and landed then
 			SpellWorld.Visual({ Kind = "Blink", From = from, To = landed, Color = look.Color })
 		end
 	elseif kind == "Effect" then
-		local target = input(compiled, ctx, id, "target")
-		if not alive(target) then
-			target = if wired(compiled, id, "target") then nil else defaultBody(ctx)
+		local effect = p.Effect
+		local def = SpellRunes.Effects[effect]
+		if not def then
+			return
 		end
-		if target then
-			SpellBody.Apply(ctx.caster, target, params.Effect, own, params.Duration * range)
+		local targets = targetsOf(compiled, ctx, id, defaultBody(ctx))
+		local power = SpellRunes.EffectPower(effect, p.Power)
+		local fed = fedBy(own / math.max(#targets, 1), SpellRunes.EffectCost(effect, power, p.Duration))
+		for _, target in targets do
+			if def.Kind == "Timed" then
+				SpellBody.Apply(ctx.caster, target, effect, power, p.Duration * fed)
+			elseif fed > 0 then
+				SpellBody.Apply(ctx.caster, target, effect, power * fed, p.Duration)
+			end
 		end
 	end
 end
@@ -1344,7 +1694,8 @@ local function fireVessel(compiled: any, ctx: Context, id: string, energy: numbe
 		return
 	end
 	local vessel = compiled.runes[id].rune
-	if not SpellRunes.Flying[vessel] and vessel ~= "Explosion" then
+	local def = SpellRunes.Runes[vessel]
+	if not def.Damaging then
 		fireUtility(compiled, ctx, id, energy, element)
 		return
 	end
@@ -1352,12 +1703,26 @@ local function fireVessel(compiled: any, ctx: Context, id: string, energy: numbe
 		return -- (the compiler insists damaging vessels get an element)
 	end
 	local info = compiled.vessels[id]
-	local stats = vesselStats(compiled, ctx, id)
+	local impact = SpellRunes.Elements[element].Impact * SpellRunes.Vessels[vessel].Impact
+	if def.Instant then
+		local shot: Shot = {
+			compiled = compiled, ctx = ctx, id = id, vessel = vessel, element = element, info = info,
+			stats = {}, perCopy = energy, damageEnergy = energy * (1 - info.triggerShare), impact = impact,
+			energyScale = ctx.energyScale or 1,
+		}
+		if vessel == "Explosion" then
+			explode(shot)
+		else
+			smite(shot)
+		end
+		return
+	end
+	local stats, modCost = vesselStats(compiled, ctx, id)
 	-- Overcharge adds copies (energy already scaled to match). A vessel with
 	-- Quantity grows its own pattern; one without fans the extras out.
 	local count = info.count
 	local copies = ctx.copyMultiplier or 1
-	if copies > 1 and vessel ~= "Explosion" then
+	if copies > 1 then
 		count = math.max(info.count, math.floor(info.count * copies + 0.5))
 		if count ~= info.count then
 			local quantity = if stats.quantity then table.clone(stats.quantity) else {
@@ -1368,7 +1733,7 @@ local function fireVessel(compiled: any, ctx: Context, id: string, energy: numbe
 			stats.quantity = quantity
 		end
 	end
-	local perCopy = energy * (1 - info.modCost) / count
+	local perCopy = energy * (1 - modCost) / count
 	local shot: Shot = {
 		compiled = compiled,
 		ctx = ctx,
@@ -1379,13 +1744,10 @@ local function fireVessel(compiled: any, ctx: Context, id: string, energy: numbe
 		stats = stats,
 		perCopy = perCopy,
 		damageEnergy = perCopy * (1 - info.triggerShare),
-		impact = SpellRunes.Elements[element].Impact * SpellRunes.Vessels[vessel].Impact,
+		impact = impact,
 		energyScale = ctx.energyScale or 1,
+		spawn = asPoint(input(compiled, ctx, id, "from")),
 	}
-	if vessel == "Explosion" then
-		explode(shot)
-		return
-	end
 	local stream = stats.quantity and stats.quantity.Pattern == "Stream"
 	if vessel == "Beam" and stats.sustain then
 		for index = 1, count do
@@ -1400,14 +1762,15 @@ local function fireVessel(compiled: any, ctx: Context, id: string, energy: numbe
 		end
 		return
 	end
-	for index, direction in spreadDirections(aimDirection(compiled, ctx, id), stats.quantity) do
+	for index, direction in spreadDirections(aimDirection(compiled, ctx, id, shot.spawn), stats.quantity) do
 		if stream and index > 1 then
 			task.delay((index - 1) * stats.quantity.Interval, function()
 				-- Re-aim each later copy from where the caster is pointing now.
 				local liveShot = table.clone(shot)
 				liveShot.ctx = liveContext(ctx)
+				liveShot.spawn = asPoint(input(compiled, liveShot.ctx, id, "from"))
 				if liveShot.ctx.character.Parent and (not liveShot.ctx.caster or alive(liveShot.ctx.caster)) then
-					launch(liveShot, aimDirection(compiled, liveShot.ctx, id))
+					launch(liveShot, aimDirection(compiled, liveShot.ctx, id, liveShot.spawn))
 				end
 			end)
 		else
@@ -1437,6 +1800,13 @@ local function conjureSpec(compiled: any, id: string): any
 	return spec
 end
 
+-- Invoke: (player, hotbar slot) -> that spell's compiled plan, or nil.
+local resolver: ((player: Player, slot: number) -> any?)? = nil
+
+function SpellRuntime.SetResolver(fn: (player: Player, slot: number) -> any?)
+	resolver = fn
+end
+
 type FlowHandler = (compiled: any, ctx: Context, id: string, params: any, energy: number, element: string?) -> ()
 
 local FLOW: { [string]: FlowHandler } = {}
@@ -1453,15 +1823,14 @@ FLOW.Divide = function(compiled, ctx, id, params, energy, element)
 	runFlow(compiled, ctx, id, "b", energy * (1 - share), element)
 end
 
-FLOW.Delay = function(compiled, ctx, id, _params, energy, element)
-	local seconds = math.clamp(number(input(compiled, ctx, id, "seconds")), 0, 10)
-	later(ctx, seconds, ctx.origin, function()
+FLOW.Delay = function(compiled, ctx, id, params, energy, element)
+	later(ctx, params.Seconds, ctx.origin, function()
 		runFlow(compiled, derive(liveContext(ctx)), id, "out", energy, element)
 	end)
 end
 
 FLOW.Repeat = function(compiled, ctx, id, params, energy, element)
-	local count = math.clamp(math.floor(number(input(compiled, ctx, id, "count")) + 0.5), 0, 20)
+	local count = params.Count
 	if count <= 0 then
 		return
 	end
@@ -1481,9 +1850,10 @@ FLOW.Repeat = function(compiled, ctx, id, params, energy, element)
 end
 
 FLOW.ForEach = function(compiled, ctx, id, params, energy, element)
-	local list = {}
+	local list, seen = {}, {}
 	for _, entity in asList(input(compiled, ctx, id, "list")) do
-		if alive(entity) and #list < params.Max then
+		if alive(entity) and not seen[entity] and #list < params.Max then
+			seen[entity] = true
 			table.insert(list, entity)
 		end
 	end
@@ -1580,7 +1950,7 @@ FLOW.Conjure = function(compiled, ctx, id, params, energy, element)
 end
 
 FLOW.Store = function(compiled, ctx, id, params, energy, element)
-	local slots = memoryOf(ctx.player)
+	local slots = memoryOf(ctx, params.Scope)
 	local entry = slots[params.Slot] or {}
 	if wired(compiled, id, "point") then
 		entry.point = asPoint(input(compiled, ctx, id, "point"))
@@ -1592,8 +1962,43 @@ FLOW.Store = function(compiled, ctx, id, params, energy, element)
 		local entity = input(compiled, ctx, id, "entity")
 		entry.entity = if alive(entity) then entity else nil
 	end
+	if wired(compiled, id, "list") then
+		entry.list = table.clone(asList(input(compiled, ctx, id, "list")))
+	end
 	slots[params.Slot] = entry
 	runFlow(compiled, ctx, id, "out", energy, element)
+end
+
+FLOW.Invoke = function(compiled, ctx, id, params, energy, _element)
+	local depth = ctx.depth or 0
+	if depth >= SpellRunes.Budget.InvokeDepth or not resolver then
+		return
+	end
+	local callee = resolver(ctx.player, params.Slot)
+	if not callee then
+		return
+	end
+	local total = 0
+	for _, rootId in callee.manaRoots do
+		total += callee.runes[rootId].params.Amount
+	end
+	if total <= 0 then
+		return
+	end
+	local entity = input(compiled, ctx, id, "entity")
+	-- (rune ids are per spell: the callee starts with no vars of its own)
+	local child = derive(ctx)
+	child.vars = {}
+	child.depth = depth + 1
+	child.copyMultiplier = nil
+	child.args = {
+		point = asPoint(input(compiled, ctx, id, "point")),
+		entity = if alive(entity) then entity else nil,
+		number = if wired(compiled, id, "number") then number(input(compiled, ctx, id, "number")) else nil,
+	}
+	for _, rootId in callee.manaRoots do
+		runFlow(callee, child, rootId, "out", energy * callee.runes[rootId].params.Amount / total, nil)
+	end
 end
 
 runFlow = function(compiled: any, ctx: Context, fromId: string, port: string, energy: number, element: string?)
@@ -1612,7 +2017,7 @@ runFlow = function(compiled: any, ctx: Context, fromId: string, port: string, en
 	else
 		local handler = FLOW[rune.rune]
 		if handler then
-			handler(compiled, ctx, id, rune.params, energy, element)
+			handler(compiled, ctx, id, settings(compiled, ctx, id), energy, element)
 		end
 	end
 end
@@ -1651,10 +2056,11 @@ function SpellRuntime.Cast(compiled: any, request: CastRequest)
 		spawnOffset = CAST_SPAWN_OFFSET,
 		memo = {},
 		vars = {},
-		cast = { player = request.player, started = os.clock(), steps = 0, vessels = 0, pending = 0, dead = false },
+		cast = { player = request.player, started = os.clock(), steps = 0, vessels = 0, pending = 0, dead = false, memory = {} },
 		live = request.live,
 		flight = 0,
 		copyMultiplier = SpellRunes.ChargeCopyMultiplier(request.charge or 1),
+		depth = 0,
 	}
 	-- Partial charge spends that fraction of every well's energy; overcharge
 	-- spends more, matching the extra copies (the caller already took mana).
@@ -1675,13 +2081,14 @@ Heartbeat.Connect(function()
 		end
 		local projectile = watch.projectile
 		local trigger = watch.compiled.runes[watch.trigger]
+		local params = watch.params
 		if watch.energy <= 0 or projectile.Dead then
 			table.remove(watches, index)
 			continue
 		end
 		if trigger.rune == "OnTimer" then
-			local pulses = math.max(trigger.params.Pulses or 1, 1)
-			if projectile.Age >= trigger.params.Delay * (watch.pulses + 1) then
+			local pulses = math.max(params.Pulses or 1, 1)
+			if projectile.Age >= params.Delay * (watch.pulses + 1) then
 				local amount = watch.energy / math.max(pulses - watch.pulses, 1)
 				watch.energy -= amount
 				watch.pulses += 1
@@ -1690,20 +2097,20 @@ Heartbeat.Connect(function()
 					watch.energy = 0 -- do not duplicate a spent trigger when later subdividing
 					table.remove(watches, index)
 				end
-				fireTrigger(watch.compiled, watch.ctx, watch.trigger, amount, watch.element, projectile.Position, headingOf(projectile, watch.ctx.heading), nil, nil, triggerScale(watch, amount * pulses), watch.sizeScale, projectile.Age, watch.pulses)
-				if last and trigger.params.Detonate then
+				fireTrigger(watch.compiled, watch.ctx, watch.trigger, amount, watch.element, projectile.Position, headingOf(projectile, watch.ctx.heading), nil, nil, triggerScale(watch, amount * pulses), projectile.Age, watch.pulses)
+				if last and params.Detonate then
 					projectile:Destroy({ Position = projectile.Position, Normal = Vector3.yAxis }, "detonate")
 				end
 			end
 		elseif trigger.rune == "OnProximity" and now >= watch.nextCheck then
 			watch.nextCheck = now + PROXIMITY_CHECK_INTERVAL
-			local struck = nearestEntity(projectile.Position, trigger.params.Radius, trigger.params.Filter, watch.ctx.caster)
+			local struck = nearestEntity(projectile.Position, params.Radius, params.Filter, watch.ctx.caster)
 			if struck then
 				table.remove(watches, index)
 				local energy = watch.energy
 				watch.energy = 0 -- do not duplicate a spent trigger when later subdividing
-				fireTrigger(watch.compiled, watch.ctx, watch.trigger, energy, watch.element, projectile.Position, headingOf(projectile, watch.ctx.heading), nil, struck, triggerScale(watch, energy), watch.sizeScale, projectile.Age)
-				if trigger.params.Detonate then
+				fireTrigger(watch.compiled, watch.ctx, watch.trigger, energy, watch.element, projectile.Position, headingOf(projectile, watch.ctx.heading), nil, struck, triggerScale(watch, energy), projectile.Age)
+				if params.Detonate then
 					projectile:Destroy({ Position = projectile.Position, Normal = Vector3.yAxis }, "detonate")
 				end
 			end

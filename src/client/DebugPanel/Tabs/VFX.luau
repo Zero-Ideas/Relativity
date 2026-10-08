@@ -1,7 +1,9 @@
 --!optimize 2
 --[[
 	VFX tab: preview ExplosionVFX locally (nothing is sent to the server, no
-	damage). Power is a 0..1 slider mapped exponentially onto 5..2000 so the
+	damage), and the portal / drone tech (client/Portal, client/DroneClient):
+	summon or dismiss your own drone without a gun, or open a test portal in
+	front of you that a drone flies out of and back into. Power is a 0..1 slider mapped exponentially onto 5..2000 so the
 	whole range is reachable; the readout shows what the generator derives
 	from it.
 ]]
@@ -14,6 +16,7 @@ local Shared = ReplicatedStorage:WaitForChild("Shared")
 local SpellRunes = require(Shared.SpellRunes)
 local Util = require(script.Parent.Parent.Util)
 local ExplosionVFX = require(script.Parent.Parent.Parent.ExplosionVFX)
+local DroneClient = require(script.Parent.Parent.Parent.DroneClient)
 local statLine = Util.statLine
 
 local localPlayer = Players.LocalPlayer
@@ -183,6 +186,48 @@ return function(window)
 				local t = (index - 1) / (SWEEP_STEPS - 1)
 				local offset = root.CFrame.RightVector * spacing * (index - (SWEEP_STEPS + 1) / 2)
 				task.delay(t * 1.6, ExplosionVFX.Play, center + offset, options(powerAt(t)))
+			end
+		end,
+	})
+
+	tab:Separator({ Text = "Portal / drone" })
+	local portalRadius = 3
+	tab:SliderFloat({
+		Label = "Test portal radius",
+		Minimum = 1,
+		Maximum = 8,
+		Value = portalRadius,
+		Format = "%.1f studs",
+		Callback = function(_, value: number)
+			portalRadius = value
+		end,
+	})
+	tab:Button({
+		Text = "Open a portal in front of me (a drone flies out)",
+		Callback = function()
+			local character = localPlayer.Character
+			local root = character and character:FindFirstChild("HumanoidRootPart")
+			if not (root and root:IsA("BasePart")) then
+				return
+			end
+			local centre = root.Position + root.CFrame.LookVector * (portalRadius * 3 + 10) + Vector3.new(0, portalRadius * 0.6 + 1, 0)
+			DroneClient.Demo(CFrame.lookAt(centre, root.Position + Vector3.new(0, 1.5, 0)), portalRadius)
+		end,
+	})
+	local droneRow = tab:Row()
+	droneRow:Button({
+		Text = "Summon my drone",
+		Callback = function()
+			if localPlayer.Character then
+				DroneClient.Summon(localPlayer.Character)
+			end
+		end,
+	})
+	droneRow:Button({
+		Text = "Dismiss it",
+		Callback = function()
+			if localPlayer.Character then
+				DroneClient.Dismiss(localPlayer.Character)
 			end
 		end,
 	})

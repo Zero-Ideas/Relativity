@@ -68,6 +68,7 @@ local CURSORS = {
 }
 
 local WHITE = Color3.new(1, 1, 1)
+local SETTING_COLOR = Color3.fromRGB(200, 225, 255) -- a setting's value on its port
 
 local function snap(value: number): number
 	return math.floor(value / SNAP + 0.5) * SNAP
@@ -110,26 +111,35 @@ local function formatNumber(value: number): string
 	return string.format("%.1f", value)
 end
 
--- One-line parameter summary shown in each rune's footer.
+-- A setting's value as the card shows it ("12 st", "on").
+function Board.formatParam(param: any, value: any): string
+	if param.Type == "bool" then
+		return if value then "on" else "off"
+	elseif param.Type == "number" and typeof(value) == "number" then
+		return formatNumber(value) .. (param.Suffix or "")
+	end
+	return tostring(value)
+end
+
+-- One-line summary of the settings that have no port of their own (enums,
+-- fixed amounts), shown in each rune's footer; the rest show on their ports.
 function Board.summary(rune: any): string
 	local def = SpellRunes.Runes[rune.rune]
 	local params = rune.params
 	if def.Id == "Compare" or def.Id == "Math" then
 		return `A {params.Op} B`
 	end
+	local portOf = SpellRunes.PortOf[def.Id]
 	local parts = {}
 	for _, param in def.Params do
+		if portOf[param.Name] then
+			continue
+		end
 		local value = params[param.Name]
 		if param.Type == "bool" then
 			if value then table.insert(parts, param.Label) end
-		elseif param.Type == "number" then
-			if param.Name == "Level" then
-				table.insert(parts, `Lv {value}`)
-			else
-				table.insert(parts, formatNumber(value) .. (param.Suffix or ""))
-			end
 		else
-			table.insert(parts, tostring(value))
+			table.insert(parts, Board.formatParam(param, value))
 		end
 	end
 	if #parts == 0 then
@@ -181,6 +191,7 @@ function Board.new(viewport: Frame, doc: any, hooks: any)
 
 	viewport.ClipsDescendants = true
 	viewport.BackgroundColor3 = Theme.Colors.board
+	viewport.BackgroundTransparency = 1 -- (the editor's glass backdrop shows through)
 	self.gridLayer = Theme.make("Frame", { Name = "Grid", BackgroundTransparency = 1, Size = UDim2.fromScale(1, 1), ZIndex = 1 }, viewport)
 	self.world = Theme.make("Frame", { Name = "World", BackgroundTransparency = 1, Size = UDim2.fromOffset(0, 0), ZIndex = 2 }, viewport)
 	self.scale = Theme.make("UIScale", {}, self.world)
@@ -276,7 +287,7 @@ function Board:renderGrid()
 		used += 1
 		local frame = self.gridLines[used]
 		if not frame then
-			frame = Theme.make("Frame", { BorderSizePixel = 0, BackgroundColor3 = Theme.Colors.grid }, self.gridLayer)
+			frame = Theme.make("Frame", { BorderSizePixel = 0, BackgroundColor3 = Theme.Colors.grid, BackgroundTransparency = Theme.GridTransparency }, self.gridLayer)
 			self.gridLines[used] = frame
 		end
 		frame.Visible = true
@@ -425,7 +436,8 @@ function Board:estimateText(rune: any): string
 		return if estimate.count and estimate.count > 1 then `{text} ×{estimate.count}` else text
 	end
 	if estimate.text and estimate.text ~= "" then
-		return estimate.text -- (utility vessels: "240 HP · 8s", "Δv 90"...)
+		-- (utility vessels: "150 HP · 8.0s", "80 st/s"...; ⚠ when underfed)
+		return if estimate.fed and estimate.fed < 0.995 then "⚠ " .. estimate.text else estimate.text
 	end
 	if estimate.energy then
 		return `⚡{math.floor(estimate.energy + 0.5)}`
@@ -448,7 +460,8 @@ function Board:buildRune(rune: any)
 		BackgroundColor3 = Theme.Colors.panel2,
 		BorderSizePixel = 0,
 	}, self.runeLayer)
-	Theme.corner(card, 8)
+	Theme.corner(card, 6)
+	Theme.glass(card, "card", true)
 	Theme.stroke(card, if invalid then Theme.Colors.bad elseif selected then WHITE else color, if selected or invalid then 2.5 else 1.5, 0.05)
 
 	local header = Theme.make("Frame", {
@@ -456,32 +469,46 @@ function Board:buildRune(rune: any)
 		BackgroundColor3 = color:Lerp(Theme.Colors.panel2, 0.5),
 		BorderSizePixel = 0,
 	}, card)
-	Theme.corner(header, 8)
+	Theme.corner(header, 6)
+	Theme.glass(header, "card")
 	-- square off the header's bottom corners
-	Theme.make("Frame", {
-		Position = UDim2.new(0, 0, 1, -8),
-		Size = UDim2.new(1, 0, 0, 8),
+	Theme.glass(Theme.make("Frame", {
+		Position = UDim2.new(0, 0, 1, -6),
+		Size = UDim2.new(1, 0, 0, 6),
 		BackgroundColor3 = header.BackgroundColor3,
 		BorderSizePixel = 0,
-	}, header)
-	Theme.label(header, (if rune.locked then "🔒 " else "") .. SpellRunes.DisplayName(def), 14, { Font = Theme.FontBold, Position = UDim2.fromOffset(10, 0), Size = UDim2.new(1, -86, 1, 0), ZIndex = 2 })
-	Theme.label(header, self:estimateText(rune), 12, {
+	}, header), "card")
+	local estimate = self.estimates[rune.id]
+	local underfed = estimate ~= nil and estimate.fed ~= nil and estimate.fed < 0.995
+	local estimateText = self:estimateText(rune)
+	local estimateWidth = if estimateText == "" then 0 else math.min(8 + #estimateText * 6, 104)
+	Theme.label(header, (if rune.locked then "🔒 " else "") .. SpellRunes.DisplayName(def), 14, { Font = Theme.FontBold, Position = UDim2.fromOffset(10, 0), Size = UDim2.new(1, -18 - estimateWidth, 1, 0), ZIndex = 2 })
+	Theme.label(header, estimateText, 12, {
 		Font = Theme.FontMedium,
-		Position = UDim2.new(1, -80, 0, 0),
-		Size = UDim2.new(0, 72, 1, 0),
+		Position = UDim2.new(1, -8 - estimateWidth, 0, 0),
+		Size = UDim2.new(0, estimateWidth, 1, 0),
 		TextXAlignment = Enum.TextXAlignment.Right,
-		TextColor3 = SpellRunes.PortColors.flow,
+		TextColor3 = if underfed then Theme.Colors.warn else SpellRunes.PortColors.flow,
 		ZIndex = 2,
 	})
 
 	local function port(side: string, index: number, portDef: any)
 		local y = LAYOUT.Header + (index - 1) * LAYOUT.Row
 		local isInput = side == "in"
-		Theme.label(card, portDef.Label, 12, {
+		-- an unwired setting shows its value; inputs below the last output
+		-- may use the card's whole width
+		local text = portDef.Label
+		local param = isInput and portDef.Param and SpellRunes.FindParam(def, portDef.Param)
+		if param and #self.doc:wiresInto(rune.id, portDef.Name) == 0 then
+			text = `{portDef.Label}  <font color="#{SETTING_COLOR:ToHex()}">{Board.formatParam(param, rune.params[param.Name])}</font>`
+		end
+		local labelWidth = if isInput and index > #def.Outputs then width - 28 else width / 2 - 14
+		Theme.label(card, text, 12, {
 			Position = UDim2.fromOffset(if isInput then 14 else width / 2, y),
-			Size = UDim2.fromOffset(width / 2 - 14, LAYOUT.Row),
+			Size = UDim2.fromOffset(labelWidth, LAYOUT.Row),
 			TextXAlignment = if isInput then Enum.TextXAlignment.Left else Enum.TextXAlignment.Right,
 			TextColor3 = if portDef.Optional then Theme.Colors.muted else Theme.Colors.text,
+			RichText = true,
 		})
 		local dot = Theme.make("Frame", {
 			AnchorPoint = Vector2.new(0.5, 0.5),

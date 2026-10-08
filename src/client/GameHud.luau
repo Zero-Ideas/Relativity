@@ -6,10 +6,17 @@
 	                   label above it. A thin vertical line on the mana bar
 	                   marks where mana would be after casting the equipped
 	                   spell (red when it can't be afforded).
-	  bottom centre -- a card per saved spell, numbered 1..n (never an empty
-	                   one; SpellCardPreview: each card's circle redraws
-	                   itself over its cooldown). Click or press its number
-	                   to select it; again to deselect.
+	  bottom centre -- the hotbar, switched with the hotbar key (E by default;
+	                   ToggleHotbar). Spells: a card per saved spell,
+	                   numbered 1..n (never an empty one; SpellCardPreview:
+	                   each card's circle redraws itself over its cooldown).
+	                   Click or press its number to select it; again to
+	                   deselect. Items: your tools as a holographic bar (cyan
+	                   glass slots, 1..9); click or press a number to equip,
+	                   again to put it away. Spells don't cast while the items
+	                   bar is up, and switching back puts the tool away. The
+	                   switch collapses one bar into a cyan line and opens the
+	                   other out of it.
 	  bottom right  -- a "Make party" button until you're in a party; then
 	                   "Party" and "+" (the leader's: PartyWindow's Invite
 	                   tab; everyone else's is an X to leave) over the members
@@ -23,11 +30,13 @@ local Players = game:GetService("Players")
 local RunService = game:GetService("RunService")
 local UserInputService = game:GetService("UserInputService")
 local ContextActionService = game:GetService("ContextActionService")
+local TweenService = game:GetService("TweenService")
 
 local SpellEditor = require(script.Parent.SpellAssemblerGui)
 local SpellSettings = require(game:GetService("ReplicatedStorage"):WaitForChild("Shared"):WaitForChild("SpellSettings"))
 local SpellCardPreview = require(script.Parent.SpellCardPreview)
 local SpellCardDecoration = require(script.Parent.SpellCardDecoration)
+local Holo = require(script.Parent:WaitForChild("SpellEditor"):WaitForChild("Theme")).Colors
 local PartyClient = require(script.Parent.PartyClient)
 local PartyWindow = require(script.Parent.PartyWindow)
 
@@ -41,7 +50,13 @@ local CARD_W, CARD_H, CARD_GAP, CARD_LIFT = 84, 84, 10, 8
 local PANEL_W = 260
 local SLOT_COUNT = 5
 local SLOT_ACTION = "GameHudSpellSlots"
-local SLOT_KEYS = { [Enum.KeyCode.One] = 1, [Enum.KeyCode.Two] = 2, [Enum.KeyCode.Three] = 3, [Enum.KeyCode.Four] = 4, [Enum.KeyCode.Five] = 5 }
+local SLOT_KEYS = {
+	[Enum.KeyCode.One] = 1, [Enum.KeyCode.Two] = 2, [Enum.KeyCode.Three] = 3, [Enum.KeyCode.Four] = 4, [Enum.KeyCode.Five] = 5,
+	[Enum.KeyCode.Six] = 6, [Enum.KeyCode.Seven] = 7, [Enum.KeyCode.Eight] = 8, [Enum.KeyCode.Nine] = 9,
+}
+local ITEM_LIMIT = 9
+local HOTBAR_PAD = 16 -- room in the hotbar's clip for card decorations
+local SWITCH_CLOSE, SWITCH_OPEN = 0.12, 0.2
 
 local GameHud = {}
 local started = false
@@ -218,6 +233,8 @@ local equippedHeading: Frame? = nil
 local equippedName: TextLabel? = nil
 local equippedUnderline: Frame? = nil
 
+local hotbarMode: "Spells" | "Items" = "Spells"
+
 local function selectCard(index: number)
 	local slot = cardSlots[index]
 	if slot then
@@ -288,7 +305,7 @@ local function refreshCards()
 	end
 	row.Size = UDim2.fromOffset(math.max(count * CARD_W + (count - 1) * CARD_GAP, 0), CARD_H + CARD_LIFT)
 	if noSpellsHint then
-		noSpellsHint.Visible = count == 0
+		noSpellsHint.Visible = count == 0 and hotbarMode == "Spells"
 	end
 
 	local selectedSlot = SpellEditor.GetSelectedSlot()
@@ -305,7 +322,7 @@ local function refreshCards()
 		card.stroke.Enabled = false
 		card.preview:SetSpell(record)
 		card.preview:SetSelected(selected)
-		if selected and equippedHeading and equippedName and equippedUnderline then
+		if selected and hotbarMode == "Spells" and equippedHeading and equippedName and equippedUnderline then
 			equippedHeading.Visible = true
 			equippedName.Text = record.name
 			equippedUnderline.BackgroundColor3 = SpellCardDecoration.GetColor(card.preview.ManaCost or 0)
@@ -319,14 +336,26 @@ local function refreshCards()
 	end
 end
 
+local hotbarClip: Frame? = nil
+
 local function buildCards(screen: ScreenGui)
+	-- (the hotbar switch collapses this clip to a line: see switchHotbar)
+	local clip = make("Frame", {
+		Name = "Hotbar",
+		AnchorPoint = Vector2.new(0.5, 0.5),
+		BackgroundTransparency = 1,
+		ClipsDescendants = true,
+		Position = UDim2.new(0.5, 0, 1, -14 - (CARD_H + CARD_LIFT) / 2),
+		Size = UDim2.new(1, 0, 0, CARD_H + CARD_LIFT + HOTBAR_PAD),
+	}, screen)
+	hotbarClip = clip
 	local row = make("Frame", {
 		Name = "SpellCards",
-		AnchorPoint = Vector2.new(0.5, 1),
+		AnchorPoint = Vector2.new(0.5, 0.5),
 		BackgroundTransparency = 1,
-		Position = UDim2.new(0.5, 0, 1, -14),
+		Position = UDim2.fromScale(0.5, 0.5),
 		Size = UDim2.fromOffset(0, CARD_H + CARD_LIFT),
-	}, screen)
+	}, clip)
 	make("UIListLayout", {
 		FillDirection = Enum.FillDirection.Horizontal,
 		SortOrder = Enum.SortOrder.LayoutOrder,
@@ -376,6 +405,330 @@ local function buildCards(screen: ScreenGui)
 		TextXAlignment = Enum.TextXAlignment.Center,
 		Visible = false,
 	}, screen)
+end
+
+
+--------------------------------------------------------------------------------
+-- Items hotbar (holographic)
+--------------------------------------------------------------------------------
+
+-- Your tools (never the SpellAssembler launcher), in the order they arrived;
+-- one cyan glass slot each.
+type ItemSlot = { holder: Frame, box: Frame, stroke: UIStroke, icon: ImageLabel, initials: TextLabel, name: TextLabel }
+local itemRow: Frame? = nil
+local itemSlots: { ItemSlot } = {}
+local itemOrder: { Tool } = {}
+local noItemsHint: TextLabel? = nil
+local switchLine: Frame? = nil
+local switching = false
+
+local function humanoidOf(): Humanoid?
+	local character = player.Character
+	return character and character:FindFirstChildOfClass("Humanoid")
+end
+
+local function ownedTools(): { [Tool]: boolean }
+	local found: { [Tool]: boolean } = {}
+	local function scan(container: Instance?)
+		if not container then
+			return
+		end
+		for _, child in container:GetChildren() do
+			if child:IsA("Tool") and child.Name ~= "SpellAssembler" then
+				found[child] = true
+			end
+		end
+	end
+	scan(player:FindFirstChildOfClass("Backpack"))
+	scan(player.Character)
+	return found
+end
+
+local function equipItem(index: number)
+	local tool = itemOrder[index]
+	local humanoid = humanoidOf()
+	if not tool or not humanoid or humanoid.Health <= 0 then
+		return
+	end
+	if tool.Parent == player.Character then
+		humanoid:UnequipTools()
+	else
+		humanoid:EquipTool(tool)
+	end
+end
+
+local function createItemSlot(index: number, row: Frame): ItemSlot
+	local holder = make("Frame", {
+		Name = "Item" .. index,
+		BackgroundTransparency = 1,
+		LayoutOrder = index,
+		Size = UDim2.fromOffset(CARD_W, CARD_H + CARD_LIFT),
+	}, row)
+	local box = make("Frame", {
+		Name = "Slot",
+		BackgroundColor3 = Holo.panel2,
+		BackgroundTransparency = 0.35,
+		Position = UDim2.fromOffset(0, CARD_LIFT),
+		Size = UDim2.fromOffset(CARD_W, CARD_H),
+	}, holder)
+	corner(box, UDim.new(0, 4))
+	make("UIGradient", { Rotation = 90, Color = ColorSequence.new(Color3.new(1, 1, 1), Color3.fromRGB(120, 135, 150)) }, box)
+	local stroke = make("UIStroke", { Color = Holo.line, Thickness = 1.5, Transparency = 0.45 }, box)
+	label({
+		Name = "Key",
+		Position = UDim2.fromOffset(5, 3),
+		Size = UDim2.fromOffset(14, 14),
+		Text = tostring(index),
+		TextSize = 12,
+		TextColor3 = Holo.muted,
+		TextStrokeTransparency = 1,
+		ZIndex = 8,
+	}, box)
+	local icon = make("ImageLabel", {
+		Name = "Icon",
+		AnchorPoint = Vector2.new(0.5, 0.5),
+		BackgroundTransparency = 1,
+		Position = UDim2.fromScale(0.5, 0.44),
+		Size = UDim2.fromScale(0.56, 0.56),
+		ImageColor3 = Holo.text,
+		ScaleType = Enum.ScaleType.Fit,
+	}, box)
+	local initials = label({
+		Name = "Initials",
+		AnchorPoint = Vector2.new(0.5, 0.5),
+		Position = UDim2.fromScale(0.5, 0.42),
+		Size = UDim2.fromScale(0.9, 0.4),
+		TextSize = 22,
+		TextColor3 = Holo.accent,
+		TextStrokeTransparency = 1,
+		TextXAlignment = Enum.TextXAlignment.Center,
+	}, box)
+	local name = label({
+		Name = "ItemName",
+		AnchorPoint = Vector2.new(0.5, 1),
+		Position = UDim2.new(0.5, 0, 1, -5),
+		Size = UDim2.new(1, -8, 0, 13),
+		TextSize = 11,
+		TextColor3 = Holo.text,
+		TextStrokeTransparency = 1,
+		TextTruncate = Enum.TextTruncate.AtEnd,
+		TextXAlignment = Enum.TextXAlignment.Center,
+	}, box)
+	local button = make("TextButton", { Name = "Select", BackgroundTransparency = 1, Size = UDim2.fromScale(1, 1), Text = "", ZIndex = 10 }, box)
+	button.Activated:Connect(function()
+		equipItem(index)
+	end)
+	return { holder = holder, box = box, stroke = stroke, icon = icon, initials = initials, name = name }
+end
+
+local function initialsOf(text: string): string
+	local letters = {}
+	for word in string.gmatch(text, "%u[%l%d]*") do
+		table.insert(letters, string.sub(word, 1, 1))
+	end
+	local result = table.concat(letters)
+	return if #result >= 2 then string.sub(result, 1, 3) else string.upper(string.sub(text, 1, 2))
+end
+
+local function refreshItems()
+	local row = itemRow
+	if not row then
+		return
+	end
+	-- keep the order things arrived in: drop what's gone, append what's new
+	local owned = ownedTools()
+	for index = #itemOrder, 1, -1 do
+		if not owned[itemOrder[index]] then
+			table.remove(itemOrder, index)
+		end
+	end
+	for tool in owned do
+		if not table.find(itemOrder, tool) and #itemOrder < ITEM_LIMIT then
+			table.insert(itemOrder, tool)
+		end
+	end
+	local count = #itemOrder
+	for index = 1, count do
+		itemSlots[index] = itemSlots[index] or createItemSlot(index, row)
+	end
+	for index = #itemSlots, count + 1, -1 do
+		itemSlots[index].holder:Destroy()
+		itemSlots[index] = nil
+	end
+	row.Size = UDim2.fromOffset(math.max(count * CARD_W + (count - 1) * CARD_GAP, 0), CARD_H + CARD_LIFT)
+	if noItemsHint then
+		noItemsHint.Visible = count == 0 and hotbarMode == "Items"
+	end
+	local equipped: Tool? = nil
+	for index, slot in itemSlots do
+		local tool = itemOrder[index]
+		local held = tool.Parent == player.Character
+		if held then
+			equipped = tool
+		end
+		slot.box.Position = UDim2.fromOffset(0, if held then 0 else CARD_LIFT)
+		slot.box.BackgroundTransparency = if held then 0.15 else 0.35
+		slot.stroke.Transparency = if held then 0 else 0.45
+		slot.stroke.Thickness = if held then 2 else 1.5
+		slot.name.Text = tool.Name
+		slot.icon.Image = tool.TextureId
+		slot.icon.Visible = tool.TextureId ~= ""
+		slot.initials.Text = initialsOf(tool.Name)
+		slot.initials.Visible = tool.TextureId == ""
+	end
+	if hotbarMode == "Items" and equippedHeading and equippedName and equippedUnderline then
+		equippedHeading.Visible = equipped ~= nil
+		equippedHeading.Size = UDim2.fromOffset(math.clamp(row.Size.X.Offset, 180, 420), 32)
+		equippedName.Text = if equipped then equipped.Name else ""
+		equippedUnderline.BackgroundColor3 = Holo.line
+	end
+end
+
+local refreshQueued = false
+local function queueItemRefresh()
+	if refreshQueued then
+		return
+	end
+	refreshQueued = true
+	task.defer(function()
+		refreshQueued = false
+		refreshItems()
+	end)
+end
+
+local function buildItems(screen: ScreenGui)
+	local clip = hotbarClip :: Frame
+	local row = make("Frame", {
+		Name = "Items",
+		AnchorPoint = Vector2.new(0.5, 0.5),
+		BackgroundTransparency = 1,
+		Position = UDim2.fromScale(0.5, 0.5),
+		Size = UDim2.fromOffset(0, CARD_H + CARD_LIFT),
+		Visible = false,
+	}, clip)
+	make("UIListLayout", {
+		FillDirection = Enum.FillDirection.Horizontal,
+		SortOrder = Enum.SortOrder.LayoutOrder,
+		Padding = UDim.new(0, CARD_GAP),
+	}, row)
+	itemRow = row
+	noItemsHint = label({
+		Name = "NoItems",
+		AnchorPoint = Vector2.new(0.5, 1),
+		Position = UDim2.new(0.5, 0, 1, -24),
+		Size = UDim2.fromOffset(320, 18),
+		Text = "No items",
+		TextColor3 = Holo.muted,
+		TextXAlignment = Enum.TextXAlignment.Center,
+		Visible = false,
+	}, screen)
+	local line = make("Frame", {
+		Name = "SwitchLine",
+		AnchorPoint = Vector2.new(0.5, 0.5),
+		BackgroundColor3 = Holo.line,
+		BorderSizePixel = 0,
+		Position = clip.Position,
+		Size = UDim2.fromOffset(0, 2),
+		Visible = false,
+		ZIndex = 20,
+	}, screen)
+	make("UIGradient", {
+		Transparency = NumberSequence.new({
+			NumberSequenceKeypoint.new(0, 1),
+			NumberSequenceKeypoint.new(0.15, 0),
+			NumberSequenceKeypoint.new(0.85, 0),
+			NumberSequenceKeypoint.new(1, 1),
+		}),
+	}, line)
+	switchLine = line
+
+	-- tools arrive / leave / move between Backpack and character (the
+	-- Backpack itself gets replaced after spawning, so watch the player)
+	local function watchTool(instance: Instance)
+		if instance:IsA("Tool") then
+			queueItemRefresh()
+		end
+	end
+	player.DescendantAdded:Connect(watchTool)
+	player.DescendantRemoving:Connect(watchTool)
+	local function watchCharacter(character: Model)
+		character.ChildAdded:Connect(watchTool)
+		character.ChildRemoved:Connect(watchTool)
+		queueItemRefresh()
+	end
+	player.CharacterAdded:Connect(watchCharacter)
+	if player.Character then
+		watchCharacter(player.Character)
+	end
+end
+
+-- Collapses the hotbar into a cyan line, swaps bars, and opens it again.
+local function switchHotbar(toItems: boolean)
+	local clip, line = hotbarClip, switchLine
+	if not clip or not line or switching then
+		return
+	end
+	switching = true
+	hotbarMode = if toItems then "Items" else "Spells"
+	if toItems then
+		SpellEditor.SetCastingPaused(true)
+	else
+		SpellEditor.SetCastingPaused(false)
+		local humanoid = humanoidOf()
+		if humanoid then
+			humanoid:UnequipTools()
+		end
+	end
+	if equippedHeading then
+		equippedHeading.Visible = false
+	end
+	if noSpellsHint then
+		noSpellsHint.Visible = false
+	end
+	if noItemsHint then
+		noItemsHint.Visible = false
+	end
+	local full = CARD_H + CARD_LIFT + HOTBAR_PAD
+	local outgoing = if toItems then cardRow else itemRow
+	local incoming = if toItems then itemRow else cardRow
+	local width = math.max((outgoing and outgoing.Size.X.Offset or 0), (incoming and incoming.Size.X.Offset or 0), 180) + 60
+	line.Size = UDim2.fromOffset(width, 2)
+	line.BackgroundTransparency = 1
+	line.Visible = true
+	TweenService:Create(line, TweenInfo.new(SWITCH_CLOSE), { BackgroundTransparency = 0 }):Play()
+	local close = TweenService:Create(clip, TweenInfo.new(SWITCH_CLOSE, Enum.EasingStyle.Quad, Enum.EasingDirection.In), { Size = UDim2.new(1, 0, 0, 2) })
+	close:Play()
+	close.Completed:Once(function()
+		if outgoing then
+			outgoing.Visible = false
+		end
+		if incoming then
+			incoming.Visible = true
+		end
+		refreshCards()
+		refreshItems()
+		local open = TweenService:Create(clip, TweenInfo.new(SWITCH_OPEN, Enum.EasingStyle.Quart, Enum.EasingDirection.Out), { Size = UDim2.new(1, 0, 0, full) })
+		open:Play()
+		TweenService:Create(line, TweenInfo.new(SWITCH_OPEN), { BackgroundTransparency = 1 }):Play()
+		open.Completed:Once(function()
+			line.Visible = false
+			switching = false
+		end)
+	end)
+end
+
+-- The hotbar key: spells <-> items. Returns false (key passes through)
+-- when the HUD isn't showing.
+function GameHud.ToggleHotbar(): boolean
+	if not enabled or not started or switching then
+		return false
+	end
+	switchHotbar(hotbarMode == "Spells")
+	return true
+end
+
+function GameHud.GetHotbarMode(): string
+	return hotbarMode
 end
 
 --------------------------------------------------------------------------------
@@ -819,11 +1172,20 @@ local function bindSlotKeys()
 		if UserInputService:GetFocusedTextBox() or SpellEditor.IsOpen() then
 			return Enum.ContextActionResult.Pass
 		end
+		local index = SLOT_KEYS[input.KeyCode]
+		if not index or (hotbarMode == "Spells" and index > SLOT_COUNT) then
+			return Enum.ContextActionResult.Pass
+		end
 		if state == Enum.UserInputState.Begin then
-			selectCard(SLOT_KEYS[input.KeyCode])
+			if hotbarMode == "Items" then
+				equipItem(index)
+			else
+				selectCard(index)
+			end
 		end
 		return Enum.ContextActionResult.Sink
-	end, false, Enum.ContextActionPriority.High.Value + 50, Enum.KeyCode.One, Enum.KeyCode.Two, Enum.KeyCode.Three, Enum.KeyCode.Four, Enum.KeyCode.Five)
+	end, false, Enum.ContextActionPriority.High.Value + 50, Enum.KeyCode.One, Enum.KeyCode.Two, Enum.KeyCode.Three, Enum.KeyCode.Four, Enum.KeyCode.Five,
+		Enum.KeyCode.Six, Enum.KeyCode.Seven, Enum.KeyCode.Eight, Enum.KeyCode.Nine)
 end
 
 function GameHud.SetEnabled(on: boolean)
@@ -873,6 +1235,7 @@ function GameHud.start()
 	screen.DisplayOrder = 5
 	buildBars(screen)
 	buildCards(screen)
+	buildItems(screen)
 	buildParty(screen)
 	screen.Parent = player:WaitForChild("PlayerGui")
 	gui = screen
@@ -891,6 +1254,7 @@ function GameHud.start()
 	PartyClient.Changed:Connect(refreshParty)
 
 	refreshCards()
+	refreshItems()
 	refreshParty()
 	if enabled then
 		bindSlotKeys()

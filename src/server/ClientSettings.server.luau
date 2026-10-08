@@ -28,6 +28,16 @@ local SCHEMA: { [string]: any } = {
 	Glints = "boolean",
 	UiMode = { "Mode 1", "Mode 2" }, -- (a choice)
 	HudScale = { 70, 130 },
+	EditorOpacity = { 20, 100 },
+	EditorBlur = { 0, 24 },
+	-- menu keybinds: a KeyCode name, or "None"
+	KeySpells = "key",
+	KeyEditor = "key",
+	KeyHotbar = "key",
+	KeyParty = "key",
+	KeyNotifications = "key",
+	KeySettings = "key",
+	KeyDebug = "key",
 	EffectsIntensity = { 0, 100 },
 	ReducedFlashes = "boolean",
 	CameraShake = { 0, 100 },
@@ -63,6 +73,12 @@ local function clean(values: any): { [string]: any }
 		local value = values[key]
 		if rule == "boolean" then
 			if typeof(value) == "boolean" then
+				result[key] = value
+			end
+		elseif rule == "key" then
+			if typeof(value) == "string" and #value <= 32 and (value == "None" or pcall(function()
+				return (Enum.KeyCode :: any)[value]
+			end)) then
 				result[key] = value
 			end
 		elseif typeof(rule[1]) == "string" then

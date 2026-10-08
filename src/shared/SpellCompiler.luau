@@ -33,7 +33,7 @@ SpellCompiler.BoardLimit = 20000
 
 -- Card geometry shared with the editor. A rune "sits in" a zone when the
 -- middle of its header does.
-SpellCompiler.Layout = { RuneWidth = 176, Header = 30, Row = 22, Footer = 24 }
+SpellCompiler.Layout = { RuneWidth = 200, Header = 30, Row = 22, Footer = 24 }
 
 function SpellCompiler.RuneHeight(runeId: string): number
 	local def = SpellRunes.Runes[runeId]
@@ -87,7 +87,16 @@ local function sanitizeParams(def: any, raw: any): { [string]: any }
 	return params
 end
 
-local function normalize(graph: any, errors: { Error }): (any, any)
+-- Params as saved, upgraded to what the rune takes now (Migrate).
+local function migrated(def: any, raw: any): any
+	local params = if typeof(raw) == "table" then table.clone(raw) else {}
+	if def.Migrate then
+		def.Migrate(params)
+	end
+	return params
+end
+
+local function normalize(graph: any, errors: { Error }, warnings: { Error }): (any, any)
 	local function fail(message: string, rune: string?, zone: string?)
 		table.insert(errors, { message = message, rune = rune, zone = zone })
 	end
@@ -164,7 +173,7 @@ local function normalize(graph: any, errors: { Error }): (any, any)
 			rune = def.Id,
 			x = raw.x,
 			y = raw.y,
-			params = sanitizeParams(def, raw.params),
+			params = sanitizeParams(def, migrated(def, raw.params)),
 			locked = if raw.locked == true then true else nil,
 		}
 		runeById[raw.id] = rune
@@ -195,7 +204,8 @@ local function normalize(graph: any, errors: { Error }): (any, any)
 		local outPort = SpellRunes.FindPort(fromDef.Outputs, raw.fromPort)
 		local inPort = SpellRunes.FindPort(toDef.Inputs, raw.toPort)
 		if not outPort or not inPort then
-			fail(`Wire {index} uses a port that doesn't exist.`, raw.to)
+			-- (a port an older version of the rune had: the wire just goes)
+			table.insert(warnings, { message = `{toDef.Name}: a wire into a port it no longer has was removed.`, rune = raw.to })
 			continue
 		end
 		if not SpellRunes.Compatible(outPort.Type, inPort.Type) then
@@ -214,6 +224,36 @@ end
 
 local function zoneContains(zone: any, x: number, y: number): boolean
 	return x >= zone.x and y >= zone.y and x <= zone.x + zone.w and y <= zone.y + zone.h
+end
+
+-- Brings a graph saved by an older editor up to date for editing, in place:
+-- params migrated, clamped and filled in; wires into ports that no longer
+-- exist dropped. (Compile does the same to its own copy.)
+function SpellCompiler.Upgrade(graph: any): any
+	if typeof(graph) ~= "table" or typeof(graph.runes) ~= "table" then
+		return graph
+	end
+	local defById = {}
+	for _, rune in graph.runes do
+		local def = if typeof(rune) == "table" then SpellRunes.Runes[rune.rune] else nil
+		if def then
+			rune.params = sanitizeParams(def, migrated(def, rune.params))
+			defById[rune.id] = def
+		end
+	end
+	if typeof(graph.wires) == "table" then
+		for index = #graph.wires, 1, -1 do
+			local wire = graph.wires[index]
+			if typeof(wire) ~= "table" then
+				continue
+			end
+			local fromDef, toDef = defById[wire.from], defById[wire.to]
+			if fromDef and toDef and (not SpellRunes.FindPort(fromDef.Outputs, wire.fromPort) or not SpellRunes.FindPort(toDef.Inputs, wire.toPort)) then
+				table.remove(graph.wires, index)
+			end
+		end
+	end
+	return graph
 end
 
 -- A name describing what a spell does, for cards saved without one: its
@@ -283,62 +323,60 @@ function SpellCompiler.CreateDefaultGraph()
 	}
 end
 
--- Size / Range multipliers from a vessel's modifier rune ids.
-function SpellCompiler.ModifierScales(modIds: { string }, runeById: { [string]: any }): (number, number)
-	local size, range = 1, 1
-	local tables = SpellRunes.ModifierTables
-	for _, modId in modIds do
-		local mod = runeById[modId]
-		if mod and mod.rune == "Size" then
-			size = tables.Size[mod.params.Level] or 1
-		elseif mod and mod.rune == "Range" then
-			range = tables.Range[mod.params.Level] or 1
-		end
-	end
-	return size, range
+local function round(value: number): string
+	return tostring(math.floor(value + 0.5))
 end
 
--- One-line estimate of what a non-damaging vessel does with `energy` (after
--- its modifiers and triggers), for the editor: "120 HP · 6s", "Δv 75"...
-function SpellCompiler.DescribeUtility(vesselId: string, params: any, energy: number, modIds: { string }, runeById: { [string]: any }): string
-	local size, range = SpellCompiler.ModifierScales(modIds, runeById)
-	local base = SpellRunes.Vessels[vesselId] or {}
-	local function round(value: number): string
-		return tostring(math.floor(value + 0.5))
-	end
+-- What a non-damaging vessel does with `energy` (after its triggers' cut),
+-- for the editor: (text, cost, fed). `params` are its settings (a wired
+-- setting is estimated from the value set on the rune). Force and Body
+-- Effect are per body.
+function SpellCompiler.DescribeUtility(vesselId: string, params: any, energy: number): (string, number, number)
+	local costs = SpellRunes.Costs
 	if vesselId == "Barrier" then
-		local hp = math.max(energy * base.HealthPerEnergy, base.MinHealth)
-		return `{round(hp)} HP · {round(params.Duration * range)}s`
+		local cost = SpellRunes.BarrierCost(params)
+		local fed = if cost > 0 then math.min(energy / cost, 1) else 1
+		return `{round(params.Health * fed)} HP · {string.format("%.1f", params.Duration * fed)}s`, cost, fed
 	elseif vesselId == "Force" then
-		return `Δv {round(math.min(energy * base.SpeedPerEnergy, base.MaxSpeed))}`
+		local cost = SpellRunes.ForceCost(params)
+		local fed = if cost > 0 then math.min(energy / cost, 1) else 1
+		local held = if params.Duration > 0 then ` · {string.format("%.1f", params.Duration)}s` else ""
+		return `{round(params.Speed * fed)} st/s{held}`, cost, fed
 	elseif vesselId == "Blink" then
-		return `{round(math.min(energy * base.StudsPerEnergy * range, base.MaxDistance))} st`
+		local cost = params.Distance * costs.BlinkStud
+		local fed = if cost > 0 then math.min(energy / cost, 1) else 1
+		return `{round(params.Distance * fed)} st`, cost, fed
 	elseif vesselId == "TimeField" then
-		local radius = math.min(base.Radius + energy * base.RadiusPerEnergy, base.MaxRadius) * size
-		return `r{round(radius)} · {round(params.Duration * range)}s`
+		local cost = SpellRunes.FieldCost(params)
+		local fed = if cost > 0 then math.min(energy / cost, 1) else 1
+		return `r{round(params.Radius)} · {string.format("%.1f", params.Duration * fed)}s`, cost, fed
 	elseif vesselId == "Effect" then
 		local effect = params.Effect
 		local def = SpellRunes.Effects[effect]
-		local strength, seconds = SpellRunes.EffectStrength(effect, energy, params.Duration * range)
 		if not def then
-			return ""
-		elseif effect == "Heal" then
-			return `+{round(strength)} HP`
-		elseif effect == "Cleanse" then
-			return "cleanse"
-		elseif def.Kind == "Pool" then
-			return `{round(strength)} shield`
-		elseif def.Kind == "Timed" then
-			return `{string.format("%.1f", seconds)}s`
+			return "", 0, 1
 		end
-		return `{round(strength * def.Swing * 100)}% · {round(seconds)}s`
+		local power = SpellRunes.EffectPower(effect, params.Power)
+		local cost = SpellRunes.EffectCost(effect, power, params.Duration)
+		local fed = if cost > 0 then math.min(energy / cost, 1) else 1
+		if effect == "Cleanse" then
+			return "cleanse", cost, fed
+		elseif def.Kind == "Instant" then
+			return `+{round(power * fed)} HP`, cost, fed
+		elseif def.Kind == "Pool" then
+			return `{round(power * fed)} shield · {round(params.Duration)}s`, cost, fed
+		elseif def.Kind == "Timed" then
+			return `{string.format("%.1f", params.Duration * fed)}s`, cost, fed
+		end
+		return `{round(power * fed)}% · {round(params.Duration)}s`, cost, fed
 	end
-	return ""
+	return "", 0, 1
 end
 
 function SpellCompiler.Compile(graph: any)
 	local errors: { Error } = {}
-	local normalized, runeById = normalize(graph, errors)
+	local warnings: { Error } = {}
+	local normalized, runeById = normalize(graph, errors, warnings)
 	if not normalized or not runeById then
 		return nil, errors, nil
 	end
@@ -347,7 +385,6 @@ function SpellCompiler.Compile(graph: any)
 	-- (their energy fizzles), `noQuantity` vessels fire a single copy. Each is
 	-- reported in `warnings` for the editor. Soft on purpose: cards saved
 	-- before these limits existed must keep casting.
-	local warnings: { Error } = {}
 	local disabled: { [string]: boolean } = {}
 	local noQuantity: { [string]: boolean } = {}
 	local function limit(message: string, rune: string?)
@@ -418,7 +455,7 @@ function SpellCompiler.Compile(graph: any)
 				fail(`{def.Name}: {port.Label} can only feed one wire. Use Divide to split energy.`, rune.id)
 			end
 			if port.Type == "mod" and n == 0 then
-				fail(`{def.Name} isn't attached to a vessel.`, rune.id)
+				limit(`{def.Name} isn't attached to a vessel, so it does nothing.`, rune.id)
 			end
 			if def.Id == "Target" and n == 0 then
 				fail("Aim: wire its Aim output into a vessel's Aim port.", rune.id)
@@ -426,7 +463,7 @@ function SpellCompiler.Compile(graph: any)
 		end
 	end
 	if #manaRoots == 0 then fail("Add a Mana Well in an Input zone.") end
-	if #vessels == 0 then fail("Add a vessel (Orb, Bullet, Beam, Barrier, Force...) in an Output zone.") end
+	if #vessels == 0 and not counts.Invoke then fail("Add a vessel (Orb, Bullet, Beam, Barrier, Force...) in an Output zone, or an Invoke.") end
 
 	-- Vessel modifier/trigger budgets -----------------------------------------
 	local vesselInfo = {}
@@ -479,7 +516,14 @@ function SpellCompiler.Compile(graph: any)
 			return
 		end
 		state[id] = 1
-		for _, links in outputs[id] do
+		local def = SpellRunes.Runes[runeById[id].rune]
+		for portName, links in outputs[id] do
+			-- (a per-item output -- Filter's Item -- feeding its own rune's
+			-- condition is how those runes work, not a loop)
+			local port = SpellRunes.FindPort(def.Outputs, portName)
+			if port and port.Scoped then
+				continue
+			end
 			for _, link in links do visit(link.to) end
 		end
 		state[id] = 2
@@ -563,12 +607,21 @@ function SpellCompiler.Compile(graph: any)
 				local perBolt = energy * (1 - math.min(info.modCost, 1)) / info.count
 				estimates[link.to].count = info.count
 				estimates[link.to].element = element
+				local own = perBolt * (1 - info.triggerShare)
 				if def.Damaging then
 					local elementDef = element and SpellRunes.Elements[element]
 					local impact = (if elementDef then elementDef.Impact else 1) * SpellRunes.Vessels[def.Id].Impact
-					estimates[link.to].damage = perBolt * (1 - info.triggerShare) * impact
+					if def.Id == "Explosion" then
+						own *= 1 - SpellRunes.ExplosionCost(rune.params.Radius)
+					end
+					estimates[link.to].damage = own * impact
 				else
-					estimates[link.to].text = SpellCompiler.DescribeUtility(def.Id, rune.params, perBolt * (1 - info.triggerShare), info.mods, runeById)
+					local text, cost, fed = SpellCompiler.DescribeUtility(def.Id, rune.params, own)
+					estimates[link.to].text = text
+					estimates[link.to].cost = cost
+					estimates[link.to].fed = fed
+					estimates[link.to].wasted = math.max(own - cost, 0)
+					estimates[link.to].perBody = def.Id == "Force" or def.Id == "Effect"
 				end
 				if #info.triggers > 0 then
 					if depth >= SpellCompiler.MaxTriggerDepth then

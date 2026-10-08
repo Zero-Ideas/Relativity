@@ -29,7 +29,7 @@ Document.deepCopy = deepCopy
 
 function Document.new(graph: any)
 	local self = setmetatable({}, Document)
-	self.graph = deepCopy(graph)
+	self.graph = SpellCompiler.Upgrade(deepCopy(graph))
 	self.undoStack = {}
 	self.redoStack = {}
 	return self
@@ -37,7 +37,7 @@ end
 
 -- Replaces the whole graph (loading a card / New). Clears history.
 function Document:load(graph: any)
-	self.graph = deepCopy(graph)
+	self.graph = SpellCompiler.Upgrade(deepCopy(graph))
 	table.clear(self.undoStack)
 	table.clear(self.redoStack)
 end

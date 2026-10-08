@@ -1,14 +1,19 @@
 --!strict
 --[[
-	The Settings window (ReGui; the topbar's gear): a dropdown, slider or
-	checkbox for each ClientSettings setting, in Interface, Effects, Audio,
-	and Advanced tabs. Changes apply at once and are saved for next time. The window
+	The Settings window (ReGui; the topbar's gear): a dropdown, slider,
+	checkbox or key button for each ClientSettings setting, in Interface,
+	Controls, Effects, Audio and Advanced tabs. A key button rebinds: click
+	it, then press the new key (Esc cancels, Backspace unbinds); menu keys
+	are paused meanwhile so the press doesn't also open something. Changes apply at once and are saved for next time. The window
 	keeps its place and follows changes made elsewhere (a reset, the saved
 	settings arriving); closing hides it instead of destroying its controls.
 ]]
 
+local UserInputService = game:GetService("UserInputService")
+
 local ReGuiLoader = require(script.Parent.ReGuiLoader)
 local ClientSettings = require(script.Parent.ClientSettings)
+local Keybinds = require(script.Parent.Keybinds)
 
 local SettingsWindow = {}
 
@@ -18,7 +23,44 @@ local position: UDim2? = nil
 local controls: { [string]: any } = {}
 local loading = false
 
+local function keyText(key: string): string
+	return "  " .. Keybinds.Label(ClientSettings.Get(key)) .. "  "
+end
+
+-- Rebinding: the next key pressed becomes the setting's key.
+type Capture = { key: string, button: TextButton, connection: RBXScriptConnection }
+local capture: Capture? = nil
+
+local function stopCapture()
+	local current = capture
+	if not current then
+		return
+	end
+	capture = nil
+	current.connection:Disconnect()
+	current.button.Text = keyText(current.key)
+	Keybinds.SetSuspended(false)
+end
+
+local function startCapture(key: string, button: TextButton)
+	stopCapture()
+	button.Text = "  press a key…  "
+	Keybinds.SetSuspended(true)
+	local connection = UserInputService.InputBegan:Connect(function(input: InputObject)
+		if input.UserInputType ~= Enum.UserInputType.Keyboard then
+			return
+		end
+		stopCapture()
+		if input.KeyCode == Enum.KeyCode.Escape then
+			return
+		end
+		ClientSettings.Set(key, if input.KeyCode == Enum.KeyCode.Backspace then "None" else input.KeyCode.Name)
+	end)
+	capture = { key = key, button = button, connection = connection }
+end
+
 local function close()
+	stopCapture()
 	open = false
 	if window then
 		position = window.WindowFrame.Position
@@ -58,6 +100,17 @@ local function build(ReGui: any)
 					ClientSettings.Set(key, value)
 				end,
 			})
+		elseif spec.Kind == "key" then
+			local row = section:Row()
+			local button: TextButton
+			button = row:Button({
+				Text = keyText(key),
+				Callback = function()
+					startCapture(key, button)
+				end,
+			})
+			row:Label({ Text = spec.Label })
+			controls[key] = { KeyButton = button }
 		elseif spec.Kind == "boolean" then
 			controls[key] = section:Checkbox({
 				Label = spec.Label,
@@ -97,7 +150,11 @@ ClientSettings.Changed:Connect(function()
 		end
 		local value = ClientSettings.Get(spec.Key)
 		pcall(function()
-			if spec.Kind == "choice" then
+			if spec.Kind == "key" then
+				if not (capture and capture.key == spec.Key) then
+					control.KeyButton.Text = keyText(spec.Key)
+				end
+			elseif spec.Kind == "choice" then
 				if control.Value ~= value then
 					control:SetValue(value)
 				end

@@ -436,6 +436,16 @@ function SpellStore.GetActiveSlot(player: Player): number?
 	return if entry and entry.loaded and entry.available then entry.data.activeSlot else nil
 end
 
+-- The record on hotbar `slot` (nil when empty or not owned) -- what the
+-- Invoke rune casts.
+function SpellStore.GetSlotRecord(player: Player, slot: number): any?
+	local entry = entries[player]
+	if not entry or not entry.loaded or not entry.available then
+		return nil
+	end
+	return resolve(entry.data, entry.data.loadout[tostring(slot)])
+end
+
 -- One library spell's record, for sharing (nil if missing).
 function SpellStore.GetLibrarySpell(player: Player, id: string): any?
 	local entry = entries[player]

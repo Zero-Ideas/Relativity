@@ -39,8 +39,8 @@ local ShooterController = {}
 local player = Players.LocalPlayer
 local COOLDOWN = 0.1 -- matches Shooter.server.luau's MIN_FIRE_INTERVAL floor; the server enforces its own copy regardless
 local lastFire = 0
-local debugRays = false -- matches the server default; toggle with B
-local debugSync = false -- prints ProjSpawn/ProjSync/ProjHit + a ProjMove rate summary server-side; toggle with V
+local debugRays = false -- matches the server default; toggle with Alt+B
+local debugSync = false -- prints ProjSpawn/ProjSync/ProjHit + a ProjMove rate summary server-side; toggle with Alt+V
 local inputConnection: RBXScriptConnection? = nil
 
 local AIM_RANGE = 5000
@@ -83,17 +83,17 @@ end
 -- (10/sec) exists to rate-limit real clicking and would silently drop almost all of a tight
 -- client-side firing loop. This sends ONE request asking the server to spawn N
 -- projectiles directly, bypassing that per-click gate entirely (see StressTestFire
--- in Shooter.server.luau). Press N to fire a stress-test batch.
+-- in Shooter.server.luau). Press Alt+N to fire a stress-test batch.
 local STRESS_TEST_COUNT = 10000
 
--- N: a normal stress test (rendered on every client). Shift+N: server-only --
+-- Alt+N: a normal stress test (rendered on every client). Alt+Shift+N: server-only --
 -- the server simulates the same projectiles but never replicates them, so
 -- the client isn't loaded at all and the Stats tab shows pure server cost.
 local function stressTest(serverOnly: boolean?)
 	VisualOffload.Fire("StressTestFire", { Count = STRESS_TEST_COUNT, ServerOnly = serverOnly == true })
 end
 
--- H / Shift+H: the same, but homing shots (they hunt Enemy-tagged entities,
+-- Alt+H / Alt+Shift+H: the same, but homing shots (they hunt Enemy-tagged entities,
 -- e.g. the test dummy) -- fewer, since homing steps serially.
 local HOMING_STRESS_COUNT = 2000
 local function homingStressTest(serverOnly: boolean?)
@@ -106,7 +106,10 @@ function ShooterController.start()
 	end
 
 	inputConnection = UserInputService.InputBegan:Connect(function(input, processed)
-		if processed then
+		-- Debug shortcuts are Alt+key, so they never collide with the menu
+		-- keys (Keybinds) -- which also mark those presses processed.
+		local alt = UserInputService:IsKeyDown(Enum.KeyCode.LeftAlt) or UserInputService:IsKeyDown(Enum.KeyCode.RightAlt)
+		if processed and not alt then
 			return -- click was consumed by the GUI (e.g. the time slider)
 		end
 		if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
@@ -115,6 +118,10 @@ function ShooterController.start()
 				lastFire = now
 				fire()
 			end
+		elseif input.KeyCode == Enum.KeyCode.R and not alt then
+			reload()
+		elseif not alt then
+			return
 		elseif input.KeyCode == Enum.KeyCode.B then
 			-- toggle raycast hit-detection visualization (server owns the flag)
 			debugRays = not debugRays
@@ -123,8 +130,6 @@ function ShooterController.start()
 			stressTest(UserInputService:IsKeyDown(Enum.KeyCode.LeftShift) or UserInputService:IsKeyDown(Enum.KeyCode.RightShift))
 		elseif input.KeyCode == Enum.KeyCode.H then
 			homingStressTest(UserInputService:IsKeyDown(Enum.KeyCode.LeftShift) or UserInputService:IsKeyDown(Enum.KeyCode.RightShift))
-		elseif input.KeyCode == Enum.KeyCode.R then
-			reload()
 		elseif input.KeyCode == Enum.KeyCode.V then
 			-- toggle ProjSpawn/ProjSync/ProjHit + ProjMove-rate server console logging
 			debugSync = not debugSync

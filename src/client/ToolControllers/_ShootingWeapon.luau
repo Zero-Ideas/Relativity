@@ -21,6 +21,7 @@
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local Shared = ReplicatedStorage:WaitForChild("Shared")
 local VisualOffload = require(Shared.VisualOffload)
+local DroneRig = require(Shared.DroneRig)
 
 local client = script.Parent.Parent
 local ShooterController = require(client.ShooterController)
@@ -33,7 +34,10 @@ function ShootingWeapon.Equip(tool: Tool, character: Model)
 	ShooterConfigGui.start() -- idempotent; no-ops outside Studio -- see ShooterConfigGui.luau
 	ShooterConfigGui.setVisible(true)
 	ShooterController.start()
-	Viewmodel.Equip(tool, character)
+	-- a drone weapon isn't held at all (client/DroneClient summons its drone)
+	if not DroneRig.IsDroneTool(tool) then
+		Viewmodel.Equip(tool, character)
+	end
 	-- Lets the server sync starting ammo immediately (see Shooter.server.
 	-- luau's "WeaponEquip" handler) instead of waiting for the first shot --
 	-- a no-op server-side for weapons with no Magazine.
@@ -43,7 +47,9 @@ end
 function ShootingWeapon.Unequip(tool: Tool, character: Model)
 	ShooterConfigGui.setVisible(false)
 	ShooterController.stop()
-	Viewmodel.Unequip(tool, character)
+	if not DroneRig.IsDroneTool(tool) then
+		Viewmodel.Unequip(tool, character)
+	end
 end
 
 return ShootingWeapon

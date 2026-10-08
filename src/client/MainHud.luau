@@ -151,7 +151,7 @@ local function bindGui(screen: ScreenGui)
 			if frame.Name == "SpellMenuButton" or frame.Name == "b5" then
 				frame.Name = "SpellMenuButton"
 				local hint = frame:FindFirstChild("Hint")
-				if hint and hint:IsA("TextLabel") then hint.Text = "Spells [E]" end
+				if hint and hint:IsA("TextLabel") then hint.Text = "Spells [V]" end
 				table.insert(uiConnections, selector.Activated:Connect(function() sound("Select"); SpellEditor.Toggle() end))
 			end
 		end

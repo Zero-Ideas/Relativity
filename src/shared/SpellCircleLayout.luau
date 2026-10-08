@@ -16,7 +16,7 @@
 	 - Core: the element glyph (Fire / Arcane / Shock).
 	 - Polygon: a star whose shape follows the vessel and whose point count
 	   is 3 + modifiers.
-	 - Modifier ring: one node per modifier glyph, with its Level.
+	 - Modifier ring: one node per modifier glyph, with 1-5 marks for how much it does.
 	 - Script band: the glyphs of every sensor/logic/targeting rune feeding
 	   the vessel, plus the Mana Well and any If / Divide on the way.
 	 - Outer ring: the mana cost in Roman numerals.
@@ -171,12 +171,12 @@ local function build(compiled: any, fromRune: string?): Spec
 		local quantity = nil
 		for _, modId in info.mods do
 			local mod = runes[modId]
-			table.insert(mods, { Glyph = glyphOf(mod.rune) or "?", Level = mod.params.Level })
+			table.insert(mods, { Glyph = glyphOf(mod.rune) or "?", Level = SpellRunes.ModifierDots(mod.rune, mod.params) })
 			collectValues(modId, seen, band)
 			if mod.rune == "Quantity" then
 				quantity = { Count = mod.params.Count, Pattern = mod.params.Pattern, Spread = mod.params.Spread }
 			elseif mod.rune == "Sustain" then
-				sustain = math.max(sustain, SpellRunes.ModifierTables.Sustain[mod.params.Level] or 0)
+				sustain = math.max(sustain, mod.params.Seconds or 0)
 			end
 		end
 

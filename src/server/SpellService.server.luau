@@ -429,6 +429,12 @@ local function compiledFor(record: any): any?
 	return cached or nil
 end
 
+-- Invoke runes cast the spell on one of the caster's hotbar slots.
+SpellRuntime.SetResolver(function(player: Player, slot: number): any?
+	local record = SpellStore.GetSlotRecord(player, slot)
+	return if record then compiledFor(record) else nil
+end)
+
 -- Spell circle VFX (client/SpellCircleVFX): the spec is built once per saved
 -- record. circleOpen marks a player whose charging circle was broadcast, so
 -- a cast that then fails (no mana, cooldown, ...) cancels it.

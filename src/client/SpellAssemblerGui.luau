@@ -6,10 +6,12 @@
 	NewLibrarySpell, SetLibraryOpener, SelectSlot, GetState, StateChanged,
 	Cast, StopCast, CancelCast. Equip/Unequip preserve old Tool compatibility.
 
-	E (outside the editor) edits the equipped spell: a library spell in place,
-	an Encyclopedia one as a copy that Save adds to the library. With nothing
-	equipped it starts a new spell. Unsaved work is never thrown away by E:
-	the editor reopens on it, and a second E within a few seconds switches.
+	The editor key (V by default; Settings > Controls -- UiMode binds it to
+	ToggleEditor) edits the equipped spell: a library spell in place, an
+	Encyclopedia one as a copy that Save adds to the library. With nothing
+	equipped it starts a new spell. Unsaved work is never thrown away by the
+	key: the editor reopens on it, and pressing it again within a few
+	seconds switches. The same key closes the editor.
 
 	Layout: a slim top bar (Library, name, status, undo/redo, panel toggles,
 	Save, guide, close) over a row of [Toolbox | Board | Inspector]. Both
@@ -29,6 +31,8 @@ local UserInputService = game:GetService("UserInputService")
 local ContextActionService = game:GetService("ContextActionService")
 local HttpService = game:GetService("HttpService")
 local GuiService = game:GetService("GuiService")
+local Lighting = game:GetService("Lighting")
+local TweenService = game:GetService("TweenService")
 
 local player = Players.LocalPlayer
 local Shared = ReplicatedStorage:WaitForChild("Shared")
@@ -56,6 +60,9 @@ local Colors = Theme.Colors
 local SpellAssemblerGui = {}
 local stateEvent = Instance.new("BindableEvent")
 SpellAssemblerGui.StateChanged = stateEvent.Event
+-- (fires true / false as the editor opens and closes)
+local openEvent = Instance.new("BindableEvent")
+SpellAssemblerGui.OpenChanged = openEvent.Event
 local firedEvent = Instance.new("BindableEvent")
 SpellAssemblerGui.SpellFired = firedEvent.Event
 local cooldownDeadlines: { [number]: number } = {}
@@ -102,7 +109,9 @@ local compactEnabled = true
 -- fired with the cost when a cast is refused for lack of mana (GameHud)
 local manaShortEvent = Instance.new("BindableEvent")
 SpellAssemblerGui.ManaShort = manaShortEvent.Event
+local castingPaused = false -- (the HUD's items bar is up)
 local function canCast(): boolean
+	if castingPaused then return false end
 	if toolRequired and not equippedTool then return false end
 	local character = player.Character
 	local humanoid = character and character:FindFirstChildOfClass("Humanoid")
@@ -319,7 +328,7 @@ local function equipSlot(slot: number)
 	local result = invoke("SetActive", { slot = slot })
 	pendingActiveSlot = nil
 	if result.ok then
-		result.message = `Equipped "{(slotRecord(slot) or {}).name or "spell"}". Close the editor [E] and click to cast.`
+		result.message = `Equipped "{(slotRecord(slot) or {}).name or "spell"}". Close the editor [V] and click to cast.`
 	end
 	applyServerResult(result)
 end
@@ -612,7 +621,8 @@ local function buildTopBar(parent: Frame)
 		BackgroundColor3 = Colors.panel,
 		BorderSizePixel = 0,
 	}, parent)
-	Theme.make("Frame", { Position = UDim2.new(0, 0, 1, -1), Size = UDim2.new(1, 0, 0, 1), BackgroundColor3 = Colors.line, BackgroundTransparency = 0.6, BorderSizePixel = 0 }, bar)
+	Theme.glass(bar, "panel", true)
+	Theme.fadeLine(bar, { Position = UDim2.new(0, 0, 1, -1) })
 
 	-- left: back to the library, the spell's name, what's being edited
 	local RIGHT_WIDTH = 500
@@ -640,7 +650,8 @@ local function buildTopBar(parent: Frame)
 		TextTruncate = Enum.TextTruncate.AtEnd,
 		LayoutOrder = 2,
 	}, leftGroup)
-	Theme.corner(box, 8)
+	Theme.corner(box)
+	Theme.field(box)
 	Theme.make("UIPadding", { PaddingLeft = UDim.new(0, 10), PaddingRight = UDim.new(0, 10) }, box)
 	box.FocusLost:Connect(function() updateTopBar() end)
 	nameBox = box
@@ -704,28 +715,38 @@ end
 local GUIDE: { { string } } = {
 	{ "The idea",
 		"Mana is energy. A Mana Well pushes it along the gold wires; every rune it passes shapes it, and a Vessel at the end turns it into magic. A cast costs the sum of your wells.",
-		"Damage vessels (Orb, Bullet, Beam, Explosion) need a Transform — Fire, Arcane or Shock — on the way. Utility vessels (Barrier, Force, Blink, Body Effect, Time Field) work on raw energy; a Transform only colours them.",
+		"Damage vessels (Orb, Bullet, Beam, Explosion, Smite) deal their energy as damage and need a Transform — Fire, Arcane or Shock — on the way.",
+		"Every other vessel does exactly what its settings say — a 14 × 8 wall with 150 HP, a 110 studs/s shove, +60 HP — and the energy that reaches it pays for it. The estimate on the card shows what it costs; fed less, it does proportionally less (⚠ on the card).",
 		"Every rune sits inside a zone of its colour. Pick a pen under Zones and drag on the board to draw one." },
+	{ "Every setting is an input",
+		"Each number or on/off setting is also a port, with its value shown beside it. Leave it unwired and it uses that value; wire anything into it and the wire decides — Barrier width from a Scan's count, Force speed from your distance to the target, a Repeat's count from your health. Wired values are kept within the setting's range.",
+		"Coloured wires carry values: numbers (blue), true/false (pink), entities (orange), points and directions (green), lists of entities (tan). An entity works as a point (its position) or as a list of one." },
+	{ "Where things go",
+		"Placed vessels take a point: At for barriers, fields and blasts, To for Blink, From and Aim for projectiles (launch from anywhere, toward anything), Centre for Force. Unwired, they use your mouse, the current target or Here.",
+		"Locate builds points around a body: 10 studs ahead along your level aim, 4 up, onto the ground. Offset, Point Math, Direction and Raycast do the rest.",
+		"Barriers: Box, Dome, Sphere or Ring of any size, turned toward Face toward, tilted, anchored by base, centre or top, optionally following an entity. Lets through and Stops spells decide who walks and whose magic passes." },
 	{ "Flow — when and where",
 		"If sends all the energy one way; Divide splits it (A runs first, then B).",
-		"Delay waits. Repeat runs what follows several times. For Each runs it once per entity of a list (Scan Area makes lists). Wait Until holds the energy until a condition is true — traps and mines.",
+		"Delay waits. Repeat runs what follows several times. For Each runs it once per entity of a list. Wait Until holds the energy until a condition is true — traps and mines.",
 		"Conjure Circle opens a new circle somewhere else — above an impact, over your cursor, on the ground — and everything after it fires from there.",
-		"Store and Recall are your memory: a point, number and entity per slot, kept for the session and shared by all your spells." },
-	{ "Values — what and where",
-		"Coloured wires carry values: numbers (blue), true/false (pink), entities (orange), points and directions (green), lists of entities (tan). An entity works as a point (its position) or as a list of one.",
-		"Sensors read the world at the moment their part of the circle runs; Logic and Vector runes compute with them. Inputs marked 'or the setting' use the rune's own setting when nothing is wired.",
+		"Store and Recall are memory: a point, number, entity and list per slot — yours for the session, or private to one cast.",
+		"Invoke casts the spell on one of your hotbar slots from here, handing it a point, entity and number (Given reads them): spells are functions you can call from other spells." },
+	{ "Values and lists",
+		"Sensors read the world at the moment their part of the circle runs; Logic and Vector runes compute with them.",
+		"Filter keeps the entities of a list for which its condition holds, and Pick finds the one with the lowest or highest score. Both judge one entity at a time: wire their Item output into the runes that decide, and back into Keep / Score.",
 		"Triggers and flow runes output what they saw: On Impact's Point, Surface and Struck, Repeat's Index, For Each's Entity, a conjured Circle's position. Wire them into anything that comes after them." },
 	{ "Triggers",
 		"Wire a vessel's Triggers port into On Impact, On Expire, On Timer or On Proximity. Each releases a share of the vessel's energy mid-flight or where it lands, and runs more of the circle from there. Barriers and Time Fields carry triggers too (On Expire fires when they break or fade)." },
-	{ "Example: Hunter's Sigil",
-		"Bullet → On Impact → Scan Area (from the impact Point) → If Count > 0 → Conjure Circle (at the impact, Height 15) → For Each (the scan's list) → Bullet. Where the bullet lands, a circle opens overhead and fires a bolt at every enemy nearby.",
-		"It's in the Encyclopedia with Starfall, Snare and Phase Step: equip one, press E outside the editor, and it opens here to take apart." },
+	{ "Examples",
+		"Dash: Caster → Force's Target, Locate's Forward → its Direction, Speed 110. Execute: Scan → Pick (Item → Health → Score) → Smite. Gravity Well: a Force pulling Toward the cursor for 2 s, then a blast there.",
+		"Hunter's Sigil: Bullet → On Impact → Scan Area → If Count > 0 → Conjure Circle above the impact → For Each → Bullet.",
+		"They're all in the Encyclopedia: equip one, press V outside the editor, and it opens here to take apart." },
 	{ "Controls",
 		"Right-drag: pan · Wheel: zoom · F: frame everything",
 		"Drag a rune from the left onto a zone, or click it to drop it mid-board. Drag from a port to wire; drag a connected input to pick its wire up.",
 		"Del: delete · Ctrl+D: duplicate · L: lock · Ctrl+Z / Ctrl+Y: undo / redo · Ctrl+S: save",
 		"Double-click a zone's tab to move it with its runes; drag an edge or corner to resize.",
-		"E outside the editor edits your equipped spell; E or × closes it." },
+		"V (or the key set in Settings > Controls) edits your equipped spell and closes the editor again; so does ×." },
 }
 
 local function buildHelp(view: Frame)
@@ -740,8 +761,8 @@ local function buildHelp(view: Frame)
 		Active = true,
 		ZIndex = 30,
 	}, view)
-	Theme.corner(frame, 12)
-	Theme.stroke(frame, Colors.line, 1, 0.3)
+	Theme.corner(frame, 6)
+	Theme.panel(frame)
 	Theme.make("UISizeConstraint", { MaxSize = Vector2.new(660, 820), MinSize = Vector2.new(320, 240) }, frame)
 	Theme.label(frame, "Spell circles · guide", 17, {
 		Font = Theme.FontBold,
@@ -802,13 +823,13 @@ local function buildBoardOverlays(view: Frame)
 		Size = UDim2.fromOffset(0, 30),
 		AutomaticSize = Enum.AutomaticSize.X,
 		BackgroundColor3 = Colors.panel,
-		BackgroundTransparency = 0.1,
 		Font = Theme.FontMedium,
 		TextXAlignment = Enum.TextXAlignment.Center,
 		Visible = false,
 		ZIndex = 20,
 	})
-	Theme.corner(label, 8)
+	Theme.corner(label)
+	Theme.panel(label)
 	Theme.make("UIPadding", { PaddingLeft = UDim.new(0, 14), PaddingRight = UDim.new(0, 14) }, label)
 	toast = label
 
@@ -821,7 +842,8 @@ local function buildBoardOverlays(view: Frame)
 		Active = true,
 		ZIndex = 10,
 	}, view)
-	Theme.corner(zoom, 8)
+	Theme.corner(zoom)
+	Theme.panel(zoom)
 	Theme.padding(zoom, 4)
 	Theme.list(zoom, 4, true)
 	local function zoomButton(text: string, width: number, order: number, callback: () -> ())
@@ -839,6 +861,106 @@ local function buildBoardOverlays(view: Frame)
 	buildHelp(view)
 end
 
+-- Holographic boot-up: the editor projects open. It sits in a clipping
+-- "aperture" that first draws as a thin cyan line across the middle of the
+-- screen, then opens up and down to full height between two glowing edges,
+-- revealing the editor (held still at full size, so nothing squashes) while
+-- its glass fades in. Closing mid-way just snaps it to the end.
+local BOOT_DRAW, BOOT_OPEN, BOOT_EDGE_FADE = 0.12, 0.34, 0.25
+local aperture: Frame? = nil
+local apertureEdges: { Frame } = {}
+local bootTweens: { Tween } = {}
+local blurEffect: BlurEffect? = nil
+local blurSize = 8
+
+local function finishBoot()
+	for _, tween in bootTweens do
+		tween:Cancel()
+	end
+	table.clear(bootTweens)
+	if aperture then
+		aperture.Size = UDim2.fromScale(1, 1)
+	end
+	if root then
+		root.Size = UDim2.fromScale(1, 1)
+	end
+	for _, edge in apertureEdges do
+		edge.Visible = false
+	end
+end
+
+local function bootTween(object: Instance, seconds: number, goal: { [string]: any }, style: Enum.EasingStyle?): Tween
+	local tween = TweenService:Create(object, TweenInfo.new(seconds, style or Enum.EasingStyle.Quad, Enum.EasingDirection.Out), goal)
+	table.insert(bootTweens, tween)
+	tween:Play()
+	return tween
+end
+
+local function bootUp()
+	local frame, editor, screen = aperture, root, gui
+	if not frame or not editor or not screen then
+		return
+	end
+	finishBoot()
+	local size = screen.AbsoluteSize
+	editor.Size = UDim2.fromOffset(size.X, size.Y)
+	frame.Size = UDim2.new(0, 0, 0, 2)
+	for _, edge in apertureEdges do
+		edge.Visible = true
+		edge.BackgroundTransparency = 0
+	end
+	Theme.FadeInGlass(BOOT_DRAW + BOOT_OPEN)
+	bootTween(frame, BOOT_DRAW, { Size = UDim2.new(1, 0, 0, 2) }).Completed:Once(function(drawn)
+		if drawn ~= Enum.PlaybackState.Completed then
+			return
+		end
+		bootTween(frame, BOOT_OPEN, { Size = UDim2.fromScale(1, 1) }, Enum.EasingStyle.Quart).Completed:Once(function(opened)
+			if opened ~= Enum.PlaybackState.Completed then
+				return
+			end
+			editor.Size = UDim2.fromScale(1, 1) -- (follows the screen again)
+			for _, edge in apertureEdges do
+				bootTween(edge, BOOT_EDGE_FADE, { BackgroundTransparency = 1 }).Completed:Once(function(faded)
+					if faded == Enum.PlaybackState.Completed then
+						edge.Visible = false
+					end
+				end)
+			end
+		end)
+	end)
+end
+
+-- The world behind the glass blurs while the editor is open (Lighting
+-- blurs the 3D world only, never the GUI).
+local BLUR_IN, BLUR_OUT = 0.3, 0.15
+
+local function setBlur(on: boolean)
+	local effect = blurEffect
+	if not effect or not effect.Parent then
+		local created = Instance.new("BlurEffect")
+		created.Name = "SpellEditorBlur"
+		created.Size = 0
+		created.Enabled = false
+		created.Parent = Lighting
+		blurEffect = created
+		effect = created
+	end
+	local target = if on then blurSize else 0
+	local blur = effect :: BlurEffect
+	if on and target > 0 then
+		blur.Enabled = true
+	end
+	local tween = TweenService:Create(blur, TweenInfo.new(if on then BLUR_IN else BLUR_OUT), { Size = target })
+	tween:Play()
+	if target <= 0 then
+		tween.Completed:Once(function()
+			if blur.Size <= 0 then
+				blur.Enabled = false
+			end
+		end)
+	end
+end
+
 local function buildGui()
 	if gui then return end
 	local screen = Theme.make("ScreenGui", {
@@ -851,14 +973,38 @@ local function buildGui()
 	}, player:WaitForChild("PlayerGui"))
 	gui = screen
 
+	-- (see bootUp)
+	local opening = Theme.make("Frame", {
+		Name = "Aperture",
+		AnchorPoint = Vector2.new(0.5, 0.5),
+		Position = UDim2.fromScale(0.5, 0.5),
+		Size = UDim2.fromScale(1, 1),
+		BackgroundTransparency = 1,
+		ClipsDescendants = true,
+	}, screen)
+	aperture = opening
+	for _, bottom in { false, true } do
+		table.insert(apertureEdges, Theme.fadeLine(opening, {
+			Name = if bottom then "BottomEdge" else "TopEdge",
+			AnchorPoint = Vector2.new(0, if bottom then 1 else 0),
+			Position = UDim2.fromScale(0, if bottom then 1 else 0),
+			Size = UDim2.new(1, 0, 0, 2),
+			BackgroundTransparency = 0,
+			Visible = false,
+			ZIndex = 200,
+		}))
+	end
 	local editor = Theme.make("Frame", {
 		Name = "Editor",
+		AnchorPoint = Vector2.new(0.5, 0.5),
+		Position = UDim2.fromScale(0.5, 0.5),
 		Size = UDim2.fromScale(1, 1),
 		BackgroundColor3 = Colors.background,
 		BorderSizePixel = 0,
 		Active = true, -- keeps clicks/wheel away from the camera
 		Visible = false,
-	}, screen)
+	}, opening)
+	Theme.glass(editor, "backdrop")
 	-- keep clear of Roblox's own top bar (it swallows clicks there); its
 	-- height is only known once the CoreGui has laid it out
 	local inset = Theme.make("UIPadding", {}, editor)
@@ -873,6 +1019,8 @@ local function buildGui()
 	local row = Theme.make("Frame", { Name = "Body", Position = UDim2.fromOffset(0, TOP_BAR), Size = UDim2.new(1, 0, 1, -TOP_BAR), BackgroundTransparency = 1 }, editor)
 	toolboxFrame = Theme.make("Frame", { Name = "Toolbox", BackgroundColor3 = Colors.panel, BorderSizePixel = 0 }, row)
 	inspectorFrame = Theme.make("Frame", { Name = "Inspector", BackgroundColor3 = Colors.panel, BorderSizePixel = 0 }, row)
+	Theme.panel(toolboxFrame :: Frame)
+	Theme.panel(inspectorFrame :: Frame)
 	viewport = Theme.make("Frame", { Name = "Board", BorderSizePixel = 0 }, row)
 	leftHandle = makeHandle(row, "left")
 	rightHandle = makeHandle(row, "right")
@@ -943,7 +1091,7 @@ local function buildGui()
 	})
 	local nextButton = Theme.button(compact, "▶", { Position = UDim2.new(1, -172, 0, 9), Size = UDim2.fromOffset(30, 36) })
 	nextButton.Activated:Connect(function() cycleActive(1) end)
-	local edit = Theme.button(compact, "Edit [E]", { Position = UDim2.new(1, -134, 0, 9), Size = UDim2.fromOffset(70, 36) })
+	local edit = Theme.button(compact, "Edit [V]", { Position = UDim2.new(1, -134, 0, 9), Size = UDim2.fromOffset(70, 36) })
 	edit.Activated:Connect(function() SpellAssemblerGui.Open() end)
 	local castButton = Theme.button(compact, "Cast", { Position = UDim2.new(1, -58, 0, 9), Size = UDim2.fromOffset(48, 36), BackgroundColor3 = Color3.fromRGB(128, 58, 44) })
 	castButton.InputBegan:Connect(function(input)
@@ -960,14 +1108,6 @@ local function buildGui()
 	-- TextBox never triggers shortcuts.
 	--------------------------------------------------------------------------
 	UserInputService.InputBegan:Connect(function(input, processed)
-		if input.KeyCode == Enum.KeyCode.E and not processed and (visible or canCast()) then
-			if visible then
-				SpellAssemblerGui.Close()
-			else
-				SpellAssemblerGui.EditEquipped()
-			end
-			return
-		end
 		if not processed and not visible and canCast() then
 			if input.KeyCode == Enum.KeyCode.R then
 				SpellAssemblerGui.Freeze()
@@ -1080,10 +1220,18 @@ function SpellAssemblerGui.Open()
 		needsFrame = false
 		task.defer(function() board:frameAll() end)
 	end
+	bootUp()
+	setBlur(true)
+	openEvent:Fire(true)
 end
 
 function SpellAssemblerGui.Close()
 	if not gui then return end
+	if visible then
+		finishBoot()
+		setBlur(false)
+		openEvent:Fire(false)
+	end
 	visible = false
 	placing, resizing = nil, nil
 	if ghost then ghost.Visible = false end
@@ -1092,6 +1240,25 @@ function SpellAssemblerGui.Close()
 	(root :: Frame).Visible = false;
 	(hud :: Frame).Visible = compactEnabled and canCast()
 	updateTopBar()
+end
+
+-- The look the player chose (Settings: "Spell editor opacity" %, "Spell
+-- editor background blur"). Applies live, even while the editor is open.
+function SpellAssemblerGui.SetAppearance(opacityPercent: number, blur: number)
+	Theme.SetOpacity(opacityPercent / 100)
+	blurSize = math.clamp(blur, 0, 56)
+	if visible then
+		setBlur(true)
+	end
+end
+
+-- The editor key: closes the editor, or edits the equipped spell.
+function SpellAssemblerGui.ToggleEditor()
+	if visible then
+		SpellAssemblerGui.Close()
+	else
+		SpellAssemblerGui.EditEquipped()
+	end
 end
 
 function SpellAssemblerGui.Toggle()
@@ -1511,6 +1678,13 @@ end
 function SpellAssemblerGui.SetCompactHudEnabled(enabled: boolean)
 	compactEnabled = enabled
 	if gui and not visible then SpellAssemblerGui.Close() end
+end
+
+-- Spells don't cast while paused (GameHud's items hotbar is showing).
+function SpellAssemblerGui.SetCastingPaused(paused: boolean)
+	if castingPaused == paused then return end
+	castingPaused = paused
+	if paused then SpellAssemblerGui.CancelCast() end
 end
 
 function SpellAssemblerGui.SetToolRequired(required: boolean)

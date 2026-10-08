@@ -46,7 +46,7 @@ local function recipe(name: string, element: string, vessel: string, mana: numbe
 		zones = {
 			{ id = "zone_input", kind = "Input", x = 0, y = 0, w = 260, h = 200 },
 			{ id = "zone_transform", kind = "Transform", x = 320, y = 0, w = 260, h = 200 },
-			{ id = "zone_modifier", kind = "Modifier", x = 320, y = 260, w = 260, h = 120 + 80 * math.max(#mods, 1) },
+			{ id = "zone_modifier", kind = "Modifier", x = 320, y = 260, w = 260, h = 120 },
 			{ id = "zone_output", kind = "Output", x = 640, y = 0, w = 280, h = 260 },
 		},
 		runes = {
@@ -59,15 +59,18 @@ local function recipe(name: string, element: string, vessel: string, mana: numbe
 			{ from = "element", fromPort = "out", to = "vessel", toPort = "in" },
 		},
 	}
+	local y = 300
 	for index, mod in mods do
 		local id = `mod{index}`
 		local params = SpellRunes.DefaultParams(mod[1])
 		for key, value in (mod[2] or {}) :: any do
 			params[key] = value
 		end
-		table.insert(graph.runes, { id = id, rune = mod[1], x = 362, y = 300 + (index - 1) * 80, params = params })
+		table.insert(graph.runes, { id = id, rune = mod[1], x = 362, y = y, params = params })
 		table.insert(graph.wires, { from = id, fromPort = "mod", to = "vessel", toPort = "mods" })
+		y += SpellCompiler.RuneHeight(mod[1]) + 16
 	end
+	graph.zones[3].h = math.max(y - 260 + 20, 120)
 	return graph
 end
 
@@ -75,7 +78,7 @@ end
 -- rune, params? } stacked top to bottom; every run of runes sharing a zone
 -- kind in a column gets one zone around it. `wires` are { from, port, to,
 -- port }.
-local COLUMN_WIDTH = 236
+local COLUMN_WIDTH = 260
 local GAP = 26
 local function circle(name: string, columns: { { { any } } }, wires: { { string } }): any
 	local graph = { version = SpellCompiler.GraphVersion, name = name, zones = {}, runes = {}, wires = {} }
@@ -131,75 +134,162 @@ local function add(id: string, name: string, element: string, description: strin
 end
 
 add("FireBolt", "Fire Bolt", "Fire", "A quick bolt of fire.", 0,
-	recipe("Fire Bolt", "Fire", "Bullet", 40, { { "Speed" } }))
+	recipe("Fire Bolt", "Fire", "Bullet", 40, { { "Speed", { Factor = 1.6 } } }))
 add("Fireball", "Fireball", "Fire", "A slow orb that bursts into flame.", 0,
-	recipe("Fireball", "Fire", "Orb", 80, { { "Size" } }))
+	recipe("Fireball", "Fire", "Orb", 80, { { "Size", { Factor = 1.4 } } }))
 add("ArcaneMissiles", "Arcane Missiles", "Arcane", "A fan of seeking missiles.", 0,
 	recipe("Arcane Missiles", "Arcane", "Bullet", 90, { { "Homing" }, { "Quantity", { Count = 3 } } }))
 add("ArcaneLance", "Arcane Lance", "Arcane", "Pierces through whatever is in the way.", 0,
-	recipe("Arcane Lance", "Arcane", "Bullet", 70, { { "Pierce" }, { "Speed" } }))
+	recipe("Arcane Lance", "Arcane", "Bullet", 70, { { "Pierce", { Count = 1 } }, { "Speed", { Factor = 1.6 } } }))
 add("ShockBeam", "Shock Beam", "Shock", "A beam that stuns.", 0,
 	recipe("Shock Beam", "Shock", "Beam", 120, {}))
-add("ShockBurst", "Shock Burst", "Shock", "An explosion of lightning around the target.", 0,
-	recipe("Shock Burst", "Shock", "Explosion", 150, {}))
-
--- Utility: movement, barriers and body magic -------------------------------
-add("ArcaneWall", "Arcane Wall", "Utility", "A wall of force where you aim. Your own magic passes through it.", 0,
-	circle("Arcane Wall", {
-		{ { "mana", "Mana", { Amount = 60 } } },
+add("ShockBurst", "Shock Burst", "Shock", "An explosion of lightning where you aim.", 0,
+	circle("Shock Burst", {
+		{ { "mana", "Mana", { Amount = 150 } } },
+		{ { "shock", "Shock" } },
+		{ { "burst", "Explosion", { Radius = 9 } } },
+	}, {
+		{ "mana", "out", "shock", "in" },
+		{ "shock", "out", "burst", "in" },
+	}))
+-- The enemy nearest your mouse, struck instantly.
+add("Smite", "Smite", "Shock", "Lightning strikes the enemy nearest your mouse -- no flight, no dodging.", 0,
+	circle("Smite", {
+		{ { "mana", "Mana", { Amount = 50 } } },
+		{ { "shock", "Shock" } },
+		{ { "cursor", "Cursor" }, { "near", "Nearest", { Radius = 12, Filter = "Hostile" } } },
+		{ { "smite", "Smite", { Range = 90 } } },
+	}, {
+		{ "mana", "out", "shock", "in" },
+		{ "shock", "out", "smite", "in" },
+		{ "cursor", "point", "near", "from" },
+		{ "near", "entity", "smite", "target" },
+	}))
+-- Pick (a per-item score): whoever around you is lowest on health.
+add("Execute", "Execute", "Arcane", "Strikes whichever enemy around you is lowest on health (as a share of their maximum).", 0,
+	circle("Execute", {
+		{ { "mana", "Mana", { Amount = 70 } } },
 		{ { "arcane", "Arcane" } },
-		{ { "wall", "Barrier", { Shape = "Wall", Duration = 8 } } },
+		{ { "scan", "Scan", { Radius = 45, Filter = "Hostile", Max = 24 } }, { "hp", "Health", { Mode = "Percent" } }, { "pick", "Pick", { Mode = "Lowest" } } },
+		{ { "smite", "Smite", { Range = 50, Sight = false } } },
 	}, {
 		{ "mana", "out", "arcane", "in" },
-		{ "arcane", "out", "wall", "in" },
+		{ "arcane", "out", "smite", "in" },
+		{ "scan", "list", "pick", "list" },
+		{ "pick", "item", "hp", "entity" },
+		{ "hp", "value", "pick", "key" },
+		{ "pick", "entity", "smite", "target" },
 	}))
-add("Bastion", "Bastion", "Utility", "A dome over the spot you aim at.", 0,
-	circle("Bastion", {
-		{ { "mana", "Mana", { Amount = 120 } } },
-		{ { "wall", "Barrier", { Shape = "Dome", Duration = 8 } } },
+
+-- Utility: movement, barriers and body magic -------------------------------
+-- Locate: 12 studs in front of you, on the ground.
+add("ArcaneWall", "Arcane Wall", "Utility", "A 14 × 8 wall 12 studs in front of you. You and your party walk through it; enemy magic doesn't.", 0,
+	circle("Arcane Wall", {
+		{ { "mana", "Mana", { Amount = 45 } } },
+		{ { "front", "Locate", { Basis = "Level aim", Forward = 12, Ground = true } } },
+		{ { "wall", "Barrier", { Shape = "Box", Width = 14, Height = 8, Depth = 1, Health = 150, Duration = 8 } } },
 	}, {
 		{ "mana", "out", "wall", "in" },
+		{ "front", "point", "wall", "aim" },
 	}))
-add("Blink", "Blink", "Utility", "Teleport toward your mouse, stopping short of walls.", 0,
+-- Follow: a dome that moves with you.
+add("Bastion", "Bastion", "Utility", "A dome around you that moves with you: your party passes freely, hostile magic breaks on it.", 0,
+	circle("Bastion", {
+		{ { "mana", "Mana", { Amount = 90 } } },
+		{ { "you", "Caster" } },
+		{ { "dome", "Barrier", { Shape = "Dome", Width = 16, Height = 8, Depth = 0.6, Health = 300, Duration = 8 } } },
+	}, {
+		{ "mana", "out", "dome", "in" },
+		{ "you", "entity", "dome", "aim" },
+		{ "you", "entity", "dome", "follow" },
+	}))
+add("Skystep", "Skystep", "Utility", "A small platform just ahead of and below you -- cast it mid-jump to climb.", 0,
+	circle("Skystep", {
+		{ { "mana", "Mana", { Amount = 20 } } },
+		{ { "step", "Locate", { Basis = "Level aim", Forward = 4, Up = -3.6 } } },
+		{ { "platform", "Barrier", { Shape = "Box", Width = 8, Height = 1, Depth = 8, Health = 60, Duration = 5, Anchor = "Top", Ground = false } } },
+	}, {
+		{ "mana", "out", "platform", "in" },
+		{ "step", "point", "platform", "aim" },
+	}))
+-- Tilt: a ramp rising away from you.
+add("Ramp", "Ramp", "Utility", "A ramp rising from your feet the way you're facing.", 0,
+	circle("Ramp", {
+		{ { "mana", "Mana", { Amount = 25 } } },
+		{ { "start", "Locate", { Basis = "Level aim", Forward = 8, Ground = true } } },
+		{ { "ramp", "Barrier", { Shape = "Box", Width = 6, Height = 1, Depth = 16, Tilt = 25, Health = 80, Duration = 6, Anchor = "Centre" } } },
+	}, {
+		{ "mana", "out", "ramp", "in" },
+		{ "start", "point", "ramp", "aim" },
+	}))
+add("Blink", "Blink", "Utility", "Teleport up to 40 studs toward your mouse, stopping short of walls.", 0,
 	circle("Blink", {
-		{ { "mana", "Mana", { Amount = 50 } } },
-		{ { "blink", "Blink" } },
+		{ { "mana", "Mana", { Amount = 20 } } },
+		{ { "blink", "Blink", { Distance = 40 } } },
 	}, {
 		{ "mana", "out", "blink", "in" },
 	}))
-add("Dash", "Dash", "Utility", "Throws you the way you're aiming.", 0,
+-- Force → Target: you. 110 studs/s the way you're facing.
+add("Dash", "Dash", "Utility", "A force on your own body: 110 studs/s the way you're looking.", 0,
 	circle("Dash", {
-		{ { "mana", "Mana", { Amount = 36 } } },
-		{ { "dash", "Force", { Mode = "Along" } } },
+		{ { "mana", "Mana", { Amount = 25 } } },
+		{ { "you", "Caster" }, { "aim", "Locate", { Basis = "Level aim", Forward = 1 } } },
+		{ { "dash", "Force", { Mode = "Along", Speed = 110 } } },
 	}, {
 		{ "mana", "out", "dash", "in" },
+		{ "you", "entity", "dash", "target" },
+		{ "aim", "forward", "dash", "dir" },
 	}))
-add("Mend", "Mend", "Utility", "Heals you.", 0,
+-- Store / Delay / Recall: memory private to one cast.
+add("Rewind", "Rewind", "Utility", "Remembers where you stand; 3 seconds later you blink back there.", 0,
+	circle("Rewind", {
+		{ { "mana", "Mana", { Amount = 60 } } },
+		{ { "here", "Locate", { Basis = "Level aim", Forward = 0, Ground = true } } },
+		{ { "mark", "Store", { Slot = "A", Scope = "This cast" } }, { "wait", "Delay", { Seconds = 3 } } },
+		{ { "spot", "Recall", { Slot = "A", Scope = "This cast" } } },
+		{ { "back", "Blink", { Distance = 150, Momentum = false } } },
+	}, {
+		{ "mana", "out", "mark", "in" },
+		{ "here", "point", "mark", "point" },
+		{ "mark", "out", "wait", "in" },
+		{ "wait", "out", "back", "in" },
+		{ "spot", "point", "back", "to" },
+	}))
+add("Mend", "Mend", "Utility", "Heals you for 60.", 0,
 	circle("Mend", {
-		{ { "mana", "Mana", { Amount = 80 } } },
-		{ { "heal", "Effect", { Effect = "Heal" } } },
+		{ { "mana", "Mana", { Amount = 40 } } },
+		{ { "you", "Caster" } },
+		{ { "heal", "Effect", { Effect = "Heal", Power = 60 } } },
 	}, {
 		{ "mana", "out", "heal", "in" },
+		{ "you", "entity", "heal", "target" },
 	}))
-add("Haste", "Haste", "Utility", "You run faster for a while.", 0,
+add("Haste", "Haste", "Utility", "You run 50% faster for 8 seconds.", 0,
 	circle("Haste", {
-		{ { "mana", "Mana", { Amount = 60 } } },
-		{ { "haste", "Effect", { Effect = "Haste", Duration = 8 } } },
+		{ { "mana", "Mana", { Amount = 40 } } },
+		{ { "haste", "Effect", { Effect = "Haste", Power = 50, Duration = 8 } } },
 	}, {
 		{ "mana", "out", "haste", "in" },
 	}))
-add("StasisField", "Stasis Field", "Utility", "A bubble of slow time where you aim: everything inside crawls.", 0,
+add("Float", "Float", "Utility", "Gravity lets go of you: you drift down slowly for 8 seconds.", 0,
+	circle("Float", {
+		{ { "mana", "Mana", { Amount = 40 } } },
+		{ { "float", "Effect", { Effect = "Levitate", Duration = 8 } } },
+	}, {
+		{ "mana", "out", "float", "in" },
+	}))
+add("StasisField", "Stasis Field", "Utility", "A 10-stud bubble of slow time where you aim: everything inside crawls at 0.2× for 5 seconds.", 0,
 	circle("Stasis Field", {
-		{ { "mana", "Mana", { Amount = 100 } } },
-		{ { "field", "TimeField", { Scale = 0.2, Duration = 5 } } },
+		{ { "mana", "Mana", { Amount = 40 } } },
+		{ { "field", "TimeField", { Radius = 10, Scale = 0.2, Duration = 5 } } },
 	}, {
 		{ "mana", "out", "field", "in" },
 	}))
-add("Repulse", "Repulse", "Shock", "Blasts everything around you away, limp.", 0,
+add("Repulse", "Repulse", "Shock", "Blasts everything within 16 studs of you away, limp.", 0,
 	circle("Repulse", {
 		{ { "mana", "Mana", { Amount = 70 } } },
 		{ { "shock", "Shock" } },
-		{ { "push", "Force", { Mode = "Push", Radius = 16, Ragdoll = true } } },
+		{ { "push", "Force", { Mode = "Away", Speed = 90, Lift = 0.45, Radius = 16, Ragdoll = true } } },
 	}, {
 		{ "mana", "out", "shock", "in" },
 		{ "shock", "out", "push", "in" },
@@ -216,7 +306,7 @@ add("HuntersSigil", "Hunter's Sigil", "Combo", "A bullet that scans where it lan
 		{ { "impact", "OnImpact", { Share = 75 } } },
 		{ { "scan", "Scan", { Radius = 35, Filter = "Hostile", Max = 6 } }, { "any", "Compare", { Op = ">", B = 0 } } },
 		{ { "if", "If" }, { "sigil", "Conjure", { Height = 15, Delay = 0.6 } }, { "each", "ForEach", { Max = 6, Interval = 0.08 } } },
-		{ { "bolt", "Bullet" }, { "speed", "Speed", { Level = 2 } } },
+		{ { "bolt", "Bullet" }, { "speed", "Speed", { Factor = 2 } } },
 	}, {
 		{ "mana", "out", "arcane", "in" },
 		{ "arcane", "out", "bullet", "in" },
@@ -242,7 +332,7 @@ add("Starfall", "Starfall", "Combo", "A circle opens high above your mouse and r
 		{ { "sky", "Conjure", { Height = 28, Delay = 0.8, Size = 1.6 } }, { "rain", "Repeat", { Count = 4, Interval = 0.3 } } },
 		{ { "orb", "Orb" }, { "ring", "Quantity", { Count = 4, Pattern = "Ring", Spread = 14 } } },
 		{ { "impact", "OnImpact", { Share = 70 } } },
-		{ { "burst", "Explosion" }, { "size", "Size", { Level = 1 } } },
+		{ { "burst", "Explosion", { Radius = 7 } } },
 	}, {
 		{ "mana", "out", "fire", "in" },
 		{ "fire", "out", "sky", "in" },
@@ -252,7 +342,42 @@ add("Starfall", "Starfall", "Combo", "A circle opens high above your mouse and r
 		{ "ring", "mod", "orb", "mods" },
 		{ "orb", "vessel", "impact", "vessel" },
 		{ "impact", "out", "burst", "in" },
-		{ "size", "mod", "burst", "mods" },
+	}))
+-- Bolts from the sky onto everyone near the cursor, one after another.
+add("ChainStorm", "Chain Storm", "Combo", "Lightning falls from the sky on every enemy near your mouse, one after another.", 0,
+	circle("Chain Storm", {
+		{ { "mana", "Mana", { Amount = 120 } } },
+		{ { "shock", "Shock" } },
+		{ { "cursor", "Cursor" }, { "scan", "Scan", { Radius = 20, Filter = "Hostile", Max = 8 } } },
+		{ { "each", "ForEach", { Max = 8, Interval = 0.12 } } },
+		{ { "sky", "Offset", { X = 0, Y = 30, Z = 0 } } },
+		{ { "smite", "Smite", { Range = 60, Sight = false } } },
+	}, {
+		{ "mana", "out", "shock", "in" },
+		{ "shock", "out", "each", "in" },
+		{ "cursor", "point", "scan", "from" },
+		{ "scan", "list", "each", "list" },
+		{ "each", "each", "smite", "in" },
+		{ "each", "entity", "sky", "point" },
+		{ "sky", "point", "smite", "from" },
+	}))
+-- A steady pull: Force Toward for 2 seconds, then a blast where they've gathered.
+add("GravityWell", "Gravity Well", "Combo", "Drags everything near your mouse into one spot for 2 seconds, then detonates it.", 0,
+	circle("Gravity Well", {
+		{ { "mana", "Mana", { Amount = 130 } } },
+		{ { "split", "Divide", { Share = 45 } } },
+		{ { "cursor", "Cursor" } },
+		{ { "pull", "Force", { Mode = "Toward", Speed = 40, Radius = 18, Duration = 2 } }, { "wait", "Delay", { Seconds = 2 } } },
+		{ { "arcane", "Arcane" } },
+		{ { "boom", "Explosion", { Radius = 10 } } },
+	}, {
+		{ "mana", "out", "split", "in" },
+		{ "split", "a", "pull", "in" },
+		{ "cursor", "point", "pull", "center" },
+		{ "split", "b", "wait", "in" },
+		{ "wait", "out", "arcane", "in" },
+		{ "arcane", "out", "boom", "in" },
+		{ "cursor", "point", "boom", "aim" },
 	}))
 -- A mine: a circle on the ground that waits for an enemy, then erupts.
 add("Snare", "Snare", "Combo", "Plants a circle on the ground at your mouse. When an enemy steps near, it erupts and roots them.", 0,
@@ -277,11 +402,11 @@ add("Snare", "Snare", "Combo", "Plants a circle on the ground at your mouse. Whe
 -- Blink to the cursor, leaving an explosion where you were.
 add("Phase", "Phase Step", "Combo", "Blinks you toward your mouse and blasts the spot you left.", 0,
 	circle("Phase Step", {
-		{ { "mana", "Mana", { Amount = 110 } } },
-		{ { "split", "Divide", { Share = 40 } } },
+		{ { "mana", "Mana", { Amount = 100 } } },
+		{ { "split", "Divide", { Share = 60 } } },
 		{ { "arcane", "Arcane" } },
 		{ { "caster", "Caster" } },
-		{ { "blink", "Blink" }, { "boom", "Explosion" } },
+		{ { "blink", "Blink", { Distance = 40 } }, { "boom", "Explosion", { Radius = 8 } } },
 	}, {
 		{ "mana", "out", "split", "in" },
 		{ "split", "a", "arcane", "in" },
@@ -289,27 +414,31 @@ add("Phase", "Phase Step", "Combo", "Blinks you toward your mouse and blasts the
 		{ "caster", "entity", "boom", "aim" },
 		{ "split", "b", "blink", "in" },
 	}))
-add("Float", "Float", "Utility", "Gravity lets go of you: you drift down slowly for a while.", 0,
-	circle("Float", {
-		{ { "mana", "Mana", { Amount = 40 } } },
-		{ { "float", "Effect", { Effect = "Levitate", Duration = 8 } } },
-	}, {
-		{ "mana", "out", "float", "in" },
-	}))
 -- A wall that blows up when it breaks or fades.
-add("VolatileWard", "Volatile Ward", "Combo", "A barrier where you aim that explodes in fire when it breaks or fades.", 0,
+add("VolatileWard", "Volatile Ward", "Combo", "A wall in front of you that explodes in fire when it breaks or fades.", 0,
 	circle("Volatile Ward", {
 		{ { "mana", "Mana", { Amount = 100 } } },
-		{ { "ward", "Barrier", { Shape = "Wall", Duration = 6 } } },
+		{ { "front", "Locate", { Basis = "Level aim", Forward = 10, Ground = true } } },
+		{ { "ward", "Barrier", { Shape = "Box", Width = 12, Height = 8, Depth = 1, Health = 150, Duration = 6 } } },
 		{ { "expire", "OnExpire", { Share = 50 } } },
 		{ { "fire", "Fire" } },
-		{ { "boom", "Explosion" }, { "size", "Size", { Level = 2 } } },
+		{ { "boom", "Explosion", { Radius = 10 } } },
 	}, {
 		{ "mana", "out", "ward", "in" },
+		{ "front", "point", "ward", "aim" },
 		{ "ward", "vessel", "expire", "vessel" },
 		{ "expire", "out", "fire", "in" },
 		{ "fire", "out", "boom", "in" },
-		{ "size", "mod", "boom", "mods" },
+	}))
+-- Invoke: spells as functions.
+add("Echo", "Echo", "Combo", "Opens a circle over your head that casts the spell on your hotbar slot 1 three times.", 0,
+	circle("Echo", {
+		{ { "mana", "Mana", { Amount = 150 } } },
+		{ { "halo", "Conjure", { Height = 7, Delay = 0.5 } }, { "thrice", "Repeat", { Count = 3, Interval = 0.35 } }, { "cast", "Invoke", { Slot = 1 } } },
+	}, {
+		{ "mana", "out", "halo", "in" },
+		{ "halo", "out", "thrice", "in" },
+		{ "thrice", "each", "cast", "in" },
 	}))
 
 Encyclopedia.Spells = spells

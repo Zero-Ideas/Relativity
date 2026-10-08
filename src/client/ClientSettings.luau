@@ -16,7 +16,12 @@
 	  Glints       the cast glint on spell circles (off by default)
 	  EffectsIntensity / ReducedFlashes / CameraShake: local cosmetics only.
 	  HudScale     both HUD modes, 70..130 percent.
+	  EditorOpacity / EditorBlur  the spell editor's holographic glass: how
+	               opaque it is (20..100 percent) and how much the world
+	               behind it blurs (0 = off). UiMode hands them to the editor.
 	  *Volume      local audio mix, 0..100 percent, multiplied by MasterVolume.
+	  Key*         menu keybinds (Kind "key": a KeyCode name or "None"; see
+	               Keybinds). Giving one action another's key swaps them.
 ]]
 
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
@@ -32,7 +37,7 @@ local remote = ReplicatedStorage:WaitForChild("ClientSettings") :: RemoteFunctio
 export type Spec = {
 	Key: string,
 	Label: string,
-	Kind: "number" | "boolean" | "choice",
+	Kind: "number" | "boolean" | "choice" | "key",
 	Options: { string }?, -- (choice)
 	Default: any,
 	Min: number?,
@@ -48,10 +53,19 @@ local ClientSettings = {}
 ClientSettings.Specs = {
 	{ Key = "UiMode", Label = "UI mode", Kind = "choice", Options = { "Mode 1", "Mode 2" }, Default = "Mode 1", Section = "Interface" },
 	{ Key = "HudScale", Label = "HUD scale (%)", Kind = "number", Default = 100, Min = 70, Max = 130, Step = 5, Section = "Interface" },
+	{ Key = "EditorOpacity", Label = "Spell editor opacity (%)", Kind = "number", Default = 60, Min = 20, Max = 100, Step = 5, Section = "Interface", Description = "How solid the spell editor's holographic panels are; lower shows more of the world behind." },
+	{ Key = "EditorBlur", Label = "Spell editor background blur", Kind = "number", Default = 8, Min = 0, Max = 24, Step = 1, Section = "Interface", Description = "Blurs the world behind the spell editor (0 = off)." },
 	{ Key = "EffectsIntensity", Label = "Particle effects intensity (%)", Kind = "number", Default = 100, Min = 0, Max = 100, Step = 5, Section = "Effects", Description = "Reduces cosmetic particles, not projectile bodies or hit detection." },
 	{ Key = "ReducedFlashes", Label = "Reduced flashes", Kind = "boolean", Default = false, Section = "Effects", Description = "Dims explosion lighting and spell circles; suppresses cast glints." },
 	{ Key = "CameraShake", Label = "Explosion camera shake (%)", Kind = "number", Default = 100, Min = 0, Max = 100, Step = 5, Section = "Effects" },
 	{ Key = "Glints", Label = "Cast glints", Kind = "boolean", Default = false, Section = "Effects" },
+	{ Key = "KeySpells", Label = "Spells menu", Kind = "key", Default = "B", Section = "Controls" },
+	{ Key = "KeyEditor", Label = "Spell editor", Kind = "key", Default = "V", Section = "Controls" },
+	{ Key = "KeyHotbar", Label = "Switch hotbar (spells / items)", Kind = "key", Default = "E", Section = "Controls" },
+	{ Key = "KeyParty", Label = "Party", Kind = "key", Default = "P", Section = "Controls" },
+	{ Key = "KeyNotifications", Label = "Notifications", Kind = "key", Default = "N", Section = "Controls" },
+	{ Key = "KeySettings", Label = "Settings", Kind = "key", Default = "Period", Section = "Controls" },
+	{ Key = "KeyDebug", Label = "Debug panel", Kind = "key", Default = "F2", Section = "Controls", Description = "Click a key, then press the new one (Esc cancels, Backspace unbinds)." },
 	{ Key = "MasterVolume", Label = "Master volume (%)", Kind = "number", Default = 100, Min = 0, Max = 100, Step = 5, Section = "Audio" },
 	{ Key = "SpellVolume", Label = "Spell / projectile volume (%)", Kind = "number", Default = 100, Min = 0, Max = 100, Step = 5, Section = "Audio" },
 	{ Key = "ImpactVolume", Label = "Impact / explosion volume (%)", Kind = "number", Default = 100, Min = 0, Max = 100, Step = 5, Section = "Audio" },
@@ -102,6 +116,20 @@ function ClientSettings.Get(key: string): any
 	return values[key]
 end
 
+-- Is `value` a key setting's value: a KeyCode name or "None"?
+function ClientSettings.IsKeyName(value: any): boolean
+	if typeof(value) ~= "string" then
+		return false
+	end
+	if value == "None" then
+		return true
+	end
+	local ok, code = pcall(function()
+		return (Enum.KeyCode :: any)[value]
+	end)
+	return ok and code ~= nil
+end
+
 -- Changes one setting: applied at once, saved shortly after.
 function ClientSettings.Set(key: string, value: any)
 	local spec = specOf(key)
@@ -113,6 +141,21 @@ function ClientSettings.Set(key: string, value: any)
 	elseif spec.Kind == "choice" then
 		if not table.find(spec.Options or {}, value) then
 			return
+		end
+	elseif spec.Kind == "key" then
+		if not ClientSettings.IsKeyName(value) then
+			return
+		end
+		-- (one key, one action: whoever had it takes this one's old key)
+		if value ~= "None" and values[key] ~= value then
+			for _, other in ClientSettings.Specs do
+				if other.Kind == "key" and other.Key ~= key and values[other.Key] == value then
+					local previous = values[key]
+					values[key] = value -- (so the swap below doesn't bounce back)
+					ClientSettings.Set(other.Key, previous)
+					values[key] = previous
+				end
+			end
 		end
 	else
 		if typeof(value) ~= "number" or value ~= value then
@@ -165,6 +208,8 @@ function ClientSettings.start()
 			elseif spec.Kind == "number" and typeof(value) == "number" and value == value then
 				values[key] = math.clamp(value, spec.Min or -math.huge, spec.Max or math.huge)
 			elseif spec.Kind == "boolean" and typeof(value) == "boolean" then
+				values[key] = value
+			elseif spec.Kind == "key" and ClientSettings.IsKeyName(value) then
 				values[key] = value
 			end
 		end

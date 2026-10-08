@@ -2,7 +2,8 @@
 --[[
 	SpellBody.luau (server)
 	Body effects -- the Body Effect vessel (server/SpellRuntime decides the
-	target, energy and duration; numbers come from SpellRunes.Effects):
+	target, power and duration -- what the energy paid for; caps come from
+	SpellRunes.Effects):
 
 	 Heal      restores health now
 	 Cleanse   ends Burn, Stun and every harmful body effect
@@ -14,7 +15,10 @@
 	 Quicken / Dilate the body's own flow of time (Entity:SetTimeScale): it
 	           moves, acts and shoots faster / slower
 
-	Reapplying an effect keeps the stronger strength and the longer time.
+	Power is HP for Heal and Shield, and a percentage for the rest (Haste 50:
+	walk x1.5; Slow 50: x0.5; Empower 30: +30% damage dealt; Weaken 30: +30%
+	damage taken; Quicken / Dilate: the body's time x(1 +/- p)). Reapplying an
+	effect keeps the stronger strength and the longer time; Shields stack.
 	Effects run on world time where the body stands (not its own, so Quicken
 	and Dilate don't stretch themselves). Harmful effects never land on
 	someone your magic can't hurt (Entity.CanDamage: your party).
@@ -64,11 +68,6 @@ local function strengthOf(body: Body, name: string): number
 	return if active then active.strength else 0
 end
 
-local function swing(name: string): number
-	local def = SpellRunes.Effects[name]
-	return if def and def.Swing then def.Swing else 0
-end
-
 local function playerOf(entity: any): Player?
 	local character = entity.Instance
 	return if character then Players:GetPlayerFromCharacter(character) else nil
@@ -81,13 +80,13 @@ local function refresh(body: Body)
 		return
 	end
 	local humanoid: Humanoid? = entity.Humanoid
-	local walk = (1 + strengthOf(body, "Haste") * swing("Haste")) * (1 - strengthOf(body, "Slow") * swing("Slow"))
-	local jump = 1 - strengthOf(body, "Slow") * swing("Slow")
+	local walk = (1 + strengthOf(body, "Haste")) * (1 - strengthOf(body, "Slow"))
+	local jump = 1 - strengthOf(body, "Slow")
 	if body.effects.Root then
 		walk, jump = 0, 0
 	end
 	local levitating = body.effects.Levitate ~= nil
-	local time = (1 + strengthOf(body, "Quicken") * swing("Quicken")) * (1 - strengthOf(body, "Dilate") * swing("Dilate"))
+	local time = (1 + strengthOf(body, "Quicken")) * (1 - strengthOf(body, "Dilate"))
 	if humanoid and humanoid.Parent then
 		humanoid:SetAttribute("SpellWalk", if math.abs(walk - 1) > 1e-3 then walk else nil)
 		humanoid:SetAttribute("SpellJump", if math.abs(jump - 1) > 1e-3 then jump else nil)
@@ -160,7 +159,7 @@ local function bodyOf(entity: any): Body
 	bodies[entity] = created
 	-- incoming: Weaken makes it hurt more, then Shield soaks what it can
 	table.insert(created.connections, entity:AddDamageModifier(function(amount: number)
-		local weaken = strengthOf(created, "Weaken") * swing("Weaken")
+		local weaken = strengthOf(created, "Weaken")
 		amount *= 1 + weaken
 		local shield = created.effects.Shield
 		if shield and shield.pool and amount > 0 then
@@ -176,7 +175,7 @@ local function bodyOf(entity: any): Body
 	end))
 	-- outgoing: Empower
 	table.insert(created.connections, entity:AddOutgoingModifier(function(amount: number)
-		return amount * (1 + strengthOf(created, "Empower") * swing("Empower"))
+		return amount * (1 + strengthOf(created, "Empower"))
 	end))
 	table.insert(created.connections, entity.Destroyed:Connect(function()
 		bodies[entity] = nil
@@ -207,17 +206,23 @@ local function visual(entity: any, name: string, seconds: number, amount: number
 	})
 end
 
--- Applies body effect `name` to `target` with `energy` over `duration`
--- seconds, cast by `caster`. Returns whether it took.
-function SpellBody.Apply(caster: any, target: any, name: string, energy: number, duration: number): boolean
+-- Applies body effect `name` to `target` at `power` (HP or percent, see
+-- above) for `duration` seconds, cast by `caster`. Returns whether it took.
+function SpellBody.Apply(caster: any, target: any, name: string, power: number, duration: number): boolean
 	local def = SpellRunes.Effects[name]
-	if not def or not alive(target) or energy <= 0 then
+	if not def or not alive(target) then
 		return false
 	end
 	if not def.Helpful and target ~= caster and not Entity.CanDamage(caster, target) then
 		return false -- (never on your party)
 	end
-	local strength, seconds = SpellRunes.EffectStrength(name, energy, duration)
+	power = SpellRunes.EffectPower(name, power)
+	local seconds = duration
+	-- HP for Heal / Shield, a fraction for the rest; Timed effects are on/off
+	local strength = if def.Kind == "Scale" then power / 100 elseif def.Kind == "Timed" then 1 else power
+	if def.Kind ~= "Timed" and name ~= "Cleanse" and power <= 0 then
+		return false
+	end
 	if name == "Heal" then
 		target:Heal(strength)
 		visual(target, name, 0.8, strength)

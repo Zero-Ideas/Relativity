@@ -20,7 +20,8 @@ local MovementController = require(script.MovementController)
 local ChunkVisualizer = require(script.ChunkVisualizer)
 local TimeControlGui = require(script.TimeControlGui)
 local ToolManager = require(script.ToolManager)
-local DebugPanel = require(script.DebugPanel) -- Studio-only ReGui panel (F2)
+local DebugPanel = require(script.DebugPanel) -- ReGui debug panel (its key: Settings > Controls)
+local DroneClient = require(script.DroneClient) -- guns summon a drone through a portal
 -- These two self-register their VisualOffload listeners at require time
 -- (no .start()) -- see AmmoState.luau (ammo cache for a future HUD) and
 -- WeaponEffects.luau (server-broadcast one-shot weapon VFX like the
@@ -43,6 +44,7 @@ TimeControlGui.start({ Headless = true })
 -- builds itself only for players allowed to use it (see DebugPanel)
 DebugPanel.start()
 ToolManager.start()
+DroneClient.start()
 -- MainHud (hotbar) or the classic Backpack UI, switched from the topbar
 task.spawn(function() require(script.UiMode).start() end)
 

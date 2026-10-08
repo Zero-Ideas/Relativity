@@ -14,16 +14,20 @@
 	                     Friends and Settings tabs)
 	  Spells  (left)  -- the Spells window (SpellLibrary: loadout, library,
 	                     encyclopedia; Edit / New spell open the editor)
-	  Bell    (left)  -- the Messages window (Notifications.luau; key N); a new
+	  Bell    (left)  -- the Messages window (Notifications.luau); a new
 	                     actionable notification (invite, join request) while
 	                     it's closed badges and rings the bell and plays a ping
-	  Debug   (left)  -- the debug panel (F2), for players allowed to use it
-	  Gear    (right) -- the Settings window (SettingsWindow; key . )
+	  Debug   (left)  -- the debug panel, for players allowed to use it
+	  Gear    (right) -- the Settings window (SettingsWindow)
 	The spell editor's Library button opens the Spells window (SpellLibrary).
+	Every menu (and the spell editor, and the spells / items hotbar switch)
+	also has a key, set in Settings > Controls (Keybinds); the icons show it.
 	Which UI shows is the player's "UI mode" setting (Settings window,
 	Interface: Mode 1 = Ours, Mode 2 = Dev), saved with their settings. The
 	current mode is also the LocalPlayer's "UiMode" attribute (client-only)
-	for other UI.
+	for other UI. Either HUD hides while the spell editor is open (its glass
+	is see-through), and the editor's look follows the "Spell editor
+	opacity" / "background blur" settings.
 ]]
 
 local Players = game:GetService("Players")
@@ -42,11 +46,10 @@ local CreditsWindow = require(script.Parent.CreditsWindow)
 local Notifications = require(script.Parent.Notifications)
 local DebugPanel = require(script.Parent.DebugPanel)
 local SpellAssemblerGui = require(script.Parent.SpellAssemblerGui)
+local Keybinds = require(script.Parent.Keybinds)
 
 local SoundService = game:GetService("SoundService")
 local TweenService = game:GetService("TweenService")
-local UserInputService = game:GetService("UserInputService")
-local ContextActionService = game:GetService("ContextActionService")
 
 local player = Players.LocalPlayer
 
@@ -63,6 +66,8 @@ export type Mode = "Ours" | "Dev"
 local UiMode = {}
 local mode: Mode = "Ours"
 local inboxIcon: any = nil
+local hintIcons: { [string]: any } = {} -- key setting -> the topbar icon showing it
+local editorOpen = false -- (the HUD hides behind the editor's glass)
 
 -- SetCoreGuiEnabled errors until the CoreScripts have registered it.
 local function hideBackpack()
@@ -78,8 +83,8 @@ end
 
 local function apply()
 	local ours = mode == "Ours"
-	MainHud.SetEnabled(not ours)
-	GameHud.SetEnabled(ours)
+	MainHud.SetEnabled(not ours and not editorOpen)
+	GameHud.SetEnabled(ours and not editorOpen)
 	-- (GameHud has its own controls; the compact casting panel is the dev UI's)
 	SpellAssemblerGui.SetCompactHudEnabled(not ours)
 	player:SetAttribute("UiMode", mode)
@@ -93,6 +98,7 @@ end
 local SETTING_FOR: { [Mode]: string } = { Ours = "Mode 1", Dev = "Mode 2" }
 
 local function follow()
+	SpellAssemblerGui.SetAppearance(ClientSettings.Get("EditorOpacity"), ClientSettings.Get("EditorBlur"))
 	local wanted: Mode = if ClientSettings.Get("UiMode") == "Mode 2" then "Dev" else "Ours"
 	if mode ~= wanted then
 		mode = wanted
@@ -132,12 +138,14 @@ local function buildTopbar()
 
 	-- Party: the Party window (Invite / Parties / Whitelist tabs)
 	local party = Icon.new():setName("Party"):setLabel("Party"):oneClick()
+	hintIcons.KeyParty = party
 	party.selected:Connect(function()
 		PartyWindow.Toggle()
 	end)
 
 	-- Spell assembler
 	local spells = Icon.new():setName("Spells"):setLabel("Spells"):oneClick()
+	hintIcons.KeySpells = spells
 	spells.selected:Connect(function()
 		SpellLibrary.Toggle() -- (its Edit / New spell open the editor)
 	end)
@@ -148,8 +156,8 @@ local function buildTopbar()
 		:setName("Notifications")
 		:setImage(BELL_IMAGE)
 		:setLabel("Notifications")
-		:setCaptionHint(Enum.KeyCode.N)
 		:oneClick()
+	hintIcons.KeyNotifications = inbox
 	inbox.selected:Connect(function()
 		inbox:clearNotices()
 		Notifications.Toggle()
@@ -183,6 +191,7 @@ local function buildTopbar()
 
 	-- Debug panel (F2 too), for players allowed to use it
 	local debugIcon = Icon.new():setName("Debug"):setLabel("Debug"):oneClick()
+	hintIcons.KeyDebug = debugIcon
 	debugIcon.selected:Connect(DebugPanel.Toggle)
 	local function refreshDebug()
 		debugIcon:setEnabled(DebugPanel.IsAllowed())
@@ -196,34 +205,50 @@ local function buildTopbar()
 		:align("Right")
 		:setImage(GEAR_IMAGE)
 		:setLabel("Settings")
-		:setCaptionHint(Enum.KeyCode.Period)
 		:oneClick()
+	hintIcons.KeySettings = settingsIcon
 	settingsIcon.selected:Connect(SettingsWindow.Toggle)
 end
 
--- N: Messages, . : Settings (not while typing). The default camera binds
--- . to rotate, so it's taken (and sunk) at a higher priority.
+-- The menu keys (Settings > Controls; see Keybinds). While the spell editor
+-- covers the screen only its own key works; the rest let the key through.
 local function bindKeys()
-	UserInputService.InputBegan:Connect(function(input, processed)
-		if processed or UserInputService:GetFocusedTextBox() then
-			return
-		end
-		if input.KeyCode == Enum.KeyCode.N then
-			if inboxIcon then
-				inboxIcon:clearNotices()
+	local function menu(open: () -> ()): () -> boolean?
+		return function()
+			if editorOpen then
+				return false
 			end
-			Notifications.Toggle()
+			open()
+			return true
 		end
+	end
+	Keybinds.Bind("KeySpells", menu(SpellLibrary.Toggle))
+	Keybinds.Bind("KeyParty", menu(function() PartyWindow.Toggle() end))
+	Keybinds.Bind("KeyNotifications", menu(function()
+		if inboxIcon then
+			inboxIcon:clearNotices()
+		end
+		Notifications.Toggle()
+	end))
+	Keybinds.Bind("KeySettings", menu(SettingsWindow.Toggle))
+	Keybinds.Bind("KeyDebug", menu(DebugPanel.Toggle))
+	Keybinds.Bind("KeyEditor", function()
+		SpellAssemblerGui.ToggleEditor()
+		return true
 	end)
-	ContextActionService:BindActionAtPriority("SettingsHotkey", function(_, state: Enum.UserInputState)
-		if UserInputService:GetFocusedTextBox() then
-			return Enum.ContextActionResult.Pass
+	Keybinds.Bind("KeyHotbar", menu(GameHud.ToggleHotbar))
+
+	-- the topbar icons show their key
+	local function refreshHints()
+		for setting, icon in hintIcons do
+			local code = Keybinds.KeyCode(setting)
+			pcall(function()
+				icon:setCaptionHint(code)
+			end)
 		end
-		if state == Enum.UserInputState.Begin then
-			SettingsWindow.Toggle()
-		end
-		return Enum.ContextActionResult.Sink
-	end, false, Enum.ContextActionPriority.High.Value, Enum.KeyCode.Period)
+	end
+	Keybinds.Changed:Connect(refreshHints)
+	refreshHints()
 end
 
 function UiMode.start()
@@ -235,6 +260,10 @@ function UiMode.start()
 	bindKeys()
 	-- the spell editor's Library button
 	SpellAssemblerGui.SetLibraryOpener(SpellLibrary.Open)
+	SpellAssemblerGui.OpenChanged:Connect(function(isOpen: boolean)
+		editorOpen = isOpen
+		apply()
+	end)
 	apply()
 	-- the UI mode is a setting (Settings window, Interface)
 	follow()

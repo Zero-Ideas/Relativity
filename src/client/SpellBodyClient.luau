@@ -4,16 +4,22 @@
 	What spells do to your own character -- which only your client can move
 	(it owns its physics) -- and the visuals of spells on bodies:
 
-	 - VisualOffload "SpellImpulse" { Velocity, Set? } (server/SpellWorld.Push,
-	   Halt): a Force on you. Added to your velocity (Set replaces it); a
-	   mostly sideways shove is held for a moment so walking can't brake it.
+	 - VisualOffload "SpellImpulse" { Velocity, Set?, Duration?, Mode?,
+	   Center?, Speed?, Lift? } (server/SpellWorld.Drive, Halt): a Force on
+	   you. A shove is added to your velocity (Set replaces it); a mostly
+	   sideways one is held for a moment so walking can't brake it. With a
+	   Duration it's a steady drive held for that long, re-aimed every frame
+	   (Toward pulls you to Center and holds you there).
+	 - Barriers you may walk through (their model's "Pass" attribute lists
+	   your UserId: your own and your party's) lose CanCollide here, for your
+	   character only.
 	 - Humanoid attributes (server/SpellBody): SpellWalk / SpellJump multiply
 	   walk speed and jump (MovementController modifier "SpellBody"; 0 =
 	   rooted), SpellLevitate lifts you (a VectorForce cancelling most of
 	   your -- dilated -- gravity), SpellTime scales your personal time.
 	 - VisualOffload "SpellFX": Kind "Blink" (a flash at both ends and a
 	   streak between), "Force" (a shockwave ring / dash streak, and a flash
-	   on each body shoved) and "Effect" (a coloured glow on the body for the
+	   on each body shoved), "Smite" (a jagged bolt) and "Effect" (a coloured glow on the body for the
 	   effect's duration; Heal and Cleanse sparkle once).
 
 	Self-registers at require time (client/SpellEffects requires it).
@@ -37,6 +43,7 @@ local LIFT = 0.92 -- share of your gravity levitation cancels
 local HOLD_MIN, HOLD_MAX = 0.12, 0.35 -- seconds a sideways shove is held (longer when faster)
 local HOLD_PER_SPEED = 1 / 350
 local AURA_FADE = 0.4
+local ARRIVE_SLOWDOWN = 4 -- (matches SpellWorld) a pull's speed near its centre: distance x this
 
 --------------------------------------------------------------------------------
 -- Your own body
@@ -49,6 +56,74 @@ local function rootOf(): (BasePart?, Humanoid?)
 	return root, humanoid
 end
 
+local function finiteNumber(value: any): number?
+	return if typeof(value) == "number" and value == value and math.abs(value) < math.huge then value else nil
+end
+
+-- A steady drive (SpellWorld.DriveVelocity, the same rules).
+type Drive = { root: BasePart, attachment: Attachment, hold: LinearVelocity, remaining: number, data: any }
+local drive: Drive? = nil
+
+local function driveVelocity(data: any, position: Vector3): Vector3
+	local center = if typeof(data.Center) == "Vector3" then data.Center else nil
+	local speed = finiteNumber(data.Speed) or data.Velocity.Magnitude
+	if center and data.Mode == "Toward" then
+		local offset = center - position
+		local distance = offset.Magnitude
+		if distance < 0.3 then
+			return Vector3.zero
+		end
+		return offset.Unit * math.min(speed, distance * ARRIVE_SLOWDOWN)
+	elseif center and data.Mode == "Away" then
+		local level = Vector3.new(position.X - center.X, 0, position.Z - center.Z)
+		if level.Magnitude < 1e-3 then
+			return Vector3.yAxis * speed
+		end
+		return (level.Unit + Vector3.new(0, finiteNumber(data.Lift) or 0, 0)).Unit * speed
+	end
+	return data.Velocity
+end
+
+local function endDrive()
+	local current = drive
+	if current then
+		drive = nil
+		current.attachment:Destroy()
+		current.hold:Destroy()
+	end
+end
+
+local function startDrive(root: BasePart, humanoid: Humanoid, data: any, seconds: number)
+	endDrive()
+	local attachment = Instance.new("Attachment")
+	attachment.Name = "SpellDrive"
+	attachment.Parent = root
+	local hold = Instance.new("LinearVelocity")
+	hold.Name = "SpellDrive"
+	hold.Attachment0 = attachment
+	hold.RelativeTo = Enum.ActuatorRelativeTo.World
+	hold.VelocityConstraintMode = Enum.VelocityConstraintMode.Vector
+	hold.MaxForce = math.huge
+	hold.VectorVelocity = driveVelocity(data, root.Position) * MovementController.GetTimeScale()
+	hold.Parent = root
+	humanoid:ChangeState(Enum.HumanoidStateType.Freefall)
+	drive = { root = root, attachment = attachment, hold = hold, remaining = seconds, data = data }
+end
+
+Heartbeat.Connect(function(dt)
+	local current = drive
+	if not current then
+		return
+	end
+	local scale = MovementController.GetTimeScale()
+	current.remaining -= dt * scale
+	if current.remaining <= 0 or not current.root.Parent then
+		endDrive()
+	else
+		current.hold.VectorVelocity = driveVelocity(current.data, current.root.Position) * scale
+	end
+end, { Name = "SpellBodyClient.Drive", Priority = 21 })
+
 VisualOffload.On("SpellImpulse", function(data)
 	if typeof(data) ~= "table" or typeof(data.Velocity) ~= "Vector3" then
 		return
@@ -57,9 +132,15 @@ VisualOffload.On("SpellImpulse", function(data)
 	if not root or not humanoid or humanoid.Health <= 0 then
 		return
 	end
+	local seconds = finiteNumber(data.Duration)
+	if seconds and seconds > 0 then
+		startDrive(root, humanoid, data, math.min(seconds, 10))
+		return
+	end
 	local deltaV = data.Velocity * MovementController.GetTimeScale()
-	if data.Set then
-		root.AssemblyLinearVelocity = deltaV
+	if data.Set and deltaV.Magnitude < 1e-3 then
+		endDrive()
+		root.AssemblyLinearVelocity = Vector3.zero
 		return
 	end
 	-- standing on the ground: a shove aimed down at the floor ahead (a dash
@@ -68,7 +149,7 @@ VisualOffload.On("SpellImpulse", function(data)
 	if deltaV.Y < 0 and humanoid.FloorMaterial ~= Enum.Material.Air and flat.Magnitude > 1e-3 then
 		deltaV = flat.Unit * deltaV.Magnitude
 	end
-	local velocity = root.AssemblyLinearVelocity + deltaV
+	local velocity = (if data.Set then Vector3.zero else root.AssemblyLinearVelocity) + deltaV
 	local sideways = Vector3.new(deltaV.X, 0, deltaV.Z).Magnitude
 	if sideways > 20 then
 		local attachment = Instance.new("Attachment")
@@ -89,6 +170,32 @@ VisualOffload.On("SpellImpulse", function(data)
 		end)
 	end
 	root.AssemblyLinearVelocity = velocity
+end)
+
+-- Barriers that let you through: CanCollide off for your character only
+-- (your client simulates it, so its local copy of the part decides).
+local passKey = `,{player.UserId},`
+
+local function considerBarrierPart(part: Instance)
+	if not part:IsA("BasePart") then
+		return
+	end
+	local model = part.Parent
+	local pass = model and model:GetAttribute("Pass")
+	if typeof(pass) == "string" and string.find(pass, passKey, 1, true) then
+		part.CanCollide = false
+	end
+end
+
+task.spawn(function()
+	local barriers = workspace:WaitForChild("SpellBarriers", 30)
+	if not barriers then
+		return
+	end
+	barriers.DescendantAdded:Connect(considerBarrierPart)
+	for _, descendant in barriers:GetDescendants() do
+		considerBarrierPart(descendant)
+	end
 end)
 
 local lift: VectorForce? = nil
@@ -241,6 +348,28 @@ local function ring(position: Vector3, radius: number, color: Color3, normal: Ve
 	Debris:AddItem(disc, 0.45)
 end
 
+-- A jagged bolt of light from a to b.
+local function bolt(a: Vector3, b: Vector3, color: Color3)
+	local length = (b - a).Magnitude
+	if length < 0.2 then
+		return
+	end
+	local segments = math.clamp(math.floor(length / 4), 2, 14)
+	local direction = (b - a).Unit
+	local side = direction:Cross(if math.abs(direction.Y) > 0.95 then Vector3.xAxis else Vector3.yAxis).Unit
+	local up = side:Cross(direction).Unit
+	local random = Random.new()
+	local previous = a
+	for index = 1, segments do
+		local t = index / segments
+		local jitter = if index < segments then (side * random:NextNumber(-1, 1) + up * random:NextNumber(-1, 1)) * math.min(length * 0.06, 1.6) else Vector3.zero
+		local point = a:Lerp(b, t) + jitter
+		streak(previous, point, color, 0.35)
+		previous = point
+	end
+	flash(b, color, 2)
+end
+
 local auras: { [Instance]: { [string]: { highlight: Highlight, token: number } } } = {}
 
 local function aura(target: Instance, effect: string, color: Color3, seconds: number)
@@ -323,6 +452,12 @@ VisualOffload.On("SpellFX", function(data)
 				local pivot = target:GetPivot().Position
 				ring(pivot, 2, color, direction)
 			end
+		end
+	elseif data.Kind == "Smite" and typeof(data.From) == "Vector3" and typeof(data.To) == "Vector3" then
+		if data.Fizzle then
+			flash(data.From, color, 1)
+		else
+			bolt(data.From, data.To, color)
 		end
 	elseif data.Kind == "Effect" and typeof(data.Target) == "Instance" and typeof(data.Effect) == "string" then
 		local seconds = if typeof(data.Duration) == "number" then data.Duration else 1

@@ -1,7 +1,7 @@
 --!optimize 2
 --[[
 	DebugPanel  (client)
-	ReGui window (closed by default; toggle with F2 or the topbar's Debug
+	ReGui window (closed by default; toggle with its key (Settings > Controls, F2 by default) or the topbar's Debug
 	button; opens on the Stats tab) for players allowed to use it: anyone in
 	Studio, players on the allowlist (Player attribute "DebugListed", set by
 	server/DebugAccess), and everyone while a listed player has opened it to
@@ -45,14 +45,12 @@
 local Players = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local RunService = game:GetService("RunService")
-local UserInputService = game:GetService("UserInputService")
 
 local Shared = ReplicatedStorage:WaitForChild("Shared")
 local Util = require(script.Util)
 
 local DebugPanel = {}
 
-local TOGGLE_KEY = Enum.KeyCode.F2
 local STATS_INTERVAL = Util.STATS_INTERVAL
 local TAB_ORDER = { "Tools", "Time", "Stats", "Entities", "Chunks", "Dummies", "VFX", "Benchmarks", "Defaults", "Admin" }
 -- Tabs only listed players ever see (the server checks these requests too).
@@ -138,11 +136,11 @@ local function build()
 	end
 
 	local window = ReGui:TabsWindow({
-		Title = "Debug  [F2]",
+		Title = "Debug",
 		-- (clear of the topbar and of GameHud's bars in the bottom-left)
 		Size = UDim2.fromOffset(360, 440),
 		Position = UDim2.fromOffset(16, 70),
-		-- the close button hides instead of destroying, so F2 can reopen it
+		-- the close button hides instead of destroying, so its key can reopen it
 		CloseCallback = function(self)
 		self:SetVisible(false)
 		return false
@@ -166,18 +164,13 @@ local function build()
 	localPlayer:GetAttributeChangedSignal("DebugListed"):Connect(refreshTabs)
 	localPlayer:GetAttributeChangedSignal("DebugDeniedTabs"):Connect(refreshTabs)
 	ReplicatedStorage:GetAttributeChangedSignal("DebugPublicTabs"):Connect(refreshTabs)
-	-- closed until F2 / the topbar's Debug button; opens on the Stats tab
+	-- closed until its key / the topbar's Debug button; opens on the Stats tab
 	-- (when this player may see it)
 	if tabVisible("Stats") then
 		window.WindowTabSelector:SetActiveTab("Stats")
 	end
 	window:SetVisible(false)
 	accessEvent:Fire()
-	UserInputService.InputBegan:Connect(function(input, processed)
-		if input.KeyCode == TOGGLE_KEY and not processed and allowed() and anyTabVisible then
-			window:SetVisible(not window.Visible)
-		end
-	end)
 
 	local function tick()
 		for _, tab in tabs do
@@ -227,7 +220,7 @@ function DebugPanel.start()
 	started = true
 	local building = false
 	-- Builds the panel the first time the player is allowed; hides it when
-	-- access is withdrawn (F2 is ignored until it comes back).
+	-- access is withdrawn (its key is ignored until it comes back).
 	local function refresh()
 		if allowed() then
 			if not building then

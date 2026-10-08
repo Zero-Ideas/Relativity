@@ -221,8 +221,10 @@ function ChunkVisualizer.start()
 		end
 	end)
 
-	UserInputService.InputBegan:Connect(function(input, processed)
-		if not processed and input.KeyCode == Enum.KeyCode.V then
+	-- Alt+V (plain V is the spell editor's key)
+	UserInputService.InputBegan:Connect(function(input)
+		local alt = UserInputService:IsKeyDown(Enum.KeyCode.LeftAlt) or UserInputService:IsKeyDown(Enum.KeyCode.RightAlt)
+		if alt and input.KeyCode == Enum.KeyCode.V and not UserInputService:GetFocusedTextBox() then
 			ChunkVisualizer.toggle()
 		end
 	end)
