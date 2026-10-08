@@ -22,9 +22,7 @@
 	when picked; it closes with the window. Shared spells arrive as
 	notifications (Accept adds a copy to your library).
 
-	The window is built once per opening and updates live (ReGuiLive): only
-	the sections whose data changed rebuild; the hotbar boxes update in
-	place.
+	The window is built once, hidden on close, and updated in place.
 ]]
 
 local Players = game:GetService("Players")
@@ -342,12 +340,19 @@ local function updateBars(state: any)
 end
 
 -- A spell's circle (clickable) for a list row.
+local rowIcons: { [Instance]: any } = setmetatable({}, { __mode = "k" }) :: any
 local function rowIcon(row: any, graph: any, onClick: () -> ())
 	local label = row:Label({ Text = "" })
 	pcall(function()
 		label.AutomaticSize = Enum.AutomaticSize.None
 		label.Size = UDim2.fromOffset(ICON, ICON)
 	end)
+	local retained = rowIcons[label]
+	if retained then
+		retained.onClick = onClick
+		retained.circle:SetGraph(graph)
+		return
+	end
 	local circle = SpellCardPreview.new(label)
 	circle.Frame.Size = UDim2.fromScale(1, 1)
 	circle.Frame.Position = UDim2.fromScale(0.5, 0.5)
@@ -358,7 +363,10 @@ local function rowIcon(row: any, graph: any, onClick: () -> ())
 	button.Size = UDim2.fromScale(1, 1)
 	button.ZIndex = 9
 	button.Parent = label
-	button.Activated:Connect(onClick)
+	retained = { circle = circle, onClick = onClick }
+	rowIcons[label] = retained
+	button.Activated:Connect(function() retained.onClick() end)
+	label.Destroying:Connect(function() circle:Destroy(); rowIcons[label] = nil end)
 end
 
 --------------------------------------------------------------------------------
@@ -436,7 +444,7 @@ local function renderLoadouts(section: ReGuiLive.Section, state: any)
 					table.insert(list, if spell then spell.Name else (names[id] or "?"))
 				end
 			end
-			local row = canvas:Row()
+			local row = canvas:Row({ LiveKey = "loadout:" .. saved.name })
 			row:Label({ Text = `{saved.name} ({#list})` })
 			row:SmallButton({ Text = "Load", Callback = function() run("LoadLoadout", { name = saved.name }) end })
 			row:SmallButton({ Text = "Delete", Callback = function() run("DeleteLoadout", { name = saved.name }) end })
@@ -482,7 +490,8 @@ local function renderSharing(section: ReGuiLive.Section)
 end
 
 -- One of your spells: circle, name (pick up), info, and its buttons.
-local function spellRow(canvas: any, state: any, spell: any)
+local function spellRow(parent: any, state: any, spell: any)
+	local canvas = parent:Group({ LiveKey = "spell:" .. spell.id })
 	local ref = "c:" .. spell.id
 	local picked = heldRef() == ref
 	local row = canvas:Row()
@@ -640,7 +649,7 @@ local function renderEncyclopedia(section: ReGuiLive.Section, state: any, ownedO
 			for _, spell in spells do
 				local ref = "e:" .. spell.Id
 				local owned = Encyclopedia.IsOwned(spell.Id, state.owned)
-				local row = inner:Row()
+				local row = inner:Row({ LiveKey = "spell:" .. spell.Id })
 				rowIcon(row, spell.Graph, function()
 					if owned then pickSpell(ref, spell.Name, spell.Graph) else showPreview(spell.Name, spell.Graph) end
 				end)
@@ -689,19 +698,16 @@ local function captureState()
 	end
 end
 
-local function removeWindow()
+local function hideWindow()
 	captureState()
 	if window then
-		window:Remove()
-		window = nil
+		window:SetVisible(false)
 	end
-	table.clear(bars)
-	table.clear(sections)
 end
 
 -- Builds the window and its static parts once; update() fills the rest.
 local function build(ReGui: any)
-	removeWindow()
+	if window then window:SetVisible(true); return end
 	local created: any
 	created = ReGui:TabsWindow({
 		Title = "Spells",
@@ -709,16 +715,11 @@ local function build(ReGui: any)
 		NoCollapse = true,
 		NoWindowRegistor = true,
 		CloseCallback = function()
-			if window == created then
-				captureState()
-				window = nil
-				table.clear(bars)
-				table.clear(sections)
-			end
+			hideWindow()
 			open = false
 			held = nil
 			closePreview()
-			return true
+			return false
 		end,
 	})
 	window = created
@@ -819,8 +820,7 @@ local function build(ReGui: any)
 	end)
 end
 
--- Brings everything in the open window up to date; each section rebuilds
--- only if what it shows changed.
+-- Reconciles changed sections; unchanged controls and their state survive.
 function update()
 	if not open or not window then
 		return
@@ -860,7 +860,7 @@ end
 function SpellLibrary.Close()
 	open = false
 	held = nil
-	removeWindow()
+	hideWindow()
 	closePreview()
 end
 

@@ -19,14 +19,14 @@
 	               and whether friends may auto-join your public party.
 	               (Rules: server/Parties, "Friends".)
 
-	The window rebuilds itself when party state or anyone's friends list
-	changes, keeping its place, size and tab.
+	The window is retained while hidden; state changes update its controls.
 ]]
 
 local Players = game:GetService("Players")
 
 local PartyClient = require(script.Parent.PartyClient)
 local ReGuiLoader = require(script.Parent.ReGuiLoader)
+local ReGuiLive = require(script.Parent.ReGuiLive)
 
 local player = Players.LocalPlayer
 
@@ -34,11 +34,12 @@ local PartyWindow = {}
 
 local open = false
 local window: any = nil
+local sections: { [string]: any } = {}
 local geometry: { position: UDim2, size: UDim2 }? = nil
 local activeTab = "Invite"
 local building = false
 local queued = false
-local whitelistInput = "" -- (the typed UserId, kept across rebuilds)
+local whitelistInput = "" -- the typed UserId, kept across updates
 local whitelistMessage = ""
 
 local function captureState()
@@ -57,11 +58,10 @@ local function captureState()
 	end
 end
 
-local function removeWindow()
+local function hideWindow()
 	captureState()
 	if window then
-		window:Remove()
-		window = nil
+		window:SetVisible(false)
 	end
 end
 
@@ -85,7 +85,7 @@ local function buildInvite(tab: any)
 	if id then
 		local leaderOf = PartyClient.LeaderOf()
 		local count = #PartyClient.GetMembers()
-		local row = tab:Row()
+		local row = tab:Row({ LiveKey = "partyStatus" })
 		row:Label({
 			Text = if leader then `Your party ({count})` else `{if leaderOf then PartyClient.NameOf(leaderOf) else "?"}'s party ({count})`,
 		})
@@ -95,7 +95,7 @@ local function buildInvite(tab: any)
 				Label = "Public party (anyone can ask to join)",
 				Value = PartyClient.IsPublic(),
 				-- (ReGui runs this on creation too: only act on a real change,
-				-- or every rebuild would re-send it and rebuild again)
+				-- or a programmatic update could echo back to the server)
 				Callback = function(_, value: boolean)
 					if value ~= PartyClient.IsPublic() then
 						PartyClient.SetPublic(value)
@@ -106,7 +106,7 @@ local function buildInvite(tab: any)
 			tab:Label({ Text = "Only the party leader can invite." })
 		end
 	else
-		local row = tab:Row()
+		local row = tab:Row({ LiveKey = "partyStatus" })
 		row:Label({ Text = "You're not in a party." })
 		row:SmallButton({ Text = "Make party", Callback = PartyClient.Create })
 	end
@@ -118,7 +118,7 @@ local function buildInvite(tab: any)
 	for _, other in others do
 		local dummy = PartyClient.IsDummy(other)
 		local name = PartyClient.NameOf(other) .. (if dummy then " (dummy)" else "")
-		local row = tab:Row()
+		local row = tab:Row({ LiveKey = other })
 		if id and PartyClient.GetPartyId(other) == id then
 			row:Label({ Text = `{name} - in party` })
 			continue
@@ -146,6 +146,7 @@ local function buildInvite(tab: any)
 end
 
 local function partyRow(tab: any, info: any)
+	tab = tab:Group({ LiveKey = tostring(info.Target) })
 	local count = #info.Members
 	local title = if count == 0 then `{info.Leader} - not in a party, trusts you`
 		else `{info.Leader}'s party ({count}){if info.Public then " - public" else " - private"}`
@@ -206,15 +207,14 @@ local function buildFriends(tab: any, whitelist: any)
 	end
 
 	local add = tab:Row()
-	local input = add:InputText({
+	add:InputText({
 		Label = "",
 		Placeholder = "UserId",
+		Value = whitelistInput,
 		Callback = function(_, text: string)
 			whitelistInput = text
 		end,
 	})
-	-- (ReGui doesn't show a starting Value by itself)
-	pcall(function() input:SetValue(whitelistInput) end)
 	add:SmallButton({
 		Text = "Add",
 		Callback = function()
@@ -237,7 +237,7 @@ local function buildFriends(tab: any, whitelist: any)
 		tab:Label({ Text = "None yet." })
 	end
 	for _, entry in entries do
-		local row = tab:Row()
+		local row = tab:Row({ LiveKey = "friend:" .. entry.UserId })
 		row:Label({ Text = `{entry.Name} ({entry.UserId}){if entry.InServer then " - here" else ""}` })
 		row:Checkbox({
 			Label = "Trusted",
@@ -257,7 +257,7 @@ local function buildFriends(tab: any, whitelist: any)
 	for _, other in Players:GetPlayers() do
 		if other ~= player and not listed[other.UserId] then
 			any = true
-			local row = tab:Row()
+			local row = tab:Row({ LiveKey = "player:" .. other.UserId })
 			row:Label({ Text = `{other.DisplayName} (@{other.Name})` })
 			row:SmallButton({ Text = "Add friend", Callback = function() changeWhitelist("WhitelistAdd", other.UserId) end })
 		end
@@ -295,7 +295,13 @@ end
 --------------------------------------------------------------------------------
 
 local function build(ReGui: any, parties: any, whitelist: any, settings: any)
-	removeWindow()
+	if window then
+		sections.Invite:Render(nil, buildInvite)
+		sections.Parties:Render(nil, function(tab) buildParties(tab, parties) end)
+		sections.Friends:Render(nil, function(tab) buildFriends(tab, whitelist) end)
+		sections.Settings:Render(nil, function(tab) buildSettings(tab, settings) end)
+		return
+	end
 	local created: any
 	created = ReGui:TabsWindow({
 		Title = "Party",
@@ -303,12 +309,9 @@ local function build(ReGui: any, parties: any, whitelist: any, settings: any)
 		NoCollapse = true,
 		NoWindowRegistor = true,
 		CloseCallback = function()
-			if window == created then
-				captureState()
-				window = nil
-			end
+			hideWindow()
 			open = false
-			return true
+			return false
 		end,
 	})
 	window = created
@@ -317,16 +320,16 @@ local function build(ReGui: any, parties: any, whitelist: any, settings: any)
 	-- bottom-right by its size instead)
 	frame.Position = if geometry then geometry.position
 		else UDim2.new(1, -16 - frame.Size.X.Offset, 1, -250 - frame.Size.Y.Offset)
-	buildInvite(created:CreateTab({ Name = "Invite" }))
-	buildParties(created:CreateTab({ Name = "Parties" }), parties)
-	buildFriends(created:CreateTab({ Name = "Friends" }), whitelist)
-	buildSettings(created:CreateTab({ Name = "Settings" }), settings)
+	for _, name in { "Invite", "Parties", "Friends", "Settings" } do
+		sections[name] = ReGuiLive.Section(created:CreateTab({ Name = name }))
+	end
+	build(ReGui, parties, whitelist, settings)
 	pcall(function()
 		created.WindowTabSelector:SetActiveTab(activeTab)
 	end)
 end
 
--- Rebuilds with fresh data; bursts of changes coalesce into one rebuild.
+-- Updates retained controls with fresh data; bursts coalesce into one query.
 function refresh()
 	if not open then
 		return
@@ -364,12 +367,13 @@ function PartyWindow.Open(tab: string?)
 		return
 	end
 	open = true
+	if window then window:SetVisible(true) end
 	refresh()
 end
 
 function PartyWindow.Close()
 	open = false
-	removeWindow()
+	hideWindow()
 end
 
 function PartyWindow.Toggle(tab: string?)
