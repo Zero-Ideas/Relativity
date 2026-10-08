@@ -33,7 +33,8 @@ local remotes = ReplicatedStorage:WaitForChild("SpellRemotes")
 local command = remotes:WaitForChild("SpellCommand") :: RemoteFunction
 local castRemote = remotes:WaitForChild("SpellCast") :: RemoteEvent
 local feedbackRemote = remotes:WaitForChild("SpellFeedback") :: RemoteEvent
-local CAST_COOLDOWN = require(Shared.SpellSettings).CastCooldown
+-- (live admin settings: cast cooldown and infinite mana)
+local SpellSettings = require(Shared.SpellSettings)
 local aimRemote = remotes:WaitForChild("SpellAim") :: UnreliableRemoteEvent
 local channelRemote = remotes:WaitForChild("SpellChannel") :: RemoteEvent
 local holdingCast = false
@@ -64,7 +65,7 @@ end)
 local lastCastAt = -math.huge -- (keeps the live cursor streaming after a cast)
 local function sendCast(target: Vector3)
 	local slot = SpellAssemblerGui.GetSelectedSlot()
-	if slot then cooldownDeadlines[slot] = workspace:GetServerTimeNow() + CAST_COOLDOWN end
+	if slot then cooldownDeadlines[slot] = workspace:GetServerTimeNow() + SpellSettings.GetCooldown() end
 	lastCastAt = os.clock()
 	castRemote:FireServer(target)
 end
@@ -1021,7 +1022,7 @@ function SpellAssemblerGui.Cast()
 		-- the charge starts (SpellService), so it must be affordable now.
 		local mana = player:GetAttribute("Mana")
 		local compiled = activeCache.compiled
-		if not compiled or typeof(mana) ~= "number" or mana < compiled.manaCost then
+		if not compiled or (not SpellSettings.InfiniteMana() and (typeof(mana) ~= "number" or mana < compiled.manaCost)) then
 			manaShortEvent:Fire(if compiled then compiled.manaCost else 0)
 			return
 		end
@@ -1041,8 +1042,9 @@ function SpellAssemblerGui.Cast()
 	local character = player.Character
 	if character and activeCache.spec then
 		local compiled = activeCache.compiled
-		if compiled then require(script.Parent.SpellCastGlint).Play(character, compiled.manaCost, mouse.Hit.Position) end
 		SpellCircleVFX.Cast(character, activeCache.spec, 1, mouse.Hit.Position, true, true)
+		-- (after Cast, so the glint follows the sustained circle)
+		if compiled then SpellCircleVFX.PlayGlint(character, compiled.manaCost, mouse.Hit.Position) end
 	end
 end
 
@@ -1070,7 +1072,7 @@ function SpellAssemblerGui.FireFrozen()
 	local frozenSlot = player:GetAttribute("SpellFrozenSlot")
 	if not character or not frozenSlot or SpellAssemblerGui.GetCooldownRemaining(frozenSlot) > 0 or not canCast() then return end
 	local target = player:GetMouse().Hit.Position
-	cooldownDeadlines[frozenSlot] = workspace:GetServerTimeNow() + CAST_COOLDOWN
+	cooldownDeadlines[frozenSlot] = workspace:GetServerTimeNow() + SpellSettings.GetCooldown()
 	lastCastAt = os.clock()
 	channelRemote:FireServer("FireFrozen", target)
 	SpellCircleVFX.FireFrozen(character, target)
@@ -1093,7 +1095,7 @@ function SpellAssemblerGui.StopCast()
 			local charge = SpellRunes.ChargeFromHold(os.clock() - chargeStarted)
 			local compiled = activeCache.compiled
 			local mana = player:GetAttribute("Mana")
-			if compiled and charge > 1 and typeof(mana) == "number"
+			if compiled and charge > 1 and not SpellSettings.InfiniteMana() and typeof(mana) == "number"
 				and mana < compiled.manaCost * (SpellRunes.ChargeEnergyMultiplier(charge) - 1) then
 				charge = 1
 			end

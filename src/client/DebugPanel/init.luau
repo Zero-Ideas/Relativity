@@ -26,6 +26,8 @@
 	              DummySpawner tool).
 	  VFX      -- local ExplosionVFX preview: power, radius, tint; spawn in front,
 	              at the cursor, or a weakest-to-strongest sweep.
+	  Benchmarks -- configurable real projectile batches (up to 50k), patterns,
+	              server-only mode, timing readouts and scoped cancel/clear.
 	  Defaults -- (listed only) max health / walk speed / jump power every
 	              player spawns with.
 	  Admin    -- (listed only) your rank; open the panel to everyone; choose
@@ -52,7 +54,7 @@ local DebugPanel = {}
 
 local TOGGLE_KEY = Enum.KeyCode.F2
 local STATS_INTERVAL = Util.STATS_INTERVAL
-local TAB_ORDER = { "Tools", "Time", "Stats", "Entities", "Chunks", "Dummies", "VFX", "Defaults", "Admin" }
+local TAB_ORDER = { "Tools", "Time", "Stats", "Entities", "Chunks", "Dummies", "VFX", "Benchmarks", "Defaults", "Admin" }
 -- Tabs only listed players ever see (the server checks these requests too).
 local LISTED_ONLY = { Defaults = true, Admin = true }
 

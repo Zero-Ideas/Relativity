@@ -18,9 +18,11 @@
 	                     actionable notification (invite, join request) while
 	                     it's closed badges and rings the bell and plays a ping
 	  Debug   (left)  -- the debug panel (F2), for players allowed to use it
-	  UI      (right) -- switches between the two UIs (selected = Dev)
-	The current mode is also the LocalPlayer's "UiMode" attribute
-	(client-only) for other UI.
+	  Gear    (right) -- the Settings window (SettingsWindow)
+	Which UI shows is the player's "UI mode" setting (Settings window,
+	Interface: Mode 1 = Ours, Mode 2 = Dev), saved with their settings. The
+	current mode is also the LocalPlayer's "UiMode" attribute (client-only)
+	for other UI.
 ]]
 
 local Players = game:GetService("Players")
@@ -33,6 +35,8 @@ local GameHud = require(script.Parent.GameHud)
 local PartyWindow = require(script.Parent.PartyWindow)
 local ServerBrowser = require(script.Parent.ServerBrowser)
 local SpellLibrary = require(script.Parent.SpellLibrary)
+local ClientSettings = require(script.Parent.ClientSettings)
+local SettingsWindow = require(script.Parent.SettingsWindow)
 local Notifications = require(script.Parent.Notifications)
 local DebugPanel = require(script.Parent.DebugPanel)
 local SpellAssemblerGui = require(script.Parent.SpellAssemblerGui)
@@ -45,13 +49,15 @@ local player = Players.LocalPlayer
 -- "Roblox Bell Notifications Icon" (Creator Store decal 129757130172668),
 -- shown through its thumbnail since a decal id isn't an image id
 local BELL_IMAGE = "rbxthumb://type=Asset&id=129757130172668&w=150&h=150"
+-- "Settings Gear Icon (GOOD)" (Creator Store decal 83508141054406, same
+-- maker as the bell), shown through its thumbnail
+local GEAR_IMAGE = "rbxthumb://type=Asset&id=83508141054406&w=150&h=150"
 local PING_SOUND = "rbxasset://sounds/electronicpingshort.wav"
 
 export type Mode = "Ours" | "Dev"
 
 local UiMode = {}
 local mode: Mode = "Ours"
-local uiIcon: any = nil
 
 -- SetCoreGuiEnabled errors until the CoreScripts have registered it.
 local function hideBackpack()
@@ -78,15 +84,20 @@ function UiMode.Get(): Mode
 	return mode
 end
 
+-- (the setting's names for the two modes)
+local SETTING_FOR: { [Mode]: string } = { Ours = "Mode 1", Dev = "Mode 2" }
+
+local function follow()
+	local wanted: Mode = if ClientSettings.Get("UiMode") == "Mode 2" then "Dev" else "Ours"
+	if mode ~= wanted then
+		mode = wanted
+		apply()
+	end
+end
+
+-- Switches the UI (saved as the player's "UI mode" setting).
 function UiMode.Set(newMode: Mode)
-	if mode == newMode then
-		return
-	end
-	mode = newMode
-	apply()
-	if uiIcon then
-		if newMode == "Dev" then uiIcon:select() else uiIcon:deselect() end
-	end
+	ClientSettings.Set("UiMode", SETTING_FOR[newMode])
 end
 
 local function buildTopbar()
@@ -170,23 +181,26 @@ local function buildTopbar()
 	DebugPanel.AccessChanged:Connect(refreshDebug)
 	refreshDebug()
 
-	-- UI switch
-	uiIcon = Icon.new()
-		:setName("UiMode")
+	-- Settings (gear): the player's own settings (SettingsWindow)
+	local settingsIcon = Icon.new()
+		:setName("Settings")
 		:align("Right")
-		:setLabel("UI: Mode 1")
-		:setLabel("UI: Mode 2", "Selected")
-		:setCaption("Switch UI")
-	uiIcon.selected:Connect(function() UiMode.Set("Dev") end)
-	uiIcon.deselected:Connect(function() UiMode.Set("Ours") end)
+		:setImage(GEAR_IMAGE)
+		:setLabel("Settings")
+		:oneClick()
+	settingsIcon.selected:Connect(SettingsWindow.Toggle)
 end
 
 function UiMode.start()
 	hideBackpack()
+	ClientSettings.start() -- (defaults now, saved settings once loaded)
 	task.spawn(MainHud.start) -- (waits for the authored MainGui)
 	GameHud.start()
 	buildTopbar()
 	apply()
+	-- the UI mode is a setting (Settings window, Interface)
+	follow()
+	ClientSettings.Changed:Connect(follow)
 end
 
 return UiMode

@@ -100,6 +100,28 @@ VisualOffload.On("DebugSetTabPublic", function(data, player)
 		DebugAccess.SetTabPublic(player, data.Tab, data.Enabled)
 	end
 end)
+
+-- Admin tab, "Game settings": infinite mana and the spell cooldown
+-- (Shared/SpellSettings reads them). Studio starts with infinite mana and no
+-- cooldown; live servers with normal mana and the default cooldown.
+do
+	local SpellSettings = require(Shared.SpellSettings)
+	local studio = game:GetService("RunService"):IsStudio()
+	ReplicatedStorage:SetAttribute("InfiniteMana", studio)
+	ReplicatedStorage:SetAttribute("SpellCooldown", if studio then 0 else SpellSettings.CastCooldown)
+	VisualOffload.On("DebugSetGameSettings", function(data, player)
+		if not player or not DebugAccess.CanUseTab(player, "Admin") or typeof(data) ~= "table" then
+			return
+		end
+		if typeof(data.InfiniteMana) == "boolean" then
+			ReplicatedStorage:SetAttribute("InfiniteMana", data.InfiniteMana)
+		end
+		local cooldown = data.SpellCooldown
+		if typeof(cooldown) == "number" and cooldown == cooldown then
+			ReplicatedStorage:SetAttribute("SpellCooldown", math.clamp(cooldown, 0, SpellSettings.MaxCooldown))
+		end
+	end)
+end
 local ChunkManager = require(Shared.ChunkManager)
 local Heartbeat = require(Shared.Heartbeat)
 local Entity = require(Shared.Entity)

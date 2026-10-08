@@ -164,6 +164,8 @@ type CastState = {
 	-- the caster
 	FrozenOrigin: Vector3?,
 	FrozenDirection: Vector3?,
+	Glint: any?, -- (its cast glint's handle: SpellCastGlint, PlayGlint)
+	GlintLocked: boolean?,
 	ChargeCap: number?, -- frozen before full charge: keeps drawing up to 1x, never overcharges
 	AssembleStart: number?, -- os.clock when a frozen cloud began reassembling (T)
 	Emitter: Attachment, -- where this cast's sounds play from (follows the main circle)
@@ -907,7 +909,7 @@ local function step(dt: number)
 		cloud = cloud * cloud * (3 - 2 * cloud) -- smoothstep
 		local cloudCentre = origin + direction * HAND_DISTANCE
 		cast.Emitter.WorldPosition = cloudCentre
-		for _, circle in cast.Circles do
+		for circleIndex, circle in cast.Circles do
 			local anchor = circle.Anchor
 			if anchor then
 				circle.OrbitAngle = (circle.OrbitAngle or 0) + ddt * spinBoost * (circle.OrbitSpeed or 0)
@@ -920,6 +922,16 @@ local function step(dt: number)
 			local position = (basis * CFrame.new(offset.X, offset.Y, -distance)).Position
 			local frame = CFrame.lookAt(position, position + direction)
 			local side = circle.Size * sizeMul * (1 - 0.25 * cloud)
+			-- the cast's glint sits on its first circle, moved in this same step;
+			-- once the spell fires (or the cast is no longer charging) it's
+			-- placed one last time and locked there
+			if circleIndex == 1 and cast.Glint and not cast.GlintLocked then
+				cast.Glint:Place(frame, side)
+				if cast.State ~= "charge" then
+					cast.GlintLocked = true
+					cast.Glint:Lock()
+				end
+			end
 			local pieceBrightness = if circle.Ghost then brightness * 0.6 else brightness
 			for index, piece in circle.Pieces do
 				local placed = frame * CFrame.new(0, 0, -PIECE_GAP * (index - 1))
@@ -961,7 +973,6 @@ end
 
 -- Starts drawing a charging circle for `caster` (replacing one in progress).
 function SpellCircleVFX.Begin(caster: Model, spec: any, target: Vector3?, isLocal: boolean?, manaCost: number?)
-	if manaCost then CastGlint.Play(caster, manaCost, target) end
 	local previous = current[caster]
 	if previous then
 		previous.State, previous.StateAge = "cancel", 0
@@ -972,6 +983,22 @@ function SpellCircleVFX.Begin(caster: Model, spec: any, target: Vector3?, isLoca
 		current[caster] = cast
 		cast.ChargeSound = playSound(cast, SOUND_CHARGE)
 		ensureRunning()
+	end
+	if manaCost then SpellCircleVFX.PlayGlint(caster, manaCost, target) end
+end
+
+-- A cast glint (SpellCastGlint) on `caster`'s current spell circle: moved
+-- with the circle in its own step while it charges, locked in place when it
+-- fires. (No circle: it places itself towards `target`.)
+function SpellCircleVFX.PlayGlint(caster: Model, manaCost: number, target: Vector3?)
+	local cast = current[caster]
+	local handle = CastGlint.Play(caster, manaCost, target)
+	if cast and handle then
+		if cast.Glint and not cast.GlintLocked then
+			cast.Glint:Lock() -- (an earlier glint on this circle stays where it is)
+		end
+		cast.Glint = handle
+		cast.GlintLocked = false
 	end
 end
 
@@ -1158,8 +1185,9 @@ VisualOffload.On("SpellCircle", function(data)
 	if data.Phase == "Begin" then
 		SpellCircleVFX.Begin(caster, data.Spec, target, false, if typeof(data.ManaCost) == "number" then data.ManaCost else nil)
 	elseif data.Phase == "Cast" then
-		if data.Sustain == true and typeof(data.ManaSpent) == "number" then CastGlint.Play(caster, data.ManaSpent, target) end
 		SpellCircleVFX.Cast(caster, data.Spec, if typeof(data.Charge) == "number" then data.Charge else 1, target, data.Sustain == true)
+		-- (after Cast, so the glint follows the sustained circle)
+		if data.Sustain == true and typeof(data.ManaSpent) == "number" then SpellCircleVFX.PlayGlint(caster, data.ManaSpent, target) end
 	elseif data.Phase == "Cancel" then
 		SpellCircleVFX.Cancel(caster)
 	elseif data.Phase == "End" then

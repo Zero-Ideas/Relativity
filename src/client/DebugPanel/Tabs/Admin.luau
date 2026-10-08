@@ -7,6 +7,8 @@
 	  * open the debug panel to every player, or back to the allowlist;
 	  * pick which tabs non-listed players get while it's open (Stats and
 	    Dummies by default). Listed players always see every tab;
+	  * game settings: infinite mana, and the spell cooldown (seconds; 0 for
+	    none). Studio starts with infinite mana and no cooldown;
 	  * player access: pick any player you outrank and untick tabs to take
 	    them from that player alone (Defaults and Admin included) -- the
 	    master's tabs can't be touched. Stored on their Player as the
@@ -23,9 +25,10 @@ local Players = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local Shared = ReplicatedStorage:WaitForChild("Shared")
 local VisualOffload = require(Shared.VisualOffload)
+local SpellSettings = require(Shared.SpellSettings)
 
 -- Mirrors server/DebugAccess.Tabs and RankNames.
-local TABS = { "Tools", "Time", "Stats", "Entities", "Chunks", "Dummies", "VFX" }
+local TABS = { "Tools", "Time", "Stats", "Entities", "Chunks", "Dummies", "VFX", "Benchmarks" }
 local ALL_TABS = table.clone(TABS) -- every tab one player can be denied (DebugAccess.AllTabs)
 table.insert(ALL_TABS, "Defaults")
 table.insert(ALL_TABS, "Admin")
@@ -103,6 +106,57 @@ return function(window)
 	ReplicatedStorage:GetAttributeChangedSignal("DebugPublic"):Connect(refresh)
 	ReplicatedStorage:GetAttributeChangedSignal("DebugPublicTabs"):Connect(refresh)
 	refresh()
+
+	----------------------------------------------------------------------------
+	-- Game settings: infinite mana and the spell cooldown (Shared/SpellSettings;
+	-- on by default in Studio: infinite mana, no cooldown)
+	----------------------------------------------------------------------------
+	tab:Separator({ Text = "Game settings" })
+	local manaBox = tab:Checkbox({
+		Label = "Infinite mana",
+		Value = SpellSettings.InfiniteMana(),
+		Callback = function(_, value: boolean)
+			if value ~= SpellSettings.InfiniteMana() then
+				VisualOffload.Fire("DebugSetGameSettings", { InfiniteMana = value })
+			end
+		end,
+	})
+	local cooldownRow = tab:Row()
+	local cooldownText = ""
+	local cooldownInput = cooldownRow:InputText({
+		Label = "",
+		Placeholder = "Seconds (0 = none)",
+		Callback = function(_, text: string)
+			cooldownText = text
+		end,
+	})
+	cooldownRow:SmallButton({
+		Text = "Apply cooldown",
+		Callback = function()
+			local seconds = tonumber(cooldownText)
+			if seconds and seconds >= 0 then
+				VisualOffload.Fire("DebugSetGameSettings", { SpellCooldown = seconds })
+			end
+		end,
+	})
+	cooldownRow:SmallButton({
+		Text = "Default",
+		Callback = function()
+			VisualOffload.Fire("DebugSetGameSettings", { SpellCooldown = SpellSettings.CastCooldown })
+		end,
+	})
+	local settingsNote = tab:Label({ Text = "" })
+	local function refreshSettings()
+		if manaBox.Value ~= SpellSettings.InfiniteMana() then
+			manaBox:SetTicked(SpellSettings.InfiniteMana())
+		end
+		local cooldown = SpellSettings.GetCooldown()
+		settingsNote.Text = `Spell cooldown: {if cooldown <= 0 then "none" else `{cooldown}s`} (default {SpellSettings.CastCooldown}s, max {SpellSettings.MaxCooldown}s). Mana: {if SpellSettings.InfiniteMana() then "infinite" else "normal"}.`
+		pcall(function() cooldownInput:SetValue(tostring(cooldown)) end)
+	end
+	ReplicatedStorage:GetAttributeChangedSignal("InfiniteMana"):Connect(refreshSettings)
+	ReplicatedStorage:GetAttributeChangedSignal("SpellCooldown"):Connect(refreshSettings)
+	refreshSettings()
 
 	----------------------------------------------------------------------------
 	-- Player access: take tabs from one player you outrank

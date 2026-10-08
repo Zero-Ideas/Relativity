@@ -6,6 +6,7 @@ local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local RunService = game:GetService("RunService")
 local Shared = ReplicatedStorage:WaitForChild("Shared")
 local Entity = require(Shared.Entity)
+local SpellSettings = require(Shared.SpellSettings)
 
 -- Retire the old per-character stamina/sprint writer, preserving its source.
 local dataFolder = game:GetService("StarterPlayer").StarterCharacterScripts:FindFirstChild("DataFolder")
@@ -44,6 +45,8 @@ end
 
 function Resources.Consume(player: Player, resource: string, amount: number): boolean
 	if (resource ~= "Mana" and resource ~= "Stamina") or not finite(amount) or amount < 0 then return false end
+	-- (admin game setting, on by default in Studio: casting costs nothing)
+	if resource == "Mana" and SpellSettings.InfiniteMana() then return true end
 	local current = player:GetAttribute(resource)
 	if not finite(current) or current < amount then return false end
 	player:SetAttribute(resource, current - amount)

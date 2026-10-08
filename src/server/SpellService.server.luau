@@ -19,7 +19,8 @@ local SpellRuntime = require(script.Parent:WaitForChild("SpellRuntime"))
 local BeamHandler = require(script.Parent:WaitForChild("Projectile"):WaitForChild("BeamProjectileHandler"))
 
 local PlayerResources = require(script.Parent.PlayerResources)
-local CAST_INTERVAL = require(Shared.SpellSettings).CastCooldown
+-- (the cast cooldown is a live admin setting: SpellSettings.GetCooldown())
+local SpellSettings = require(Shared.SpellSettings)
 local COMMAND_INTERVAL = 0.15
 
 local remoteFolder = ReplicatedStorage:FindFirstChild("SpellRemotes") or Instance.new("Folder")
@@ -103,7 +104,7 @@ local lastCommand: { [Player]: number } = {}
 local function coolingDown(player: Player, slot: number?): boolean
 	local key = slot or SpellStore.GetActiveSlot(player)
 	local previous = key and lastCast[player] and lastCast[player][key]
-	return previous ~= nil and os.clock() - previous < CAST_INTERVAL
+	return previous ~= nil and os.clock() - previous < SpellSettings.GetCooldown()
 end
 
 local function markCast(player: Player, slot: number?, manaSpent: number)
@@ -111,7 +112,7 @@ local function markCast(player: Player, slot: number?, manaSpent: number)
 	local deadlines = lastCast[player]
 	if not deadlines then deadlines = {}; lastCast[player] = deadlines end
 	deadlines[slot] = os.clock()
-	local deadline = workspace:GetServerTimeNow() + CAST_INTERVAL
+	local deadline = workspace:GetServerTimeNow() + SpellSettings.GetCooldown()
 	player:SetAttribute("SpellCooldownEndsAt" .. slot, deadline)
 	feedback:FireClient(player, { Accepted = true, Slot = slot, EndsAt = deadline, ManaSpent = manaSpent })
 end

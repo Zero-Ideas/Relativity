@@ -55,7 +55,7 @@ local PUBLIC_TABS_ATTRIBUTE = "DebugPublicTabs"
 
 -- Every panel tab (client/DebugPanel's TAB_ORDER, minus Admin, which is
 -- listed-only), and the ones non-listed players see by default.
-DebugAccess.Tabs = { "Tools", "Time", "Stats", "Entities", "Chunks", "Dummies", "VFX" }
+DebugAccess.Tabs = { "Tools", "Time", "Stats", "Entities", "Chunks", "Dummies", "VFX", "Benchmarks" }
 local publicTabs: { [string]: boolean } = { Stats = true, Dummies = true }
 -- Tabs only listed players get. Everything (these too) can also be taken
 -- from one particular player by someone who outranks them (SetPlayerTab).

@@ -25,6 +25,7 @@ local UserInputService = game:GetService("UserInputService")
 local ContextActionService = game:GetService("ContextActionService")
 
 local SpellEditor = require(script.Parent.SpellAssemblerGui)
+local SpellSettings = require(game:GetService("ReplicatedStorage"):WaitForChild("Shared"):WaitForChild("SpellSettings"))
 local SpellCardPreview = require(script.Parent.SpellCardPreview)
 local SpellCardDecoration = require(script.Parent.SpellCardDecoration)
 local PartyClient = require(script.Parent.PartyClient)
@@ -170,7 +171,7 @@ local function stepBars(dt: number)
 		local show = cost ~= nil and cost > 0 and maxMana > 0 and not SpellEditor.IsCharging()
 		marker.Visible = show
 		if show then
-			local short = mana < (cost :: number) or os.clock() < manaShortUntil
+			local short = not SpellSettings.InfiniteMana() and (mana < (cost :: number) or os.clock() < manaShortUntil)
 			marker.Position = UDim2.new(math.clamp((mana - (cost :: number)) / maxMana, 0, 1), 0, 0.5, 0)
 			marker.BackgroundColor3 = if short then Color3.fromRGB(255, 70, 70) else Color3.new(1, 1, 1)
 		end

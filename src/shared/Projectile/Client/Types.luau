@@ -54,6 +54,8 @@ export type Visual = {
 	-- presentation
 	lastRenderStep: number,
 	inView: boolean,
+	hidden: boolean?, -- beyond the player's render limits (ProjectileClient.SetRenderSettings)
+	parked: boolean?, -- moved out of sight while hidden
 	offscreenSince: number?,
 	culled: boolean,
 	effectCullDelay: number,

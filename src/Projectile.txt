@@ -33,11 +33,11 @@
 --     src/server/Projectile/ApplyPass.luau (89 lines)
 --     src/server/Projectile/Parallel.luau (1074 lines)
 --     src/server/Projectile/init.luau (1546 lines)
---     src/server/Projectile/BeamProjectileHandler.luau (351 lines)
+--     src/server/Projectile/BeamProjectileHandler.luau (359 lines)
 --     src/server/ProjectileQuota.luau (41 lines)
 --     src/server/ProjectileWorkerBootstrap.server.luau (183 lines)
 --   Client prediction and visuals
---     src/shared/Projectile/Client/Types.luau (79 lines)
+--     src/shared/Projectile/Client/Types.luau (81 lines)
 --     src/shared/Projectile/Client/Prediction.luau (147 lines)
 --     src/shared/Projectile/Client/View.luau (55 lines)
 --     src/shared/Projectile/Client/DebugRays.luau (42 lines)
@@ -45,7 +45,7 @@
 --     src/shared/Projectile/Client/VisualModel.luau (571 lines)
 --     src/shared/Projectile/Client/BeamGeometry.luau (116 lines)
 --     src/shared/Projectile/Client/BeamVisual.luau (520 lines)
---     src/shared/Projectile/Client/init.luau (746 lines)
+--     src/shared/Projectile/Client/init.luau (841 lines)
 
 -- =============================================================================
 -- SECTION: Shared foundations
@@ -9832,9 +9832,17 @@ Heartbeat.Connect(function(globalDt: number)
 		local channel = channels[index]
 		local player, character = channel.Player, channel.Character
 		local humanoid = character:FindFirstChildOfClass("Humanoid")
-		local tool = character:FindFirstChild("SpellAssembler")
+		-- spells cast without a Tool now: a channel only ends early if another
+		-- weapon is taken out (same rule as SpellService.canCastSpells)
+		local otherTool = false
+		for _, child in character:GetChildren() do
+			if child:IsA("Tool") and child.Name ~= "SpellAssembler" then
+				otherTool = true
+				break
+			end
+		end
 		if channel.Remaining <= 1e-8 or not player.Parent or player.Character ~= character
-			or not humanoid or humanoid.Health <= 0 or not tool or not tool:IsA("Tool")
+			or not humanoid or humanoid.Health <= 0 or otherTool
 			or now - (lastInput[player] or 0) > INPUT_TIMEOUT or now - channel.Started >= 60 then
 			table.remove(channels, index)
 			continue
@@ -10165,6 +10173,8 @@ export type Visual = {
 	-- presentation
 	lastRenderStep: number,
 	inView: boolean,
+	hidden: boolean?, -- beyond the player's render limits (ProjectileClient.SetRenderSettings)
+	parked: boolean?, -- moved out of sight while hidden
 	offscreenSince: number?,
 	culled: boolean,
 	effectCullDelay: number,
@@ -11867,8 +11877,22 @@ local DEFAULT_MAX_REAL_LIFETIME = 60
 -- GlobalTimeScale cannot collapse previously staggered cohorts onto one frame.
 local MAX_VISUAL_UPDATES_PER_FRAME = 2500
 local SMOOTH_RADIUS = 100
-local MAX_SMOOTH_PROJECTILES = 500
 local SMOOTH_SET_REFRESH_INTERVAL = 0.1 -- real seconds; selection is presentation-only
+
+-- Player-adjustable render limits (client/ClientSettings; SetRenderSettings):
+--   MaxDistance -- projectiles farther from the camera are hidden
+--   MaxRendered -- hard admission limit for live visuals (including beams).
+--                  Excess spawn events are dropped before construction.
+--   MaxSmooth   -- the nearest this many (within SMOOTH_RADIUS) tween every
+--                  frame ("high resolution"); the rest move on the scheduler
+-- A distance-hidden visual is parked out of sight with its effects suspended and
+-- keeps simulating; it re-enters like any visual coming back on screen.
+-- Beams aren't hidden (they draw through BeamVisual).
+--   MaxUpdates  -- on-screen redraws per frame (the round-robin budget;
+--                  presentation only: positions come from elapsed time, so a
+--                  visual left waiting catches up exactly on its next turn)
+local renderSettings = { MaxDistance = 2048, MaxRendered = 5000, MaxSmooth = 500, MaxUpdates = MAX_VISUAL_UPDATES_PER_FRAME }
+local PARK_POSITION = Vector3.new(0, -1e5, 0)
 local DEFAULT_SMOOTH_DURATION = 1 / 60
 
 local clientRendering = false
@@ -11885,6 +11909,9 @@ local smoothVisuals: { Visual } = {}
 local nextSmoothSetRefresh = 0
 
 local function visualInView(visual: Types.Visual, position: Vector3): boolean
+	if visual.hidden then
+		return false -- (beyond the render limits)
+	end
 	if visual.rig and visual.rig.beam then
 		local center, radius = BeamVisual.GetBounds(visual, position, globalSimulationClock)
 		return View.contains(center, radius)
@@ -11902,10 +11929,28 @@ local function refreshSmoothVisuals(now: number)
 	end
 	nextSmoothSetRefresh = now + SMOOTH_SET_REFRESH_INTERVAL
 
+	debug.profilebegin("ProjectileClient.RefreshSmoothSet")
+	-- Admission already enforces MaxRendered. Only distance visibility needs
+	-- refreshing; never sort every projectile to choose a rendered subset.
+	do
+		local camera = workspace.CurrentCamera
+		local eye = if camera then camera.CFrame.Position else Vector3.zero
+		local maxDistanceSq = renderSettings.MaxDistance * renderSettings.MaxDistance
+		for _, visual in visuals do
+			if visual.rig and visual.rig.beam then
+				visual.hidden = false
+				continue
+			end
+			local offset = visual.position - eye
+			local distanceSq = offset:Dot(offset)
+			visual.hidden = distanceSq > maxDistanceSq
+		end
+	end
+
 	local player = Players.LocalPlayer
 	local character = player and player.Character
 	local root = character and (character:FindFirstChild("HumanoidRootPart") or character.PrimaryPart)
-	debug.profilebegin("ProjectileClient.RefreshSmoothSet")
+	local MAX_SMOOTH_PROJECTILES = renderSettings.MaxSmooth
 	-- Keep only the nearest K candidates in a max-heap, so this never sorts
 	-- every nearby visual when only MAX_SMOOTH_PROJECTILES can be selected.
 	local heapVisuals: { Visual } = table.create(MAX_SMOOTH_PROJECTILES)
@@ -11953,8 +11998,10 @@ local function refreshSmoothVisuals(now: number)
 		for _, visual in visuals do
 			local offset = visual.position - rootPosition
 			local distanceSq = offset:Dot(offset)
-			if distanceSq <= radiusSq and View.contains(visual.position) then
-				if heapSize < MAX_SMOOTH_PROJECTILES then
+			if distanceSq <= radiusSq and not visual.hidden and View.contains(visual.position) then
+				if MAX_SMOOTH_PROJECTILES <= 0 then
+					continue
+				elseif heapSize < MAX_SMOOTH_PROJECTILES then
 					push(visual, distanceSq)
 				elseif distanceSq < heapDistances[1] then
 					replaceRoot(visual, distanceSq)
@@ -12004,7 +12051,7 @@ end
 -- flashing in mid-air. The bullet DISAPPEARS instantly, but the actual
 -- :Destroy() waits out the longest lifetime among the effects that were
 -- emitting (or DestroyDelay, whichever is longer) -- see VisualModel.Retire.
-local function destroyVisual(id: number)
+local function destroyVisual(id: number, discard: boolean?)
 	local visual = visuals[id]
 	if not visual then
 		return
@@ -12013,7 +12060,16 @@ local function destroyVisual(id: number)
 	deferredVisuals[id] = nil
 	visualCount -= 1
 	visualTombstones += 1
-	VisualModel.Retire(visual, visual.destroyDelay)
+	if discard then
+		-- Settings eviction is not a hit: no draining beam tail or lingering
+		-- effects should continue doing presentation work beyond the new cap.
+		if not BeamVisual.Discard(visual) then
+			visual.waitForParticles, visual.waitForTrails = false, false
+			VisualModel.Retire(visual, 0)
+		end
+	else
+		VisualModel.Retire(visual, visual.destroyDelay)
+	end
 end
 
 -- Adopts an authoritative pose as of NOW. Every server pose (spawn, bounce,
@@ -12034,6 +12090,9 @@ local function onSpawn(data: Protocol.SpawnPayload)
 	if visuals[data.Id] then
 		return
 	end
+	-- Rejected shots have no model, rig, predictor, deferred entry or queue.
+	-- Later move/hit/sync packets already ignore IDs absent from `visuals`.
+	if visualCount >= renderSettings.MaxRendered then return end
 	-- Beams are timestamped, but catching up the transit time on arrival put
 	-- a fast packet tens of studs downrange on its first frame. Like every
 	-- other projectile, start from the received pose: shift this packet's
@@ -12046,7 +12105,10 @@ local function onSpawn(data: Protocol.SpawnPayload)
 	end
 	local model, rig = VisualModel.Build(data)
 	local now = os.clock()
-	local inView = View.contains(data.Position, data.Beam and data.Beam.Length)
+	local camera = workspace.CurrentCamera
+	local hidden = not data.Beam and camera ~= nil
+		and (data.Position - camera.CFrame.Position).Magnitude > renderSettings.MaxDistance
+	local inView = not hidden and View.contains(data.Position, data.Beam and data.Beam.Length)
 	local visual: Visual = {
 		id = data.Id,
 		model = model,
@@ -12088,6 +12150,8 @@ local function onSpawn(data: Protocol.SpawnPayload)
 		smoothTransform = false,
 		transformElapsed = 0,
 		transformDuration = 0,
+		hidden = hidden,
+		parked = false,
 	}
 	BeamVisual.Attach(visual)
 	if data.ActivateParticlesOnCreate then
@@ -12234,6 +12298,7 @@ local function reenterView(visual: Visual, now: number)
 	BeamVisual.Reset(visual)
 	VisualModel.Place(visual, visual.position, visual.velocity)
 	visual.culled = false
+	visual.parked = false
 	visual.resumeEffectsOnNextUpdate = now
 	visual.offscreenSince = nil
 end
@@ -12243,6 +12308,7 @@ end
 local function recoverStalePose(visual: Visual, position: Vector3, now: number)
 	local rig = visual.rig
 	if rig and rig.beam and rig.beam.group then return end -- shared geometry is flushed once per channel
+	if visual.parked then return end -- (hidden by the render limits: already out of sight)
 	-- Native culling uses the Instance's last rendered bounds. If a camera turn
 	-- exposes those stale bounds while the current trajectory is still outside
 	-- view, move them outside too. No scene unparenting/visibility override.
@@ -12261,6 +12327,14 @@ end
 local function updateOffscreen(visual: Visual, now: number)
 	local since: number = if visual.inView then now else visual.offscreenSince or now
 	visual.offscreenSince = since
+	if visual.hidden and not visual.parked then
+		-- beyond the render limits: out of sight at once, effects off (it's
+		-- placed back where it really is when it comes back)
+		VisualModel.SuspendEffects(visual)
+		visual.culled = true
+		VisualModel.Place(visual, PARK_POSITION, visual.velocity)
+		visual.parked = true
+	end
 	if not visual.culled and now - since >= visual.effectCullDelay then
 		VisualModel.SuspendEffects(visual)
 		visual.culled = true
@@ -12399,7 +12473,7 @@ local function checkPassBys()
 	end
 end
 
--- Visits visuals round-robin until MAX_VISUAL_UPDATES_PER_FRAME on-screen
+-- Visits visuals round-robin until renderSettings.MaxUpdates on-screen
 -- transforms have been spent (or every visual was visited once).
 local function renderStep(globalDt: number)
 	globalSimulationClock += globalDt
@@ -12412,7 +12486,8 @@ local function renderStep(globalDt: number)
 	local slotCount = #visualOrder
 	local inspected = 0
 	local transformed = 0
-	while inspected < slotCount and transformed < MAX_VISUAL_UPDATES_PER_FRAME do
+	local budget = math.max(renderSettings.MaxUpdates, 1)
+	while inspected < slotCount and transformed < budget do
 		if visualCursor > slotCount then
 			visualCursor = 1
 		end
@@ -12525,9 +12600,39 @@ end
 function ProjectileClient.GetStats()
 	return {
 		Visuals = visualCount,
-		VisualUpdatesPerFrame = MAX_VISUAL_UPDATES_PER_FRAME,
-		SmoothLimit = MAX_SMOOTH_PROJECTILES,
+		VisualUpdatesPerFrame = renderSettings.MaxUpdates,
+		SmoothLimit = renderSettings.MaxSmooth,
 	}
+end
+
+-- Changes the render limits (any of MaxDistance, MaxRendered, MaxSmooth,
+-- MaxUpdates);
+-- they apply from the next selection refresh (~0.1 s).
+function ProjectileClient.SetRenderSettings(settings: { [string]: number })
+	for key in renderSettings do
+		local value = settings[key]
+		if typeof(value) == "number" and value == value and value >= 0 and value < math.huge then
+			renderSettings[key] = if key == "MaxRendered" then math.floor(value) else value
+		end
+	end
+	-- Lowering the cap takes effect now. Keep oldest admissions; retire the
+	-- newest excess without impact VFX, and never keep hidden simulation slots.
+	if visualCount > renderSettings.MaxRendered then
+		for index = #visualOrder, 1, -1 do
+			if visuals[visualOrder[index]] then destroyVisual(visualOrder[index], true) end
+			if visualCount <= renderSettings.MaxRendered then break end
+		end
+		local retained: {Visual} = {}
+		for _, visual in smoothVisuals do
+			if visuals[visual.id] == visual then table.insert(retained, visual) end
+		end
+		smoothVisuals = retained
+	end
+	nextSmoothSetRefresh = 0
+end
+
+function ProjectileClient.GetRenderSettings(): { [string]: number }
+	return table.clone(renderSettings)
 end
 
 return ProjectileClient
