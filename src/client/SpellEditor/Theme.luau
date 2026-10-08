@@ -16,6 +16,7 @@ Theme.Colors = {
 	accent = Color3.fromRGB(176, 120, 255),
 	good = Color3.fromRGB(96, 222, 150),
 	bad = Color3.fromRGB(255, 96, 116),
+	warn = Color3.fromRGB(255, 190, 80),
 	selection = Color3.fromRGB(255, 255, 255),
 }
 

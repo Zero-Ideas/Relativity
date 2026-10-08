@@ -21,6 +21,8 @@
 	 entity:GetPositionAt(realTime) -> Vector3  (rewound position; see history below)
 	 entity:OnUpdate(fn(dt, entity)) -> connection-like {Disconnect}
 	 entity:SetTimeScale(scale) / :GetEffectiveTimeScale()
+	 entity:RefreshMovement()                 (reapply walk/jump after a Humanoid
+	                                         SpellWalk / SpellJump attribute change)
 	 entity:AddTag(tag) / :RemoveTag(tag) / :HasTag(tag)
 	 entity:AddDamageModifier(fn) / :AddOutgoingModifier(fn) -> {Disconnect}
 	 entity:TakeDamage(amount, info?) -> finalAmount
@@ -497,13 +499,26 @@ function Entity:_refreshHumanoidScale()
 		return
 	end
 	self._lastHumanoidScale = scale
-	humanoid.WalkSpeed = (self._baseWalkSpeed or 16) * (humanoid:GetAttribute("SprintMultiplier") or 1) * scale
+	-- SpellWalk / SpellJump: body-effect multipliers (server/SpellBody: Haste,
+	-- Slow, Root); a player's own client applies them to its character too
+	local spellWalk = humanoid:GetAttribute("SpellWalk")
+	local spellJump = humanoid:GetAttribute("SpellJump")
+	local walk = if typeof(spellWalk) == "number" then spellWalk else 1
+	local jump = if typeof(spellJump) == "number" then spellJump else 1
+	humanoid.WalkSpeed = (self._baseWalkSpeed or 16) * (humanoid:GetAttribute("SprintMultiplier") or 1) * walk * scale
 	if humanoid.UseJumpPower then
-		humanoid.JumpPower = (self._baseJumpPower or 50) * scale
+		humanoid.JumpPower = (self._baseJumpPower or 50) * jump * scale
 	else
 		-- jump height scales with time² (h = v²/2g with both v and g dilated)
-		humanoid.JumpHeight = (self._baseJumpPower or 7.2) * scale * scale
+		humanoid.JumpHeight = (self._baseJumpPower or 7.2) * jump * jump * scale * scale
 	end
+end
+
+-- Reapplies walk speed / jump now (after the Humanoid's SpellWalk /
+-- SprintMultiplier attributes changed), not just on the next time-scale change.
+function Entity:RefreshMovement()
+	self._lastHumanoidScale = nil
+	self:_refreshHumanoidScale()
 end
 
 --------------------------------------------------------------------------------

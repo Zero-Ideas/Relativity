@@ -1,15 +1,22 @@
 --!strict
 --[[
-	Spell circle editor: a full-screen whiteboard for building spell cards,
-	plus a compact casting HUD. MainHud launches it without a Tool.
-	Public API: start, Open, Close, Toggle, SelectSlot, GetState, StateChanged,
+	Spell circle editor: a full-screen whiteboard for building spells, plus a
+	compact casting HUD. MainHud launches it without a Tool.
+	Public API: start, Open, Close, Toggle, EditEquipped, EditSpell,
+	NewLibrarySpell, SetLibraryOpener, SelectSlot, GetState, StateChanged,
 	Cast, StopCast, CancelCast. Equip/Unequip preserve old Tool compatibility.
 
-	Layout: top bar (name, card slots, save/equip) over a row of
-	[Toolbox | Board | Inspector]. Both side panels resize by dragging their
-	inner edge and collapse from the top bar. The pieces live in SpellEditor/:
-	Document (graph + undo), Board (whiteboard), Panels (toolbox, inspector,
-	problems).
+	E (outside the editor) edits the equipped spell: a library spell in place,
+	an Encyclopedia one as a copy that Save adds to the library. With nothing
+	equipped it starts a new spell. Unsaved work is never thrown away by E:
+	the editor reopens on it, and a second E within a few seconds switches.
+
+	Layout: a slim top bar (Library, name, status, undo/redo, panel toggles,
+	Save, guide, close) over a row of [Toolbox | Board | Inspector]. Both
+	side panels resize by dragging their inner edge and collapse from the top
+	bar; the ? button opens the guide over the board. The pieces live in
+	SpellEditor/: Document (graph + undo), Board (whiteboard), Panels
+	(toolbox, inspector, problems).
 
 	While the editor is open its root frame is Active, so mouse input never
 	reaches the camera, and movement keys are sunk through
@@ -75,7 +82,7 @@ local selectingCard = false
 local pendingActiveSlot: number? = nil
 
 local SLOT_COUNT = 5
-local TOP_BAR = 52
+local TOP_BAR = 48
 local HANDLE = 6
 local LEFT_RANGE = Vector2.new(200, 480)
 local RIGHT_RANGE = Vector2.new(240, 520)
@@ -112,9 +119,15 @@ local activeLabel: TextLabel? = nil
 local toast: TextLabel? = nil
 local nameBox: TextBox? = nil
 local saveButton: TextButton? = nil
+local statusChip: TextButton? = nil
+local modeLabel: TextLabel? = nil
+local helpFrame: Frame? = nil
 local zoomLabel: TextLabel? = nil
 local ghost: TextLabel? = nil
-local slotButtons: { TextButton } = {}
+-- opens the spell library window (UiMode wires it: SpellLibrary requires us)
+local libraryOpener: (() -> ())? = nil
+-- E pressed over unsaved work: a second E before this switches anyway
+local discardArmed: { until_: number, id: string? }? = nil
 local toolboxFrame: Frame? = nil
 local inspectorFrame: Frame? = nil
 local viewport: Frame? = nil
@@ -201,19 +214,35 @@ end
 
 local function updateTopBar()
 	local dirty = savedSignature ~= signature()
-	for slot, button in slotButtons do
-		local record = slotRecord(slot)
-		local active = (pendingActiveSlot or serverState.activeSlot) == slot
-		button.Text = `{slot}  {if record then record.name else "Empty"}{if active then "  ◆" else ""}`
-		button.BackgroundColor3 = if selectedSlot == slot and not libraryMode then Colors.accent:Lerp(Colors.panel, 0.45) else Colors.panel2
-		button.TextColor3 = if record then Colors.text else Colors.muted
-	end
 	if saveButton then
 		local available = serverState.available == true
-		local target = if libraryMode then "library" else tostring(selectedSlot)
-		saveButton.Text = if savingCard then "Saving…" elseif not available then "Save unavailable" elseif dirty then `Save to {target} •` else "Saved"
+		saveButton.Text = if savingCard then "Saving…" elseif not available then "Unavailable" elseif dirty then "Save" else "Saved ✓"
 		saveButton.BackgroundColor3 = if compiledOk and dirty and available and not savingCard then Color3.fromRGB(58, 128, 86) else Colors.panel3
 		saveButton.AutoButtonColor = compiledOk and available and not savingCard
+	end
+	if modeLabel then
+		local where = if libraryMode then (if editingSpellId then "Library spell" else "New spell · Save adds it to your library") else `Hotbar slot {selectedSlot}`
+		modeLabel.Text = where .. (if dirty then "  ·  unsaved" else "")
+	end
+	if statusChip then
+		local warnings = if analysis and analysis.warnings then #analysis.warnings else 0
+		local mana = if analysis then `{analysis.manaCost} mana` else ""
+		local color
+		if #errors > 0 then
+			statusChip.Text = `✖  {#errors} problem{if #errors == 1 then "" else "s"}`
+			color = Colors.bad
+		elseif warnings > 0 then
+			statusChip.Text = `⚠  {mana} · {warnings} warning{if warnings == 1 then "" else "s"}`
+			color = Colors.warn
+		else
+			statusChip.Text = `✓  {mana}`
+			color = Colors.good
+		end
+		statusChip.TextColor3 = color:Lerp(Color3.new(1, 1, 1), 0.25)
+		statusChip.BackgroundColor3 = color:Lerp(Colors.panel, 0.8)
+	end
+	if nameBox then
+		nameBox.PlaceholderText = SpellCompiler.SuggestName(doc.graph)
 	end
 	local displaySlot = pendingActiveSlot or serverState.activeSlot
 	local active = displaySlot and slotRecord(displaySlot)
@@ -316,6 +345,7 @@ local function saveCard(): boolean
 		local result = invoke("SaveSpell", { id = editingSpellId, name = currentName(), graph = doc.graph })
 		savingCard = false
 		if result.state then serverState = result.state end
+		local wasNew = editingSpellId == nil
 		if result.ok then
 			editingSpellId = result.id or editingSpellId
 			for _, spell in serverState.library or {} do
@@ -328,6 +358,28 @@ local function saveCard(): boolean
 		end
 		applyServerResult(result)
 		refresh()
+		-- nothing equipped yet: a brand-new spell goes on the first free box
+		-- and is selected, so it casts straight away
+		if result.ok and wasNew and editingSpellId and not serverState.activeSlot then
+			local free = nil
+			for slot = 1, SLOT_COUNT do
+				if not slotRecord(slot) then
+					free = slot
+					break
+				end
+			end
+			if free then
+				task.wait(COMMAND_GAP)
+				local equipped = invoke("Equip", { slot = free, ref = "c:" .. editingSpellId })
+				if equipped.state then serverState = equipped.state end
+				if equipped.ok then
+					task.wait(COMMAND_GAP)
+					equipSlot(free)
+				else
+					applyServerResult(equipped)
+				end
+			end
+		end
 		return result.ok == true
 	end
 	local result = invoke("SaveCard", { slot = selectedSlot, name = currentName(), graph = doc.graph })
@@ -510,6 +562,23 @@ end
 -- Build
 --------------------------------------------------------------------------------
 
+local function iconButton(parent: Instance, text: string, order: number, callback: () -> ()): TextButton
+	local button = Theme.button(parent, text, {
+		Size = UDim2.fromOffset(32, 32),
+		LayoutOrder = order,
+		BackgroundColor3 = Colors.panel2,
+		TextSize = 16,
+	})
+	button.Activated:Connect(callback)
+	return button
+end
+
+local function setHelpVisible(on: boolean)
+	if helpFrame then
+		helpFrame.Visible = on
+	end
+end
+
 local function buildTopBar(parent: Frame)
 	local bar = Theme.make("Frame", {
 		Name = "TopBar",
@@ -517,93 +586,184 @@ local function buildTopBar(parent: Frame)
 		BackgroundColor3 = Colors.panel,
 		BorderSizePixel = 0,
 	}, parent)
-	Theme.make("Frame", { Position = UDim2.new(0, 0, 1, -1), Size = UDim2.new(1, 0, 0, 1), BackgroundColor3 = Colors.line, BackgroundTransparency = 0.5, BorderSizePixel = 0 }, bar)
+	Theme.make("Frame", { Position = UDim2.new(0, 0, 1, -1), Size = UDim2.new(1, 0, 0, 1), BackgroundColor3 = Colors.line, BackgroundTransparency = 0.6, BorderSizePixel = 0 }, bar)
 
-	-- Everything left of the panel toggles. The slot tabs share whatever width
-	-- the fixed controls leave (see fitTopBar), so Equip/Delete can never be
-	-- pushed off the edge on narrower screens.
-	local leftGroup = Theme.make("Frame", { BackgroundTransparency = 1, Size = UDim2.new(1, -260, 1, 0), ClipsDescendants = true }, bar)
-	local leftList = Theme.list(leftGroup, 8, true)
+	-- left: back to the library, the spell's name, what's being edited
+	local RIGHT_WIDTH = 500
+	local leftGroup = Theme.make("Frame", { BackgroundTransparency = 1, Size = UDim2.new(1, -RIGHT_WIDTH, 1, 0), ClipsDescendants = true }, bar)
+	local leftList = Theme.list(leftGroup, 10, true)
 	leftList.VerticalAlignment = Enum.VerticalAlignment.Center
-	Theme.make("UIPadding", { PaddingLeft = UDim.new(0, 14) }, leftGroup)
-
-	Theme.label(leftGroup, "SPELL CIRCLE", 15, { Font = Theme.FontBold, Size = UDim2.fromOffset(118, 32), TextColor3 = Colors.accent, LayoutOrder = 1 })
+	Theme.make("UIPadding", { PaddingLeft = UDim.new(0, 12) }, leftGroup)
+	local library = Theme.button(leftGroup, "☰  Library", { Size = UDim2.fromOffset(96, 32), LayoutOrder = 1, BackgroundColor3 = Colors.panel2 })
+	library.Activated:Connect(function()
+		SpellAssemblerGui.Close()
+		if libraryOpener then libraryOpener() end
+	end)
 	local box = Theme.make("TextBox", {
-		Size = UDim2.fromOffset(170, 34),
+		Size = UDim2.fromOffset(240, 32),
 		BackgroundColor3 = Colors.panel2,
 		BorderSizePixel = 0,
 		ClearTextOnFocus = false,
-		Font = Theme.FontMedium,
+		Font = Theme.FontBold,
 		PlaceholderText = "Spell name",
 		PlaceholderColor3 = Colors.muted,
 		Text = doc.graph.name,
 		TextColor3 = Colors.text,
-		TextSize = 14,
+		TextSize = 15,
 		TextXAlignment = Enum.TextXAlignment.Left,
+		TextTruncate = Enum.TextTruncate.AtEnd,
 		LayoutOrder = 2,
 	}, leftGroup)
-	Theme.corner(box, 6)
-	Theme.make("UIPadding", { PaddingLeft = UDim.new(0, 10) }, box)
+	Theme.corner(box, 8)
+	Theme.make("UIPadding", { PaddingLeft = UDim.new(0, 10), PaddingRight = UDim.new(0, 10) }, box)
 	box.FocusLost:Connect(function() updateTopBar() end)
 	nameBox = box
+	modeLabel = Theme.label(leftGroup, "", 12, {
+		Size = UDim2.fromOffset(0, 32),
+		AutomaticSize = Enum.AutomaticSize.X,
+		TextColor3 = Colors.muted,
+		LayoutOrder = 3,
+	})
 
-	for slot = 1, SLOT_COUNT do
-		local button = Theme.button(leftGroup, tostring(slot), {
-			Size = UDim2.fromOffset(122, 34),
-			TextSize = 12,
-			TextTruncate = Enum.TextTruncate.AtEnd,
-			LayoutOrder = 10 + slot,
-		})
-		button.Activated:Connect(function() loadSlot(slot) end)
-		slotButtons[slot] = button
-	end
-	local newButton = Theme.button(leftGroup, "New", { Size = UDim2.fromOffset(56, 34), LayoutOrder = 3 })
-	newButton.Activated:Connect(newSpell)
-	local save = Theme.button(leftGroup, "Save", { Size = UDim2.fromOffset(104, 34), LayoutOrder = 4 })
-	save.Activated:Connect(saveCard)
-	saveButton = save
-	local equip = Theme.button(leftGroup, "Equip", { Size = UDim2.fromOffset(64, 34), LayoutOrder = 5, BackgroundColor3 = Color3.fromRGB(60, 96, 130) })
-	equip.Activated:Connect(function()
-		-- Equipping unsaved edits would cast the old version: save first.
-		if savedSignature ~= signature() then
-			if not saveCard() then return end
-			task.wait(COMMAND_GAP)
-		end
-		equipSlot(selectedSlot)
-	end)
-	local delete = Theme.button(leftGroup, "Delete", { Size = UDim2.fromOffset(64, 34), LayoutOrder = 6, BackgroundColor3 = Color3.fromRGB(100, 40, 56) })
-	delete.Activated:Connect(function()
-		applyServerResult(invoke("DeleteCard", { slot = selectedSlot }))
-	end)
-
-	-- Fixed-width controls above: title 118 + name 170 + New 56 + Save 104 +
-	-- Equip 64 + Delete 64, plus 10 gaps of 8 and 14 left padding.
-	local FIXED_WIDTH = 118 + 170 + 56 + 104 + 64 + 64 + 10 * 8 + 14
-	local function fitTopBar()
-		local slotWidth = math.clamp(math.floor((leftGroup.AbsoluteSize.X - FIXED_WIDTH) / SLOT_COUNT), 44, 130)
-		for _, button in slotButtons do
-			button.Size = UDim2.fromOffset(slotWidth, 34)
-		end
-	end
-	leftGroup:GetPropertyChangedSignal("AbsoluteSize"):Connect(fitTopBar)
-	fitTopBar()
-
-	local rightGroup = Theme.make("Frame", { AnchorPoint = Vector2.new(1, 0), Position = UDim2.new(1, -12, 0, 0), Size = UDim2.new(0, 250, 1, 0), BackgroundTransparency = 1 }, bar)
-	local rightList = Theme.list(rightGroup, 8, true)
+	-- right: status, history, panels, save, guide, close
+	local rightGroup = Theme.make("Frame", {
+		AnchorPoint = Vector2.new(1, 0),
+		Position = UDim2.new(1, -12, 0, 0),
+		Size = UDim2.new(0, RIGHT_WIDTH - 12, 1, 0),
+		BackgroundTransparency = 1,
+	}, bar)
+	local rightList = Theme.list(rightGroup, 6, true)
 	rightList.VerticalAlignment = Enum.VerticalAlignment.Center
 	rightList.HorizontalAlignment = Enum.HorizontalAlignment.Right
-	local toolsToggle = Theme.button(rightGroup, "Toolbox", { Size = UDim2.fromOffset(74, 34), LayoutOrder = 1 })
-	toolsToggle.Activated:Connect(function()
+	local chip = Theme.button(rightGroup, "", {
+		Size = UDim2.fromOffset(0, 30),
+		AutomaticSize = Enum.AutomaticSize.X,
+		LayoutOrder = 1,
+		TextSize = 12,
+		Font = Theme.FontBold,
+	})
+	Theme.corner(chip, 15)
+	Theme.make("UIPadding", { PaddingLeft = UDim.new(0, 12), PaddingRight = UDim.new(0, 12) }, chip)
+	chip.Activated:Connect(function()
+		-- show (or hide) the problem list on the board
+		if problems then
+			problems.expanded = not problems.expanded
+			problems:show(problems.errors or {}, problems.summary or "")
+		end
+	end)
+	statusChip = chip
+	Theme.make("Frame", { BackgroundTransparency = 1, Size = UDim2.fromOffset(6, 1), LayoutOrder = 2 }, rightGroup)
+	iconButton(rightGroup, "↶", 3, function() if doc:undo() then refresh() end end)
+	iconButton(rightGroup, "↷", 4, function() if doc:redo() then refresh() end end)
+	iconButton(rightGroup, "◧", 5, function()
 		panelState.leftOpen = not panelState.leftOpen
 		relayout()
 	end)
-	local inspectToggle = Theme.button(rightGroup, "Inspector", { Size = UDim2.fromOffset(80, 34), LayoutOrder = 2 })
-	inspectToggle.Activated:Connect(function()
+	iconButton(rightGroup, "◨", 6, function()
 		panelState.rightOpen = not panelState.rightOpen
 		relayout()
 	end)
-	local close = Theme.button(rightGroup, "Close [E]", { Size = UDim2.fromOffset(76, 34), LayoutOrder = 3 })
-	close.Activated:Connect(function() SpellAssemblerGui.Close() end)
+	local save = Theme.button(rightGroup, "Save", { Size = UDim2.fromOffset(92, 32), LayoutOrder = 7, Font = Theme.FontBold })
+	save.Activated:Connect(saveCard)
+	saveButton = save
+	iconButton(rightGroup, "?", 8, function()
+		setHelpVisible(not (helpFrame and helpFrame.Visible))
+	end)
+	iconButton(rightGroup, "✕", 9, function() SpellAssemblerGui.Close() end)
+end
+
+-- The guide (? in the top bar): how spells work, the building blocks, how
+-- they compose, and the controls. Each section: heading, then paragraphs.
+local GUIDE: { { string } } = {
+	{ "The idea",
+		"Mana is energy. A Mana Well pushes it along the gold wires; every rune it passes shapes it, and a Vessel at the end turns it into magic. A cast costs the sum of your wells.",
+		"Damage vessels (Orb, Bullet, Beam, Explosion) need a Transform -- Fire, Arcane or Shock -- on the way. Utility vessels (Barrier, Force, Blink, Body Effect, Time Field) work on raw energy; a Transform only colours them.",
+		"Every rune sits inside a zone of its colour. Pick a pen under Zones and drag on the board to draw one." },
+	{ "Flow -- when and where",
+		"If sends all the energy one way; Divide splits it (A runs first, then B).",
+		"Delay waits. Repeat runs what follows several times. For Each runs it once per entity of a list (Scan Area makes lists). Wait Until holds the energy until a condition is true -- traps and mines.",
+		"Conjure Circle opens a new circle somewhere else -- above an impact, over your cursor, on the ground -- and everything after it fires from there.",
+		"Store and Recall are your memory: a point, number and entity per slot, kept for the session and shared by all your spells." },
+	{ "Values -- what and where",
+		"Coloured wires carry values: numbers (blue), true/false (pink), entities (orange), points and directions (green), lists of entities (tan). An entity works as a point (its position) or as a list of one.",
+		"Sensors read the world at the moment their part of the circle runs; Logic and Vector runes compute with them. Inputs marked 'or the setting' use the rune's own setting when nothing is wired.",
+		"Triggers and flow runes output what they saw: On Impact's Point, Surface and Struck, Repeat's Index, For Each's Entity, a conjured Circle's position. Wire them into anything that comes after them." },
+	{ "Triggers",
+		"Wire a vessel's Triggers port into On Impact, On Expire, On Timer or On Proximity. Each releases a share of the vessel's energy mid-flight or where it lands, and runs more of the circle from there. Barriers and Time Fields carry triggers too (On Expire fires when they break or fade)." },
+	{ "Example: Hunter's Sigil",
+		"Bullet → On Impact → Scan Area (from the impact Point) → If Count > 0 → Conjure Circle (at the impact, Height 15) → For Each (the scan's list) → Bullet. Where the bullet lands, a circle opens overhead and fires a bolt at every enemy nearby.",
+		"It's in the Encyclopedia with Starfall, Snare and Phase Step: equip one, press E outside the editor, and it opens here to take apart." },
+	{ "Controls",
+		"Right-drag: pan · Wheel: zoom · F: frame everything",
+		"Drag a rune from the left onto a zone, or click it to drop it mid-board. Drag from a port to wire; drag a connected input to pick its wire up.",
+		"Del: delete · Ctrl+D: duplicate · L: lock · Ctrl+Z / Ctrl+Y: undo / redo · Ctrl+S: save",
+		"Double-click a zone's tab to move it with its runes; drag an edge or corner to resize.",
+		"E outside the editor edits your equipped spell; E or ✕ closes it." },
+}
+
+local function buildHelp(view: Frame)
+	local frame = Theme.make("Frame", {
+		Name = "Guide",
+		AnchorPoint = Vector2.new(0.5, 0.5),
+		Position = UDim2.fromScale(0.5, 0.5),
+		Size = UDim2.fromScale(0.72, 0.84),
+		BackgroundColor3 = Colors.panel,
+		BorderSizePixel = 0,
+		Visible = false,
+		Active = true,
+		ZIndex = 30,
+	}, view)
+	Theme.corner(frame, 12)
+	Theme.stroke(frame, Colors.line, 1, 0.3)
+	Theme.make("UISizeConstraint", { MaxSize = Vector2.new(660, 820), MinSize = Vector2.new(320, 240) }, frame)
+	Theme.label(frame, "Spell circles · guide", 17, {
+		Font = Theme.FontBold,
+		Position = UDim2.fromOffset(18, 12),
+		Size = UDim2.new(1, -70, 0, 26),
+		ZIndex = 31,
+	})
+	local close = Theme.button(frame, "✕", {
+		AnchorPoint = Vector2.new(1, 0),
+		Position = UDim2.new(1, -12, 0, 10),
+		Size = UDim2.fromOffset(30, 30),
+		ZIndex = 31,
+	})
+	close.Activated:Connect(function() setHelpVisible(false) end)
+	local scroll = Theme.make("ScrollingFrame", {
+		Position = UDim2.fromOffset(18, 48),
+		Size = UDim2.new(1, -26, 1, -60),
+		BackgroundTransparency = 1,
+		BorderSizePixel = 0,
+		ScrollBarThickness = 4,
+		ScrollBarImageColor3 = Colors.line,
+		AutomaticCanvasSize = Enum.AutomaticSize.Y,
+		CanvasSize = UDim2.new(),
+		ZIndex = 31,
+	}, frame)
+	Theme.list(scroll, 6)
+	Theme.make("UIPadding", { PaddingRight = UDim.new(0, 10), PaddingBottom = UDim.new(0, 12) }, scroll)
+	local order = 0
+	for sectionIndex, section in GUIDE do
+		for index, text in section do
+			order += 1
+			local heading = index == 1
+			local label = Theme.label(scroll, if heading then string.upper(text) else text, if heading then 12 else 13, {
+				Font = if heading then Theme.FontBold else Theme.Font,
+				TextColor3 = if heading then Colors.accent else Colors.text,
+				TextWrapped = true,
+				TextTruncate = Enum.TextTruncate.None,
+				AutomaticSize = Enum.AutomaticSize.Y,
+				Size = UDim2.new(1, 0, 0, 0),
+				LayoutOrder = order,
+				ZIndex = 32,
+			})
+			if heading and sectionIndex > 1 then
+				Theme.make("UIPadding", { PaddingTop = UDim.new(0, 10) }, label)
+			end
+		end
+	end
+	helpFrame = frame
+	board:addOverlay(frame)
 end
 
 local function buildBoardOverlays(view: Frame)
@@ -647,6 +807,7 @@ local function buildBoardOverlays(view: Frame)
 
 	problems = Panels.Problems.new(view, { onFocus = focusProblem })
 	board:addOverlay(problems.frame)
+	buildHelp(view)
 end
 
 local function buildGui()
@@ -764,7 +925,11 @@ local function buildGui()
 	--------------------------------------------------------------------------
 	UserInputService.InputBegan:Connect(function(input, processed)
 		if input.KeyCode == Enum.KeyCode.E and not processed and (visible or canCast()) then
-			SpellAssemblerGui.Toggle()
+			if visible then
+				SpellAssemblerGui.Close()
+			else
+				SpellAssemblerGui.EditEquipped()
+			end
 			return
 		end
 		if not processed and not visible and canCast() then
@@ -800,6 +965,10 @@ local function buildGui()
 		elseif key == Enum.KeyCode.F then
 			board:frameAll()
 		elseif key == Enum.KeyCode.Escape then
+			if helpFrame and helpFrame.Visible then
+				setHelpVisible(false)
+				return
+			end
 			if board:cancel() then return end
 			if armedZone then armZone(nil) else board:select(nil) end
 		end
@@ -1224,12 +1393,64 @@ function SpellAssemblerGui.EditSpell(id: string)
 	refresh()
 end
 
--- Opens the editor on a fresh circle; Save adds it to the library.
-function SpellAssemblerGui.NewLibrarySpell()
+-- Opens the editor on a fresh circle (or a copy of `graph`); Save adds it to
+-- the library.
+function SpellAssemblerGui.NewLibrarySpell(graph: any?, name: string?)
 	SpellAssemblerGui.Open()
 	libraryMode, editingSpellId = true, nil
 	newSpell()
-	setStatus("New spell: Save adds it to your library.")
+	if graph then
+		doc:load(graph)
+		if nameBox then nameBox.Text = name or "" end
+		if board then
+			board.selection = nil
+			board:frameAll()
+		end
+		refresh()
+		setStatus(`Editing a copy of "{name or "spell"}": Save adds it to your library.`)
+	else
+		setStatus("New spell: Save adds it to your library.")
+	end
+end
+
+-- What E opens: the equipped spell (a library spell in place, an
+-- Encyclopedia one as a copy), else a new spell. Unsaved edits to something
+-- else reopen instead; pressing E again within a few seconds switches anyway.
+function SpellAssemblerGui.EditEquipped()
+	local slot = serverState.activeSlot
+	local record = slot and slotRecord(slot)
+	local ref = record and record.ref
+	local id = if typeof(ref) == "string" and string.sub(ref, 1, 2) == "c:" then string.sub(ref, 3) else nil
+	local target = if typeof(ref) == "string" then ref else "new"
+	local editingSame = libraryMode and id ~= nil and editingSpellId == id
+	-- (edited since it was loaded, and not saved since)
+	local dirty = #doc.undoStack > 0 and savedSignature ~= signature()
+	local armed = discardArmed ~= nil and discardArmed.id == target and os.clock() < discardArmed.until_
+	if editingSame or (dirty and not armed) then
+		SpellAssemblerGui.Open()
+		if dirty and not editingSame then
+			discardArmed = { until_ = os.clock() + 6, id = target }
+			local what = if record then `edit "{record.name}"` else "start a new spell"
+			setStatus(`Unsaved changes here. Save them (Ctrl+S), or close and press E again to {what} anyway.`, false, true)
+		end
+		return
+	end
+	discardArmed = nil
+	if id then
+		SpellAssemblerGui.EditSpell(id)
+	elseif record and record.graph then
+		SpellAssemblerGui.NewLibrarySpell(record.graph, record.name)
+	elseif libraryMode and not editingSpellId and #doc.graph.runes > 0 then
+		SpellAssemblerGui.Open() -- (already on a new spell)
+	else
+		SpellAssemblerGui.NewLibrarySpell()
+	end
+end
+
+-- The Library button opens the spell library (SpellLibrary requires this
+-- module, so it's handed in: UiMode).
+function SpellAssemblerGui.SetLibraryOpener(open: () -> ())
+	libraryOpener = open
 end
 
 function SpellAssemblerGui.GetSelectedSlot(): number?

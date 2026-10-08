@@ -11,8 +11,9 @@
 	grid: COARSE-stud cells, each holding a 4096-bit mask (a 512-byte buffer)
 	of FINE-stud sub-voxels. Masks are interned: a cell points at a shared,
 	never-mutated mask (marking copies, edits and re-interns), so the many
-	identical cells along a floor or wall cost one table slot each -- which
-	matters because every parallel projectile worker bakes its own copy. Every part is marked by its world AABB grown by PAD
+	identical cells along a floor or wall cost one table slot each. One serial
+	publisher bakes the grid; Actors import deduplicated masks and later deltas
+	into local lookup tables. Every part is marked by its world AABB grown by PAD
 	studs, which is what makes a centreline walk safe for sphere sweeps up to
 	MaxRadius: any surface within that distance of the path lies in a marked
 	voxel on the path. Marks are only ever added (a moved static part is
@@ -25,7 +26,8 @@
 	its box is split recursively and each piece tested with GetPartsInPart
 	(the same geometry raycasts hit), so e.g. a tree's mostly-empty bounding
 	box isn't marked solid. While that runs the part counts as dynamic (coarse,
-	conservative); the initial bake finishes it before anything is skipped.
+	conservative). The base grid is usable immediately; expensive shape
+	refinement continues in one background queue and publishes finished cells.
 
 	Dynamic geometry -- anything unanchored, and every part of a model with a
 	Humanoid (characters, dummies, ragdolls) -- is re-marked at coarse level
@@ -47,6 +49,7 @@
 ]]
 
 local Occupancy = {}
+local isWorker = _G.__RelativityOccupancyWorker == true
 
 local COARSE = 64 -- studs per coarse cell edge
 local FINE = 4 -- studs per sub-voxel edge
@@ -103,6 +106,14 @@ local staticMoves: { [BasePart]: number } = {}
 local watchedRoots: { [BasePart]: { BasePart } } = {} -- anchored root -> parts welded to it
 local dynamicStamp = -1 -- workspace.DistributedGameTime the dynamic marks belong to
 local ready = false
+local startupDone = false
+local importedReady = false
+local hasSnapshot = false
+local revision = 0
+local dirtyCells: {[number]: boolean} = {}
+local publishedParts: {[BasePart]: {any}} = {}
+local dirtyParts: {[BasePart]: boolean} = {}
+local schedulePublish: (() -> ())? = nil
 -- While the map has terrain: the scanned area; outside it nothing is skipped.
 local hasTerrain = false
 local terrainMin, terrainMax = Vector3.zero, Vector3.zero
@@ -113,6 +124,22 @@ local stats = { Checks = 0, Skipped = 0, Coarse = 0, StaticCells = 0, DistinctMa
 	LargestDynamic = nil :: string?, -- (diagnostic: the biggest moving part, by name)
 }
 local blockedByMoving = false -- set by fineOccupied when a moving part's cell is what blocked
+local refineCpu, refineProbes, refineYields = 0, 0, 0
+
+local function setStatic(key: number, mask: buffer)
+	if static[key] == mask then return end
+	static[key] = mask
+	if not isWorker then
+		dirtyCells[key] = true
+		if schedulePublish then schedulePublish() end
+	end
+end
+
+local function rememberPart(part: BasePart)
+	publishedParts[part] = {part, part.CFrame, part.Size}
+	dirtyParts[part] = true
+	if schedulePublish then schedulePublish() end
+end
 
 local function intern(mask: buffer): buffer
 	local contents = buffer.tostring(mask)
@@ -164,7 +191,7 @@ local function markStatic(lo: Vector3, hi: Vector3)
 					stats.StaticCells += 1
 				end
 				if ax == 0 and bx == DIV - 1 and ay == 0 and by == DIV - 1 and az == 0 and bz == DIV - 1 then
-					static[k] = FULL
+					setStatic(k, FULL)
 					continue
 				end
 				-- shared masks are never edited in place: edit a copy, re-intern
@@ -180,7 +207,7 @@ local function markStatic(lo: Vector3, hi: Vector3)
 						writeu16(scratch, offset, bor(readu16(scratch, offset), row))
 					end
 				end
-				static[k] = intern(scratch)
+				setStatic(k, intern(scratch))
 			end
 		end
 	end
@@ -231,7 +258,7 @@ local function markVoxels(boxes: { Vector3 })
 		if not static[k] then
 			stats.StaticCells += 1
 		end
-		static[k] = intern(mask)
+		setStatic(k, intern(mask))
 	end
 end
 
@@ -333,6 +360,7 @@ local function leafFor(part: BasePart): number
 end
 
 local function refineShape(part: BasePart): { Vector3 }?
+	local initialFrame, initialSize = part.CFrame, part.Size
 	local params = OverlapParams.new()
 	params.FilterType = Enum.RaycastFilterType.Include
 	params.FilterDescendantsInstances = { part }
@@ -363,13 +391,16 @@ local function refineShape(part: BasePart): { Vector3 }?
 			continue
 		end
 		if os.clock() - sliceStarted > REFINE_SLICE then
+			refineCpu += os.clock() - sliceStarted
+			refineYields += 1
 			task.wait()
 			sliceStarted = os.clock()
-			if not part.Parent then
+			if not part.Parent or part.CFrame ~= initialFrame or part.Size ~= initialSize then
 				return nil
 			end
 		end
 		probes += 1
+		refineProbes += 1
 		probe.Size = nodeHi - nodeLo + grow
 		probe.CFrame = CFrame.new((nodeLo + nodeHi) * 0.5)
 		if #workspace:GetPartsInPart(probe, params) == 0 then
@@ -391,66 +422,74 @@ local function refineShape(part: BasePart): { Vector3 }?
 			end
 		end
 	end
+	refineCpu += os.clock() - sliceStarted
 	return boxes
 end
 
--- Workers don't probe (that's the main thread's job, once): they keep a big
--- shaped part dynamic until the main thread sends its boxes (ApplyShape).
-local isWorker = _G.__RelativityOccupancyWorker == true
+-- Workers never bake: static parts stay dynamic until a current mask/pose
+-- record arrives from the publisher (ApplyBake).
 local shaped: { [BasePart]: boolean } = {} -- (worker) boxes already applied
 local watched: { [BasePart]: boolean } = {}
-
--- (main) Every refined shape so far, so a worker that starts listening
--- late (messages sent before an Actor binds its handler are dropped) still
--- gets them all: each worker fires ProjectileActors.OccupancyHello once its
--- handler is bound, and is sent the lot.
-local shapes: { [BasePart]: { Vector3 } } = {}
 
 local function actorsFolder(): Instance?
 	return game:GetService("ServerScriptService"):FindFirstChild("ProjectileActors", true)
 end
 
--- (main) Sends a part's refined boxes to every projectile worker.
-local function broadcastShape(part: BasePart, boxes: { Vector3 })
-	shapes[part] = boxes
-	local folder = actorsFolder()
-	if not folder then
-		return
-	end
-	for _, actor in folder:GetChildren() do
-		if actor:IsA("Actor") then
-			local ok, err = pcall(function()
-				actor:SendMessage("OccupancyShape", part, boxes)
-			end)
-			if not ok then
-				warn(`[Projectile] occupancy: couldn't send {part:GetFullName()}'s shape ({#boxes // 2} boxes) to a worker: {err}`)
+-- Bake masks once. Transfer deduplicated immutable buffers at startup and
+-- changed-cell deltas afterwards; workers keep ordinary local table/buffer
+-- reads in the hot path (no SharedTable lookup/string conversion per sweep).
+local function packet(full: boolean): any
+	local keys, ids, unique, indices, parts = {}, {}, {}, {}, {}
+	local source = if full then static else dirtyCells
+	for key in source do
+		local mask = static[key]
+		if mask then
+			local index = indices[mask]
+			if not index then
+				index = #unique + 1; indices[mask] = index; unique[index] = mask
 			end
+			table.insert(keys, key); table.insert(ids, index)
 		end
 	end
+	local partSource = if full then publishedParts else dirtyParts
+	for part in partSource do
+		local record = publishedParts[part]
+		if record and part.Parent then table.insert(parts, record) end
+	end
+	return {Version = revision, Full = full, Keys = keys, MaskIds = ids, Masks = unique, Parts = parts,
+		Ready = ready, HasTerrain = hasTerrain, TerrainMin = terrainMin, TerrainMax = terrainMax}
+end
+
+local publishQueued = false
+local function publish()
+	publishQueued = false
+	if isWorker or not startupDone then return end
+	local folder = actorsFolder()
+	if not folder then return end
+	revision += 1
+	local update = packet(revision == 1)
+	table.clear(dirtyCells); table.clear(dirtyParts)
+	for _, actor in folder:GetChildren() do
+		if actor:IsA("Actor") then actor:SendMessage("OccupancyBake", update) end
+	end
+end
+schedulePublish = function()
+	if isWorker or not startupDone or publishQueued then return end
+	publishQueued = true
+	task.defer(publish)
 end
 
 if not isWorker then
 	task.spawn(function()
 		local folder = actorsFolder()
-		while not folder do
-			task.wait(0.5)
-			folder = actorsFolder()
-		end
+		while not folder do task.wait(0.5); folder = actorsFolder() end
 		local function sendAll(actor: Actor)
-			for part, boxes in shapes do
-				if part.Parent then
-					actor:SendMessage("OccupancyShape", part, boxes)
-				end
-			end
+			if startupDone and actor.Parent then actor:SendMessage("OccupancyBake", packet(true)) end
 		end
 		local hello = (folder :: Instance):WaitForChild("OccupancyHello") :: BindableEvent
 		hello.Event:Connect(sendAll)
-		-- and once now, for any worker that said hello before we listened
-		-- (duplicates are harmless: ApplyShape just marks the same voxels)
 		for _, actor in (folder :: Instance):GetChildren() do
-			if actor:IsA("Actor") then
-				sendAll(actor)
-			end
+			if actor:IsA("Actor") then sendAll(actor) end
 		end
 	end)
 end
@@ -472,6 +511,12 @@ local function staticChanged(part: BasePart)
 	if not part.Parent or dynamicParts[part] then
 		return
 	end
+	if isWorker then
+		-- Until a current publisher record arrives, moved geometry is dynamic.
+		-- Never trust a stale snapshot at its new location.
+		makeDynamic(part)
+		return
+	end
 	local root = part.AssemblyRootPart
 	if not (part.Anchored or (root and root.Anchored)) then
 		makeDynamic(part)
@@ -485,6 +530,7 @@ local function staticChanged(part: BasePart)
 	end
 	local lo, hi = bounds(part, PAD)
 	markStatic(lo, hi)
+	rememberPart(part)
 end
 
 local function watchStatic(part: BasePart)
@@ -517,6 +563,43 @@ local function watchStatic(part: BasePart)
 	end
 end
 
+local refineQueue: {BasePart} = {}
+local refineQueued: {[BasePart]: boolean} = {}
+local refining = false
+local function queueRefinement(part: BasePart)
+	if refineQueued[part] then return end
+	refineQueued[part] = true
+	table.insert(refineQueue, part)
+	if refining then return end
+	refining = true
+	task.defer(function()
+		local started, completed = os.clock(), 0
+		local cpuBefore, probesBefore, yieldsBefore = refineCpu, refineProbes, refineYields
+		for _, candidate in refineQueue do
+			if candidate.Parent then
+				local boxes = refineShape(candidate)
+				local root = candidate.AssemblyRootPart
+				if boxes and candidate.Parent and candidate.CanQuery
+					and (candidate.Anchored or (root and root.Anchored)) and not inCharacter(candidate) then
+					local markStarted = os.clock()
+					markVoxels(boxes)
+					refineCpu += os.clock() - markStarted
+					rememberPart(candidate)
+					dynamicParts[candidate] = nil
+					if not watched[candidate] then watched[candidate] = true; watchStatic(candidate) end
+					completed += 1
+				end
+			end
+			refineQueued[candidate] = nil
+		end
+		table.clear(refineQueue)
+		refining = false
+		print(string.format("[Projectile] occupancy refinement complete: %d shapes, %d cells, %.0f ms wall / %.0f ms CPU, %d probes, %d yields (base grid already usable)",
+			completed, stats.StaticCells, (os.clock() - started) * 1000, (refineCpu - cpuBefore) * 1000,
+			refineProbes - probesBefore, refineYields - yieldsBefore))
+	end)
+end
+
 function classify(part: BasePart)
 	if part:IsA("Terrain") or not part:IsDescendantOf(workspace) then
 		return
@@ -541,25 +624,21 @@ function classify(part: BasePart)
 		makeDynamic(part)
 		return
 	end
+	if isWorker then
+		if not shaped[part] then makeDynamic(part) end
+		if not watched[part] then watched[part] = true; watchStatic(part) end
+		return -- workers import finished masks; no box/shape/terrain bake
+	end
 	local size = part.Size
 	if (size.X > REFINE_OVER or size.Y > REFINE_OVER or size.Z > REFINE_OVER) and not boxShaped(part) then
-		if isWorker then
-			if not shaped[part] then
-				makeDynamic(part) -- (conservative until the main thread's boxes arrive)
-			end
-			return
-		end
 		makeDynamic(part) -- (conservative while its shape is probed)
-		local boxes = refineShape(part)
-		if not boxes or not part.Parent then
-			return
-		end
-		markVoxels(boxes)
-		broadcastShape(part, boxes)
+		queueRefinement(part)
+		return
 	else
 		local lo, hi = bounds(part, PAD)
 		markStatic(lo, hi)
 	end
+	rememberPart(part)
 	dynamicParts[part] = nil
 	if not watched[part] then
 		watched[part] = true
@@ -567,18 +646,47 @@ function classify(part: BasePart)
 	end
 end
 
--- (worker) The main thread's refined boxes for a big shaped part.
-function Occupancy.ApplyShape(part: BasePart, boxes: { Vector3 })
-	if not part.Parent then
-		return
+-- Serial Actor handler. Buffers are already baked and deduplicated by the
+-- publisher; adopt them directly, never rebuild voxel masks in each Actor.
+function Occupancy.ApplyBake(update: any): boolean
+	if not isWorker then return true end
+	if update.Version < revision then return hasSnapshot end
+	-- Never enable skipping from a partial/missed delta. A late worker (or a
+	-- gap in delivery) requests a fresh snapshot and casts normally meanwhile.
+	if not update.Full and (not hasSnapshot or update.Version > revision + 1) then
+		ready = false
+		hasSnapshot = false
+		return false
 	end
-	shaped[part] = true
-	markVoxels(boxes)
-	dynamicParts[part] = nil
-	if not watched[part] then
-		watched[part] = true
-		watchStatic(part)
+	if update.Full then hasSnapshot = true end
+	local started = os.clock()
+	local first = not importedReady
+	revision = update.Version
+	-- Intern once per received mask, not per cell/query. Deltas can contain a
+	-- pattern already received in an earlier packet; keep just one local copy.
+	local importedMasks = table.create(#update.Masks)
+	for index, mask in update.Masks do importedMasks[index] = intern(mask) end
+	for index, key in update.Keys do
+		if not static[key] then stats.StaticCells += 1 end
+		static[key] = importedMasks[update.MaskIds[index]]
 	end
+	for _, record in update.Parts do
+		local part = record[1]
+		if part.Parent and part.CFrame == record[2] and part.Size == record[3] and part.CanQuery
+			and (part.Anchored or (part.AssemblyRootPart and part.AssemblyRootPart.Anchored)) and not inCharacter(part) then
+			shaped[part] = true
+			dynamicParts[part] = nil
+			if not watched[part] then watched[part] = true; watchStatic(part) end
+		end
+	end
+	dynamicStamp = -1
+	hasTerrain, terrainMin, terrainMax = update.HasTerrain, update.TerrainMin, update.TerrainMax
+	importedReady = update.Ready
+	ready = startupDone and importedReady
+	if first and importedReady then
+		print(string.format("[Projectile] occupancy imported (no bake): %d cells, %.2f ms", stats.StaticCells, (os.clock() - started) * 1000))
+	end
+	return true
 end
 
 -- A joint went away: its parts may now be loose, so stop trusting them as static.
@@ -807,7 +915,8 @@ workspace.DescendantRemoving:Connect(function(instance)
 		queryWatched[instance] = nil
 		ownerOf[instance] = nil
 		shaped[instance] = nil
-		shapes[instance] = nil
+		publishedParts[instance] = nil
+		dirtyParts[instance] = nil
 		watched[instance] = nil
 	elseif instance:IsA("JointInstance") or instance:IsA("WeldConstraint") then
 		jointRemoved(instance)
@@ -830,16 +939,23 @@ task.spawn(function()
 			task.wait()
 		end
 	end
+	startupDone = true
+	if isWorker then
+		ready = importedReady
+		return -- startup classification only; static masks come from the publisher
+	end
 	local ok, cells = pcall(function()
 		return workspace.Terrain:CountCells()
 	end)
 	if not ok or cells > 0 then
 		hasTerrain = true
 		terrainMin, terrainMax = terrainScanArea(parts)
+		publish() -- unready snapshot: terrain must remain conservative until scanned
 		Occupancy.BakeTerrain(terrainMin, terrainMax)
 	end
 	ready = true
-	print(string.format("[Projectile] occupancy baked: %d parts%s, %d cells, %.0f ms", #parts,
+	publish()
+	print(string.format("[Projectile] occupancy base baked once: %d parts%s, %d cells, %.0f ms (shape refinement continues safely in background)", #parts,
 		if hasTerrain then " + terrain" else "", stats.StaticCells, (os.clock() - started) * 1000))
 end)
 

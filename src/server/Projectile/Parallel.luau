@@ -39,7 +39,8 @@
 	Workers mirror what they need: time scales/zones (sent when
 	ChunkManager.GetTimeVersion changes), raycast filters (sent once per
 	distinct filter, usable from the next frame), and which chunks hold
-	entities (with every batch). Each bakes its own Occupancy.
+	entities (with every batch). Occupancy masks are baked once and copied to
+	each worker at startup, followed by changed-cell deltas.
 
 	Worker raycasts run in the parallel phase that follows PreSimulation, i.e.
 	against the world as it was before this frame's physics step; the serial

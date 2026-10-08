@@ -14,11 +14,12 @@
 	                     Friends and Settings tabs)
 	  Spells  (left)  -- the Spells window (SpellLibrary: loadout, library,
 	                     encyclopedia; Edit / New spell open the editor)
-	  Bell    (left)  -- the Messages window (Notifications.luau); a new
+	  Bell    (left)  -- the Messages window (Notifications.luau; key N); a new
 	                     actionable notification (invite, join request) while
 	                     it's closed badges and rings the bell and plays a ping
 	  Debug   (left)  -- the debug panel (F2), for players allowed to use it
-	  Gear    (right) -- the Settings window (SettingsWindow)
+	  Gear    (right) -- the Settings window (SettingsWindow; key . )
+	The spell editor's Library button opens the Spells window (SpellLibrary).
 	Which UI shows is the player's "UI mode" setting (Settings window,
 	Interface: Mode 1 = Ours, Mode 2 = Dev), saved with their settings. The
 	current mode is also the LocalPlayer's "UiMode" attribute (client-only)
@@ -43,6 +44,7 @@ local SpellAssemblerGui = require(script.Parent.SpellAssemblerGui)
 
 local SoundService = game:GetService("SoundService")
 local TweenService = game:GetService("TweenService")
+local UserInputService = game:GetService("UserInputService")
 
 local player = Players.LocalPlayer
 
@@ -58,6 +60,7 @@ export type Mode = "Ours" | "Dev"
 
 local UiMode = {}
 local mode: Mode = "Ours"
+local inboxIcon: any = nil
 
 -- SetCoreGuiEnabled errors until the CoreScripts have registered it.
 local function hideBackpack()
@@ -141,11 +144,13 @@ local function buildTopbar()
 		:setName("Notifications")
 		:setImage(BELL_IMAGE)
 		:setLabel("Notifications")
+		:setCaptionHint(Enum.KeyCode.N)
 		:oneClick()
 	inbox.selected:Connect(function()
 		inbox:clearNotices()
 		Notifications.Toggle()
 	end)
+	inboxIcon = inbox
 	-- a new notification while the window is closed: a count badge on the
 	-- bell, the bell rings (wiggles) and a soft ping plays
 	local ping = Instance.new("Sound")
@@ -187,8 +192,26 @@ local function buildTopbar()
 		:align("Right")
 		:setImage(GEAR_IMAGE)
 		:setLabel("Settings")
+		:setCaptionHint(Enum.KeyCode.Period)
 		:oneClick()
 	settingsIcon.selected:Connect(SettingsWindow.Toggle)
+end
+
+-- N: Messages, . : Settings (not while typing)
+local function bindKeys()
+	UserInputService.InputBegan:Connect(function(input, processed)
+		if processed or UserInputService:GetFocusedTextBox() then
+			return
+		end
+		if input.KeyCode == Enum.KeyCode.N then
+			if inboxIcon then
+				inboxIcon:clearNotices()
+			end
+			Notifications.Toggle()
+		elseif input.KeyCode == Enum.KeyCode.Period then
+			SettingsWindow.Toggle()
+		end
+	end)
 end
 
 function UiMode.start()
@@ -197,6 +220,9 @@ function UiMode.start()
 	task.spawn(MainHud.start) -- (waits for the authored MainGui)
 	GameHud.start()
 	buildTopbar()
+	bindKeys()
+	-- the spell editor's Library button
+	SpellAssemblerGui.SetLibraryOpener(SpellLibrary.Open)
 	apply()
 	-- the UI mode is a setting (Settings window, Interface)
 	follow()

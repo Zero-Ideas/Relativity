@@ -424,6 +424,9 @@ function Board:estimateText(rune: any): string
 		local text = `{math.floor(estimate.damage + 0.5)} dmg`
 		return if estimate.count and estimate.count > 1 then `{text} ×{estimate.count}` else text
 	end
+	if estimate.text and estimate.text ~= "" then
+		return estimate.text -- (utility vessels: "240 HP · 8s", "Δv 90"...)
+	end
 	if estimate.energy then
 		return `⚡{math.floor(estimate.energy + 0.5)}`
 	end

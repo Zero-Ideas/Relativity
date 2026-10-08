@@ -24,9 +24,9 @@ local SpellRunes = require(script.Parent.SpellRunes)
 local SpellCompiler = {}
 
 SpellCompiler.GraphVersion = 3
-SpellCompiler.MaxRunes = 64
-SpellCompiler.MaxWires = 128
-SpellCompiler.MaxZones = 24
+SpellCompiler.MaxRunes = 96
+SpellCompiler.MaxWires = 192
+SpellCompiler.MaxZones = 32
 SpellCompiler.MaxTriggerDepth = 3
 SpellCompiler.MaxChainQuantity = 2 -- Quantity runes allowed along one trigger chain (cast -> trigger -> ...)
 SpellCompiler.BoardLimit = 20000
@@ -236,7 +236,11 @@ function SpellCompiler.SuggestName(graph: any): string
 			table.insert(elements, id)
 		elseif SpellRunes.Vessels[id] then
 			seen[id] = true
-			table.insert(vessels, id)
+			-- (a body effect is named for what it does: "Heal", "Haste"...)
+			local params = if typeof(rune.params) == "table" then rune.params else {}
+			local name = if id == "Effect" and typeof(params.Effect) == "string" then params.Effect
+				else (SpellRunes.Runes[id] :: any).Name
+			table.insert(vessels, name)
 		elseif id == "Sustain" then
 			sustained = true
 		end
@@ -277,6 +281,59 @@ function SpellCompiler.CreateDefaultGraph()
 			{ from = "speed", fromPort = "mod", to = "orb", toPort = "mods" },
 		},
 	}
+end
+
+-- Size / Range multipliers from a vessel's modifier rune ids.
+function SpellCompiler.ModifierScales(modIds: { string }, runeById: { [string]: any }): (number, number)
+	local size, range = 1, 1
+	local tables = SpellRunes.ModifierTables
+	for _, modId in modIds do
+		local mod = runeById[modId]
+		if mod and mod.rune == "Size" then
+			size = tables.Size[mod.params.Level] or 1
+		elseif mod and mod.rune == "Range" then
+			range = tables.Range[mod.params.Level] or 1
+		end
+	end
+	return size, range
+end
+
+-- One-line estimate of what a non-damaging vessel does with `energy` (after
+-- its modifiers and triggers), for the editor: "120 HP · 6s", "Δv 75"...
+function SpellCompiler.DescribeUtility(vesselId: string, params: any, energy: number, modIds: { string }, runeById: { [string]: any }): string
+	local size, range = SpellCompiler.ModifierScales(modIds, runeById)
+	local base = SpellRunes.Vessels[vesselId] or {}
+	local function round(value: number): string
+		return tostring(math.floor(value + 0.5))
+	end
+	if vesselId == "Barrier" then
+		local hp = math.max(energy * base.HealthPerEnergy, base.MinHealth)
+		return `{round(hp)} HP · {round(params.Duration * range)}s`
+	elseif vesselId == "Force" then
+		return `Δv {round(math.min(energy * base.SpeedPerEnergy, base.MaxSpeed))}`
+	elseif vesselId == "Blink" then
+		return `{round(math.min(energy * base.StudsPerEnergy * range, base.MaxDistance))} st`
+	elseif vesselId == "TimeField" then
+		local radius = math.min(base.Radius + energy * base.RadiusPerEnergy, base.MaxRadius) * size
+		return `r{round(radius)} · {round(params.Duration * range)}s`
+	elseif vesselId == "Effect" then
+		local effect = params.Effect
+		local def = SpellRunes.Effects[effect]
+		local strength, seconds = SpellRunes.EffectStrength(effect, energy, params.Duration * range)
+		if not def then
+			return ""
+		elseif effect == "Heal" then
+			return `+{round(strength)} HP`
+		elseif effect == "Cleanse" then
+			return "cleanse"
+		elseif def.Kind == "Pool" then
+			return `{round(strength)} shield`
+		elseif def.Kind == "Timed" then
+			return `{string.format("%.1f", seconds)}s`
+		end
+		return `{round(strength * def.Swing * 100)}% · {round(seconds)}s`
+	end
+	return ""
 end
 
 function SpellCompiler.Compile(graph: any)
@@ -361,7 +418,7 @@ function SpellCompiler.Compile(graph: any)
 				fail(`{def.Name}: {port.Label} can only feed one wire. Use Divide to split energy.`, rune.id)
 			end
 			if port.Type == "mod" and n == 0 then
-				fail(`{def.Name} isn't attached to a vessel (Orb, Bullet or Beam).`, rune.id)
+				fail(`{def.Name} isn't attached to a vessel.`, rune.id)
 			end
 			if def.Id == "Target" and n == 0 then
 				fail("Aim: wire its Aim output into a vessel's Aim port.", rune.id)
@@ -369,7 +426,7 @@ function SpellCompiler.Compile(graph: any)
 		end
 	end
 	if #manaRoots == 0 then fail("Add a Mana Well in an Input zone.") end
-	if #vessels == 0 then fail("Add a vessel (Orb, Bullet or Beam) in an Output zone.") end
+	if #vessels == 0 then fail("Add a vessel (Orb, Bullet, Beam, Barrier, Force...) in an Output zone.") end
 
 	-- Vessel modifier/trigger budgets -----------------------------------------
 	local vesselInfo = {}
@@ -399,7 +456,7 @@ function SpellCompiler.Compile(graph: any)
 		for _, link in (outputs[vesselId].vessel or {}) do
 			local trigger = runeById[link.to]
 			if not SpellRunes.TriggerApplies(vesselDef.Id, trigger.rune) then
-				fail(`{SpellRunes.Runes[trigger.rune].Name} can't be used on this {vesselDef.Name}: it has no flight time.`, link.to)
+				fail(`{SpellRunes.Runes[trigger.rune].Name} can't be used on a {vesselDef.Name}.`, link.to)
 			end
 			table.insert(triggers, link.to)
 			share += trigger.params.Share / 100
@@ -451,7 +508,11 @@ function SpellCompiler.Compile(graph: any)
 			local rune = runeById[link.to]
 			local def = SpellRunes.Runes[rune.rune]
 			reached[link.to] = true
-			estimates[link.to] = { energy = energy }
+			-- (a rune reached along two paths -- both sides of an If -- shows the larger)
+			local previous = estimates[link.to]
+			if not previous or not previous.energy or previous.energy < energy then
+				estimates[link.to] = { energy = energy }
+			end
 			if def.Element then
 				follow(link.to, "out", energy, def.Element, depth, source, quantities)
 			elseif def.Id == "If" then
@@ -461,6 +522,15 @@ function SpellCompiler.Compile(graph: any)
 				local share = rune.params.Share / 100
 				follow(link.to, "a", energy * share, element, depth, source, quantities)
 				follow(link.to, "b", energy * (1 - share), element, depth, source, quantities)
+			elseif def.Pass then
+				-- Repeat shares its energy between its runs; the rest pass it all
+				-- on ("up to", for For Each's and Wait Until's two exits)
+				local each = if def.Id == "Repeat" then energy / math.max(rune.params.Count, 1) else energy
+				for _, out in def.Outputs do
+					if out.Type == "flow" then
+						follow(link.to, out.Name, each, element, depth, source, quantities)
+					end
+				end
 			elseif def.Vessel then
 				local chainQuantities = quantities :: number
 				for _, modId in vesselInfo[link.to].mods do
@@ -474,27 +544,32 @@ function SpellCompiler.Compile(graph: any)
 						end
 					end
 				end
-				if def.Id ~= "Explosion" then
+				-- (splitting limits: only projectiles multiply)
+				if SpellRunes.Flying[def.Id] then
 					if source == "Beam" then
-						limit(`Beam triggers can only fire an Explosion -- this {def.Name} won't fire.`, link.to)
+						limit(`Beam triggers can only fire an Explosion or a non-projectile vessel -- this {def.Name} won't fire.`, link.to)
 						disabled[link.to] = true
 					elseif depth >= 2 then
-						limit(`Only an Explosion can come from a vessel fired by a trigger -- this {def.Name} won't fire.`, link.to)
+						limit(`Only non-projectile vessels can come from a vessel fired by a trigger -- this {def.Name} won't fire.`, link.to)
 						disabled[link.to] = true
 					end
 				end
-				if not element then
-					fail(`Energy reaches this {def.Name} without a Transform rune (Fire, Arcane or Shock).`, link.to)
-				else
+				if element then
 					elements[link.to] = element
+				elseif def.Damaging then
+					fail(`Energy reaches this {def.Name} without a Transform rune (Fire, Arcane or Shock).`, link.to)
 				end
 				local info = vesselInfo[link.to]
 				local perBolt = energy * (1 - math.min(info.modCost, 1)) / info.count
-				local elementDef = element and SpellRunes.Elements[element]
-				local impact = (if elementDef then elementDef.Impact else 1) * SpellRunes.Vessels[def.Id].Impact
 				estimates[link.to].count = info.count
-				estimates[link.to].damage = perBolt * (1 - info.triggerShare) * impact
 				estimates[link.to].element = element
+				if def.Damaging then
+					local elementDef = element and SpellRunes.Elements[element]
+					local impact = (if elementDef then elementDef.Impact else 1) * SpellRunes.Vessels[def.Id].Impact
+					estimates[link.to].damage = perBolt * (1 - info.triggerShare) * impact
+				else
+					estimates[link.to].text = SpellCompiler.DescribeUtility(def.Id, rune.params, perBolt * (1 - info.triggerShare), info.mods, runeById)
+				end
 				if #info.triggers > 0 then
 					if depth >= SpellCompiler.MaxTriggerDepth then
 						fail(`Triggers can nest at most {SpellCompiler.MaxTriggerDepth} deep.`, link.to)

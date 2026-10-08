@@ -8,7 +8,7 @@
 	ProjectileActors, each holding a clone of itself, plus the Results event
 	they report through. Inside an Actor it becomes a worker that keeps its
 	own mirrors of everything Sweep needs -- chunk time scales and zones
-	("TimeWorld"), raycast filters ("Filter"), and its own Occupancy bake --
+	("TimeWorld"), raycast filters ("Filter"), and imported Occupancy masks --
 	and on each "Sweep" message runs its batch in parallel, then fires its
 	result buffer (plus the frame it belongs to) through the "Results"
 	BindableEvent next to the actors -- one copy, no strings. It arrives
@@ -37,7 +37,7 @@ if not actor then
 	end
 	if not folder:FindFirstChild("OccupancyHello") then
 		local hello = Instance.new("BindableEvent")
-		hello.Name = "OccupancyHello" -- a worker is listening: send it every shape so far
+		hello.Name = "OccupancyHello" -- a worker is listening: send it the baked grid
 		hello.Parent = folder
 	end
 	if not folder:FindFirstChildWhichIsA("Actor") then
@@ -62,8 +62,7 @@ local Shared = ReplicatedStorage:WaitForChild("Shared")
 local ChunkManager = require(Shared:WaitForChild("ChunkManager"))
 local projectileModule = (actor.Parent :: Instance).Parent:WaitForChild("Projectile")
 local Sweep = require(projectileModule:WaitForChild("Sweep"))
--- (tells Occupancy it's a worker's copy: it takes the main thread's shape
--- probes instead of running its own -- see Occupancy.ApplyShape)
+-- Workers import centrally baked masks; they never probe shapes/read terrain.
 _G.__RelativityOccupancyWorker = true
 local Occupancy = require(projectileModule:WaitForChild("Occupancy"))
 local results = (actor.Parent :: Instance):WaitForChild("Results") :: BindableEvent
@@ -71,10 +70,16 @@ local results = (actor.Parent :: Instance):WaitForChild("Results") :: BindableEv
 local filters: { [number]: RaycastParams } = {}
 local filterIgnores: { [number]: { [Instance]: boolean } } = {} -- filter id -> its excluded instances (for Occupancy)
 
-actor:BindToMessage("OccupancyShape", function(part: BasePart, boxes: { Vector3 })
-	Occupancy.ApplyShape(part, boxes)
+local occupancySnapshotRequested = false
+actor:BindToMessage("OccupancyBake", function(update)
+	if Occupancy.ApplyBake(update) then
+		occupancySnapshotRequested = false
+	elseif not occupancySnapshotRequested then
+		occupancySnapshotRequested = true
+		((actor.Parent :: Instance):WaitForChild("OccupancyHello") :: BindableEvent):Fire(actor)
+	end
 end)
--- now that it's bound, ask for every shape the main thread already sent
+-- now that it's bound, ask for the complete grid the main thread already baked
 -- (Actor messages sent before a handler is bound are dropped)
 task.defer(function()
 	((actor.Parent :: Instance):WaitForChild("OccupancyHello") :: BindableEvent):Fire(actor)

@@ -28,6 +28,7 @@ local VisualOffload = require(Shared.VisualOffload)
 local Impact = require(Shared.Projectile.Client.Impact)
 local ExplosionVFX = require(script.Parent.ExplosionVFX)
 local _SpellCircleVFX = require(script.Parent.SpellCircleVFX) -- self-registers "SpellCircle"
+local _SpellBodyClient = require(script.Parent.SpellBodyClient) -- impulses, body effects, "SpellFX"
 
 local SpellEffects = {}
 

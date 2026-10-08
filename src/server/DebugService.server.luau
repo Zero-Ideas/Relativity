@@ -637,6 +637,7 @@ local function buildStats()
 		WorstFrameMs = worstFrame * 1000,
 		HeartbeatMs = readStat("HeartbeatTimeMs"),
 		PhysicsMs = readStat("PhysicsStepTimeMs"),
+		PhysicsPrimitives = readStat("PrimitivesCount"),
 		SendKbps = readStat("DataSendKbps"),
 		MemoryMb = Stats:GetTotalMemoryUsageMb(),
 		Instances = readStat("InstanceCount"),

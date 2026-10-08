@@ -7,8 +7,11 @@
 	one locally (same graph -> same spec, same seeds) for zero-latency
 	feedback. client/SpellCircleVFX renders it.
 
-	One circle per vessel reached straight from a Mana Well, ordered by flow;
+	One circle per vessel reached straight from a Mana Well, ordered by flow
+	(through every flow rune: Delay, Repeat, For Each, Conjure Circle...);
 	vessels fired by triggers become satellites on their parent's rim.
+	BuildFrom(compiled, runeId) is the circle a Conjure Circle draws: the
+	vessels reached from that rune.
 	Anatomy, centre outward:
 	 - Core: the element glyph (Fire / Arcane / Shock).
 	 - Polygon: a star whose shape follows the vessel and whose point count
@@ -57,7 +60,7 @@ export type Spec = {
 
 local MIN_SCALE = 0.55
 local MAX_POINTS = 9
-local VALUE_CATEGORIES = { Sensor = true, Logic = true, Targeting = true }
+local VALUE_CATEGORIES = { Sensor = true, Logic = true, Targeting = true, Vector = true }
 
 local NUMERALS = {
 	{ 1000, "M" }, { 900, "CM" }, { 500, "D" }, { 400, "CD" },
@@ -111,7 +114,8 @@ local function glyphOf(runeId: string): string?
 	return def and def.Glyph
 end
 
-function SpellCircleLayout.Build(compiled: any): Spec
+-- (`fromRune`: build the circle conjured by that rune instead -- see BuildFrom)
+local function build(compiled: any, fromRune: string?): Spec
 	local runes = compiled.runes
 	local ids = {}
 	for id in runes do
@@ -157,8 +161,8 @@ function SpellCircleLayout.Build(compiled: any): Spec
 		local rune = runes[vesselId]
 		local def = SpellRunes.Runes[rune.rune]
 		local info = compiled.vessels[vesselId] or { mods = {}, triggers = {} }
-		local elementId = compiled.elements[vesselId] or "Arcane"
-		local element = SpellRunes.Elements[elementId]
+		local elementId = compiled.elements[vesselId]
+		local element = (elementId and SpellRunes.Elements[elementId]) or SpellRunes.Raw
 
 		local band = table.clone(path)
 		local seen = {}
@@ -188,8 +192,8 @@ function SpellCircleLayout.Build(compiled: any): Spec
 		return {
 			Vessel = def.Id,
 			VesselGlyph = def.Glyph or "?",
-			Element = elementId,
-			ElementGlyph = glyphOf(elementId) or "?",
+			Element = elementId or "Raw",
+			ElementGlyph = (elementId and glyphOf(elementId)) or SpellRunes.Raw.Glyph,
 			Color = element.Color,
 			Core = element.Core,
 			Scale = math.clamp(math.sqrt(share), MIN_SCALE, 1),
@@ -222,6 +226,17 @@ function SpellCircleLayout.Build(compiled: any): Spec
 				table.insert(branchPath, def.Glyph or "?")
 				follow(link.to, "a", branchPath, out, depth)
 				follow(link.to, "b", branchPath, out, depth)
+			elseif def.Pass then
+				-- flow runes: their glyph goes in the band, and their own
+				-- inputs' values with it
+				local branchPath = table.clone(path)
+				table.insert(branchPath, def.Glyph or "?")
+				collectValues(link.to, {}, branchPath)
+				for _, port in def.Outputs do
+					if port.Type == "flow" then
+						follow(link.to, port.Name, branchPath, out, depth)
+					end
+				end
 			elseif def.Vessel then
 				table.insert(out, buildCircle(link.to, path, depth))
 			end
@@ -229,8 +244,19 @@ function SpellCircleLayout.Build(compiled: any): Spec
 	end
 
 	local circles: { CircleSpec } = {}
-	for _, rootId in compiled.manaRoots do
-		follow(rootId, "out", { glyphOf("Mana") or "?" }, circles, 0)
+	if fromRune then
+		local def = runes[fromRune] and SpellRunes.Runes[runes[fromRune].rune]
+		if def then
+			for _, port in def.Outputs do
+				if port.Type == "flow" then
+					follow(fromRune, port.Name, { def.Glyph or "?" }, circles, 0)
+				end
+			end
+		end
+	else
+		for _, rootId in compiled.manaRoots do
+			follow(rootId, "out", { glyphOf("Mana") or "?" }, circles, 0)
+		end
 	end
 
 	return {
@@ -240,6 +266,16 @@ function SpellCircleLayout.Build(compiled: any): Spec
 		Sustain = sustain,
 		Circles = circles,
 	}
+end
+
+function SpellCircleLayout.Build(compiled: any): Spec
+	return build(compiled, nil)
+end
+
+-- The circle a Conjure Circle rune draws where it appears: the vessels its
+-- flow reaches (same seed and numerals as the whole spell).
+function SpellCircleLayout.BuildFrom(compiled: any, runeId: string): Spec
+	return build(compiled, runeId)
 end
 
 return SpellCircleLayout

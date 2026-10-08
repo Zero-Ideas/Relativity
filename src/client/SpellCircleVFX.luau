@@ -14,11 +14,15 @@
 	locally built spec; everyone else gets the server's "SpellCircle"
 	VisualOffload messages:
 	 { Phase = "Begin" | "Cast" | "Cancel" | "End" | "Freeze" | "FireFrozen"
-	   | "ClearFrozen", Caster = Model, Spec = Spec?, Target = Vector3?,
-	   Charge = number?, Sustain = boolean?, Position = Vector3?, Direction = Vector3? }
+	   | "ClearFrozen" | "Conjure", Caster = Model, Spec = Spec?, Target = Vector3?,
+	   Charge = number?, Sustain = boolean?, Position = Vector3?, Direction = Vector3?,
+	   Duration = number?, Size = number? }
 	Freeze (R while charging) pins the charging circle in world space;
 	FireFrozen (T) turns the caster's oldest frozen circle to the target and
-	releases it.
+	releases it. Conjure (the Conjure Circle rune, server only -- the caster's
+	client doesn't predict it) draws a circle at Position facing Direction
+	over Duration seconds, then releases it; it stays even if its caster's
+	character goes.
 
 	Each circle is one transparent Part carrying a fixed-size SurfaceGui;
 	everything inside is laid out in 0..1 canvas coordinates so satellites
@@ -149,7 +153,7 @@ type CastState = {
 	Circles: { Circle },
 	Items: { Item },
 	Layers: { Layer },
-	State: string, -- "charge" | "frozen" | "assemble" | "sustain" | "release" | "cancel"
+	State: string, -- "charge" | "frozen" | "assemble" | "sustain" | "conjure" | "release" | "cancel"
 	Began: number, -- os.clock at Begin (charge is held in real time)
 	Charge: number, -- current draw progress 0..Charge.Max
 	Age: number, -- dilated seconds
@@ -168,6 +172,8 @@ type CastState = {
 	GlintLocked: boolean?,
 	ChargeCap: number?, -- frozen before full charge: keeps drawing up to 1x, never overcharges
 	AssembleStart: number?, -- os.clock when a frozen cloud began reassembling (T)
+	ConjureTime: number?, -- (conjured circles) seconds it takes to draw in
+	SizeScale: number?, -- (conjured circles) size multiplier
 	Emitter: Attachment, -- where this cast's sounds play from (follows the main circle)
 	ChargeSound: Sound?,
 	Hum: Sound?,
@@ -792,12 +798,13 @@ local function step(dt: number)
 		local cast = casts[index]
 		local caster = cast.Caster
 		local head = caster.Parent and (caster:FindFirstChild("Head") or caster.PrimaryPart)
-		if not head or not head:IsA("BasePart") or #cast.Circles == 0 then
+		local anchored = cast.ConjureTime ~= nil -- (a conjured circle outlives its caster's body)
+		if ((not head or not head:IsA("BasePart")) and not anchored) or #cast.Circles == 0 then
 			destroyCast(cast)
 			table.remove(casts, index)
 			continue
 		end
-		local origin = cast.FrozenOrigin or head.Position - Vector3.new(0, 0.3, 0)
+		local origin = cast.FrozenOrigin or (head :: BasePart).Position - Vector3.new(0, 0.3, 0)
 		local dilation = Heartbeat.GetGlobalTimeScale() * ChunkManager.GetTimeScaleAt(origin)
 		local ddt = dt * dilation
 		cast.Age += ddt
@@ -839,6 +846,17 @@ local function step(dt: number)
 			over = math.clamp((cast.Charge - 1) / (SpellRunes.Charge.Max - 1), 0, 1)
 			spinBoost = 3 + 5 * f
 			flash = 1.5 * f
+			if f >= 1 then
+				cast.State, cast.StateAge = "release", 0
+				playSound(cast, SOUND_FIRE)
+			end
+		elseif cast.State == "conjure" then
+			-- a conjured circle draws itself in where it was put, then fires
+			local f = math.clamp(cast.StateAge / (cast.ConjureTime or 0.5), 0, 1)
+			cast.Charge = f
+			progress = f
+			spinBoost = 1 + 2 * f
+			flash = f * f
 			if f >= 1 then
 				cast.State, cast.StateAge = "release", 0
 				playSound(cast, SOUND_FIRE)
@@ -921,7 +939,7 @@ local function step(dt: number)
 			local distance = circle.Distance + push
 			local position = (basis * CFrame.new(offset.X, offset.Y, -distance)).Position
 			local frame = CFrame.lookAt(position, position + direction)
-			local side = circle.Size * sizeMul * (1 - 0.25 * cloud)
+			local side = circle.Size * sizeMul * (cast.SizeScale or 1) * (1 - 0.25 * cloud)
 			-- the cast's glint sits on its first circle, moved in this same step;
 			-- once the spell fires (or the cast is no longer charging) it's
 			-- placed one last time and locked there
@@ -1111,6 +1129,22 @@ function SpellCircleVFX.FireFrozen(caster: Model, target: Vector3)
 	cast.AssembleStart = os.clock()
 end
 
+-- A circle conjured at `position` facing `direction` (the Conjure Circle
+-- rune): draws in over `duration` seconds, then releases.
+function SpellCircleVFX.Conjure(caster: Model, position: Vector3, direction: Vector3, spec: any, duration: number, size: number?)
+	local cast = createCast(caster, spec, nil, false)
+	if not cast then
+		return
+	end
+	cast.FrozenDirection = direction
+	cast.FrozenOrigin = position - direction * HAND_DISTANCE
+	cast.ConjureTime = math.max(duration, 0.05)
+	cast.SizeScale = size
+	cast.State, cast.StateAge = "conjure", 0
+	playSound(cast, SOUND_MANIFEST)
+	ensureRunning()
+end
+
 -- Drops every frozen circle of the caster (death, respawn, leaving).
 function SpellCircleVFX.ClearFrozen(caster: Model)
 	for _, cast in frozen[caster] or {} do
@@ -1175,6 +1209,15 @@ VisualOffload.On("SpellCircle", function(data)
 	end
 	if data.Phase == "ClearFrozen" then
 		SpellCircleVFX.ClearFrozen(caster) -- also for our own character: the server decides when
+		return
+	elseif data.Phase == "Conjure" then
+		-- (our own too: only the server knows where a conjured circle goes)
+		local position, direction = data.Position, data.Direction
+		if typeof(position) == "Vector3" and typeof(direction) == "Vector3" and direction.Magnitude > 1e-3 then
+			SpellCircleVFX.Conjure(caster, position, direction.Unit, data.Spec,
+				if typeof(data.Duration) == "number" then data.Duration else 0.5,
+				if typeof(data.Size) == "number" then math.clamp(data.Size, 0.25, 4) else nil)
+		end
 		return
 	end
 	-- the caster's own client already drew it locally
