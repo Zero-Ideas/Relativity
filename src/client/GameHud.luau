@@ -46,6 +46,16 @@ local FONT = Enum.Font.GothamBold
 local TEXT = Color3.fromRGB(240, 240, 240)
 local BAR_WIDTH = 320
 local BAR_HEIGHT = 5
+-- UI 2's authored proportions, enlarged around a 63-pixel card width.
+-- Its deck occupies half the HUD height; resource bars occupy .075759 each.
+local MODE3_CARD_WIDTH = 63
+local MODE3_HUD_HEIGHT = (MODE3_CARD_WIDTH / 0.65) * 2
+local MODE3_HUD_WIDTH = MODE3_CARD_WIDTH * 6.0256
+local MODE3_BAR_HEIGHT = MODE3_HUD_HEIGHT * 0.075759
+local MODE3_BAR_GAP = MODE3_HUD_HEIGHT * (0.128322 - 0.075759)
+local MODE3_DECK_GAP = MODE3_HUD_HEIGHT * (0.665167 - 0.6)
+local MODE3_NUMBER_FONT = Font.new("rbxasset://fonts/families/SourceSansPro.json", Enum.FontWeight.Heavy)
+local MODE3_CARD_FONT = Font.new("rbxasset://fonts/families/FredokaOne.json", Enum.FontWeight.Bold)
 local CARD_W, CARD_H, CARD_GAP, CARD_LIFT = 84, 84, 10, 8
 local PANEL_W = 260
 local SLOT_COUNT = 5
@@ -61,6 +71,16 @@ local SWITCH_CLOSE, SWITCH_OPEN = 0.12, 0.2
 local GameHud = {}
 local started = false
 local enabled = false
+local layoutMode: "Mode 1" | "Mode 3" = "Mode 3"
+local function spellCardWidth(): number
+	return if layoutMode == "Mode 3" then MODE3_CARD_WIDTH else CARD_W
+end
+local function spellCardHeight(): number
+	return if layoutMode == "Mode 3" then MODE3_CARD_WIDTH / 0.65 else CARD_H
+end
+local function spellCardGap(): number
+	return if layoutMode == "Mode 3" then MODE3_HUD_WIDTH * 0.05 else CARD_GAP
+end
 local gui: ScreenGui? = nil
 local renderConnection: RBXScriptConnection? = nil
 
@@ -91,6 +111,8 @@ local function label(props: { [string]: any }, parent: Instance): TextLabel
 	for key, value in props do
 		base[key] = value
 	end
+	-- Font and FontFace both mutate the font; never assign them in arbitrary order.
+	if props.FontFace then base.Font = nil end
 	return make("TextLabel", base, parent)
 end
 
@@ -98,8 +120,12 @@ end
 -- Resource bars
 --------------------------------------------------------------------------------
 
-type Bar = { name: string, fill: Frame, label: TextLabel, value: number }
+type Bar = {
+	name: string, row: Frame, area: Frame, fill: Frame, strip: Frame, color: Color3,
+	label: TextLabel, track: Frame, value: number, trackGradient: UIGradient, fillGradient: UIGradient, border: UIStroke,
+}
 local bars: { Bar } = {}
+local resourcesFrame: Frame? = nil
 local manaMarker: Frame? = nil
 local manaShortUntil = 0
 
@@ -133,7 +159,14 @@ local function buildBar(parent: Instance, name: string, color: Color3, order: nu
 		BorderSizePixel = 0,
 		Size = UDim2.fromScale(1, 1),
 	}, area)
-	make("UIGradient", { Transparency = FADE }, track)
+	local trackGradient = make("UIGradient", { Transparency = FADE }, track)
+	local border = make("UIStroke", {
+		ApplyStrokeMode = Enum.ApplyStrokeMode.Border,
+		Color = Color3.fromRGB(100, 110, 125),
+		Transparency = 0.45,
+		Thickness = 1,
+		Enabled = false,
+	}, area)
 	local clip = make("Frame", {
 		Name = "Fill",
 		BackgroundTransparency = 1,
@@ -147,8 +180,11 @@ local function buildBar(parent: Instance, name: string, color: Color3, order: nu
 		Size = UDim2.new(0, BAR_WIDTH, 1, 0),
 		ZIndex = 2,
 	}, clip)
-	make("UIGradient", { Transparency = FADE }, strip)
-	return { name = name, fill = clip, label = text, value = 1 }, area
+	local fillGradient = make("UIGradient", { Transparency = FADE }, strip)
+	return {
+		name = name, row = row, area = area, fill = clip, strip = strip, color = color, label = text, track = track, value = 1,
+		trackGradient = trackGradient, fillGradient = fillGradient, border = border,
+	}, area
 end
 
 local function resource(name: string): (number, number)
@@ -201,6 +237,7 @@ local function buildBars(screen: ScreenGui)
 		Position = UDim2.new(0, 24, 1, -20),
 		Size = UDim2.fromOffset(BAR_WIDTH, 3 * 30 + 2 * 6),
 	}, screen)
+	resourcesFrame = holder
 	make("UIListLayout", { SortOrder = Enum.SortOrder.LayoutOrder, Padding = UDim.new(0, 6) }, holder)
 	local health = buildBar(holder, "Health", Color3.fromRGB(60, 200, 90), 1)
 	local mana, manaArea = buildBar(holder, "Mana", Color3.fromRGB(70, 110, 255), 2)
@@ -224,16 +261,29 @@ end
 -- One card per saved spell, in slot order, numbered 1..n: never an empty
 -- card. Key k (or clicking card k) selects the k-th saved spell; selecting
 -- the selected one again deselects it. With no spells, a hint shows instead.
-type Card = { holder: Frame, card: Frame, stroke: UIStroke, key: TextLabel, preview: any }
+type Card = { holder: Frame, card: Frame, stroke: UIStroke, key: TextLabel, name: TextLabel, preview: any }
 local cards: { Card } = {}
 local cardSlots: { number } = {} -- card index -> spell slot
 local cardRow: Frame? = nil
 local noSpellsHint: TextLabel? = nil
+local noItemsHint: TextLabel? = nil
 local equippedHeading: Frame? = nil
 local equippedName: TextLabel? = nil
 local equippedUnderline: Frame? = nil
+local hotbarClip: Frame? = nil
+local switchLine: Frame? = nil
+local applyHudLayout: () -> ()
+local switching = false
 
 local hotbarMode: "Spells" | "Items" = "Spells"
+local function hotbarPadding(): number
+	return if layoutMode == "Mode 3" then 48 else HOTBAR_PAD
+end
+local function hotbarHeight(): number
+	-- Mode 3 swaps content in one fixed deck, without moving the bars or
+	-- changing the collapse/expand animation's origin. Tech slots stay square.
+	return if layoutMode == "Mode 3" or hotbarMode == "Spells" then spellCardHeight() else CARD_H
+end
 
 local function selectCard(index: number)
 	local slot = cardSlots[index]
@@ -247,14 +297,15 @@ local function createCard(index: number, row: Frame): Card
 		Name = "Card" .. index,
 		BackgroundTransparency = 1,
 		LayoutOrder = index,
-		Size = UDim2.fromOffset(CARD_W, CARD_H + CARD_LIFT),
+		Size = UDim2.fromOffset(spellCardWidth(), spellCardHeight() + CARD_LIFT),
 	}, row)
 	local card = make("Frame", {
 		Name = "Card",
 		BackgroundColor3 = Color3.fromRGB(12, 12, 16),
 		BackgroundTransparency = 0.15,
+		BorderSizePixel = 0,
 		Position = UDim2.fromOffset(0, CARD_LIFT),
-		Size = UDim2.fromOffset(CARD_W, CARD_H),
+		Size = UDim2.fromOffset(spellCardWidth(), spellCardHeight()),
 	}, holder)
 	local stroke = make("UIStroke", { Color = Color3.fromRGB(90, 90, 95), Thickness = 1.5 }, card)
 	local key = label({
@@ -279,7 +330,20 @@ local function createCard(index: number, row: Frame): Card
 	local preview = SpellCardPreview.new(card, true)
 	preview.Frame.Size = UDim2.fromScale(0.82, 0.82)
 	preview.Frame.Position = UDim2.fromScale(0.5, 0.5)
-	return { holder = holder, card = card, stroke = stroke, key = key, preview = preview }
+	local name = label({
+		Name = "SpellName",
+		AnchorPoint = Vector2.new(0.5, 1),
+		Position = UDim2.new(0.5, 0, 1, -9),
+		Size = UDim2.new(1, -14, 0, 26),
+		Text = "",
+		TextSize = 11,
+		TextWrapped = true,
+		TextTruncate = Enum.TextTruncate.AtEnd,
+		TextXAlignment = Enum.TextXAlignment.Center,
+		ZIndex = 8,
+		Visible = layoutMode == "Mode 3",
+	}, card)
+	return { holder = holder, card = card, stroke = stroke, key = key, name = name, preview = preview }
 end
 
 local function refreshCards()
@@ -303,7 +367,10 @@ local function refreshCards()
 		cards[index].holder:Destroy()
 		cards[index] = nil
 	end
-	row.Size = UDim2.fromOffset(math.max(count * CARD_W + (count - 1) * CARD_GAP, 0), CARD_H + CARD_LIFT)
+	row.Size = UDim2.fromOffset(math.max(count * spellCardWidth() + (count - 1) * spellCardGap(), 0), spellCardHeight() + CARD_LIFT)
+	local layout = row:FindFirstChildOfClass("UIListLayout")
+	if layout then layout.Padding = UDim.new(0, spellCardGap()) end
+	applyHudLayout()
 	if noSpellsHint then
 		noSpellsHint.Visible = count == 0 and hotbarMode == "Spells"
 	end
@@ -318,11 +385,36 @@ local function refreshCards()
 		local slot = cardSlots[index]
 		local record = state.slots[slot] or state.slots[tostring(slot)]
 		local selected = selectedSlot == slot
+		local tall = layoutMode == "Mode 3"
+		card.holder.Size = UDim2.fromOffset(spellCardWidth(), spellCardHeight() + CARD_LIFT)
+		card.card.Size = UDim2.fromOffset(spellCardWidth(), spellCardHeight())
+		card.name.Visible = tall
+		card.name.Text = record.name
+		card.name.TextSize = if tall then 10 else 11
+		card.name.AnchorPoint = if tall then Vector2.zero else Vector2.new(0.5, 1)
+		card.name.Size = if tall then UDim2.fromScale(0.9, 0.175) else UDim2.new(1, -12, 0, 26)
+		card.name.Position = if tall then UDim2.fromScale(0.05, 0.025) else UDim2.new(0.5, 0, 1, -9)
+		card.name.FontFace = if tall then MODE3_CARD_FONT else Font.fromEnum(FONT)
+		card.name.TextScaled = tall
+		card.name.TextStrokeTransparency = if tall then 0 else 0.6
+		card.card.BackgroundColor3 = if tall then Color3.new(0, 0, 0) else Color3.fromRGB(12, 12, 16)
+		card.card.BackgroundTransparency = if tall then 0 else 0.15
+		-- Tuck the number against the corner; its higher ZIndex keeps it legible
+		-- above the filigree, and the clip leaves room for the raised card.
+		card.key.Position = if tall then UDim2.fromOffset(-10, -13) else UDim2.fromOffset(5, 3)
+		card.key.Size = if tall then UDim2.fromOffset(18, 20) else UDim2.fromOffset(14, 14)
+		card.key.TextSize = if tall then 20 else 12
+		card.key.FontFace = if tall then MODE3_NUMBER_FONT else Font.fromEnum(FONT)
+		card.key.TextColor3 = if tall then Color3.new(1, 1, 1) else Color3.fromRGB(180, 180, 180)
+		card.key.TextStrokeTransparency = if tall then 0 else 0.6
+		card.key.TextXAlignment = if tall then Enum.TextXAlignment.Center else Enum.TextXAlignment.Left
+		card.preview.Frame.Size = if tall then UDim2.fromOffset(spellCardWidth() * 0.8, spellCardWidth() * 0.8) else UDim2.fromScale(0.82, 0.82)
+		card.preview.Frame.Position = UDim2.fromScale(0.5, 0.5)
 		card.card.Position = UDim2.fromOffset(0, if selected then 0 else CARD_LIFT)
 		card.stroke.Enabled = false
 		card.preview:SetSpell(record)
 		card.preview:SetSelected(selected)
-		if selected and hotbarMode == "Spells" and equippedHeading and equippedName and equippedUnderline then
+		if selected and not tall and hotbarMode == "Spells" and equippedHeading and equippedName and equippedUnderline then
 			equippedHeading.Visible = true
 			equippedName.Text = record.name
 			equippedUnderline.BackgroundColor3 = SpellCardDecoration.GetColor(card.preview.ManaCost or 0)
@@ -336,7 +428,6 @@ local function refreshCards()
 	end
 end
 
-local hotbarClip: Frame? = nil
 
 local function buildCards(screen: ScreenGui)
 	-- (the hotbar switch collapses this clip to a line: see switchHotbar)
@@ -408,6 +499,61 @@ local function buildCards(screen: ScreenGui)
 end
 
 
+-- Mode 3 follows the authored HUD's centered deck/resources arrangement.
+-- Spell cards and holographic items share the same deck position.
+function applyHudLayout()
+	local compactBars = layoutMode == "Mode 3"
+	local centered = compactBars
+	local resourceHeight = if compactBars then 3 * MODE3_BAR_HEIGHT + 2 * MODE3_BAR_GAP else 3 * 30 + 2 * 6
+	local height = hotbarHeight()
+	if resourcesFrame then
+		local width = if centered then MODE3_HUD_WIDTH else BAR_WIDTH
+		resourcesFrame.AnchorPoint = Vector2.new(if centered then 0.5 else 0, 1)
+		resourcesFrame.Position = if centered then UDim2.new(0.5, 0, 1, -20) else UDim2.new(0, 24, 1, -20)
+		resourcesFrame.Size = UDim2.fromOffset(width, resourceHeight)
+		local layout = resourcesFrame:FindFirstChildOfClass("UIListLayout")
+		if layout then layout.Padding = UDim.new(0, if compactBars then MODE3_BAR_GAP else 6) end
+		for _, bar in bars do
+			bar.strip.Size = UDim2.new(0, width, 1, 0)
+			bar.row.Size = UDim2.new(1, 0, 0, if compactBars then MODE3_BAR_HEIGHT else 30)
+			bar.area.Position = UDim2.fromOffset(0, if compactBars then 0 else 20)
+			bar.area.Size = UDim2.new(1, 0, 0, if compactBars then MODE3_BAR_HEIGHT else BAR_HEIGHT)
+			bar.label.Size = if compactBars then UDim2.fromScale(1, 1.5) else UDim2.new(1, 0, 0, 16)
+			bar.label.Position = if compactBars then UDim2.fromScale(0, -0.25) else UDim2.fromOffset(0, 0)
+			bar.label.TextXAlignment = if compactBars then Enum.TextXAlignment.Center else Enum.TextXAlignment.Left
+			bar.label.TextYAlignment = Enum.TextYAlignment.Center
+			bar.label.TextSize = if compactBars then 18 else 14
+			bar.label.FontFace = if compactBars then MODE3_NUMBER_FONT else Font.fromEnum(FONT)
+			bar.label.TextStrokeTransparency = if compactBars then 0 else 0.6
+			bar.label.ZIndex = 4
+			local themeColor = if bar.name == "Health" then Color3.fromRGB(0, 230, 75)
+				elseif bar.name == "Mana" then Color3.fromRGB(40, 110, 255)
+				else Color3.fromRGB(255, 128, 0)
+			bar.strip.BackgroundColor3 = if compactBars then themeColor else bar.color
+			bar.track.BackgroundColor3 = if compactBars then themeColor:Lerp(Color3.new(0, 0, 0), 0.7) else Color3.new(0, 0, 0)
+			bar.track.BackgroundTransparency = if compactBars then 0 else 0.55
+			bar.trackGradient.Enabled = not compactBars
+			bar.fillGradient.Enabled = not compactBars
+			bar.border.Color = Color3.new(0, 0, 0)
+			bar.border.Transparency = 0
+			bar.border.Thickness = 3
+			bar.border.Enabled = compactBars
+		end
+	end
+	if hotbarClip then
+		local bottom = if centered then 20 + resourceHeight + MODE3_DECK_GAP else 14
+		hotbarClip.Position = UDim2.new(0.5, 0, 1, -bottom - (height + CARD_LIFT) / 2)
+		if switchLine then switchLine.Position = hotbarClip.Position end
+		if not switching then hotbarClip.Size = UDim2.new(1, 0, 0, height + CARD_LIFT + hotbarPadding()) end
+	end
+	if noSpellsHint then
+		noSpellsHint.Position = UDim2.new(0.5, 0, 1, if centered then -(20 + resourceHeight + 20) else -24)
+	end
+	if noItemsHint then
+		noItemsHint.Position = UDim2.new(0.5, 0, 1, if centered then -(20 + resourceHeight + 20) else -24)
+	end
+end
+
 --------------------------------------------------------------------------------
 -- Items hotbar (holographic)
 --------------------------------------------------------------------------------
@@ -418,9 +564,6 @@ type ItemSlot = { holder: Frame, box: Frame, stroke: UIStroke, icon: ImageLabel,
 local itemRow: Frame? = nil
 local itemSlots: { ItemSlot } = {}
 local itemOrder: { Tool } = {}
-local noItemsHint: TextLabel? = nil
-local switchLine: Frame? = nil
-local switching = false
 
 local function humanoidOf(): Humanoid?
 	local character = player.Character
@@ -577,7 +720,7 @@ local function refreshItems()
 		slot.initials.Visible = tool.TextureId == ""
 	end
 	if hotbarMode == "Items" and equippedHeading and equippedName and equippedUnderline then
-		equippedHeading.Visible = equipped ~= nil
+		equippedHeading.Visible = layoutMode ~= "Mode 3" and equipped ~= nil
 		equippedHeading.Size = UDim2.fromOffset(math.clamp(row.Size.X.Offset, 180, 420), 32)
 		equippedName.Text = if equipped then equipped.Name else ""
 		equippedUnderline.BackgroundColor3 = Holo.line
@@ -688,7 +831,6 @@ local function switchHotbar(toItems: boolean)
 	if noItemsHint then
 		noItemsHint.Visible = false
 	end
-	local full = CARD_H + CARD_LIFT + HOTBAR_PAD
 	local outgoing = if toItems then cardRow else itemRow
 	local incoming = if toItems then itemRow else cardRow
 	local width = math.max((outgoing and outgoing.Size.X.Offset or 0), (incoming and incoming.Size.X.Offset or 0), 180) + 60
@@ -707,12 +849,14 @@ local function switchHotbar(toItems: boolean)
 		end
 		refreshCards()
 		refreshItems()
+		local full = hotbarHeight() + CARD_LIFT + hotbarPadding()
 		local open = TweenService:Create(clip, TweenInfo.new(SWITCH_OPEN, Enum.EasingStyle.Quart, Enum.EasingDirection.Out), { Size = UDim2.new(1, 0, 0, full) })
 		open:Play()
 		TweenService:Create(line, TweenInfo.new(SWITCH_OPEN), { BackgroundTransparency = 1 }):Play()
 		open.Completed:Once(function()
 			line.Visible = false
 			switching = false
+			applyHudLayout()
 		end)
 	end)
 end
@@ -1188,8 +1332,27 @@ local function bindSlotKeys()
 		Enum.KeyCode.Six, Enum.KeyCode.Seven, Enum.KeyCode.Eight, Enum.KeyCode.Nine)
 end
 
+function GameHud.SetLayout(layout: "Mode 1" | "Mode 3")
+	if layoutMode == layout then return end
+	layoutMode = layout
+	if started then
+		refreshCards()
+		refreshItems()
+	end
+end
+
 function GameHud.SetEnabled(on: boolean)
 	if enabled == on then
+		-- Modes 1 and 3 share this HUD instance. Re-entering it must restore
+		-- input ownership and the actual displayed hotbar, not just its skin.
+		if on and started then
+			bindSlotKeys()
+			if cardRow then cardRow.Visible = hotbarMode == "Spells" end
+			if itemRow then itemRow.Visible = hotbarMode == "Items" end
+			SpellEditor.SetCastingPaused(hotbarMode == "Items")
+			refreshCards()
+			refreshItems()
+		end
 		return
 	end
 	enabled = on
@@ -1201,7 +1364,11 @@ function GameHud.SetEnabled(on: boolean)
 	end
 	if on then
 		bindSlotKeys()
+		if cardRow then cardRow.Visible = hotbarMode == "Spells" end
+		if itemRow then itemRow.Visible = hotbarMode == "Items" end
+		SpellEditor.SetCastingPaused(hotbarMode == "Items")
 		refreshCards()
+		refreshItems()
 		refreshParty()
 		if not renderConnection then
 			renderConnection = RunService.RenderStepped:Connect(stepBars)

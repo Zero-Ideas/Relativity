@@ -11,6 +11,9 @@
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local Shared = ReplicatedStorage:WaitForChild("Shared")
 
+-- Apply the default WIP-UI filter before loading the other client systems.
+require(script.UiVisibility).start()
+
 local ChunkManager = require(Shared.ChunkManager)
 local ProjectileClient = require(Shared.Projectile.Client)
 local Entity = require(Shared.Entity)
@@ -37,6 +40,7 @@ Entity.EnableHurtboxRendering() -- draws hurtboxes when Entity.ShowHurtboxes is 
 Entity.EnableHurtboxHistoryRendering() -- draws the history trail when Entity.ShowHurtboxHistory is true
 
 MovementController.start()
+task.spawn(function() require(script.PlayerLocomotion).start() end)
 ChunkVisualizer.start()
 -- the time slider lives in the debug panel's Time tab; the old on-screen
 -- panel is gone everywhere

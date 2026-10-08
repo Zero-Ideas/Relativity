@@ -4,21 +4,18 @@ local Players = game:GetService("Players")
 local RunService = game:GetService("RunService")
 local UserInputService = game:GetService("UserInputService")
 local ContextActionService = game:GetService("ContextActionService")
-local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local SpellEditor = require(script.Parent.SpellAssemblerGui)
 local SpellCardPreview = require(script.Parent.SpellCardPreview)
 local player = Players.LocalPlayer
-local movement = ReplicatedStorage:WaitForChild("PlayerMovement") :: RemoteEvent
 
 local Hud = {}
 local started = false
-local enabled = true -- (UiMode turns the HUD off for the classic UI)
+local enabled = false -- UiMode explicitly grants input ownership to this HUD.
 local gui: ScreenGui? = nil
 local uiConnections: { RBXScriptConnection } = {}
 local characterConnections: { RBXScriptConnection } = {}
 local animatorConnection: RBXScriptConnection? = nil
 local humanoid: Humanoid? = nil
-local lastForward = -math.huge
 type Bar = { fill: Frame, label: TextLabel, value: number, target: number }
 local bars: { [string]: Bar } = {}
 local slots: { any } = {}
@@ -163,7 +160,6 @@ end
 local function bindCharacter(character: Model)
 	disconnect(characterConnections)
 	humanoid = nil
-	lastForward = -math.huge
 	local found = character:WaitForChild("Humanoid", 10)
 	if player.Character ~= character or not found or not found:IsA("Humanoid") then return end
 	humanoid = found
@@ -184,7 +180,7 @@ local function bindSlotKeys()
 	end, false, Enum.ContextActionPriority.High.Value + 50, Enum.KeyCode.One, Enum.KeyCode.Two, Enum.KeyCode.Three, Enum.KeyCode.Four, Enum.KeyCode.Five)
 end
 
--- Shows or hides the HUD and its 1-5 card shortcuts (sprint and flip stay).
+-- Shows or hides the HUD and its 1-5 card shortcuts. Locomotion is separate.
 function Hud.SetEnabled(on: boolean)
 	if enabled == on then return end
 	enabled = on
@@ -213,31 +209,6 @@ function Hud.start()
 	player.CharacterRemoving:Connect(function() disconnect(characterConnections); humanoid = nil; refreshStats() end)
 	if player.Character then task.spawn(bindCharacter, player.Character) end
 	if enabled then bindSlotKeys() end
-	UserInputService.InputBegan:Connect(function(input, processed)
-		if processed or UserInputService:GetFocusedTextBox() or SpellEditor.IsOpen() then return end
-		if input.KeyCode == Enum.KeyCode.LeftControl then movement:FireServer("ToggleSprint")
-		elseif input.KeyCode == Enum.KeyCode.W then
-			local now = os.clock()
-			if now - lastForward < 0.2 then movement:FireServer("Flip"); lastForward = -math.huge else lastForward = now end
-		end
-	end)
-	movement.OnClientEvent:Connect(function(action, scale)
-		if action ~= "Flip" or typeof(scale) ~= "number" then return end
-		local character = player.Character
-		local root = character and character:FindFirstChild("HumanoidRootPart")
-		if not root or not root:IsA("BasePart") or not humanoid or humanoid.Health <= 0 then return end
-		local camera = workspace.CurrentCamera
-		local look = if camera then camera.CFrame.LookVector else root.CFrame.LookVector
-		local direction = look * Vector3.new(1, 0, 1)
-		if direction.Magnitude < 0.001 then direction = Vector3.zAxis end
-		root.AssemblyLinearVelocity += (Vector3.yAxis * 110 + direction.Unit * 125) * scale
-		local storage = game:GetService("Lighting"):FindFirstChild("AnimationStorage")
-		local animation = storage and storage:FindFirstChild("FrontFlip")
-		local animator = humanoid:FindFirstChildOfClass("Animator")
-		if animation and animation:IsA("Animation") and animator then
-			pcall(function() local track = animator:LoadAnimation(animation); track:Play(); track:AdjustSpeed(scale); track.Stopped:Once(function() track:Destroy() end) end)
-		end
-	end)
 	local playerGui = player:WaitForChild("PlayerGui")
 	playerGui.ChildAdded:Connect(function(child) if child.Name == "MainGui" and child:IsA("ScreenGui") then bindGui(child) end end)
 	local screen = playerGui:FindFirstChild("MainGui")

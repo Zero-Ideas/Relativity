@@ -26,8 +26,12 @@ local settings = Resources.Settings
 local remote = Instance.new("RemoteEvent")
 remote.Name = "PlayerMovement"
 remote.Parent = ReplicatedStorage
-local lastRequest: { [Player]: number } = {}
+remote:SetAttribute("SprintMultiplier", settings.SprintMultiplier)
+remote:SetAttribute("FlipCost", settings.FlipCost)
+remote:SetAttribute("FlipCooldown", settings.FlipCooldown)
+local lastSprintRequest: { [Player]: number } = {}
 local lastFlip: { [Player]: number } = {}
+local lastGrounded: { [Player]: number } = {}
 
 local function finite(value: any): boolean
 	return typeof(value) == "number" and value == value and math.abs(value) < math.huge
@@ -63,29 +67,37 @@ end
 
 local function setSprint(player: Player, enabled: boolean)
 	player:SetAttribute("Sprinting", enabled)
-	local character = player.Character
-	local humanoid = character and character:FindFirstChildOfClass("Humanoid")
-	if humanoid then humanoid:SetAttribute("SprintMultiplier", if enabled then settings.SprintMultiplier else 1) end
-	local entity = character and Entity.Get(character)
-	if entity then entity._lastHumanoidScale = nil end
 end
 
-remote.OnServerEvent:Connect(function(player: Player, action: any)
-	if action ~= "ToggleSprint" and action ~= "Flip" then return end
+remote.OnServerEvent:Connect(function(player: Player, action: any, id: any, value: any, requestedCharacter: any)
+	if action ~= "SetSprint" and action ~= "Flip" then return end
+	if not finite(id) or id % 1 ~= 0 or id < 1 or id > 2^31 then return end
 	local now = os.clock()
-	if lastRequest[player] and now - lastRequest[player] < 0.1 then return end
-	lastRequest[player] = now
 	local character = player.Character
 	local humanoid = character and character:FindFirstChildOfClass("Humanoid")
 	local entity = character and Entity.Get(character)
-	if not humanoid or humanoid.Health <= 0 or not entity or entity:GetEffectiveTimeScale() <= 0 then return end
-	if action == "ToggleSprint" then
-		setSprint(player, player:GetAttribute("Sprinting") ~= true and (player:GetAttribute("Stamina") or 0) > 0)
-	elseif humanoid.FloorMaterial ~= Enum.Material.Air
-		and (not lastFlip[player] or now - lastFlip[player] >= settings.FlipCooldown)
-		and Resources.Consume(player, "Stamina", settings.FlipCost) then
-		lastFlip[player] = now
-		remote:FireClient(player, "Flip", entity:GetEffectiveTimeScale())
+	local valid = character == requestedCharacter and humanoid ~= nil and humanoid.Health > 0
+		and not humanoid.PlatformStand and entity ~= nil and entity:GetEffectiveTimeScale() > 0
+	if action == "SetSprint" then
+		if typeof(value) ~= "boolean" then return end
+		if valid and (not lastSprintRequest[player] or now - lastSprintRequest[player] >= 0.05) then
+			lastSprintRequest[player] = now
+			setSprint(player, value and (player:GetAttribute("Stamina") or 0) > 0)
+		end
+		remote:FireClient(player, "SprintResult", id, player:GetAttribute("Sprinting") == true)
+	else
+		-- A predicted flip may already be airborne when this request arrives.
+		-- Accept a short, server-observed ground grace; never trust a client
+		-- flag or accept arbitrary client speed/cost/cooldown values.
+		local grounded = humanoid and humanoid.FloorMaterial ~= Enum.Material.Air
+		local recentlyGrounded = lastGrounded[player] and now - lastGrounded[player] <= 0.3
+		local accepted = valid and (grounded or recentlyGrounded) and (not lastFlip[player] or now - lastFlip[player] >= settings.FlipCooldown)
+			and Resources.Consume(player, "Stamina", settings.FlipCost)
+		if accepted then
+			lastFlip[player] = now
+			lastGrounded[player] = nil
+		end
+		remote:FireClient(player, "FlipResult", id, accepted == true)
 	end
 end)
 
@@ -95,13 +107,14 @@ local function onPlayer(player: Player)
 		setSprint(player, false)
 		player:SetAttribute("Stamina", player:GetAttribute("MaxStamina"))
 		lastFlip[player] = nil
+		lastGrounded[player] = nil
 	end)
 	player.CharacterRemoving:Connect(function() setSprint(player, false) end)
 end
 Players.PlayerAdded:Connect(onPlayer)
 for _, player in Players:GetPlayers() do onPlayer(player) end
 Players.PlayerRemoving:Connect(function(player)
-	lastRequest[player], lastFlip[player] = nil, nil
+	lastSprintRequest[player], lastFlip[player], lastGrounded[player] = nil, nil, nil
 end)
 
 local elapsed = 0
@@ -119,6 +132,7 @@ RunService.Heartbeat:Connect(function(dt: number)
 			continue
 		end
 		local scaledDt = interval * entity:GetEffectiveTimeScale()
+		if humanoid.FloorMaterial ~= Enum.Material.Air then lastGrounded[player] = os.clock() end
 		if scaledDt <= 0 then continue end
 		-- passive health regen (the place's StarterCharacterScripts "Health"
 		-- script turns Roblox's own off)

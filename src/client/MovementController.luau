@@ -98,6 +98,7 @@ local player = Players.LocalPlayer
 local started = false
 local personalScale = 1
 local lastEffScale = 1
+local localSprintMultiplier: number? = nil
 
 export type Modifier = {
 	WalkSpeedMultiplier: number?,
@@ -227,7 +228,7 @@ local function step()
 	local baseWalk, baseJump, jumpMode = bases(current)
 
 	-- Horizontal movement dilation.
-	local sprint = finite(humanoid:GetAttribute("SprintMultiplier")) or 1
+	local sprint = localSprintMultiplier or finite(humanoid:GetAttribute("SprintMultiplier")) or 1
 	humanoid.WalkSpeed = resolve(baseWalk, "WalkSpeedAdd", "WalkSpeedMultiplier", "WalkSpeed") * sprint * effScale
 
 	-- Jump impulse dilation (velocity scales with effScale; height with its square).
@@ -331,7 +332,13 @@ function MovementController.GetWalkSpeed(): number?
 		return nil
 	end
 	local walk = bases(current)
-	return resolve(walk, "WalkSpeedAdd", "WalkSpeedMultiplier", "WalkSpeed") * (finite(current.humanoid:GetAttribute("SprintMultiplier")) or 1)
+	return resolve(walk, "WalkSpeedAdd", "WalkSpeedMultiplier", "WalkSpeed") * (localSprintMultiplier or finite(current.humanoid:GetAttribute("SprintMultiplier")) or 1)
+end
+
+-- Local locomotion predicts sprint immediately; nil returns to replicated
+-- metadata. This is separate from modifiers so sprint never stacks twice.
+function MovementController.SetSprintMultiplier(value: number?)
+	localSprintMultiplier = if value then math.max(finite(value) or 1, 0) else nil
 end
 
 -- Undilated jump (power or height -- see GetBase) after modifiers.

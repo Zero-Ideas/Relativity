@@ -612,7 +612,14 @@ function SpellCompiler.Compile(graph: any)
 					local elementDef = element and SpellRunes.Elements[element]
 					local impact = (if elementDef then elementDef.Impact else 1) * SpellRunes.Vessels[def.Id].Impact
 					if def.Id == "Explosion" then
-						own *= 1 - SpellRunes.ExplosionCost(rune.params.Radius)
+						local sizeFactor = 1
+						for _, modId in info.mods do
+							local modifier = runeById[modId]
+							if modifier.rune == "Size" then sizeFactor = modifier.params.Factor end
+						end
+						local radius = SpellRunes.ExplosionRadius(rune.params.Radius, sizeFactor)
+						estimates[link.to].radius = radius
+						own *= 1 - SpellRunes.ExplosionCost(radius)
 					end
 					estimates[link.to].damage = own * impact
 				else

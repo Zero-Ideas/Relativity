@@ -16,6 +16,7 @@ local RagdollModule = {}
 local RAGDOLL_INSTANCE_NAMES = {
 	["RagdollAttachment"] = true,
 	["RagdollConstraint"] = true,
+	["RagdollNoCollision"] = true,
 	["ColliderPart"] = true, -- Keep this for cleanup in case old ragdolls had them
 	["RagdollTimeAttachment"] = true,
 	["RagdollTimeGravity"] = true,
@@ -104,6 +105,7 @@ local function beginTracking(character: Model)
 	-- Existing motion becomes dilated as soon as the body ragdolls. New pushes
 	-- should use SetRootVelocity below so they are expressed in world-time units.
 	for _, part in state.Parts do
+		state.FrozenVelocity[part] = {Linear = part.AssemblyLinearVelocity, Angular = part.AssemblyAngularVelocity}
 		part.AssemblyLinearVelocity *= scale
 		part.AssemblyAngularVelocity *= scale
 		local force = getGravityForce(part)
@@ -181,6 +183,13 @@ end)
 local function replaceJoints(character: Model, humanoid: Humanoid)
 	local animateScript = character:FindFirstChild("Animate")
 	local motors = {}
+	local collisions = {}
+	for _, part in character:GetChildren() do
+		if part:IsA("BasePart") then
+			collisions[part] = part.CanCollide
+			part.CanCollide = part.Name ~= "HumanoidRootPart"
+		end
+	end
 	for _, joint in character:GetDescendants() do
 		if joint:IsA("Motor6D") then motors[joint] = joint.Enabled end
 	end
@@ -188,6 +197,8 @@ local function replaceJoints(character: Model, humanoid: Humanoid)
 		RequiresNeck = humanoid.RequiresNeck,
 		BreakJointsOnDeath = humanoid.BreakJointsOnDeath,
 		AutoRotate = humanoid.AutoRotate,
+		PlatformStand = humanoid.PlatformStand,
+		Collisions = collisions,
 		GettingUp = humanoid:GetStateEnabled(Enum.HumanoidStateType.GettingUp),
 		AnimateEnabled = animateScript and animateScript:IsA("LocalScript") and animateScript.Enabled,
 		Motors = motors,
@@ -262,6 +273,10 @@ local function replaceJoints(character: Model, humanoid: Humanoid)
 			attachment0.Parent = motor.Part0
 			attachment1.Parent = motor.Part1
 			ballSocketConstraint.Parent = motor.Parent
+			local noCollision = Instance.new("NoCollisionConstraint")
+			noCollision.Name = "RagdollNoCollision"
+			noCollision.Part0, noCollision.Part1 = motor.Part0, motor.Part1
+			noCollision.Parent = motor.Parent
 		end
 	end
 
@@ -296,6 +311,12 @@ local function resetJoints(character: Model, humanoid: Humanoid)
 	humanoid.RequiresNeck = if original then original.RequiresNeck else true
 	humanoid.BreakJointsOnDeath = if original then original.BreakJointsOnDeath else humanoid.BreakJointsOnDeath
 	humanoid.AutoRotate = if original then original.AutoRotate else true
+	humanoid.PlatformStand = if original then original.PlatformStand else false
+	if original then
+		for part, canCollide in original.Collisions do
+			if part.Parent then part.CanCollide = canCollide end
+		end
+	end
 	humanoid:SetStateEnabled(Enum.HumanoidStateType.GettingUp, if original then original.GettingUp else true)
 
 	-- Re-enable the 'Animate' script
@@ -352,10 +373,11 @@ function RagdollModule.SetRagdoll(character: Model, value: boolean, applyPushOnR
 			replaceJoints(character, humanoid)
 			beginTracking(character)
 		end
+		humanoid.PlatformStand = true
 		
 		--> Check to see if the module is being called from client/server
 		if RunService:IsClient() then
-			humanoid:ChangeState(Enum.HumanoidStateType.Ragdoll)
+			if humanoid.Health > 0 then humanoid:ChangeState(Enum.HumanoidStateType.Physics) end
 			humanoid:SetStateEnabled(Enum.HumanoidStateType.GettingUp, false)
 			
 		elseif RunService:IsServer() then
@@ -365,7 +387,7 @@ function RagdollModule.SetRagdoll(character: Model, value: boolean, applyPushOnR
 			-- rig, so handing the root back to the player restores all of it.
 			takeOwnership(character)
 			
-			humanoid:ChangeState(Enum.HumanoidStateType.Ragdoll)
+			if humanoid.Health > 0 then humanoid:ChangeState(Enum.HumanoidStateType.Physics) end
 			humanoid:SetStateEnabled(Enum.HumanoidStateType.GettingUp, false)
 		end
 
@@ -394,6 +416,28 @@ function RagdollModule.SetRagdoll(character: Model, value: boolean, applyPushOnR
 			end
 		end
 	end
+end
+
+-- One small tipping impulse, not a persistent torque or a velocity reset.
+-- Applied to the torso after joints/ownership are ready; retains launches
+-- and honors local dilation, including a currently frozen ragdoll.
+function RagdollModule.Tip(character: Model, strength: number?)
+	local state = trackedRagdolls[character]
+	if not state then return end
+	local torso = character:FindFirstChild("UpperTorso") or character:FindFirstChild("Torso") or getRoot(character)
+	if not torso or not torso:IsA("BasePart") or torso.Anchored then return end
+	local speed = math.clamp(strength or 2.2, 0, 5)
+	local axis = (torso.CFrame.RightVector + torso.CFrame.LookVector * 0.2).Unit
+	local spin = axis * speed
+	if state.Scale <= SCALE_EPSILON then
+		local frozen = state.FrozenVelocity[torso] or {Linear = Vector3.zero, Angular = Vector3.zero}
+		frozen.Angular += spin
+		state.FrozenVelocity[torso] = frozen
+		return
+	end
+	local size = torso.Size
+	local inertia = torso.AssemblyMass * (size.Y * size.Y + size.Z * size.Z) / 12
+	torso:ApplyAngularImpulse(spin * inertia * state.Scale)
 end
 
 -- Launches a (ragdolled) character: server takes every limb, then each gets

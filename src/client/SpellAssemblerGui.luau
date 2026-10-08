@@ -288,8 +288,23 @@ end
 -- Commands
 --------------------------------------------------------------------------------
 
+-- All editor/library/share calls use the same serialized dispatcher. A
+-- background GetState must not make an interactive command fail as busy
+-- or hit the server's 0.15-second command limit.
+local COMMAND_GAP = 0.2
+local commandBusy = false
+local commandReleased = Instance.new("BindableEvent")
+local lastCommandAt = -math.huge
+
 local function invoke(action: string, payload: any?): any
+	while commandBusy do commandReleased.Event:Wait() end
+	commandBusy = true
+	local remaining = COMMAND_GAP - (os.clock() - lastCommandAt)
+	if remaining > 0 then task.wait(remaining) end
+	lastCommandAt = os.clock()
 	local ok, result = pcall(command.InvokeServer, command, action, payload)
+	commandBusy = false
+	commandReleased:Fire()
 	if not ok or typeof(result) ~= "table" then
 		return { ok = false, message = "The spell service did not respond." }
 	end
@@ -305,10 +320,6 @@ local function applyServerResult(result: any)
 	setStatus(message, result.ok)
 	updateTopBar()
 end
-
--- The server rate-limits spell commands (COMMAND_INTERVAL = 0.15s), so
--- chained commands wait this long between calls.
-local COMMAND_GAP = 0.2
 
 -- Unequips the active spell (nothing casts until another is selected).
 local function deselectSlot()
@@ -378,11 +389,9 @@ local function saveCard(): boolean
 				end
 			end
 			if free then
-				task.wait(COMMAND_GAP)
 				local equipped = invoke("Equip", { slot = free, ref = "c:" .. editingSpellId })
 				if equipped.state then serverState = equipped.state end
 				if equipped.ok then
-					task.wait(COMMAND_GAP)
 					equipSlot(free)
 				else
 					applyServerResult(equipped)
@@ -405,7 +414,6 @@ local function saveCard(): boolean
 	applyServerResult(result)
 	refresh()
 	if result.ok and not serverState.activeSlot then
-		task.wait(COMMAND_GAP)
 		equipSlot(selectedSlot)
 	end
 	return result.ok == true
@@ -1312,6 +1320,11 @@ local function buildChargeBar()
 	local frame = Instance.new("Frame")
 	frame.AnchorPoint = Vector2.new(0.5, 1)
 	frame.Position = UDim2.new(0.5, 0, 1, -170)
+	local function placeChargeBar()
+		frame.Position = UDim2.new(0.5, 0, 1, if player:GetAttribute("UiMode") == "Mode3" then -206 else -170)
+	end
+	player:GetAttributeChangedSignal("UiMode"):Connect(placeChargeBar)
+	placeChargeBar()
 	frame.Size = UDim2.fromOffset(240, 10)
 	frame.BackgroundColor3 = Color3.fromRGB(20, 22, 30)
 	frame.BackgroundTransparency = 0.2

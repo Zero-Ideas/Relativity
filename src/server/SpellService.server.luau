@@ -191,7 +191,7 @@ end
 
 -- Shared spells waiting for an answer: shares[recipient][shareId].
 local SHARE_LIFETIME = 60
-type Share = { from: Player, name: string, graph: any, expiry: number }
+type Share = { from: Player, name: string, graph: any, expiry: number, savedId: string? }
 local shares: { [Player]: { [string]: Share } } = {}
 
 local function refOf(payload: any): string?
@@ -287,13 +287,18 @@ local function handleLibraryCommand(player: Player, action: string, payload: any
 		return done(ok, err, state, "Purchased.")
 	elseif action == "ShareSpell" then
 		-- offer one of your spells to another player in this server
-		local id, target = textOf(payload.id, 64), payload.target
+		local id = textOf(payload.id, 64)
+		local target = if typeof(payload.targetUserId) == "number" then Players:GetPlayerByUserId(payload.targetUserId) else payload.target
 		local record = id and SpellStore.GetLibrarySpell(player, id)
 		if not record or record.invalid then
 			return response(false, SpellStore.GetState(player), nil, "Pick a working spell from your library.")
 		end
 		if typeof(target) ~= "Instance" or not target:IsA("Player") or target == player or target.Parent ~= Players then
 			return response(false, SpellStore.GetState(player), nil, "Pick someone in this server.")
+		end
+		local compiled, _, snapshot = SpellCompiler.Compile(record.graph)
+		if not compiled or not snapshot then
+			return response(false, SpellStore.GetState(player), nil, "That spell no longer compiles. Edit and save it before sharing.")
 		end
 		local pending = shares[target]
 		if not pending then
@@ -305,9 +310,18 @@ local function handleLibraryCommand(player: Player, action: string, payload: any
 				return response(false, SpellStore.GetState(player), nil, `{target.DisplayName} hasn't answered your last share yet.`)
 			end
 		end
+		-- The sender's personal filter result isn't valid for the recipient.
+		-- Filter before showing the offer, not only after it is accepted.
+		local ok, filtered = pcall(function()
+			local result = TextService:FilterStringAsync(record.name, player.UserId)
+			return result:GetNonChatStringForUserAsync(target.UserId)
+		end)
+		local name = if ok and typeof(filtered) == "string" and filtered ~= "" then truncateCharacters(filtered, 24) else "Shared spell"
+		if target.Parent ~= Players then return response(false, SpellStore.GetState(player), nil, "That player left the server.") end
+		snapshot.name = name
 		local shareId = HttpService:GenerateGUID(false)
-		pending[shareId] = { from = player, name = record.name, graph = record.graph, expiry = os.clock() + SHARE_LIFETIME }
-		shareRemote:FireClient(target, "Offer", shareId, player, record.name, workspace:GetServerTimeNow() + SHARE_LIFETIME)
+		pending[shareId] = { from = player, name = name, graph = snapshot, expiry = os.clock() + SHARE_LIFETIME }
+		shareRemote:FireClient(target, "Offer", shareId, player, name, workspace:GetServerTimeNow() + SHARE_LIFETIME)
 		task.delay(SHARE_LIFETIME, function()
 			if shares[target] then shares[target][shareId] = nil end
 		end)
@@ -319,21 +333,26 @@ local function handleLibraryCommand(player: Player, action: string, payload: any
 		if not share then
 			return response(false, SpellStore.GetState(player), nil, "That share has expired.")
 		end
-		(pending :: any)[shareId] = nil
 		local from = share.from
-		if action == "DeclineShare" or share.expiry < os.clock() then
+		if share.expiry < os.clock() then
+			(pending :: any)[shareId] = nil
+			return response(false, SpellStore.GetState(player), nil, "That share has expired.")
+		end
+		if action == "DeclineShare" then
+			(pending :: any)[shareId] = nil
 			if from.Parent == Players then shareRemote:FireClient(from, "Answer", player, false, share.name) end
 			return response(true, SpellStore.GetState(player), nil, "Declined.")
 		end
-		-- (its name was filtered for its maker: filter it again for you)
+		-- Keep the offer until saving succeeds. If persistence failed after
+		-- inserting the in-session copy, a retry saves that same copy, never
+		-- adds a duplicate spell.
 		local name = share.name
-		local ok, filtered = pcall(function()
-			local result = TextService:FilterStringAsync(share.name, from.UserId)
-			return result:GetNonChatStringForUserAsync(player.UserId)
-		end)
-		name = if ok and typeof(filtered) == "string" and filtered ~= "" then filtered else "Shared spell"
-		local saved, err, state = SpellStore.SaveSpell(player, nil, truncateCharacters(name, 24), share.graph)
-		if saved and from.Parent == Players then shareRemote:FireClient(from, "Answer", player, true, share.name) end
+		local saved, err, state, savedId = SpellStore.SaveSpell(player, share.savedId, name, share.graph)
+		share.savedId = savedId or share.savedId
+		if saved then
+			(pending :: any)[shareId] = nil
+			if from.Parent == Players then shareRemote:FireClient(from, "Answer", player, true, share.name) end
+		end
 		return done(saved, err, state, `Added "{name}" to your library.`)
 	end
 	return nil

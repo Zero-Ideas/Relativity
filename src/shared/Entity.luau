@@ -139,6 +139,13 @@ Entity.HeadshotMultiplier = 2 -- damage multiplier applied by Shooter.server.lua
 -- Set Entity.RespawnDelay = nil to turn forced respawn off.
 Entity.RespawnDelay = 5 :: number?
 local respawnHandler: ((any) -> boolean?)? = nil
+local deathHandler: ((any, any?) -> ())? = nil
+
+-- Server-owned physical death behavior, without coupling shared Entity to
+-- a server-only ragdoll module. Runs before entity-specific death listeners.
+function Entity.SetDeathHandler(fn: ((any, any?) -> ())?)
+	deathHandler = fn
+end
 
 function Entity.SetRespawnHandler(fn: ((any) -> boolean?)?)
 	respawnHandler = fn
@@ -226,6 +233,7 @@ function Entity.new(instance: Instance?, props: { [string]: any }?)
 				or (humanoid and instance:FindFirstChild("HumanoidRootPart") :: BasePart?)
 				or instance:FindFirstChildWhichIsA("BasePart", true)
 			if humanoid then
+				if RunService:IsServer() then humanoid.BreakJointsOnDeath = false end
 				self.Humanoid = humanoid
 				self.Health = humanoid.Health
 				self.MaxHealth = humanoid.MaxHealth
@@ -686,6 +694,10 @@ function Entity:_handleDeath(info: any?)
 		return
 	end
 	self._dead = true
+	if RunService:IsServer() and deathHandler then
+		local ok, err = pcall(deathHandler, self, info)
+		if not ok then warn("[Entity] death handler failed: " .. tostring(err)) end
+	end
 	self.Died:Fire(info)
 	print(`[Entity][respawn-debug] death detected: {self.Instance and self.Instance:GetFullName() or "data entity"} #{self.Id} server={RunService:IsServer()} delay={Entity.RespawnDelay}`) -- TEMP
 

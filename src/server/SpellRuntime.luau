@@ -1009,16 +1009,17 @@ local function fireTrigger(compiled: any, parent: Context, triggerId: string, en
 	runFlow(compiled, ctx, triggerId, "out", energy, element)
 end
 
--- Flight stats for one projectile vessel after its modifiers (their
+-- Flight/placement stats for one vessel after its modifiers (their
 -- settings resolved in this context), and the energy fraction the
 -- modifiers take. Evaluated once per firing, so a Stream's later copies
 -- reuse the cast-time Homing lock.
 local function vesselStats(compiled: any, ctx: Context, id: string): (any, number)
 	local base = SpellRunes.Vessels[compiled.runes[id].rune]
 	local stats = {
-		speed = base.Speed,
-		radius = base.Radius,
-		lifetime = base.Lifetime,
+		speed = base.Speed or 0,
+		radius = base.Radius or 1,
+		lifetime = base.Lifetime or 1,
+		castRange = base.MaxCastRange or 0,
 		scale = base.Scale or 1,
 		gravity = 0,
 		bounces = 0,
@@ -1049,6 +1050,7 @@ local function vesselStats(compiled: any, ctx: Context, id: string): (any, numbe
 			stats.falloff = p.Falloff / 100
 		elseif kind == "Range" then
 			stats.lifetime *= p.Factor
+			stats.castRange *= p.Factor
 		elseif kind == "Quantity" then
 			-- over the chain's Quantity limit (SpellCompiler): one copy
 			if not (compiled.noQuantity and compiled.noQuantity[id]) then
@@ -1416,9 +1418,10 @@ local MIN_EXPLOSION_SCALE = 0.2 -- smallest radius fraction a split blast keeps
 local function explode(shot: Shot)
 	local ctx = shot.ctx
 	local params = settings(shot.compiled, ctx, shot.id)
-	local center = placement(shot.compiled, ctx, shot.id, SpellRunes.Vessels.Explosion.MaxCastRange)
-	local radius = params.Radius * math.clamp(shot.energyScale ^ (1 / 3), MIN_EXPLOSION_SCALE, 1)
-	local damageEnergy = shot.damageEnergy * (1 - SpellRunes.ExplosionCost(params.Radius))
+	local center = placement(shot.compiled, ctx, shot.id, shot.stats.castRange or SpellRunes.Vessels.Explosion.MaxCastRange)
+	local desiredRadius = SpellRunes.ExplosionRadius(params.Radius, shot.stats.scale)
+	local radius = desiredRadius * math.clamp(shot.energyScale ^ (1 / 3), MIN_EXPLOSION_SCALE, 1)
+	local damageEnergy = shot.damageEnergy * (1 - SpellRunes.ExplosionCost(desiredRadius))
 	local edge = params.Edge / 100
 	for _, entity in ChunkManager.GetEntitiesInRadius(center, radius) do
 		if entity ~= ctx.caster and alive(entity) then
@@ -1705,9 +1708,12 @@ local function fireVessel(compiled: any, ctx: Context, id: string, energy: numbe
 	local info = compiled.vessels[id]
 	local impact = SpellRunes.Elements[element].Impact * SpellRunes.Vessels[vessel].Impact
 	if def.Instant then
+		local stats, modCost = {}, 0
+		if vessel == "Explosion" then stats, modCost = vesselStats(compiled, ctx, id) end
+		local perCopy = energy * (1 - modCost)
 		local shot: Shot = {
 			compiled = compiled, ctx = ctx, id = id, vessel = vessel, element = element, info = info,
-			stats = {}, perCopy = energy, damageEnergy = energy * (1 - info.triggerShare), impact = impact,
+			stats = stats, perCopy = perCopy, damageEnergy = perCopy * (1 - info.triggerShare), impact = impact,
 			energyScale = ctx.energyScale or 1,
 		}
 		if vessel == "Explosion" then

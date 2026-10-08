@@ -6,7 +6,7 @@
 	SurfaceGui on its front face (kept in PlayerGui and adorning the panel:
 	ViewportFrames don't draw in a SurfaceGui parented under a part) holding a round ViewportFrame (UICorner): the
 	"inside". What's inside lives in that ViewportFrame in WORLD
-	coordinates behind the portal's plane (a void with drifting stars, plus
+	coordinates behind the portal's plane (an illuminated concrete bay, plus
 	whatever goes in portal.Inside -- e.g. a drone about to fly out).
 
 	The window effect: every frame the ViewportFrame's camera is put where
@@ -34,12 +34,8 @@ local TweenService = game:GetService("TweenService")
 local Portal = {}
 Portal.__index = Portal
 
-local VOID = Color3.fromRGB(6, 3, 18)
-local VIOLET = Color3.fromRGB(150, 110, 255)
+local VOID = Color3.fromRGB(65, 68, 72)
 local CYAN = Color3.fromRGB(110, 230, 255)
-local STARS = 46
-local STAR_DEPTH = 40 -- how deep the star field goes behind the plane
-local SPIN = 0.35 -- rad/s the inside slowly turns about the portal's axis
 local PIXELS_PER_STUD = 60
 local MARGIN = 1.05 -- the panel is a little bigger than the opening (overshoot room)
 
@@ -52,8 +48,8 @@ export type Portal = typeof(setmetatable({} :: {
 	_surface: SurfaceGui,
 	_view: ViewportFrame,
 	_camera: Camera,
-	_stars: Model,
-	_spin: number,
+	_room: Model,
+	_users: number,
 	_tween: Tween?,
 	_value: NumberValue,
 	_dead: boolean,
@@ -63,7 +59,7 @@ local live: { Portal } = {}
 local stepping: RBXScriptConnection? = nil
 
 -- Points the portal's inside camera through its opening from the real camera.
-local function fit(portal: Portal, camera: Camera, dt: number)
+local function fit(portal: Portal, camera: Camera)
 	local frame = portal.CFrame
 	local panel = portal._panel
 	panel.CFrame = frame
@@ -75,7 +71,7 @@ local function fit(portal: Portal, camera: Camera, dt: number)
 	local toEye = eye - frame.Position
 	-- (from behind there's nothing to see inside)
 	local facing = toEye:Dot(frame.LookVector) > 0.05
-	portal._stars.Parent = if facing then view else nil
+	portal._room.Parent = if facing then view else nil
 	portal.Inside.Parent = if facing then view else nil
 	if not facing or radius <= 0.02 then
 		return
@@ -84,8 +80,6 @@ local function fit(portal: Portal, camera: Camera, dt: number)
 	-- upright along the portal, so the image lines up with its surface
 	portal._camera.CFrame = CFrame.lookAt(eye, frame.Position, frame.UpVector)
 	portal._camera.FieldOfView = math.clamp(math.deg(2 * math.atan(radius / math.max(distance, 0.1))), 1, 120)
-	portal._spin += dt * SPIN
-	portal._stars:PivotTo(frame * CFrame.Angles(0, 0, portal._spin))
 end
 
 local function step(dt: number)
@@ -95,7 +89,7 @@ local function step(dt: number)
 		if portal._dead then
 			table.remove(live, index)
 		elseif camera then
-			fit(portal, camera, dt)
+			fit(portal, camera)
 		end
 	end
 	if #live == 0 and stepping then
@@ -104,36 +98,28 @@ local function step(dt: number)
 	end
 end
 
-local function starField(): Model
+local function concreteBay(radius: number): Model
 	local model = Instance.new("Model")
-	model.Name = "Stars"
-	local random = Random.new()
-	-- (in the portal's own space, behind its plane: +Z is behind)
-	for index = 1, STARS do
-		local depth = random:NextNumber(3, STAR_DEPTH)
-		local spread = depth * 0.9
-		local star = Instance.new("Part")
-		star.Anchored = true
-		star.CanCollide = false
-		star.CanQuery = false
-		star.Material = Enum.Material.Neon
-		star.Shape = Enum.PartType.Ball
-		star.Size = Vector3.one * random:NextNumber(0.08, 0.28) * (1 + depth / STAR_DEPTH)
-		star.Color = (if index % 3 == 0 then VIOLET else CYAN):Lerp(Color3.new(1, 1, 1), random:NextNumber(0.2, 0.7))
-		star.CFrame = CFrame.new(random:NextNumber(-spread, spread), random:NextNumber(-spread, spread), depth)
-		star.Parent = model
+	model.Name = "ConcreteDroneBay"
+	local half, depth = radius * 1.35, math.max(12, radius * 5)
+	local concrete = Color3.fromRGB(125, 128, 132)
+	local function panel(name: string, size: Vector3, position: Vector3, luminous: boolean?)
+		local part = Instance.new("Part")
+		part.Name, part.Size, part.Position = name, size, position
+		part.Anchored = true
+		part.CanCollide, part.CanQuery, part.CanTouch, part.CastShadow = false, false, false, false
+		part.Material = if luminous then Enum.Material.Neon else Enum.Material.Concrete
+		part.Color = if luminous then Color3.fromRGB(255, 244, 220) else concrete
+		part.Parent = model
 	end
-	-- a faint glowing disc deep inside, so the hole reads as a tunnel
-	local core = Instance.new("Part")
-	core.Anchored = true
-	core.CanCollide = false
-	core.Material = Enum.Material.Neon
-	core.Shape = Enum.PartType.Cylinder
-	core.Size = Vector3.new(0.2, 9, 9)
-	core.Color = VIOLET
-	core.Transparency = 0.55
-	core.CFrame = CFrame.new(0, 0, STAR_DEPTH) * CFrame.Angles(0, math.rad(90), 0)
-	core.Parent = model
+	panel("Floor", Vector3.new(half * 2, 0.3, depth), Vector3.new(0, -half, depth / 2))
+	panel("Ceiling", Vector3.new(half * 2, 0.3, depth), Vector3.new(0, half, depth / 2))
+	panel("LeftWall", Vector3.new(0.3, half * 2, depth), Vector3.new(-half, 0, depth / 2))
+	panel("RightWall", Vector3.new(0.3, half * 2, depth), Vector3.new(half, 0, depth / 2))
+	panel("BackWall", Vector3.new(half * 2, half * 2, 0.3), Vector3.new(0, 0, depth))
+	for _, z in {2.5, depth / 2, depth - 2} do
+		panel("CeilingLight", Vector3.new(half * 1.45, 0.06, 0.35), Vector3.new(0, half - 0.18, z), true)
+	end
 	model.WorldPivot = CFrame.new()
 	return model
 end
@@ -176,8 +162,9 @@ function Portal.new(cframe: CFrame, radius: number): Portal
 	view.BackgroundColor3 = VOID
 	view.BackgroundTransparency = 0
 	view.BorderSizePixel = 0
-	view.Ambient = Color3.fromRGB(150, 140, 200)
-	view.LightColor = Color3.fromRGB(200, 230, 255)
+	-- Viewports use their own ambient/directional light, not PointLights.
+	view.Ambient = Color3.fromRGB(175, 175, 170)
+	view.LightColor = Color3.fromRGB(255, 244, 220)
 	view.LightDirection = Vector3.new(-0.3, -1, -0.4)
 	view.Parent = surface
 	local corner = Instance.new("UICorner")
@@ -187,8 +174,9 @@ function Portal.new(cframe: CFrame, radius: number): Portal
 	camera.Parent = view
 	view.CurrentCamera = camera
 
-	local stars = starField()
-	stars.Parent = view
+	local room = concreteBay(radius)
+	room:PivotTo(cframe)
+	room.Parent = view
 	local inside = Instance.new("Model")
 	inside.Name = "Contents"
 	inside.Parent = view
@@ -212,8 +200,8 @@ function Portal.new(cframe: CFrame, radius: number): Portal
 		_surface = surface,
 		_view = view,
 		_camera = camera,
-		_stars = stars,
-		_spin = 0,
+		_room = room,
+		_users = 0,
 		_tween = nil,
 		_value = value,
 		_dead = false,
@@ -229,7 +217,21 @@ function Portal.new(cframe: CFrame, radius: number): Portal
 end
 
 function Portal.SetCFrame(self: Portal, cframe: CFrame)
+	if self.CFrame ~= cframe then self._room:PivotTo(cframe) end
 	self.CFrame = cframe
+end
+
+-- During a weapon swap the departing and arriving drones share one opening.
+-- Neither may close/destroy it while the other is still passing through.
+function Portal.Retain(self: Portal)
+	assert(not self._dead, "Cannot retain a destroyed portal")
+	self._users += 1
+end
+
+function Portal.Release(self: Portal, seconds: number?)
+	if self._dead then return end
+	self._users = math.max(0, self._users - 1)
+	if self._users == 0 then self:Close(seconds, true) end
 end
 
 -- Grows the opening from nothing (a little overshoot, like it tears open).
@@ -267,6 +269,9 @@ function Portal.Destroy(self: Portal)
 		self._tween:Cancel()
 	end
 	self._panel:Destroy()
+	-- fit can temporarily unparent these when viewed from behind.
+	self._room:Destroy()
+	self.Inside:Destroy()
 	self._surface:Destroy()
 	self._value:Destroy()
 end

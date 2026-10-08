@@ -101,7 +101,7 @@ SpellRunes.Zones = {
 	Conditional = { Color = Color3.fromRGB(255, 205, 80), Description = "Sensors, logic, vector math and lists that compute values and conditions. Any of them can feed any rune's settings." },
 	Branch = { Color = Color3.fromRGB(255, 150, 70), Glyph = "Δ", Description = "Controls the flow of mana: route, split, wait, repeat, loop over entities, conjure a new circle elsewhere, remember things, or invoke another of your spells." },
 	Transform = { Color = Color3.fromRGB(255, 95, 80), Description = "Converts raw mana into an element. Only damaging vessels need one." },
-	Modifier = { Color = Color3.fromRGB(170, 130, 255), Description = "Shapes how a projectile flies, how many there are and how big they are." },
+	Modifier = { Color = Color3.fromRGB(170, 130, 255), Description = "Shapes projectile flight, count and size, or explosion radius and placement range." },
 	Output = { Color = Color3.fromRGB(255, 90, 140), Description = "Where energy leaves the circle: Vessels give the magic its form -- projectiles, blasts, smites, barriers, forces, blinks, body effects and time fields." },
 	Trigger = { Color = Color3.fromRGB(80, 215, 230), Description = "Runs more of the circle while a vessel is in flight, where it lands, or when a barrier or field ends." },
 }
@@ -738,7 +738,7 @@ local defs: { RuneDef } = {
 	},
 	{
 		Id = "Size", Name = "Size", Glyph = "λ", Category = "Modifier", Zones = { "Modifier" },
-		Description = "Multiplies the projectile's size and hitbox (a Beam's width). Costs 7.5% of the energy per +1×.",
+		Description = "Multiplies projectile size and hitbox, Beam width, or Explosion radius. Costs 7.5% of the energy per +1×; Explosion radius also pays its usual size cost.",
 		Inputs = {}, Outputs = { modOut() }, Params = { num("Factor", "Size", 1.8, 0.3, 4, 0.05, "×") },
 		Migrate = function(params) fromLevel(params, "Factor", SpellRunes.LegacyLevels.Size) end,
 	},
@@ -789,7 +789,7 @@ local defs: { RuneDef } = {
 	},
 	{
 		Id = "Range", Name = "Range", Glyph = "↔", Category = "Modifier", Zones = { "Modifier" },
-		Description = "Multiplies how long it flies (below 1 shortens it, for free). 6% per +1×.",
+		Description = "Multiplies projectile flight time or an Explosion's placement range (below 1 shortens it, for free). 6% per +1×.",
 		Inputs = {}, Outputs = { modOut() }, Params = { num("Factor", "Range", 1.7, 0.1, 4, 0.05, "×") },
 		Migrate = function(params) fromLevel(params, "Factor", SpellRunes.LegacyLevels.Range) end,
 	},
@@ -806,8 +806,8 @@ local defs: { RuneDef } = {
 	projectile("Beam", "Beam", "═", "A cylinder of magic traveling at 2000 studs/s from From toward Aim. Supports all flight modifiers and triggers; Sustain emits a continuous cursor-following beam."),
 	{
 		Id = "Explosion", Name = "Explosion", Glyph = "✽", Category = "Vessel", Zones = { "Output" }, Vessel = true, Damaging = true, Instant = true,
-		Description = "Bursts at At (default: a trigger's impact point, the For Each entity, or your mouse), hitting everything within Radius: full damage at the centre down to Edge at the rim. Radius beyond 4 studs costs 2% of the energy per stud (up to 60%). Fling throws hard-hit bodies.",
-		Inputs = { flowIn(), opt("aim", "point", "At") },
+		Description = "Bursts at At (default: a trigger's impact point, the For Each entity, or your mouse), hitting everything within Radius: full damage at the centre down to Edge at the rim. Size multiplies blast radius; Range multiplies placement distance. Effective radius beyond 4 studs costs 2% of the energy per stud (up to 60%). Fling throws hard-hit bodies.",
+		Inputs = { flowIn(), opt("aim", "point", "At"), modsIn() },
 		Outputs = {},
 		Params = { num("Radius", "Radius", 6, 1, 30, 0.5, " st"), num("Edge", "Edge damage", 50, 0, 100, 5, "%"), bool("Fling", "Fling", true) },
 		Migrate = function(params) params.Radius = params.Radius or 6 end,
@@ -1099,6 +1099,12 @@ function SpellRunes.ExplosionCost(radius: number): number
 	return math.clamp((radius - costs.ExplosionFreeRadius) * costs.ExplosionRadius, 0, costs.ExplosionMaxCost)
 end
 
+-- The bounded Radius (1..30) and Size (0.3..4) settings produce this range.
+-- Shared by damage previews and runtime, before split-energy radius scaling.
+function SpellRunes.ExplosionRadius(radius: number, sizeFactor: number?): number
+	return math.clamp(radius * (sizeFactor or 1), 0.3, 120)
+end
+
 -- Body effects. Power is HP (Heal, Shield) or a percentage capped at Cap
 -- (Scale effects: Haste/Quicken x(1 + p), Slow/Dilate x(1 - p), Empower +p
 -- outgoing damage, Weaken +p damage taken). Cost: per HP (Instant / Pool),
@@ -1172,10 +1178,14 @@ function SpellRunes.ModifierDots(runeId: string, p: { [string]: any }): number?
 	return math.clamp(math.floor(SpellRunes.ModifierCost(runeId, p) / 0.04 + 0.5), 1, 5)
 end
 
--- Modifiers only shape projectiles.
+-- Flight modifiers shape projectiles; placed explosions also support Size
+-- and Range. Never accept a modifier that the runtime would silently ignore.
 SpellRunes.Flying = { Orb = true, Bullet = true, Beam = true } :: { [string]: boolean }
 
 function SpellRunes.ModifierApplies(vesselId: string, modifierId: string): boolean
+	if vesselId == "Explosion" then
+		return modifierId == "Size" or modifierId == "Range"
+	end
 	if modifierId == "Sustain" then
 		return vesselId == "Beam"
 	end

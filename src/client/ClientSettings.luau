@@ -31,6 +31,7 @@ local Glint = require(script.Parent.SpellCastGlint)
 local Presentation = require(ReplicatedStorage.Shared.ClientPresentation)
 local ClientAudio = require(script.Parent.ClientAudio)
 local HudScale = require(script.Parent.HudScale)
+local UiVisibility = require(script.Parent.UiVisibility)
 
 local remote = ReplicatedStorage:WaitForChild("ClientSettings") :: RemoteFunction
 
@@ -51,7 +52,8 @@ local ClientSettings = {}
 
 -- (also the order and grouping of the Settings window)
 ClientSettings.Specs = {
-	{ Key = "UiMode", Label = "UI mode", Kind = "choice", Options = { "Mode 1", "Mode 2" }, Default = "Mode 1", Section = "Interface" },
+	{ Key = "UiMode", Label = "UI mode", Kind = "choice", Options = { "Mode 1", "Mode 2", "Mode 3" }, Default = "Mode 3", Section = "Interface" },
+	{ Key = "HideUnintegratedUi", Label = "Hide everything not part of the UI", Kind = "boolean", Default = true, Section = "Interface", Description = "Hides unfinished and unintegrated interfaces. Keeps the active HUD, menus, effects, and tool controls. Turn off to preview WIP UI." },
 	{ Key = "HudScale", Label = "HUD scale (%)", Kind = "number", Default = 100, Min = 70, Max = 130, Step = 5, Section = "Interface" },
 	{ Key = "EditorOpacity", Label = "Spell editor opacity (%)", Kind = "number", Default = 60, Min = 20, Max = 100, Step = 5, Section = "Interface", Description = "How solid the spell editor's holographic panels are; lower shows more of the world behind." },
 	{ Key = "EditorBlur", Label = "Spell editor background blur", Kind = "number", Default = 8, Min = 0, Max = 24, Step = 1, Section = "Interface", Description = "Blurs the world behind the spell editor (0 = off)." },
@@ -89,6 +91,9 @@ local changedEvent = Instance.new("BindableEvent")
 ClientSettings.Changed = changedEvent.Event
 
 local function apply(key: string?)
+	if not key or key == "HideUnintegratedUi" then
+		UiVisibility.SetEnabled(values.HideUnintegratedUi == true)
+	end
 	if not key or key == "MaxDistance" or key == "MaxRendered" or key == "MaxSmooth" or key == "MaxUpdates" then
 		ProjectileClient.SetRenderSettings({
 			MaxDistance = values.MaxDistance,

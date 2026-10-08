@@ -1,9 +1,11 @@
 --!strict
 --[[
-	Topbar (TopbarPlus) and the switch between the two client UIs:
+	Topbar (TopbarPlus) and the switch between the three client UI layouts:
 
-	- Ours (default): GameHud -- resource bars, spell cards, party panel.
+	- Ours: GameHud -- resource bars, spell cards, party panel.
 	- Dev: the other developer's authored MainGui (MainHud.luau).
+	- Mode3 (default): GameHud with the authored UI's centered deck/resource layout,
+	  portrait spell cards with names on-card, and the unchanged tech hotbar.
 
 	Either way Roblox's Backpack stays hidden and spells cast without a Tool.
 	Topbar icons:
@@ -61,10 +63,10 @@ local BELL_IMAGE = "rbxthumb://type=Asset&id=129757130172668&w=150&h=150"
 local GEAR_IMAGE = "rbxthumb://type=Asset&id=83508141054406&w=150&h=150"
 local PING_SOUND = "rbxasset://sounds/electronicpingshort.wav"
 
-export type Mode = "Ours" | "Dev"
+export type Mode = "Ours" | "Dev" | "Mode3"
 
 local UiMode = {}
-local mode: Mode = "Ours"
+local mode: Mode = "Mode3"
 local inboxIcon: any = nil
 local hintIcons: { [string]: any } = {} -- key setting -> the topbar icon showing it
 local editorOpen = false -- (the HUD hides behind the editor's glass)
@@ -82,7 +84,8 @@ local function hideBackpack()
 end
 
 local function apply()
-	local ours = mode == "Ours"
+	local ours = mode ~= "Dev"
+	GameHud.SetLayout(if mode == "Mode3" then "Mode 3" else "Mode 1")
 	MainHud.SetEnabled(not ours and not editorOpen)
 	GameHud.SetEnabled(ours and not editorOpen)
 	-- (GameHud has its own controls; the compact casting panel is the dev UI's)
@@ -95,11 +98,12 @@ function UiMode.Get(): Mode
 end
 
 -- (the setting's names for the two modes)
-local SETTING_FOR: { [Mode]: string } = { Ours = "Mode 1", Dev = "Mode 2" }
+local SETTING_FOR: { [Mode]: string } = { Ours = "Mode 1", Dev = "Mode 2", Mode3 = "Mode 3" }
 
 local function follow()
 	SpellAssemblerGui.SetAppearance(ClientSettings.Get("EditorOpacity"), ClientSettings.Get("EditorBlur"))
-	local wanted: Mode = if ClientSettings.Get("UiMode") == "Mode 2" then "Dev" else "Ours"
+	local setting = ClientSettings.Get("UiMode")
+	local wanted: Mode = if setting == "Mode 2" then "Dev" elseif setting == "Mode 3" then "Mode3" else "Ours"
 	if mode ~= wanted then
 		mode = wanted
 		apply()
@@ -236,7 +240,10 @@ local function bindKeys()
 		SpellAssemblerGui.ToggleEditor()
 		return true
 	end)
-	Keybinds.Bind("KeyHotbar", menu(GameHud.ToggleHotbar))
+	Keybinds.Bind("KeyHotbar", function()
+		if editorOpen then return false end
+		return GameHud.ToggleHotbar()
+	end)
 
 	-- the topbar icons show their key
 	local function refreshHints()

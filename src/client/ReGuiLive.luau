@@ -78,6 +78,16 @@ local proxy: (node: any) -> any
 proxy = function(node: any): any
 	return setmetatable({}, {
 		__index = function(_, method)
+			if method == "RetainChildren" then
+				-- A hidden, previously populated dropdown keeps its descendants
+				-- without reconciling them or constructing anything new.
+				return function()
+					local function retain(parent: any)
+						for _, child in parent.children do child.seen = true; retain(child) end
+					end
+					retain(node)
+				end
+			end
 			if not ELEMENTS[method] then
 				local value = node.class[method]
 				return if typeof(value) == "function" then function(_, ...) return value(node.class, ...) end else value
@@ -158,6 +168,7 @@ function Section.Clear(self: any)
 		end
 	end
 	table.clear(self.node.children)
+	table.clear(self.headerHooks)
 	self.key = nil
 end
 
@@ -169,6 +180,9 @@ function Section.Render(self: any, key: string?, build: (canvas: any) -> ()): bo
 	begin(self.node)
 	build(self.canvas)
 	finish(self.node)
+	for id in self.headerHooks do
+		if not self.headers[id] then self.headerHooks[id] = nil end
+	end
 	self.key = key
 	return true
 end
@@ -181,8 +195,29 @@ function Section.Header(self: any, canvas: any, id: string, config: { [string]: 
 	if remembered ~= nil then
 		config.Collapsed = not remembered
 	end
-	local header = canvas:CollapsingHeader(config)
+	local supplied = table.clone(config)
+	supplied.OnToggle = nil
+	local header = canvas:CollapsingHeader(supplied)
 	self.headers[id] = header
+	if config.OnToggle then
+		local hook = self.headerHooks[id]
+		if not hook or hook.header ~= header then
+			hook = { header = header, callback = config.OnToggle }
+			self.headerHooks[id] = hook
+			local setCollapsed = header.SetCollapsed
+			header.SetCollapsed = function(_, collapsed)
+				local changed = header.Collapsed ~= collapsed
+				setCollapsed(header, collapsed)
+				if changed then
+					self.open[id] = not collapsed
+					self.key = nil
+					hook.callback()
+				end
+			end
+		else
+			hook.callback = config.OnToggle
+		end
+	end
 	return header
 end
 
@@ -195,6 +230,7 @@ function ReGuiLive.Section(parent: any): Section
 		object = object,
 		key = nil,
 		headers = {},
+		headerHooks = {},
 		open = {},
 	}, Section) :: any
 end

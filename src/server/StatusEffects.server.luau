@@ -18,6 +18,15 @@ local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local Shared = ReplicatedStorage:WaitForChild("Shared")
 local StatusEffectSys = require(Shared.StatusEffectSys)
 local Ragdoll = require(script.Parent.Ragdoll)
+local Entity = require(Shared.Entity)
+
+Entity.SetDeathHandler(function(entity)
+	local character = entity.Instance
+	if character and character:IsA("Model") and character:FindFirstChildOfClass("Humanoid") then
+		Ragdoll.SetRagdoll(character, true)
+		Ragdoll.Tip(character, 2.6)
+	end
+end)
 
 -- Stun: ragdolls the entity's character for the effect's Duration, then
 -- restores normal Motor6D-driven animation the instant it expires --
@@ -33,6 +42,7 @@ StatusEffectSys.Register("Stun", {
 		local character = entity.Instance
 		if character and character:IsA("Model") then
 			Ragdoll.SetRagdoll(character, true)
+			Ragdoll.Tip(character, 2.2)
 		end
 	end,
 	OnExpire = function(entity)

@@ -53,6 +53,8 @@ local open = false
 local window: any = nil
 local geometry: { position: UDim2, size: UDim2 }? = nil
 local activeTab = "Library"
+local tabBuilders: { [string]: () -> () } = {}
+local updateQueued = false
 
 -- what you've picked up: a spell (to equip) or a hotbar box (to swap)
 type Held = { kind: "spell", ref: string, name: string, id: string? } | { kind: "slot", slot: number }
@@ -211,6 +213,9 @@ local function run(action: string, payload: any?)
 	task.spawn(function()
 		local result = SpellEditor.Command(action, payload)
 		message = result.message or (if result.ok then "" else "That didn't work.")
+		if not open or action == "ShareSpell" then
+			Notifications.Push({ Title = "Spell sharing", Text = message })
+		end
 		update()
 	end)
 end
@@ -252,7 +257,7 @@ end
 --------------------------------------------------------------------------------
 
 type Box = { frame: Frame, stroke: UIStroke, name: TextLabel, preview: any }
-type Bar = { boxes: { Box } }
+type Bar = { boxes: { Box }, tab: string }
 local bars: { Bar } = {}
 
 -- An empty ReGui label used as a host for custom frames of a given height.
@@ -274,7 +279,7 @@ local function buildBar(canvas: any): Bar
 	layout.FillDirection = Enum.FillDirection.Horizontal
 	layout.Padding = UDim.new(0, BOX_GAP)
 	layout.Parent = row
-	local bar: Bar = { boxes = {} }
+	local bar: Bar = { boxes = {}, tab = activeTab }
 	for slot = 1, SLOT_COUNT do
 		local frame = Instance.new("TextButton")
 		frame.Name = "Box" .. slot
@@ -322,6 +327,7 @@ end
 
 local function updateBars(state: any)
 	for _, bar in bars do
+		if bar.tab ~= activeTab then continue end
 		for slot, box in bar.boxes do
 			local record = state.slots and state.slots[tostring(slot)]
 			box.preview:SetSpell(record)
@@ -375,6 +381,25 @@ end
 --------------------------------------------------------------------------------
 
 local sections: { [string]: ReGuiLive.Section } = {}
+local SPELLS_PER_PAGE = 12
+local rowLimits: { [string]: number } = {}
+
+local function rowLimit(id: string): number
+	return rowLimits[id] or SPELLS_PER_PAGE
+end
+
+local function moreRows(section: ReGuiLive.Section, canvas: any, id: string, count: number)
+	local limit = rowLimit(id)
+	if count <= limit then return end
+	canvas:SmallButton({
+		Text = `Show {math.min(SPELLS_PER_PAGE, count - limit)} more ({limit} / {count})`,
+		Callback = function()
+			rowLimits[id] = limit + SPELLS_PER_PAGE
+			section.key = nil
+			update()
+		end,
+	})
+end
 
 local function heldText(): string
 	if not held then
@@ -478,7 +503,8 @@ local function renderSharing(section: ReGuiLive.Section)
 					Text = other.DisplayName,
 					Callback = function()
 						sharing = nil
-						run("ShareSpell", { id = share.id, target = other })
+						update()
+						run("ShareSpell", { id = share.id, targetUserId = other.UserId })
 					end,
 				})
 			end
@@ -590,7 +616,8 @@ local function renderMySpells(section: ReGuiLive.Section, state: any)
 			if search ~= "" and #spells == 0 then
 				continue
 			end
-			local inner = section:Header(canvas, "folder:" .. folder, { Title = `{folder} ({#spells})`, Collapsed = search == "" })
+			local inner = section:Header(canvas, "folder:" .. folder, { Title = `{folder} ({#spells})`, Collapsed = search == "", OnToggle = update })
+			if inner.Collapsed then inner:RetainChildren(); continue end
 			local tools = inner:Row()
 			moveHere(tools, folder)
 			tools:SmallButton({
@@ -605,14 +632,23 @@ local function renderMySpells(section: ReGuiLive.Section, state: any)
 					end
 				end,
 			})
-			for _, spell in spells do
+			local listId = "folder:" .. folder
+			for index, spell in spells do
+				if index > rowLimit(listId) then break end
 				spellRow(inner, state, spell)
 			end
+			moreRows(section, inner, listId, #spells)
 		end
-		local unfiledCanvas = section:Header(canvas, "unfiled", { Title = `Unfiled ({#unfiled})`, Collapsed = false })
-		moveHere(unfiledCanvas, nil)
-		for _, spell in unfiled do
-			spellRow(unfiledCanvas, state, spell)
+		local unfiledCanvas = section:Header(canvas, "unfiled", { Title = `Unfiled ({#unfiled})`, Collapsed = false, OnToggle = update })
+		if unfiledCanvas.Collapsed then
+			unfiledCanvas:RetainChildren()
+		else
+			moveHere(unfiledCanvas, nil)
+			for index, spell in unfiled do
+				if index > rowLimit("unfiled") then break end
+				spellRow(unfiledCanvas, state, spell)
+			end
+			moreRows(section, unfiledCanvas, "unfiled", #unfiled)
 		end
 		if search ~= "" and #unfiled == 0 and next(byFolder) == nil then
 			canvas:Label({ Text = "None match." })
@@ -644,11 +680,14 @@ local function renderEncyclopedia(section: ReGuiLive.Section, state: any, ownedO
 			local inner = section:Header(canvas, id, {
 				Title = `{element.Name} ({#spells})`,
 				Collapsed = not withSearch or search == "",
+				OnToggle = update,
 			})
+			if inner.Collapsed then inner:RetainChildren(); continue end
 			if not ownedOnly then
 				inner:Label({ Text = `{element.Description}  ({if element.Price <= 0 then "free" else tostring(element.Price)})` })
 			end
-			for _, spell in spells do
+			for index, spell in spells do
+				if index > rowLimit(id) then break end
 				local ref = "e:" .. spell.Id
 				local tooltipRecord = { name = spell.Name, graph = spell.Graph, encyclopedia = spell.Id }
 				local owned = Encyclopedia.IsOwned(spell.Id, state.owned)
@@ -675,6 +714,7 @@ local function renderEncyclopedia(section: ReGuiLive.Section, state: any, ownedO
 					inner:Label({ Text = "    " .. spell.Description })
 				end
 			end
+			moreRows(section, inner, id, #spells)
 		end
 		if not any then
 			canvas:Label({ Text = "None match." })
@@ -695,7 +735,7 @@ local function captureState()
 	local selector = window.WindowTabSelector
 	if selector then
 		for _, entry in selector.Tabs do
-			if entry.IsSelected then
+			if selector.ActiveTab == entry.Canvas then
 				activeTab = entry.Name
 			end
 		end
@@ -734,111 +774,145 @@ local function build(ReGui: any)
 
 	-- Loadout
 	local loadout = created:CreateTab({ Name = "Loadout" })
-	buildBar(loadout)
-	sections.loadoutStatus = ReGuiLive.Section(loadout)
-	loadout:Separator({ Text = "Saved loadouts" })
-	local saveRow = loadout:Row()
-	local loadoutName = ""
-	saveRow:InputText({
-		Label = "",
-		Placeholder = "Loadout name",
-		Callback = function(_, text: string)
-			loadoutName = text
-		end,
-	})
-	saveRow:SmallButton({
-		Text = "Save current hotbar",
-		Callback = function()
-			if loadoutName == "" then
-				message = "Name the loadout first."
-				update()
-				return
-			end
-			run("SaveLoadout", { name = loadoutName })
-		end,
-	})
-	sections.loadouts = ReGuiLive.Section(loadout)
+	tabBuilders.Loadout = function()
+		buildBar(loadout)
+		sections.loadoutStatus = ReGuiLive.Section(loadout)
+		loadout:Separator({ Text = "Saved loadouts" })
+		local saveRow = loadout:Row()
+		local loadoutName = ""
+		saveRow:InputText({
+			Label = "",
+			Placeholder = "Loadout name",
+			Callback = function(_, text: string)
+				loadoutName = text
+			end,
+		})
+		saveRow:SmallButton({
+			Text = "Save current hotbar",
+			Callback = function()
+				if loadoutName == "" then
+					message = "Name the loadout first."
+					update()
+					return
+				end
+				run("SaveLoadout", { name = loadoutName })
+			end,
+		})
+		sections.loadouts = ReGuiLive.Section(loadout)
+	end
 
 	-- Library
 	local library = created:CreateTab({ Name = "Library" })
-	buildBar(library)
-	sections.libraryStatus = ReGuiLive.Section(library)
-	local top = library:Row()
-	local searchDraft = search
-	local searchBox = top:InputText({
-		Label = "",
-		Placeholder = "Search (Enter)",
-		Callback = function(_, text: string)
-			searchDraft = text
-		end,
-	})
-	pcall(function()
-		searchBox:SetValue(search)
-		searchBox.Frame.Input.FocusLost:Connect(function()
-			if search ~= searchDraft then
-				search = searchDraft
-				update()
-			end
+	tabBuilders.Library = function()
+		buildBar(library)
+		sections.libraryStatus = ReGuiLive.Section(library)
+		local top = library:Row()
+		local searchDraft = search
+		local searchBox = top:InputText({
+			Label = "",
+			Placeholder = "Search (Enter)",
+			Callback = function(_, text: string)
+				searchDraft = text
+			end,
+		})
+		pcall(function()
+			searchBox:SetValue(search)
+			searchBox.Frame.Input.FocusLost:Connect(function()
+				if search ~= searchDraft then
+					search = searchDraft
+					update()
+				end
+			end)
 		end)
-	end)
-	top:SmallButton({ Text = "Search", Callback = function() search = searchDraft; update() end })
-	top:SmallButton({ Text = "+ New spell", Callback = function() SpellEditor.NewLibrarySpell() end })
-	local folderRow = library:Row()
-	local folderName = ""
-	folderRow:InputText({
-		Label = "",
-		Placeholder = "Folder name",
-		Callback = function(_, text: string)
-			folderName = text
-		end,
-	})
-	folderRow:SmallButton({
-		Text = "+ New folder",
-		Callback = function()
-			if folderName == "" then
-				message = "Name the folder first."
-				update()
-				return
-			end
-			run("CreateFolder", { name = folderName })
-		end,
-	})
-	sections.sharing = ReGuiLive.Section(library)
-	sections.mySpells = ReGuiLive.Section(library)
-	sections.librarySpells = ReGuiLive.Section(library)
+		top:SmallButton({ Text = "Search", Callback = function() search = searchDraft; update() end })
+		top:SmallButton({ Text = "+ New spell", Callback = function() SpellEditor.NewLibrarySpell() end })
+		local folderRow = library:Row()
+		local folderName = ""
+		folderRow:InputText({
+			Label = "",
+			Placeholder = "Folder name",
+			Callback = function(_, text: string)
+				folderName = text
+			end,
+		})
+		folderRow:SmallButton({
+			Text = "+ New folder",
+			Callback = function()
+				if folderName == "" then
+					message = "Name the folder first."
+					update()
+					return
+				end
+				run("CreateFolder", { name = folderName })
+			end,
+		})
+		sections.sharing = ReGuiLive.Section(library)
+		sections.mySpells = ReGuiLive.Section(library)
+		sections.librarySpells = ReGuiLive.Section(library)
+	end
 
 	-- Encyclopedia
 	local encyclopedia = created:CreateTab({ Name = "Encyclopedia" })
-	buildBar(encyclopedia)
-	sections.encyclopediaStatus = ReGuiLive.Section(encyclopedia)
-	local note = encyclopedia:Label({ Text = "Elements and premade spells. Buying isn't available yet; free ones are already yours." })
-	pcall(function()
-		note.TextWrapped = true
-		note.AutomaticSize = Enum.AutomaticSize.Y
-		note.Size = UDim2.new(1, 0, 0, 0)
-	end)
-	sections.encyclopedia = ReGuiLive.Section(encyclopedia)
+	tabBuilders.Encyclopedia = function()
+		buildBar(encyclopedia)
+		sections.encyclopediaStatus = ReGuiLive.Section(encyclopedia)
+		local note = encyclopedia:Label({ Text = "Elements and premade spells. Buying isn't available yet; free ones are already yours." })
+		pcall(function()
+			note.TextWrapped = true
+			note.AutomaticSize = Enum.AutomaticSize.Y
+			note.Size = UDim2.new(1, 0, 0, 0)
+		end)
+		sections.encyclopedia = ReGuiLive.Section(encyclopedia)
+	end
+
+	for _, entry in created.WindowTabSelector.Tabs do
+		entry.Content:GetPropertyChangedSignal("Visible"):Connect(function()
+			if entry.Content.Visible then
+				activeTab = entry.Name
+				update()
+			end
+		end)
+	end
 
 	pcall(function()
 		created.WindowTabSelector:SetActiveTab(activeTab)
 	end)
 end
 
--- Reconciles changed sections; unchanged controls and their state survive.
-function update()
+-- Only populate the selected tab, once per burst of state changes. Hidden
+-- tabs keep their controls and catch up from current state when revisited.
+local function updateSelectedTab()
 	if not open or not window then
 		return
 	end
+	local buildTab = tabBuilders[activeTab]
+	if buildTab then
+		tabBuilders[activeTab] = nil
+		buildTab()
+	end
 	local state = SpellEditor.GetState()
 	updateBars(state)
-	for _, name in { "loadoutStatus", "libraryStatus", "encyclopediaStatus" } do
-		renderStatus(sections[name], state)
+	if activeTab == "Loadout" then
+		renderStatus(sections.loadoutStatus, state)
+		renderLoadouts(sections.loadouts, state)
+	elseif activeTab == "Library" then
+		renderStatus(sections.libraryStatus, state)
+		renderSharing(sections.sharing)
+		renderMySpells(sections.mySpells, state)
+		renderEncyclopedia(sections.librarySpells, state, true, true)
+	elseif activeTab == "Encyclopedia" then
+		renderStatus(sections.encyclopediaStatus, state)
+		renderEncyclopedia(sections.encyclopedia, state, false, false)
 	end
-	renderLoadouts(sections.loadouts, state)
-	renderSharing(sections.sharing)
-	renderMySpells(sections.mySpells, state)
-	renderEncyclopedia(sections.librarySpells, state, true, true)
-	renderEncyclopedia(sections.encyclopedia, state, false, false)
+end
+
+function update()
+	if updateQueued or not open or not window then return end
+	updateQueued = true
+	task.defer(function()
+		updateQueued = false
+		updateSelectedTab()
+	end)
 end
 
 function SpellLibrary.Open()
@@ -883,21 +957,37 @@ SpellEditor.StateChanged:Connect(function()
 		update()
 	end
 end)
+Players.PlayerAdded:Connect(update)
+Players.PlayerRemoving:Connect(function() task.defer(update) end)
 
 -- Spells shared with you, and answers to the ones you shared.
 shareRemote.OnClientEvent:Connect(function(kind: any, a: any, b: any, c: any, d: any)
 	if kind == "Offer" and typeof(a) == "string" and typeof(b) == "Instance" and b:IsA("Player") then
 		local shareId, from, name = a, b :: Player, tostring(c)
-		local seconds = if typeof(d) == "number" then math.max(d - workspace:GetServerTimeNow(), 1) else 60
-		Notifications.Push({
-			Title = "Shared spell",
-			Text = `{from.DisplayName} wants to share "{name}" with you.`,
-			ExpiresIn = seconds,
-			Buttons = {
-				{ Text = "Accept", Callback = function() run("AcceptShare", { shareId = shareId }) end },
-				{ Text = "Decline", Callback = function() run("DeclineShare", { shareId = shareId }) end },
-			},
-		})
+		local expiresAt = if typeof(d) == "number" then d else workspace:GetServerTimeNow() + 60
+		local offer: () -> ()
+		local function answer(action: string)
+			task.spawn(function()
+				local result = SpellEditor.Command(action, { shareId = shareId })
+				message = result.message or (if result.ok then "Spell sharing completed." else "Spell sharing failed. Try again.")
+				Notifications.Push({ Title = "Spell sharing", Text = message })
+				if not result.ok and workspace:GetServerTimeNow() < expiresAt then offer() end
+				update()
+			end)
+		end
+		function offer()
+			Notifications.Push({
+				Title = "Shared spell",
+				Text = `{from.DisplayName} wants to share "{name}" with you. Accept adds it to your Library, not directly to the hotbar.`,
+				ExpiresIn = math.max(expiresAt - workspace:GetServerTimeNow(), 0),
+				Buttons = {
+					{ Text = "Accept", Callback = function() answer("AcceptShare") end },
+					{ Text = "Decline", Callback = function() answer("DeclineShare") end },
+				},
+			})
+		end
+		offer()
+		Notifications.SetOpen(true)
 	elseif kind == "Answer" and typeof(a) == "Instance" and a:IsA("Player") then
 		Notifications.Push({
 			Title = "Shared spell",

@@ -9,14 +9,16 @@
 
 	Summon: a portal (client/Portal: a SurfaceGui window hanging in mid-air)
 	tears open beside the character (DroneRig.Portal), the drone flies up out
-	of the void inside it -- seen through the opening (a copy of it inside
+	of the illuminated concrete bay -- seen through the opening (a copy inside
 	the portal's ViewportFrame) until its centre is through the portal's
 	plane, then the real one -- to its hover point over the shoulder, and
 	the portal closes. Dismiss runs it
 	backwards. Everything is measured from the character's root each frame,
 	so it all keeps up with a moving character.
 
-	The drone (for now) is one Part. It hovers with a slow bob and turns to
+	Each Tool gets a separate quadcopter with one underside weapon. Switching
+	Tools sends the old drone home and launches a fresh one, never rearming an
+	existing drone. It hovers with a slow bob and turns to
 	face where its owner aims: the mouse for your own drone, the
 	character's facing for everyone else's.
 
@@ -31,6 +33,7 @@ local ReplicatedStorage = game:GetService("ReplicatedStorage")
 
 local DroneRig = require(ReplicatedStorage:WaitForChild("Shared"):WaitForChild("DroneRig"))
 local Portal = require(script.Parent.Portal)
+local DroneVisual = require(script.Parent.DroneVisual)
 
 local DroneClient = {}
 
@@ -38,16 +41,22 @@ local OPEN_TIME = 0.3
 local TRAVEL_TIME = 0.75
 local CLOSE_TIME = 0.25
 local START_DEPTH = 7 -- studs behind the portal's plane the drone starts
-local DRONE_SIZE = Vector3.new(1.4, 0.45, 1.4)
 local BOB, BOB_SPEED = 0.15, 2.2
 local TURN_RATE = 12 -- how quickly it turns to its aim (1/s)
+local MAX_RETURNING = 2 -- rapid tool switching must not accumulate drone copies
 
 type State = "summoning" | "hovering" | "dismissing"
 type Drone = {
 	character: Model,
 	root: BasePart,
-	part: BasePart,
-	ghost: BasePart, -- its copy inside the portal
+	part: Model,
+	ghost: Model, -- its copy inside the portal
+	parts: {BasePart},
+	rotors: {DroneVisual.Rotor},
+	ghostRotors: {DroneVisual.Rotor},
+	behind: boolean,
+	weaponTool: Tool?, -- immutable equipment identity, including during return
+	createdAt: number,
 	portal: any?,
 	state: State,
 	t: number, -- seconds into the current summon / dismiss
@@ -57,26 +66,20 @@ type Drone = {
 }
 
 local drones: { [Model]: Drone } = {}
+local live: {[Drone]: boolean} = {} -- includes outgoing drones during a swap
 local stepping: RBXScriptConnection? = nil
 local player = Players.LocalPlayer
+local started = false
+local watchedCharacters: {[Model]: boolean} = setmetatable({}, {__mode = "k"}) :: any
+local watchedPlayers: {[Player]: boolean} = setmetatable({}, {__mode = "k"}) :: any
 
-local function makeDrone(): BasePart
-	local part = Instance.new("Part")
-	part.Name = "Drone"
-	part.Anchored = true
-	part.CanCollide = false
-	part.CanQuery = false
-	part.CanTouch = false
-	part.CastShadow = false
-	part.Size = DRONE_SIZE
-	part.Material = Enum.Material.Metal
-	part.Color = Color3.fromRGB(40, 44, 56)
-	local light = Instance.new("PointLight")
-	light.Color = Color3.fromRGB(110, 230, 255)
-	light.Range = 6
-	light.Brightness = 1.2
-	light.Parent = part
-	return part
+local makeDrone = DroneVisual.Create
+
+local function openPortal(frame: CFrame, seconds: number?): any
+	local portal = Portal.new(frame, DroneRig.PortalRadius)
+	portal:Retain()
+	portal:Open(seconds or OPEN_TIME)
+	return portal
 end
 
 local function ease(t: number): number
@@ -88,6 +91,7 @@ end
 local function aimOf(drone: Drone, from: Vector3): Vector3
 	if drone.character == player.Character then
 		local camera = workspace.CurrentCamera
+		if not camera then return drone.root.CFrame.LookVector end
 		local mouse = UserInputService:GetMouseLocation()
 		local ray = camera:ViewportPointToRay(mouse.X, mouse.Y)
 		local target = ray.Origin + ray.Direction * 300
@@ -137,10 +141,12 @@ local function showTool(drone: Drone)
 end
 
 local function finish(drone: Drone)
+	live[drone] = nil
 	drone.part:Destroy()
 	drone.ghost:Destroy()
 	if drone.portal then
-		drone.portal:Destroy()
+		drone.portal:Release(CLOSE_TIME)
+		drone.portal = nil
 	end
 	showTool(drone)
 	if drones[drone.character] == drone then
@@ -150,7 +156,8 @@ end
 
 local function step(dt: number)
 	local now = os.clock()
-	for character, drone in drones do
+	for drone in live do
+		local character = drone.character
 		local root = drone.root
 		if not root.Parent or not character.Parent then
 			finish(drone)
@@ -182,12 +189,12 @@ local function step(dt: number)
 						-- (the ghost isn't needed while it hovers; keep it out of
 						-- the closing portal, which takes its contents with it)
 						drone.ghost.Parent = nil
-						drone.portal:Close(CLOSE_TIME, true)
+						drone.portal:Release(CLOSE_TIME)
 						drone.portal = nil
 					end
 				else
 					if drone.portal then
-						drone.portal:Close(CLOSE_TIME, true)
+						drone.portal:Release(CLOSE_TIME)
 						drone.portal = nil
 					end
 					finish(drone)
@@ -204,11 +211,18 @@ local function step(dt: number)
 		-- before that it's only seen through the opening (its ghost inside)
 		local depth = (position - portalFrame.Position):Dot(-portalFrame.LookVector) -- >0: behind the plane
 		local behind = drone.state ~= "hovering" and depth > 0
-		drone.part.LocalTransparencyModifier = if behind then 1 else 0
-		drone.part.CFrame = frame
-		drone.ghost.CFrame = frame
+		if drone.behind ~= behind then
+			drone.behind = behind
+			DroneVisual.SetHidden(drone.parts, behind)
+		end
+		drone.part:PivotTo(frame)
+		if not behind then DroneVisual.Spin(drone.rotors, frame, now) end
+		if drone.portal then
+			drone.ghost:PivotTo(frame)
+			DroneVisual.Spin(drone.ghostRotors, frame, now)
+		end
 	end
-	if next(drones) == nil and stepping then
+	if next(live) == nil and stepping then
 		stepping:Disconnect()
 		stepping = nil
 	end
@@ -227,6 +241,20 @@ function DroneClient.Summon(character: Model, tool: Tool?)
 		return
 	end
 	local existing = drones[character]
+	if existing and existing.root ~= root then
+		-- Streaming can replace the root before the next render cleanup.
+		-- Do not reuse a drone still following the removed root.
+		finish(existing)
+		existing = nil
+	end
+	local sharedPortal: any = nil
+	if existing and existing.weaponTool ~= tool then
+		-- Keep the previous quadcopter flying home independently. Its mounted
+		-- weapon is immutable, so the new Tool needs a different drone.
+		DroneClient.Dismiss(character)
+		sharedPortal = existing.portal
+		existing = nil
+	end
 	if existing then
 		hideTool(existing, tool)
 		if existing.state == "dismissing" then
@@ -234,25 +262,32 @@ function DroneClient.Summon(character: Model, tool: Tool?)
 			existing.state = "summoning"
 			existing.t = OPEN_TIME * 0.6 + TRAVEL_TIME * (1 - math.clamp((existing.t - OPEN_TIME * 0.6) / TRAVEL_TIME, 0, 1))
 			if not existing.portal then
-				existing.portal = Portal.new(DroneRig.Portal(root.CFrame), DroneRig.PortalRadius)
-				existing.portal:Open(0.15)
+				existing.portal = openPortal(DroneRig.Portal(root.CFrame), 0.15)
 				existing.ghost.Parent = existing.portal.Inside
 			end
 		end
 		return
 	end
-	local portal = Portal.new(DroneRig.Portal(root.CFrame), DroneRig.PortalRadius)
-	portal:Open(OPEN_TIME)
-	local part = makeDrone()
-	part.LocalTransparencyModifier = 1
+	local portal = sharedPortal or openPortal(DroneRig.Portal(root.CFrame))
+	if sharedPortal then portal:Retain() end
+	local part = makeDrone(tool)
+	local parts = DroneVisual.Parts(part)
+	DroneVisual.SetHidden(parts, true)
 	part.Parent = workspace
-	local ghost = makeDrone()
+	local ghost = part:Clone()
+	DroneVisual.SetHidden(DroneVisual.Parts(ghost), false)
 	ghost.Parent = portal.Inside
 	local drone: Drone = {
 		character = character,
 		root = root,
 		part = part,
 		ghost = ghost,
+		parts = parts,
+		rotors = DroneVisual.Rotors(part),
+		ghostRotors = DroneVisual.Rotors(ghost),
+		behind = true,
+		weaponTool = tool,
+		createdAt = os.clock(),
 		portal = portal,
 		state = "summoning",
 		t = 0,
@@ -262,6 +297,18 @@ function DroneClient.Summon(character: Model, tool: Tool?)
 	}
 	hideTool(drone, tool)
 	drones[character] = drone
+	live[drone] = true
+	while true do
+		local count, oldest = 0, nil :: Drone?
+		for returning in live do
+			if returning.character == character and returning.state == "dismissing" then
+				count += 1
+				if not oldest or returning.createdAt < oldest.createdAt then oldest = returning end
+			end
+		end
+		if count <= MAX_RETURNING or not oldest then break end
+		finish(oldest)
+	end
 	ensureStepping()
 end
 
@@ -280,8 +327,7 @@ function DroneClient.Dismiss(character: Model)
 	-- (pick up from wherever a summon had got to)
 	drone.t = OPEN_TIME * 0.6 + TRAVEL_TIME * (1 - travelled)
 	if not drone.portal then
-		local portal = Portal.new(DroneRig.Portal(drone.root.CFrame), DroneRig.PortalRadius)
-		portal:Open(OPEN_TIME)
+		local portal = openPortal(DroneRig.Portal(drone.root.CFrame))
 		drone.portal = portal
 		drone.ghost.Parent = portal.Inside
 		drone.t = 0 -- (wait for it to open)
@@ -295,11 +341,14 @@ function DroneClient.Demo(portalFrame: CFrame, radius: number)
 	local portal = Portal.new(portalFrame, radius)
 	portal:Open(OPEN_TIME)
 	local part = makeDrone()
-	part.Size = DRONE_SIZE * math.max(radius / DroneRig.PortalRadius, 1)
-	part.LocalTransparencyModifier = 1
+	part:ScaleTo(math.max(radius / DroneRig.PortalRadius, 1))
+	local parts = DroneVisual.Parts(part)
+	DroneVisual.SetHidden(parts, true)
 	part.Parent = workspace
 	local ghost = part:Clone()
+	DroneVisual.SetHidden(DroneVisual.Parts(ghost), false)
 	ghost.Parent = portal.Inside
+	local rotors, ghostRotors = DroneVisual.Rotors(part), DroneVisual.Rotors(ghost)
 	local start = portalFrame * CFrame.new(0, 0, START_DEPTH + radius * 2)
 	local stop = portalFrame * CFrame.new(0, 0, -(radius * 2.5 + 2))
 	local OUT, HANG, BACK = TRAVEL_TIME * 1.4, 0.8, TRAVEL_TIME * 1.2
@@ -318,9 +367,12 @@ function DroneClient.Demo(portalFrame: CFrame, radius: number)
 		local position = start.Position:Lerp(stop.Position, math.clamp(alpha, 0, 1))
 		local frame = CFrame.lookAt(position, position + portalFrame.LookVector) * CFrame.new(0, math.sin(os.clock() * BOB_SPEED) * BOB, 0)
 		local depth = (position - portalFrame.Position):Dot(-portalFrame.LookVector)
-		part.LocalTransparencyModifier = if depth > 0 then 1 else 0
-		part.CFrame = frame
-		ghost.CFrame = frame
+		DroneVisual.SetHidden(parts, depth > 0)
+		part:PivotTo(frame)
+		ghost:PivotTo(frame)
+		local clock = os.clock()
+		if depth <= 0 then DroneVisual.Spin(rotors, frame, clock) end
+		DroneVisual.Spin(ghostRotors, frame, clock)
 		if t >= OUT + HANG + BACK then
 			connection:Disconnect()
 			part:Destroy()
@@ -335,6 +387,8 @@ end
 
 -- Watches every character for drone weapons being equipped / put away.
 local function watchCharacter(character: Model)
+	if watchedCharacters[character] then return end
+	watchedCharacters[character] = true
 	local function check()
 		local tool: Tool? = nil
 		for _, child in character:GetChildren() do
@@ -350,7 +404,7 @@ local function watchCharacter(character: Model)
 		end
 	end
 	character.ChildAdded:Connect(function(child)
-		if child:IsA("Tool") then
+		if child:IsA("Tool") or child.Name == "HumanoidRootPart" then
 			task.defer(check)
 		end
 	end)
@@ -363,6 +417,8 @@ local function watchCharacter(character: Model)
 end
 
 local function watchPlayer(other: Player)
+	if watchedPlayers[other] then return end
+	watchedPlayers[other] = true
 	other.CharacterAdded:Connect(watchCharacter)
 	if other.Character then
 		task.spawn(watchCharacter, other.Character)
@@ -370,6 +426,11 @@ local function watchPlayer(other: Player)
 end
 
 function DroneClient.start()
+	if started then return end
+	started = true
+	-- Every client observes ALL players' replicated equipped Tools and builds
+	-- their drones locally, including players already equipped when we join.
+	-- No owner-only rendering or per-frame drone transform remotes.
 	Players.PlayerAdded:Connect(watchPlayer)
 	for _, other in Players:GetPlayers() do
 		watchPlayer(other)
