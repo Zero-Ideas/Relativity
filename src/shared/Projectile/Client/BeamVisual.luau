@@ -3,16 +3,16 @@
 -- from the muzzle to the cursor. Sustained channels share a linked centerline
 -- with server collision; individual beams retain their traveled path tail.
 -- Collision/damage/bounce/pierce/homing stay server-owned.
-local ChunkManager = require(script.Parent.Parent.ChunkManager)
+local ChunkManager = require(script.Parent.Parent.Parent.ChunkManager)
 local Types = require(script.Parent.Types)
-local Protocol = require(script.Parent.Parent.ProjectileProtocol)
+local Protocol = require(script.Parent.Parent.Parent.Projectile.Protocol)
 local Geometry = require(script.Parent.BeamGeometry)
 local View = require(script.Parent.View)
 local RunService = game:GetService("RunService")
-local Planner = require(script.Parent.Parent.ProjectileStepPlanner)
+local Planner = require(script.Parent.Parent.Parent.Projectile.StepPlanner)
 local Prediction = require(script.Parent.Prediction)
-local Heartbeat = require(script.Parent.Parent.Heartbeat)
-local BeamPath = require(script.Parent.Parent:WaitForChild("Projectile"):WaitForChild("BeamPath"))
+local Heartbeat = require(script.Parent.Parent.Parent.Heartbeat)
+local BeamPath = require(script.Parent.Parent.Parent:WaitForChild("Projectile"):WaitForChild("BeamPath"))
 
 local BeamVisual = {}
 local MAX_SEGMENTS = 8

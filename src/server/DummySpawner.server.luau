@@ -167,6 +167,8 @@ local function spawn(player, data, playerRoot, target)
 	local entity = Entity.new(model, { Team = "Undead", ScaleHumanoid = true })
 	entity:AddTag("Enemy")
 	entity:AddTag("TestDummy")
+	-- (Parties: can be invited for testing, and accepts straight away)
+	game:GetService("CollectionService"):AddTag(model, "PartyDummy")
 	table.insert(list, model)
 	local hp, damage = makeDisplay(model, root)
 	local state = { HealthLabel = hp, DamageLabel = damage, Entity = entity, Total = 0, Last = 0, Hits = 0, Dirty = true, FeetOffset = feetOffset }

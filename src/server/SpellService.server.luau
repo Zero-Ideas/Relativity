@@ -43,6 +43,11 @@ channel.Parent = remoteFolder
 -- Hold-to-charge: the server times the hold itself, from ChargeBegin to the
 -- SpellCast that ends it, so a client can't claim a charge it never held.
 local chargeStart: { [Player]: number } = {}
+-- Mana is paid when charging starts: the spell's full (charge 1) cost on
+-- ChargeBegin. The release settles the difference -- the unused part of a
+-- partial charge comes back, overcharge pays extra -- and a cancelled charge
+-- keeps what it paid.
+local chargePaid: { [Player]: number } = {}
 
 -- While the tool is held the client streams its cursor here (unreliable,
 -- ~20 Hz) so Stream copies can re-aim mid-cast. Only positions newer than
@@ -101,6 +106,25 @@ local function markCast(player: Player, slot: number?)
 	local deadline = workspace:GetServerTimeNow() + CAST_INTERVAL
 	player:SetAttribute("SpellCooldownEndsAt" .. slot, deadline)
 	feedback:FireClient(player, { Accepted = true, Slot = slot, EndsAt = deadline })
+end
+
+-- Settles a charge that prepaid `paid` mana: pays the rest of its cost at
+-- `charge`, or refunds the excess. Overcharge that can't be afforded falls
+-- back to charge 1. Returns the charge to cast at, or nil when even that
+-- can't be paid.
+local function settleCharge(player: Player, compiled: any, charge: number, paid: number): number?
+	local cost = compiled.manaCost * SpellRunes.ChargeEnergyMultiplier(charge)
+	if cost > paid and not PlayerResources.Consume(player, "Mana", cost - paid) then
+		charge = math.min(charge, 1)
+		cost = compiled.manaCost * SpellRunes.ChargeEnergyMultiplier(charge)
+		if cost > paid and not PlayerResources.Consume(player, "Mana", cost - paid) then
+			return nil
+		end
+	end
+	if cost < paid then
+		PlayerResources.Refund(player, "Mana", paid - cost)
+	end
+	return charge
 end
 
 local function rejectCast(player: Player, slot: number?)
@@ -167,6 +191,12 @@ local function handleCommand(player: Player, action: any, payload: any)
 	lastCommand[player] = now
 	if action == "GetState" then
 		return response(true, SpellStore.GetState(player))
+	end
+	if action == "ClearActive" then
+		-- (deselect: no spell equipped)
+		BeamHandler.Stop(player)
+		local ok, err, state = SpellStore.SetActive(player, nil)
+		return response(ok, state or SpellStore.GetState(player), nil, err or "Spell deselected.")
 	end
 	if typeof(payload) ~= "table" then
 		return response(false, SpellStore.GetState(player), nil, "Invalid spell command payload.")
@@ -365,14 +395,13 @@ local function freezeSpell(player: Player, rawPosition: any)
 	end
 	local existing = frozenSpells[player]
 	if existing and #existing >= SpellRunes.Freeze.MaxQueued and coolingDown(player, existing[1].slot) then return end
-	local charge = SpellRunes.ChargeFromHold(held)
-	local manaCost = compiled.manaCost * SpellRunes.ChargeEnergyMultiplier(charge)
-	local mana = player:GetAttribute("Mana")
-	if typeof(mana) ~= "number" or mana < manaCost then
+	local settled = settleCharge(player, compiled, SpellRunes.ChargeFromHold(held), chargePaid[player] or 0)
+	if not settled then
 		return
 	end
-	if not PlayerResources.Consume(player, "Mana", manaCost) then return end
+	local charge = settled
 	chargeStart[player] = nil
+	chargePaid[player] = nil
 	circleOpen[player] = nil
 
 	-- where the circle hangs: the client's claim if it's near the head,
@@ -428,6 +457,7 @@ local function watchCharacters(player: Player)
 	end)
 	player.CharacterRemoving:Connect(function(character)
 		clearFrozen(player, character)
+		chargeStart[player], chargePaid[player] = nil, nil
 	end)
 end
 for _, player in Players:GetPlayers() do watchCharacters(player) end
@@ -468,10 +498,21 @@ channel.OnServerEvent:Connect(function(player: Player, action: any, payload: any
 	elseif action == "ChargeBegin" then
 		if coolingDown(player) or not canCastSpells(player) or not SpellStore.GetActive(player) then return end
 		if chargeStart[player] and os.clock() - chargeStart[player] <= SpellRunes.Charge.StaleAfter then return end
+		local record = SpellStore.GetActive(player)
+		local compiled = record and compiledFor(record)
+		if not compiled then return end
+		local paid = 0
+		if not SpellRunes.HasSustain(compiled) then
+			-- (Sustain spells don't charge: they pay when cast)
+			if not PlayerResources.Consume(player, "Mana", compiled.manaCost) then return end
+			paid = compiled.manaCost
+		end
 		chargeStart[player] = os.clock()
+		chargePaid[player] = paid
 		circleBegin(player)
 	elseif action == "ChargeCancel" then
 		chargeStart[player] = nil
+		chargePaid[player] = nil
 		if circleOpen[player] then
 			circleOpen[player] = nil
 			circleClose(player, "Cancel")
@@ -523,10 +564,12 @@ local function castSpell(player: Player, rawTarget: any): boolean
 			else SpellRunes.Charge.Min
 	end
 	chargeStart[player] = nil
-	local manaCost = compiled.manaCost * SpellRunes.ChargeEnergyMultiplier(charge)
-	local mana = player:GetAttribute("Mana")
-	if typeof(mana) ~= "number" or mana < manaCost then return false end
-	if not PlayerResources.Consume(player, "Mana", manaCost) then return false end
+	-- what ChargeBegin prepaid (none for a Sustain spell or a click whose
+	-- ChargeBegin never arrived: those pay for their charge here)
+	local settled = settleCharge(player, compiled, charge, chargePaid[player] or 0)
+	chargePaid[player] = nil
+	if not settled then return false end
+	charge = settled
 	markCast(player, SpellStore.GetActiveSlot(player))
 
 	local head = character:FindFirstChild("Head")
@@ -565,6 +608,7 @@ end
 
 cast.OnServerEvent:Connect(function(player: Player, rawTarget: any)
 	if not castSpell(player, rawTarget) then
+		chargePaid[player] = nil
 		rejectCast(player)
 		if circleOpen[player] then
 			circleOpen[player] = nil
@@ -579,6 +623,7 @@ Players.PlayerRemoving:Connect(function(player)
 	liveAim[player] = nil
 	lastCast[player] = nil
 	chargeStart[player] = nil
+	chargePaid[player] = nil
 	lastCommand[player] = nil
 	circleOpen[player] = nil
 	lastCircleBegin[player] = nil

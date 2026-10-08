@@ -564,12 +564,28 @@ function Entity:AddOutgoingModifier(fn: (amount: number, info: any, entity: any,
 	return addModifier(self._outgoingModifiers, fn)
 end
 
+-- Global gate over every hit: fn(source, target) -> false blocks the damage
+-- (server/Parties uses it so party members can't hurt each other).
+local damageGate: ((source: any, target: any) -> boolean)? = nil
+
+function Entity.SetDamageGate(fn: ((source: any, target: any) -> boolean)?)
+	damageGate = fn
+end
+
+-- Whether `source` (an Entity, Player or nil) may damage `target`.
+function Entity.CanDamage(source: any, target: any): boolean
+	return source == nil or damageGate == nil or damageGate(source, target)
+end
+
 -- info is a free-form table (e.g. { Type = "Fire", Source = attacker, Crit = true }).
 function Entity:TakeDamage(amount: number, info: any?): number
 	if self.IsDestroyed or self.Health <= 0 then
 		return 0
 	end
 	info = info or {}
+	if not Entity.CanDamage(info.Source, self) then
+		return 0
+	end
 
 	for _, modifier in self._damageModifiers do
 		amount = modifier(amount, info, self)

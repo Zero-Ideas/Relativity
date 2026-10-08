@@ -2,7 +2,7 @@
 --!strict
 --!optimize 2
 --[[
-	ProjectileStepPlanner.luau
+	Projectile/StepPlanner.luau
 	Chooses the next integration substep for a projectile. The authoritative
 	server Step and the client's dead-reckoning both call this, so they
 	partition time identically: same chunk sampling, same boundary stops,
@@ -21,9 +21,9 @@
 	step of stepDt dilated seconds consumes stepDt / chunkScale of it.
 ]]
 
-local ChunkManager = require(script.Parent.ChunkManager)
-local ProjectileMotion = require(script.Parent.ProjectileMotion)
-local SafeMath = require(script.Parent.SafeMath)
+local ChunkManager = require(script.Parent.Parent.ChunkManager)
+local ProjectileMotion = require(script.Parent.Motion)
+local SafeMath = require(script.Parent.Parent.SafeMath)
 
 local Planner = {}
 

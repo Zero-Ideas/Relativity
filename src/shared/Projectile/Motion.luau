@@ -22,7 +22,7 @@
 	GetNudge.
 ]]
 
-local SafeMath = require(script.Parent.SafeMath)
+local SafeMath = require(script.Parent.Parent.SafeMath)
 
 export type Acceleration = number | Vector3
 

@@ -1,7 +1,7 @@
 --!strict
 --!optimize 2
 --[[
-	ProjectileClient/DebugRays.luau
+	Projectile/Client/DebugRays.luau
 	Draws one raycast segment as a thin fading line, colored by resolution --
 	receives ProjRay events streamed while the server's Projectile.SetDebugRays
 	is on (see example/init.server.luau's "SetProjectileDebug" handler).

@@ -232,8 +232,8 @@ end
 -- Damages `target` (before headshot scaling) and applies the element's
 -- secondary effect sized from `energy`, the damage energy this hit carried.
 local function strike(ctx: Context, target: any, amount: number, hurtbox: string?, position: Vector3, element: string, energy: number)
-	if not alive(target) or target == ctx.caster then
-		return
+	if not alive(target) or target == ctx.caster or not Entity.CanDamage(ctx.caster, target) then
+		return -- (an ally: no damage, burn or stun either)
 	end
 	if hurtbox == "Head" then
 		amount *= target.HeadshotMultiplier

@@ -1,7 +1,7 @@
 --!strict
 --!optimize 2
 --[[
-	ProjectileClient/Impact.luau
+	Projectile/Client/Impact.luau
 	Hit-effect visuals -- a short neon flash + spreading ring at the impact
 	point, color-coded by what was struck. Games can swap this out entirely
 	via Impact.SetHandler(fn(position, normal, model, kind)).

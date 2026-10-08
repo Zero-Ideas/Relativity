@@ -1,7 +1,7 @@
 -- Temporary Studio LocalScript; never shipped by the Rojo game project.
 local RunService = game:GetService("RunService")
 assert(RunService:IsStudio())
-local modules = game.ReplicatedStorage.Shared.ProjectileClient
+local modules = game.ReplicatedStorage.Shared.Projectile.Client
 local Geometry = require(modules.BeamGeometry)
 local dots, dotCaps = Geometry.Merge({{Vector3.zero},{Vector3.xAxis*50}}, .35)
 assert(#dots == 0 and #dotCaps == 0, "zero-length paths left floating glow dots")

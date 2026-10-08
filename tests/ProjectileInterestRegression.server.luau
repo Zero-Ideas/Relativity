@@ -4,7 +4,7 @@ local shared = game.ReplicatedStorage._ProjectileRegressionShared
 local server = game.ServerScriptService._ProjectileRegressionServer
 local Replication = require(server.Projectile.Replication)
 local Transport = require(shared.VisualOffload)
-local Protocol = require(shared.ProjectileProtocol)
+local Protocol = require(shared.Projectile.Protocol)
 local player = game.Players:GetPlayers()[1]
 assert(player and player.Character and player.Character.PrimaryPart)
 local near = player.Character.PrimaryPart.Position + Vector3.yAxis*5

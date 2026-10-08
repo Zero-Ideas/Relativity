@@ -49,6 +49,14 @@ function Resources.Consume(player: Player, resource: string, amount: number): bo
 	return true
 end
 
+-- Gives back a refund (capped at the maximum).
+function Resources.Refund(player: Player, resource: string, amount: number)
+	if (resource ~= "Mana" and resource ~= "Stamina") or not finite(amount) or amount <= 0 then return end
+	local current, maximum = player:GetAttribute(resource), player:GetAttribute("Max" .. resource)
+	if not finite(current) or not finite(maximum) then return end
+	player:SetAttribute(resource, math.min(current + amount, maximum))
+end
+
 local function setSprint(player: Player, enabled: boolean)
 	player:SetAttribute("Sprinting", enabled)
 	local character = player.Character

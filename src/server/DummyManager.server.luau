@@ -32,6 +32,8 @@ local function registerDummy(model: Model)
 		ScaleHumanoid = true, -- moves/reacts in dilated time inside slow chunks
 	})
 	entity:AddTag("Enemy") -- homing targets this tag
+	-- (Parties: can be invited for testing, and accepts straight away)
+	game:GetService("CollectionService"):AddTag(model, "PartyDummy")
 
 	entity.Died:Connect(function()
 		local elapsed = 0

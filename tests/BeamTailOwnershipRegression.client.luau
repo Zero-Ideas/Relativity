@@ -1,7 +1,7 @@
 -- Temporary Studio LocalScript; never shipped by the Rojo game project.
 -- Every logical sample has an old vertical trajectory, but the sustained
 -- centerline runs sideways. None may add a private trajectory tail.
-local modules=game.ReplicatedStorage.Shared.ProjectileClient
+local modules=game.ReplicatedStorage.Shared.Projectile.Client
 local Beam=require(modules.BeamVisual)
 local Geometry=require(modules.BeamGeometry)
 local origin=Vector3.new(0,500,0)

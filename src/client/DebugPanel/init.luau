@@ -1,7 +1,8 @@
 --!optimize 2
 --[[
 	DebugPanel  (client)
-	ReGui window (toggle with F2) for players allowed to use it: anyone in
+	ReGui window (closed by default; toggle with F2 or the topbar's Debug
+	button; opens on the Stats tab) for players allowed to use it: anyone in
 	Studio, players on the allowlist (Player attribute "DebugListed", set by
 	server/DebugAccess), and everyone while a listed player has opened it to
 	all (ReplicatedStorage attribute "DebugPublic"). Non-listed players only
@@ -59,6 +60,8 @@ local started = false
 local localPlayer = Players.LocalPlayer
 local panelWindow: any = nil -- the built ReGui window, once allowed
 local anyTabVisible = true -- false when every tab has been taken from this player
+local accessEvent = Instance.new("BindableEvent") -- (DebugPanel.AccessChanged)
+DebugPanel.AccessChanged = accessEvent.Event
 
 local function listed(): boolean
 	return localPlayer:GetAttribute("DebugListed") == true
@@ -109,6 +112,7 @@ local function applyTabVisibility(window)
 	elseif activeHidden then
 		selector:SetActiveTab(firstVisible)
 	end
+	accessEvent:Fire()
 end
 
 local function tabShowing(window, name: string): boolean
@@ -123,46 +127,19 @@ local function tabShowing(window, name: string): boolean
 	return false
 end
 
-local PREFABS_TIMEOUT = 30
-
 local function build()
-	-- ReGui only waits 2s for its prefabs, but this ~400-instance ScreenGui
-	-- can take longer than that to replicate, so wait for it here instead.
-	local module = Shared:WaitForChild("ReGui")
-	local prefabs = module:WaitForChild("ReGui-Prefabs", PREFABS_TIMEOUT)
-	if not prefabs then
-		warn("[DebugPanel] ReGui-Prefabs never replicated; panel disabled")
+	-- (shared with Notifications: initialised once)
+	local ReGui = require(script.Parent.ReGuiLoader).Get()
+	if not ReGui then
+		warn("[DebugPanel] ReGui unavailable; panel disabled")
 		return
 	end
-	local ReGui = require(module)
-	-- ReGui probes gethui()/CoreGui before PlayerGui (executor leftovers); the
-	-- CoreGui probe passes in a playtest but the real parent assignment then
-	-- fails silently, leaving the container parentless, so pin it.
-	ReGui:Init({
-		Prefabs = prefabs,
-		ContainerParent = localPlayer:WaitForChild("PlayerGui"),
-	})
-	-- ReGui's container is a Folder holding two ScreenGuis, and a respawn
-	-- clears everything in PlayerGui except ResetOnSpawn=false ScreenGuis --
-	-- folder included. ReGui only ever indexes Container.Windows/.Overlays,
-	-- so lift both ScreenGuis out and point Container at them directly.
-	local folder = ReGui.Container
-	local playerGui = localPlayer.PlayerGui
-	local lifted = {}
-	for _, name in { "Windows", "Overlays" } do
-		local gui = folder:FindFirstChild(name) :: ScreenGui
-		gui.ResetOnSpawn = false
-		gui.Name = "ReGui" .. name
-		gui.Parent = playerGui
-		lifted[name] = gui
-	end
-	ReGui.Container = lifted
-	folder:Destroy()
 
 	local window = ReGui:TabsWindow({
 		Title = "Debug  [F2]",
-		Size = UDim2.fromOffset(360, 520),
-		Position = UDim2.fromOffset(16, 160),
+		-- (clear of the topbar and of GameHud's bars in the bottom-left)
+		Size = UDim2.fromOffset(360, 440),
+		Position = UDim2.fromOffset(16, 70),
 		-- the close button hides instead of destroying, so F2 can reopen it
 		CloseCallback = function(self)
 		self:SetVisible(false)
@@ -187,9 +164,13 @@ local function build()
 	localPlayer:GetAttributeChangedSignal("DebugListed"):Connect(refreshTabs)
 	localPlayer:GetAttributeChangedSignal("DebugDeniedTabs"):Connect(refreshTabs)
 	ReplicatedStorage:GetAttributeChangedSignal("DebugPublicTabs"):Connect(refreshTabs)
-	if not RunService:IsStudio() then
-		window:SetVisible(false) -- live servers: wait for F2 instead of popping up
+	-- closed until F2 / the topbar's Debug button; opens on the Stats tab
+	-- (when this player may see it)
+	if tabVisible("Stats") then
+		window.WindowTabSelector:SetActiveTab("Stats")
 	end
+	window:SetVisible(false)
+	accessEvent:Fire()
 	UserInputService.InputBegan:Connect(function(input, processed)
 		if input.KeyCode == TOGGLE_KEY and not processed and allowed() and anyTabVisible then
 			window:SetVisible(not window.Visible)
@@ -225,6 +206,18 @@ local function build()
 	end)
 end
 
+-- For the topbar's Debug button (UiMode): whether this player can open the
+-- panel (AccessChanged fires when that may have changed), and a toggle.
+function DebugPanel.IsAllowed(): boolean
+	return allowed() and anyTabVisible
+end
+
+function DebugPanel.Toggle()
+	if panelWindow and DebugPanel.IsAllowed() then
+		panelWindow:SetVisible(not panelWindow.Visible)
+	end
+end
+
 function DebugPanel.start()
 	if started then
 		return
@@ -248,6 +241,7 @@ function DebugPanel.start()
 		elseif panelWindow and panelWindow.Visible then
 			panelWindow:SetVisible(false)
 		end
+		accessEvent:Fire()
 	end
 	localPlayer:GetAttributeChangedSignal("DebugListed"):Connect(refresh)
 	ReplicatedStorage:GetAttributeChangedSignal("DebugPublic"):Connect(refresh)

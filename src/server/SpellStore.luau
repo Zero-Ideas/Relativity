@@ -304,16 +304,17 @@ function SpellStore.DeleteSlot(player: Player, slot: number)
 	return ok, err, publicState(entry)
 end
 
-function SpellStore.SetActive(player: Player, slot: number)
+-- nil deselects (no spell equipped).
+function SpellStore.SetActive(player: Player, slot: number?)
 	local entry = entries[player]
 	if not entry or not entry.loaded or not entry.available then
 		return false, entry and entry.error or "Spell data has not loaded."
 	end
-	if slot % 1 ~= 0 or slot < 1 or slot > 5 or not entry.data.slots[tostring(slot)] then
+	if slot ~= nil and (slot % 1 ~= 0 or slot < 1 or slot > 5 or not entry.data.slots[tostring(slot)]) then
 		return false, "That spell card does not exist."
 	end
 	if entry.saving then return false, "A spell save is already in progress." end
-	if entry.data.slots[tostring(slot)].invalid then return false, "This saved spell no longer compiles; its original graph has been preserved." end
+	if slot ~= nil and entry.data.slots[tostring(slot)].invalid then return false, "This saved spell no longer compiles; its original graph has been preserved." end
 	entry.data.activeSlot = slot
 	entry.dirty = true
 	entry.localRevision += 1

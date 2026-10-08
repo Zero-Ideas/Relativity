@@ -25,7 +25,7 @@ local TweenService = game:GetService("TweenService")
 
 local Shared = ReplicatedStorage:WaitForChild("Shared")
 local VisualOffload = require(Shared.VisualOffload)
-local Impact = require(Shared.ProjectileClient.Impact)
+local Impact = require(Shared.Projectile.Client.Impact)
 local ExplosionVFX = require(script.Parent.ExplosionVFX)
 local _SpellCircleVFX = require(script.Parent.SpellCircleVFX) -- self-registers "SpellCircle"
 

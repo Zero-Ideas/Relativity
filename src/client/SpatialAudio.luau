@@ -18,7 +18,7 @@
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 
 local Shared = ReplicatedStorage:WaitForChild("Shared")
-local ProjectileClient = require(Shared:WaitForChild("ProjectileClient"))
+local ProjectileClient = require(Shared:WaitForChild("Projectile"):WaitForChild("Client"))
 
 local SpatialAudio = {}
 

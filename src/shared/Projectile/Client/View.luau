@@ -2,7 +2,7 @@
 --!strict
 --!optimize 2
 --[[
-	ProjectileClient/View.luau
+	Projectile/Client/View.luau
 	Calculation-visibility snapshot, refreshed once per frame. This gates Lua
 	work only; Roblox retains ownership of draw culling. View.contains is then
 	pure Luau dot products instead of one WorldToViewportPoint engine call per

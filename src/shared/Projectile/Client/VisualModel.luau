@@ -1,13 +1,13 @@
 --!strict
 --!optimize 2
 --[[
-	ProjectileClient/VisualModel.luau
+	Projectile/Client/VisualModel.luau
 	Builds and positions the actual Instance a projectile visual renders as.
 	Pure presentation -- no networking, no gameplay state.
 ]]
 
-local Protocol = require(script.Parent.Parent:WaitForChild("ProjectileProtocol"))
-local SafeMath = require(script.Parent.Parent:WaitForChild("SafeMath"))
+local Protocol = require(script.Parent.Parent.Parent:WaitForChild("Projectile"):WaitForChild("Protocol"))
+local SafeMath = require(script.Parent.Parent.Parent:WaitForChild("SafeMath"))
 
 local Types = require(script.Parent.Types)
 local BeamVisual = require(script.Parent.BeamVisual)

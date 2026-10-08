@@ -1,10 +1,10 @@
 --!strict
 --[[
-	ProjectileClient/Types.luau
+	Projectile/Client/Types.luau
 	Shared shapes for the client renderer's modules. No runtime behaviour.
 ]]
 
-local Protocol = require(script.Parent.Parent:WaitForChild("ProjectileProtocol"))
+local Protocol = require(script.Parent.Parent.Parent:WaitForChild("Projectile"):WaitForChild("Protocol"))
 
 -- A visual driven by a Motor6D from an invisible anchored root; see
 -- VisualModel.Build.

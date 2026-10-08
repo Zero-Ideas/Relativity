@@ -1,10 +1,10 @@
 -- Isolated transport fixture exercising actual client message handlers,
 -- not only BeamVisual helpers. Install _BeamPredictionProtocolShared first.
 local shared = game.ReplicatedStorage._BeamPredictionProtocolShared
-local Client = require(shared.ProjectileClient)
+local Client = require(shared.Projectile.Client)
 local V = require(shared.VisualOffload)
 local HB = require(shared.Heartbeat)
-local Beam = require(shared.ProjectileClient.BeamVisual)
+local Beam = require(shared.Projectile.Client.BeamVisual)
 local RunService = game:GetService("RunService")
 local camera = workspace.CurrentCamera
 local heading = camera.CFrame.LookVector

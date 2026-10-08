@@ -3,8 +3,8 @@
 --[[
 	Projectile/Replication.luau
 	Everything that pushes projectile state from the server to rendering
-	clients (see ProjectileClient in ReplicatedStorage.Shared for the
-	receiving side, and Shared.ProjectileProtocol for the wire format). The
+	clients (see ProjectileClient (ReplicatedStorage.Shared.Projectile.Client) for the
+	receiving side, and Shared.Projectile.Protocol for the wire format). The
 	server stays authoritative; this module only ever sends -- see the
 	top-level Projectile doc comment (init.luau) for the protocol's design.
 
@@ -20,8 +20,8 @@ local Players = game:GetService("Players")
 
 local Shared = game:GetService("ReplicatedStorage"):WaitForChild("Shared")
 local VisualOffload = require(Shared:WaitForChild("VisualOffload"))
-local Protocol = require(Shared:WaitForChild("ProjectileProtocol"))
-local Codec = require(Shared:WaitForChild("ProjectileCodec"))
+local Protocol = require(Shared:WaitForChild("Projectile"):WaitForChild("Protocol"))
+local Codec = require(Shared:WaitForChild("Projectile"):WaitForChild("Codec"))
 local Heartbeat = require(Shared:WaitForChild("Heartbeat"))
 
 local Types = require(script.Parent.Types)
@@ -126,7 +126,7 @@ end
 
 -- Sends each entry to every player within its Range (everyone when the range
 -- is unlimited), as ONE event per recipient no matter how many entries.
--- With `encode` (ProjMove / ProjHitBatch -- see ProjectileCodec) each entry is
+-- With `encode` (ProjMove / ProjHitBatch -- see Projectile.Codec) each entry is
 -- encoded once and every recipient's message is one packed buffer of them.
 local function fanOut(channel: string, entries: { Entry }, encode: ((any) -> buffer)?)
 	if #entries == 0 then

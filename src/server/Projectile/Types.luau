@@ -7,8 +7,8 @@
 ]]
 
 local Shared = game:GetService("ReplicatedStorage"):WaitForChild("Shared")
-local ProjectileMotion = require(Shared:WaitForChild("ProjectileMotion"))
-local Protocol = require(Shared:WaitForChild("ProjectileProtocol"))
+local ProjectileMotion = require(Shared:WaitForChild("Projectile"):WaitForChild("Motion"))
+local Protocol = require(Shared:WaitForChild("Projectile"):WaitForChild("Protocol"))
 
 export type Acceleration = ProjectileMotion.Acceleration
 export type VisualSpec = Protocol.VisualSpec

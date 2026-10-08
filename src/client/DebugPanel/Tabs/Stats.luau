@@ -11,7 +11,7 @@ local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local Shared = ReplicatedStorage:WaitForChild("Shared")
 local VisualOffload = require(Shared.VisualOffload)
 local Util = require(script.Parent.Parent.Util)
-local ProjectileClient = require(Shared.ProjectileClient)
+local ProjectileClient = require(Shared.Projectile.Client)
 local statLine = Util.statLine
 local fmt, readStat = Util.fmt, Util.readStat
 

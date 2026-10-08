@@ -13,7 +13,7 @@ local RunService = game:GetService("RunService")
 local Shared = ReplicatedStorage:WaitForChild("Shared")
 
 local ChunkManager = require(Shared.ChunkManager)
-local ProjectileClient = require(Shared.ProjectileClient)
+local ProjectileClient = require(Shared.Projectile.Client)
 local Entity = require(Shared.Entity)
 
 -- Client-local systems (sibling ModuleScripts of this LocalScript).
@@ -47,7 +47,8 @@ end
 -- builds itself only for players allowed to use it (see DebugPanel)
 DebugPanel.start()
 ToolManager.start()
-task.spawn(function() require(script.MainHud).start() end)
+-- MainHud (hotbar) or the classic Backpack UI, switched from the topbar
+task.spawn(function() require(script.UiMode).start() end)
 
 -- Optional: custom impact VFX for offloaded projectiles.
 -- ProjectileClient.SetImpactHandler(function(position, normal, model)
@@ -56,10 +57,5 @@ task.spawn(function() require(script.MainHud).start() end)
 -- 	effect.Parent = workspace
 -- 	task.delay(1, effect.Destroy, effect)
 -- end)
-local StarterGui = game:GetService("StarterGui")
 
--- Wait for the game to load the core GUI, then disable the backpack
-pcall(function()
-    StarterGui:SetCoreGuiEnabled(Enum.CoreGuiType.Backpack, false)
-end)
 print("[Relativity] client render systems online")

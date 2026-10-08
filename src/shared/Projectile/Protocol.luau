@@ -1,6 +1,6 @@
 --!strict
 --[[
-	ProjectileProtocol.luau
+	Projectile/Protocol.luau
 	The wire format between the server projectile system
 	(ServerScriptService.Server.Projectile/Replication.luau, sending) and
 	ProjectileClient (receiving). Channel names and payload shapes live here

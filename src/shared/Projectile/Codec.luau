@@ -2,9 +2,9 @@
 --!native
 --!optimize 2
 --[[
-	ProjectileCodec.luau
+	Projectile/Codec.luau
 	Binary wire format for the two per-frame projectile batches, ProjMove and
-	ProjHitBatch (see ProjectileProtocol for the payload fields). A table batch
+	ProjHitBatch (see Projectile.Protocol for the payload fields). A table batch
 	makes Roblox send every key name of every entry; these are packed buffers
 	instead: each entry is a fixed header plus only the optional fields it
 	has, flagged in a bitmask.

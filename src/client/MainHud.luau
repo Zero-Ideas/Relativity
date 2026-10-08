@@ -12,6 +12,7 @@ local movement = ReplicatedStorage:WaitForChild("PlayerMovement") :: RemoteEvent
 
 local Hud = {}
 local started = false
+local enabled = true -- (UiMode turns the HUD off for the classic UI)
 local gui: ScreenGui? = nil
 local uiConnections: { RBXScriptConnection } = {}
 local characterConnections: { RBXScriptConnection } = {}
@@ -109,6 +110,7 @@ local function bindGui(screen: ScreenGui)
 	table.clear(slots)
 	gui = screen
 	screen.ResetOnSpawn = false
+	screen.Enabled = enabled
 	local legacy = screen:FindFirstChild("Display")
 	if legacy and legacy:IsA("LocalScript") then legacy.Disabled = true end
 	local hotbar = screen:FindFirstChild("Hotbar")
@@ -169,6 +171,33 @@ local function bindCharacter(character: Model)
 	refreshStats()
 end
 
+local SLOT_KEYS = { [Enum.KeyCode.One] = 1, [Enum.KeyCode.Two] = 2, [Enum.KeyCode.Three] = 3, [Enum.KeyCode.Four] = 4, [Enum.KeyCode.Five] = 5 }
+
+-- Own the spell-card shortcuts so Roblox's Backpack cannot equip a weapon
+-- on the same keypress. Weapons remain selectable from the Backpack UI.
+local function bindSlotKeys()
+	ContextActionService:BindActionAtPriority("MainHudSpellSlots", function(_, state, input)
+		if UserInputService:GetFocusedTextBox() or SpellEditor.IsOpen() then return Enum.ContextActionResult.Pass end
+		if state == Enum.UserInputState.Begin then task.spawn(SpellEditor.SelectSlot, SLOT_KEYS[input.KeyCode]) end
+		return Enum.ContextActionResult.Sink
+	end, false, Enum.ContextActionPriority.High.Value + 50, Enum.KeyCode.One, Enum.KeyCode.Two, Enum.KeyCode.Three, Enum.KeyCode.Four, Enum.KeyCode.Five)
+end
+
+-- Shows or hides the HUD and its 1-5 card shortcuts (sprint and flip stay).
+function Hud.SetEnabled(on: boolean)
+	if enabled == on then return end
+	enabled = on
+	if gui then gui.Enabled = on end
+	if not started then return end
+	if on then
+		bindSlotKeys()
+		refreshStats()
+		refreshCards()
+	else
+		ContextActionService:UnbindAction("MainHudSpellSlots")
+	end
+end
+
 function Hud.start()
 	if started then return end
 	started = true
@@ -182,14 +211,7 @@ function Hud.start()
 	player.CharacterAdded:Connect(bindCharacter)
 	player.CharacterRemoving:Connect(function() disconnect(characterConnections); humanoid = nil; refreshStats() end)
 	if player.Character then task.spawn(bindCharacter, player.Character) end
-	local keys = { [Enum.KeyCode.One] = 1, [Enum.KeyCode.Two] = 2, [Enum.KeyCode.Three] = 3, [Enum.KeyCode.Four] = 4, [Enum.KeyCode.Five] = 5 }
-	-- Own the spell-card shortcuts so Roblox's Backpack cannot equip a weapon
-	-- on the same keypress. Weapons remain selectable from the Backpack UI.
-	ContextActionService:BindActionAtPriority("MainHudSpellSlots", function(_, state, input)
-		if UserInputService:GetFocusedTextBox() or SpellEditor.IsOpen() then return Enum.ContextActionResult.Pass end
-		if state == Enum.UserInputState.Begin then task.spawn(SpellEditor.SelectSlot, keys[input.KeyCode]) end
-		return Enum.ContextActionResult.Sink
-	end, false, Enum.ContextActionPriority.High.Value + 50, Enum.KeyCode.One, Enum.KeyCode.Two, Enum.KeyCode.Three, Enum.KeyCode.Four, Enum.KeyCode.Five)
+	if enabled then bindSlotKeys() end
 	UserInputService.InputBegan:Connect(function(input, processed)
 		if processed or UserInputService:GetFocusedTextBox() or SpellEditor.IsOpen() then return end
 		if input.KeyCode == Enum.KeyCode.LeftControl then movement:FireServer("ToggleSprint")

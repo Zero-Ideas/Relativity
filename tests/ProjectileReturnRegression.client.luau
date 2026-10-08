@@ -1,11 +1,11 @@
 -- Private-network Studio harness: exercises the real updated renderer.
 local shared=game.ReplicatedStorage._ProjectileRegressionShared
 local transport=require(shared.VisualOffload)
-local protocol=require(shared.ProjectileProtocol)
-local view=require(shared.ProjectileClient.View)
+local protocol=require(shared.Projectile.Protocol)
+local view=require(shared.Projectile.Client.View)
 -- Test flight stays high above the map; avoid moving the user's camera.
 view.contains=function() return true end
-local renderer=require(shared.ProjectileClient)
+local renderer=require(shared.Projectile.Client)
 renderer.EnableClientRendering()
 local spawns,exits=0,0
 local connections={}

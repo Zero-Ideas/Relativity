@@ -4,7 +4,7 @@
 --[[
 	ProjectileClient (client rendering, purely cosmetic)
 	Receives the server-authoritative Projectile system's replication stream
-	(see Shared.ProjectileProtocol for the wire format, and
+	(see Shared.Projectile.Protocol for the wire format, and
 	ServerScriptService.Server.Projectile/Replication.luau for the sending
 	side) and renders tracers/impacts. This module never makes a gameplay
 	decision -- no hit detection, no damage, no entity access -- it only draws
@@ -30,12 +30,12 @@
 local RunService = game:GetService("RunService")
 local Players = game:GetService("Players")
 
-local Shared = script.Parent
+local Shared = script.Parent.Parent
 local Heartbeat = require(Shared:WaitForChild("Heartbeat"))
 local ChunkManager = require(Shared:WaitForChild("ChunkManager"))
 local VisualOffload = require(Shared:WaitForChild("VisualOffload"))
-local Protocol = require(Shared:WaitForChild("ProjectileProtocol"))
-local Codec = require(Shared:WaitForChild("ProjectileCodec"))
+local Protocol = require(Shared:WaitForChild("Projectile"):WaitForChild("Protocol"))
+local Codec = require(Shared:WaitForChild("Projectile"):WaitForChild("Codec"))
 
 local DebugRays = require(script.DebugRays)
 local Impact = require(script.Impact)
@@ -705,7 +705,7 @@ function ProjectileClient.EnableClientRendering()
 	end)
 	VisualOffload.On(Channels.TimeScale, onTimeScale)
 	VisualOffload.On(Channels.Sync, onSync)
-	-- ProjMove / ProjHitBatch arrive packed (see ProjectileCodec); a plain
+	-- ProjMove / ProjHitBatch arrive packed (see Projectile.Codec); a plain
 	-- table batch is still accepted.
 	VisualOffload.On(Channels.Move, function(batch: any)
 		onMove(if typeof(batch) == "buffer" then Codec.DecodeMoves(batch) else batch)

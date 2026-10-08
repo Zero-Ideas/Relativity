@@ -26,9 +26,9 @@
 
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local Shared = ReplicatedStorage:WaitForChild("Shared")
-local ProjectileMotion = require(Shared:WaitForChild("ProjectileMotion"))
+local ProjectileMotion = require(Shared:WaitForChild("Projectile"):WaitForChild("Motion"))
 local Math = require(script.Parent.Math)
-local Planner = require(Shared:WaitForChild("ProjectileStepPlanner"))
+local Planner = require(Shared:WaitForChild("Projectile"):WaitForChild("StepPlanner"))
 
 local Sweep = {}
 

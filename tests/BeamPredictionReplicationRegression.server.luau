@@ -6,7 +6,7 @@ local H = require(server.Projectile.BeamProjectileHandler)
 local R = require(server.Projectile.Replication)
 local HB = require(shared.Heartbeat)
 local V = require(shared.VisualOffload)
-local Protocol = require(shared.ProjectileProtocol)
+local Protocol = require(shared.Projectile.Protocol)
 local origin = Vector3.new(0, 6000, 0)
 local moves, known = {}, {}
 local function receive()

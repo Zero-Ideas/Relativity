@@ -84,7 +84,15 @@ local SINK_KEYS = {
 }
 
 local equippedTool: Tool? = nil
+-- Classic UI (see UiMode): casting and the E editor need the SpellAssembler
+-- Tool held, as before MainHud; the hotbar UI casts without a Tool.
+local toolRequired = false
+local compactEnabled = true
+-- fired with the cost when a cast is refused for lack of mana (GameHud)
+local manaShortEvent = Instance.new("BindableEvent")
+SpellAssemblerGui.ManaShort = manaShortEvent.Event
 local function canCast(): boolean
+	if toolRequired and not equippedTool then return false end
 	local character = player.Character
 	local humanoid = character and character:FindFirstChildOfClass("Humanoid")
 	if not character or not humanoid or humanoid.Health <= 0 then return false end
@@ -253,6 +261,15 @@ end
 -- The server rate-limits spell commands (COMMAND_INTERVAL = 0.15s), so
 -- chained commands wait this long between calls.
 local COMMAND_GAP = 0.2
+
+-- Unequips the active spell (nothing casts until another is selected).
+local function deselectSlot()
+	if pendingActiveSlot then return end
+	SpellAssemblerGui.CancelCast()
+	local result = invoke("ClearActive")
+	if result.ok then result.message = "Spell deselected." end
+	applyServerResult(result)
+end
 
 local function equipSlot(slot: number)
 	if pendingActiveSlot then return end
@@ -838,7 +855,7 @@ function SpellAssemblerGui.Close()
 	if board then board:setCursor("") end
 	ContextActionService:UnbindAction(SINK_ACTION);
 	(root :: Frame).Visible = false;
-	(hud :: Frame).Visible = canCast()
+	(hud :: Frame).Visible = compactEnabled and canCast()
 	updateTopBar()
 end
 
@@ -971,7 +988,14 @@ function SpellAssemblerGui.Cast()
 		return
 	end
 	if not activeHasSustain() then
-		-- charge while held; released in StopCast
+		-- charge while held; released in StopCast. The full cost is paid as
+		-- the charge starts (SpellService), so it must be affordable now.
+		local mana = player:GetAttribute("Mana")
+		local compiled = activeCache.compiled
+		if not compiled or typeof(mana) ~= "number" or mana < compiled.manaCost then
+			manaShortEvent:Fire(if compiled then compiled.manaCost else 0)
+			return
+		end
 		charging = true
 		chargeStarted = os.clock()
 		channelRemote:FireServer("ChargeBegin")
@@ -999,9 +1023,8 @@ function SpellAssemblerGui.Freeze()
 	local compiled = activeCache.compiled
 	if not charging or not character or not compiled then return end
 	if SpellCircleVFX.FrozenCount(character) >= SpellRunes.Freeze.MaxQueued and SpellAssemblerGui.GetCooldownRemaining(player:GetAttribute("SpellFrozenSlot")) > 0 then return end
-	local charge = SpellRunes.ChargeFromHold(os.clock() - chargeStarted)
-	local mana = player:GetAttribute("Mana")
-	if typeof(mana) ~= "number" or mana < compiled.manaCost * SpellRunes.ChargeEnergyMultiplier(charge) then return end
+	-- (already paid for when the charge began; unaffordable overcharge falls
+	-- back to charge 1 on the server)
 	stopChargeBar()
 	if SpellCircleVFX.FrozenCount(character) >= SpellRunes.Freeze.MaxQueued then
 		SpellCircleVFX.FireFrozen(character, player:GetMouse().Hit.Position)
@@ -1033,16 +1056,16 @@ function SpellAssemblerGui.StopCast()
 		sendCast(target)
 		local character = player.Character
 		if character then
-			-- predict the server's mana check so a cast it will refuse fizzles
+			-- the charge was paid for when it began; overcharge the server
+			-- can't take the extra mana for fires at charge 1 instead
 			local charge = SpellRunes.ChargeFromHold(os.clock() - chargeStarted)
-			local mana = player:GetAttribute("Mana")
 			local compiled = activeCache.compiled
-			local cost = if compiled then compiled.manaCost * SpellRunes.ChargeEnergyMultiplier(charge) else math.huge
-			if typeof(mana) == "number" and mana >= cost then
-				SpellCircleVFX.Cast(character, activeCache.spec, charge, target, false, true)
-			else
-				SpellCircleVFX.Cancel(character)
+			local mana = player:GetAttribute("Mana")
+			if compiled and charge > 1 and typeof(mana) == "number"
+				and mana < compiled.manaCost * (SpellRunes.ChargeEnergyMultiplier(charge) - 1) then
+				charge = 1
 			end
+			SpellCircleVFX.Cast(character, activeCache.spec, charge, target, false, true)
 		end
 		return
 	end
@@ -1135,6 +1158,30 @@ function SpellAssemblerGui.IsOpen(): boolean
 	return visible
 end
 
+-- Mana cost (at charge 1) of the equipped spell, or nil with none equipped.
+function SpellAssemblerGui.GetActiveManaCost(): number?
+	refreshActive()
+	return if activeCache.compiled then activeCache.compiled.manaCost else nil
+end
+
+function SpellAssemblerGui.IsCharging(): boolean
+	return charging
+end
+
+-- The compact casting panel (bottom right); GameHud has its own controls.
+function SpellAssemblerGui.SetCompactHudEnabled(enabled: boolean)
+	compactEnabled = enabled
+	if gui and not visible then SpellAssemblerGui.Close() end
+end
+
+function SpellAssemblerGui.SetToolRequired(required: boolean)
+	if toolRequired == required then return end
+	toolRequired = required
+	if not canCast() then SpellAssemblerGui.CancelCast() end
+	-- (Close refreshes the compact HUD's visibility from canCast)
+	if gui and (not visible or not canCast()) then SpellAssemblerGui.Close() end
+end
+
 function SpellAssemblerGui.SelectSlot(slot: number)
 	if selectingCard or loadingCards then return end
 	if not slotRecord(slot) then
@@ -1146,7 +1193,13 @@ function SpellAssemblerGui.SelectSlot(slot: number)
 	local character = player.Character
 	local humanoid = character and character:FindFirstChildOfClass("Humanoid")
 	if humanoid then humanoid:UnequipTools() end
-	if serverState.activeSlot ~= slot then equipSlot(slot) end
+	if serverState.activeSlot == slot then
+		-- selecting the selected spell again deselects it
+		deselectSlot()
+		selectingCard = false
+		return
+	end
+	equipSlot(slot)
 	selectingCard = false
 	if serverState.activeSlot == slot then SpellAssemblerGui.Close() end
 end

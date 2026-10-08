@@ -10,12 +10,12 @@
 --     src/shared/Heartbeat.luau (208 lines)
 --     src/shared/VisualOffload.luau (117 lines)
 --     src/shared/ChunkManager.luau (642 lines)
---     src/shared/Entity.luau (980 lines)
+--     src/shared/Entity.luau (996 lines)
 --   Shared projectile motion and protocol
---     src/shared/ProjectileMotion.luau (227 lines)
---     src/shared/ProjectileStepPlanner.luau (101 lines)
---     src/shared/ProjectileProtocol.luau (112 lines)
---     src/shared/ProjectileCodec.luau (222 lines)
+--     src/shared/Projectile/Motion.luau (227 lines)
+--     src/shared/Projectile/StepPlanner.luau (101 lines)
+--     src/shared/Projectile/Protocol.luau (112 lines)
+--     src/shared/Projectile/Codec.luau (222 lines)
 --     src/shared/Projectile/BeamPath.luau (86 lines)
 --   Server simulation
 --     src/server/Projectile/Types.luau (242 lines)
@@ -37,15 +37,15 @@
 --     src/server/ProjectileQuota.luau (41 lines)
 --     src/server/ProjectileWorkerBootstrap.server.luau (183 lines)
 --   Client prediction and visuals
---     src/shared/ProjectileClient/Types.luau (79 lines)
---     src/shared/ProjectileClient/Prediction.luau (147 lines)
---     src/shared/ProjectileClient/View.luau (55 lines)
---     src/shared/ProjectileClient/DebugRays.luau (42 lines)
---     src/shared/ProjectileClient/Impact.luau (90 lines)
---     src/shared/ProjectileClient/VisualModel.luau (571 lines)
---     src/shared/ProjectileClient/BeamGeometry.luau (116 lines)
---     src/shared/ProjectileClient/BeamVisual.luau (520 lines)
---     src/shared/ProjectileClient/init.luau (746 lines)
+--     src/shared/Projectile/Client/Types.luau (79 lines)
+--     src/shared/Projectile/Client/Prediction.luau (147 lines)
+--     src/shared/Projectile/Client/View.luau (55 lines)
+--     src/shared/Projectile/Client/DebugRays.luau (42 lines)
+--     src/shared/Projectile/Client/Impact.luau (90 lines)
+--     src/shared/Projectile/Client/VisualModel.luau (571 lines)
+--     src/shared/Projectile/Client/BeamGeometry.luau (116 lines)
+--     src/shared/Projectile/Client/BeamVisual.luau (520 lines)
+--     src/shared/Projectile/Client/init.luau (746 lines)
 
 -- =============================================================================
 -- SECTION: Shared foundations
@@ -1832,12 +1832,28 @@ function Entity:AddOutgoingModifier(fn: (amount: number, info: any, entity: any,
 	return addModifier(self._outgoingModifiers, fn)
 end
 
+-- Global gate over every hit: fn(source, target) -> false blocks the damage
+-- (server/Parties uses it so party members can't hurt each other).
+local damageGate: ((source: any, target: any) -> boolean)? = nil
+
+function Entity.SetDamageGate(fn: ((source: any, target: any) -> boolean)?)
+	damageGate = fn
+end
+
+-- Whether `source` (an Entity, Player or nil) may damage `target`.
+function Entity.CanDamage(source: any, target: any): boolean
+	return source == nil or damageGate == nil or damageGate(source, target)
+end
+
 -- info is a free-form table (e.g. { Type = "Fire", Source = attacker, Crit = true }).
 function Entity:TakeDamage(amount: number, info: any?): number
 	if self.IsDestroyed or self.Health <= 0 then
 		return 0
 	end
 	info = info or {}
+	if not Entity.CanDamage(info.Source, self) then
+		return 0
+	end
 
 	for _, modifier in self._damageModifiers do
 		amount = modifier(amount, info, self)
@@ -2255,7 +2271,7 @@ return Entity
 -- =============================================================================
 
 -- =============================================================================
--- BEGIN FILE: src/shared/ProjectileMotion.luau
+-- BEGIN FILE: src/shared/Projectile/Motion.luau
 -- =============================================================================
 --!native
 --!strict
@@ -2281,7 +2297,7 @@ return Entity
 	GetNudge.
 ]]
 
-local SafeMath = require(script.Parent.SafeMath)
+local SafeMath = require(script.Parent.Parent.SafeMath)
 
 export type Acceleration = number | Vector3
 
@@ -2485,17 +2501,17 @@ end
 
 return ProjectileMotion
 -- =============================================================================
--- END FILE: src/shared/ProjectileMotion.luau
+-- END FILE: src/shared/Projectile/Motion.luau
 -- =============================================================================
 
 -- =============================================================================
--- BEGIN FILE: src/shared/ProjectileStepPlanner.luau
+-- BEGIN FILE: src/shared/Projectile/StepPlanner.luau
 -- =============================================================================
 --!native
 --!strict
 --!optimize 2
 --[[
-	ProjectileStepPlanner.luau
+	Projectile/StepPlanner.luau
 	Chooses the next integration substep for a projectile. The authoritative
 	server Step and the client's dead-reckoning both call this, so they
 	partition time identically: same chunk sampling, same boundary stops,
@@ -2514,9 +2530,9 @@ return ProjectileMotion
 	step of stepDt dilated seconds consumes stepDt / chunkScale of it.
 ]]
 
-local ChunkManager = require(script.Parent.ChunkManager)
-local ProjectileMotion = require(script.Parent.ProjectileMotion)
-local SafeMath = require(script.Parent.SafeMath)
+local ChunkManager = require(script.Parent.Parent.ChunkManager)
+local ProjectileMotion = require(script.Parent.Motion)
+local SafeMath = require(script.Parent.Parent.SafeMath)
 
 local Planner = {}
 
@@ -2593,15 +2609,15 @@ end
 
 return Planner
 -- =============================================================================
--- END FILE: src/shared/ProjectileStepPlanner.luau
+-- END FILE: src/shared/Projectile/StepPlanner.luau
 -- =============================================================================
 
 -- =============================================================================
--- BEGIN FILE: src/shared/ProjectileProtocol.luau
+-- BEGIN FILE: src/shared/Projectile/Protocol.luau
 -- =============================================================================
 --!strict
 --[[
-	ProjectileProtocol.luau
+	Projectile/Protocol.luau
 	The wire format between the server projectile system
 	(ServerScriptService.Server.Projectile/Replication.luau, sending) and
 	ProjectileClient (receiving). Channel names and payload shapes live here
@@ -2712,19 +2728,19 @@ export type RayPayload = {
 
 return Protocol
 -- =============================================================================
--- END FILE: src/shared/ProjectileProtocol.luau
+-- END FILE: src/shared/Projectile/Protocol.luau
 -- =============================================================================
 
 -- =============================================================================
--- BEGIN FILE: src/shared/ProjectileCodec.luau
+-- BEGIN FILE: src/shared/Projectile/Codec.luau
 -- =============================================================================
 --!strict
 --!native
 --!optimize 2
 --[[
-	ProjectileCodec.luau
+	Projectile/Codec.luau
 	Binary wire format for the two per-frame projectile batches, ProjMove and
-	ProjHitBatch (see ProjectileProtocol for the payload fields). A table batch
+	ProjHitBatch (see Projectile.Protocol for the payload fields). A table batch
 	makes Roblox send every key name of every entry; these are packed buffers
 	instead: each entry is a fixed header plus only the optional fields it
 	has, flagged in a bitmask.
@@ -2941,7 +2957,7 @@ end
 
 return ProjectileCodec
 -- =============================================================================
--- END FILE: src/shared/ProjectileCodec.luau
+-- END FILE: src/shared/Projectile/Codec.luau
 -- =============================================================================
 
 -- =============================================================================
@@ -3053,8 +3069,8 @@ return BeamPath
 ]]
 
 local Shared = game:GetService("ReplicatedStorage"):WaitForChild("Shared")
-local ProjectileMotion = require(Shared:WaitForChild("ProjectileMotion"))
-local Protocol = require(Shared:WaitForChild("ProjectileProtocol"))
+local ProjectileMotion = require(Shared:WaitForChild("Projectile"):WaitForChild("Motion"))
+local Protocol = require(Shared:WaitForChild("Projectile"):WaitForChild("Protocol"))
 
 export type Acceleration = ProjectileMotion.Acceleration
 export type VisualSpec = Protocol.VisualSpec
@@ -5062,8 +5078,8 @@ return RewindHit
 --[[
 	Projectile/Replication.luau
 	Everything that pushes projectile state from the server to rendering
-	clients (see ProjectileClient in ReplicatedStorage.Shared for the
-	receiving side, and Shared.ProjectileProtocol for the wire format). The
+	clients (see ProjectileClient (ReplicatedStorage.Shared.Projectile.Client) for the
+	receiving side, and Shared.Projectile.Protocol for the wire format). The
 	server stays authoritative; this module only ever sends -- see the
 	top-level Projectile doc comment (init.luau) for the protocol's design.
 
@@ -5079,8 +5095,8 @@ local Players = game:GetService("Players")
 
 local Shared = game:GetService("ReplicatedStorage"):WaitForChild("Shared")
 local VisualOffload = require(Shared:WaitForChild("VisualOffload"))
-local Protocol = require(Shared:WaitForChild("ProjectileProtocol"))
-local Codec = require(Shared:WaitForChild("ProjectileCodec"))
+local Protocol = require(Shared:WaitForChild("Projectile"):WaitForChild("Protocol"))
+local Codec = require(Shared:WaitForChild("Projectile"):WaitForChild("Codec"))
 local Heartbeat = require(Shared:WaitForChild("Heartbeat"))
 
 local Types = require(script.Parent.Types)
@@ -5185,7 +5201,7 @@ end
 
 -- Sends each entry to every player within its Range (everyone when the range
 -- is unlimited), as ONE event per recipient no matter how many entries.
--- With `encode` (ProjMove / ProjHitBatch -- see ProjectileCodec) each entry is
+-- With `encode` (ProjMove / ProjHitBatch -- see Projectile.Codec) each entry is
 -- encoded once and every recipient's message is one packed buffer of them.
 local function fanOut(channel: string, entries: { Entry }, encode: ((any) -> buffer)?)
 	if #entries == 0 then
@@ -6325,9 +6341,9 @@ return Spec
 
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local Shared = ReplicatedStorage:WaitForChild("Shared")
-local ProjectileMotion = require(Shared:WaitForChild("ProjectileMotion"))
+local ProjectileMotion = require(Shared:WaitForChild("Projectile"):WaitForChild("Motion"))
 local Math = require(script.Parent.Math)
-local Planner = require(Shared:WaitForChild("ProjectileStepPlanner"))
+local Planner = require(Shared:WaitForChild("Projectile"):WaitForChild("StepPlanner"))
 
 local Sweep = {}
 
@@ -8041,7 +8057,7 @@ return Parallel
 	 Projectile.SetDefaultMaxRealLifetime(seconds) -- default 60; see MaxRealLifetime below
 	 Projectile.SetDebugSync(enabled)            -- see Projectile/Replication.luau
 	 (Rendering API -- EnableClientRendering(), SetImpactHandler(fn) -- moved to
-	 ProjectileClient in ReplicatedStorage.Shared; require that from client code.)
+	 ProjectileClient (ReplicatedStorage.Shared.Projectile.Client); require that from client code.)
 
 	 Query (server-only -- projectiles only ever live in the server's `active`
 	 list. Every result is the LIVE projectile object, not a copy, so an
@@ -8255,8 +8271,8 @@ local Shared = game:GetService("ReplicatedStorage"):WaitForChild("Shared")
 local Heartbeat = require(Shared:WaitForChild("Heartbeat"))
 local ChunkManager = require(Shared:WaitForChild("ChunkManager"))
 local Entity = require(Shared:WaitForChild("Entity"))
-local ProjectileMotion = require(Shared:WaitForChild("ProjectileMotion"))
-local Planner = require(Shared:WaitForChild("ProjectileStepPlanner"))
+local ProjectileMotion = require(Shared:WaitForChild("Projectile"):WaitForChild("Motion"))
+local Planner = require(Shared:WaitForChild("Projectile"):WaitForChild("StepPlanner"))
 local SafeMath = require(Shared:WaitForChild("SafeMath"))
 local Signal = require(Shared:WaitForChild("Signal"))
 local BeamPath = require(Shared:WaitForChild("Projectile"):WaitForChild("BeamPath"))
@@ -10091,15 +10107,15 @@ end)
 -- =============================================================================
 
 -- =============================================================================
--- BEGIN FILE: src/shared/ProjectileClient/Types.luau
+-- BEGIN FILE: src/shared/Projectile/Client/Types.luau
 -- =============================================================================
 --!strict
 --[[
-	ProjectileClient/Types.luau
+	Projectile/Client/Types.luau
 	Shared shapes for the client renderer's modules. No runtime behaviour.
 ]]
 
-local Protocol = require(script.Parent.Parent:WaitForChild("ProjectileProtocol"))
+local Protocol = require(script.Parent.Parent.Parent:WaitForChild("Projectile"):WaitForChild("Protocol"))
 
 -- A visual driven by a Motor6D from an invisible anchored root; see
 -- VisualModel.Build.
@@ -10173,17 +10189,17 @@ export type Visual = {
 -- ModuleScripts must return exactly one non-nil value.
 return {}
 -- =============================================================================
--- END FILE: src/shared/ProjectileClient/Types.luau
+-- END FILE: src/shared/Projectile/Client/Types.luau
 -- =============================================================================
 
 -- =============================================================================
--- BEGIN FILE: src/shared/ProjectileClient/Prediction.luau
+-- BEGIN FILE: src/shared/Projectile/Client/Prediction.luau
 -- =============================================================================
 --!native
 --!strict
 --!optimize 2
 --[[
-	ProjectileClient/Prediction.luau
+	Projectile/Client/Prediction.luau
 	Client dead-reckoning: the mirror of the server's Projectile Step minus
 	hit detection. Substeps are chosen by the same ProjectileStepPlanner the
 	server uses, and time that is too small to integrate is carried exactly
@@ -10194,10 +10210,10 @@ return {}
 	returns (alive, moved).
 ]]
 
-local Shared = script.Parent.Parent
+local Shared = script.Parent.Parent.Parent
 local ChunkManager = require(Shared:WaitForChild("ChunkManager"))
-local ProjectileMotion = require(Shared:WaitForChild("ProjectileMotion"))
-local Planner = require(Shared:WaitForChild("ProjectileStepPlanner"))
+local ProjectileMotion = require(Shared:WaitForChild("Projectile"):WaitForChild("Motion"))
+local Planner = require(Shared:WaitForChild("Projectile"):WaitForChild("StepPlanner"))
 local SafeMath = require(Shared:WaitForChild("SafeMath"))
 
 local Types = require(script.Parent.Types)
@@ -10327,17 +10343,17 @@ end
 
 return Prediction
 -- =============================================================================
--- END FILE: src/shared/ProjectileClient/Prediction.luau
+-- END FILE: src/shared/Projectile/Client/Prediction.luau
 -- =============================================================================
 
 -- =============================================================================
--- BEGIN FILE: src/shared/ProjectileClient/View.luau
+-- BEGIN FILE: src/shared/Projectile/Client/View.luau
 -- =============================================================================
 --!native
 --!strict
 --!optimize 2
 --[[
-	ProjectileClient/View.luau
+	Projectile/Client/View.luau
 	Calculation-visibility snapshot, refreshed once per frame. This gates Lua
 	work only; Roblox retains ownership of draw culling. View.contains is then
 	pure Luau dot products instead of one WorldToViewportPoint engine call per
@@ -10389,16 +10405,16 @@ end
 
 return View
 -- =============================================================================
--- END FILE: src/shared/ProjectileClient/View.luau
+-- END FILE: src/shared/Projectile/Client/View.luau
 -- =============================================================================
 
 -- =============================================================================
--- BEGIN FILE: src/shared/ProjectileClient/DebugRays.luau
+-- BEGIN FILE: src/shared/Projectile/Client/DebugRays.luau
 -- =============================================================================
 --!strict
 --!optimize 2
 --[[
-	ProjectileClient/DebugRays.luau
+	Projectile/Client/DebugRays.luau
 	Draws one raycast segment as a thin fading line, colored by resolution --
 	receives ProjRay events streamed while the server's Projectile.SetDebugRays
 	is on (see example/init.server.luau's "SetProjectileDebug" handler).
@@ -10438,16 +10454,16 @@ end
 
 return DebugRays
 -- =============================================================================
--- END FILE: src/shared/ProjectileClient/DebugRays.luau
+-- END FILE: src/shared/Projectile/Client/DebugRays.luau
 -- =============================================================================
 
 -- =============================================================================
--- BEGIN FILE: src/shared/ProjectileClient/Impact.luau
+-- BEGIN FILE: src/shared/Projectile/Client/Impact.luau
 -- =============================================================================
 --!strict
 --!optimize 2
 --[[
-	ProjectileClient/Impact.luau
+	Projectile/Client/Impact.luau
 	Hit-effect visuals -- a short neon flash + spreading ring at the impact
 	point, color-coded by what was struck. Games can swap this out entirely
 	via Impact.SetHandler(fn(position, normal, model, kind)).
@@ -10535,22 +10551,22 @@ end
 
 return Impact
 -- =============================================================================
--- END FILE: src/shared/ProjectileClient/Impact.luau
+-- END FILE: src/shared/Projectile/Client/Impact.luau
 -- =============================================================================
 
 -- =============================================================================
--- BEGIN FILE: src/shared/ProjectileClient/VisualModel.luau
+-- BEGIN FILE: src/shared/Projectile/Client/VisualModel.luau
 -- =============================================================================
 --!strict
 --!optimize 2
 --[[
-	ProjectileClient/VisualModel.luau
+	Projectile/Client/VisualModel.luau
 	Builds and positions the actual Instance a projectile visual renders as.
 	Pure presentation -- no networking, no gameplay state.
 ]]
 
-local Protocol = require(script.Parent.Parent:WaitForChild("ProjectileProtocol"))
-local SafeMath = require(script.Parent.Parent:WaitForChild("SafeMath"))
+local Protocol = require(script.Parent.Parent.Parent:WaitForChild("Projectile"):WaitForChild("Protocol"))
+local SafeMath = require(script.Parent.Parent.Parent:WaitForChild("SafeMath"))
 
 local Types = require(script.Parent.Types)
 local BeamVisual = require(script.Parent.BeamVisual)
@@ -11113,11 +11129,11 @@ end
 
 return VisualModel
 -- =============================================================================
--- END FILE: src/shared/ProjectileClient/VisualModel.luau
+-- END FILE: src/shared/Projectile/Client/VisualModel.luau
 -- =============================================================================
 
 -- =============================================================================
--- BEGIN FILE: src/shared/ProjectileClient/BeamGeometry.luau
+-- BEGIN FILE: src/shared/Projectile/Client/BeamGeometry.luau
 -- =============================================================================
 --!native
 --!strict
@@ -11236,27 +11252,27 @@ end
 
 return Geometry
 -- =============================================================================
--- END FILE: src/shared/ProjectileClient/BeamGeometry.luau
+-- END FILE: src/shared/Projectile/Client/BeamGeometry.luau
 -- =============================================================================
 
 -- =============================================================================
--- BEGIN FILE: src/shared/ProjectileClient/BeamVisual.luau
+-- BEGIN FILE: src/shared/Projectile/Client/BeamVisual.luau
 -- =============================================================================
 --!strict
 -- Finite, traveling cylinders along a bounded path, not an instantaneous ray
 -- from the muzzle to the cursor. Sustained channels share a linked centerline
 -- with server collision; individual beams retain their traveled path tail.
 -- Collision/damage/bounce/pierce/homing stay server-owned.
-local ChunkManager = require(script.Parent.Parent.ChunkManager)
+local ChunkManager = require(script.Parent.Parent.Parent.ChunkManager)
 local Types = require(script.Parent.Types)
-local Protocol = require(script.Parent.Parent.ProjectileProtocol)
+local Protocol = require(script.Parent.Parent.Parent.Projectile.Protocol)
 local Geometry = require(script.Parent.BeamGeometry)
 local View = require(script.Parent.View)
 local RunService = game:GetService("RunService")
-local Planner = require(script.Parent.Parent.ProjectileStepPlanner)
+local Planner = require(script.Parent.Parent.Parent.Projectile.StepPlanner)
 local Prediction = require(script.Parent.Prediction)
-local Heartbeat = require(script.Parent.Parent.Heartbeat)
-local BeamPath = require(script.Parent.Parent:WaitForChild("Projectile"):WaitForChild("BeamPath"))
+local Heartbeat = require(script.Parent.Parent.Parent.Heartbeat)
+local BeamPath = require(script.Parent.Parent.Parent:WaitForChild("Projectile"):WaitForChild("BeamPath"))
 
 local BeamVisual = {}
 local MAX_SEGMENTS = 8
@@ -11763,11 +11779,11 @@ end
 
 return BeamVisual
 -- =============================================================================
--- END FILE: src/shared/ProjectileClient/BeamVisual.luau
+-- END FILE: src/shared/Projectile/Client/BeamVisual.luau
 -- =============================================================================
 
 -- =============================================================================
--- BEGIN FILE: src/shared/ProjectileClient/init.luau
+-- BEGIN FILE: src/shared/Projectile/Client/init.luau
 -- =============================================================================
 --!native
 --!strict
@@ -11775,7 +11791,7 @@ return BeamVisual
 --[[
 	ProjectileClient (client rendering, purely cosmetic)
 	Receives the server-authoritative Projectile system's replication stream
-	(see Shared.ProjectileProtocol for the wire format, and
+	(see Shared.Projectile.Protocol for the wire format, and
 	ServerScriptService.Server.Projectile/Replication.luau for the sending
 	side) and renders tracers/impacts. This module never makes a gameplay
 	decision -- no hit detection, no damage, no entity access -- it only draws
@@ -11801,12 +11817,12 @@ return BeamVisual
 local RunService = game:GetService("RunService")
 local Players = game:GetService("Players")
 
-local Shared = script.Parent
+local Shared = script.Parent.Parent
 local Heartbeat = require(Shared:WaitForChild("Heartbeat"))
 local ChunkManager = require(Shared:WaitForChild("ChunkManager"))
 local VisualOffload = require(Shared:WaitForChild("VisualOffload"))
-local Protocol = require(Shared:WaitForChild("ProjectileProtocol"))
-local Codec = require(Shared:WaitForChild("ProjectileCodec"))
+local Protocol = require(Shared:WaitForChild("Projectile"):WaitForChild("Protocol"))
+local Codec = require(Shared:WaitForChild("Projectile"):WaitForChild("Codec"))
 
 local DebugRays = require(script.DebugRays)
 local Impact = require(script.Impact)
@@ -12476,7 +12492,7 @@ function ProjectileClient.EnableClientRendering()
 	end)
 	VisualOffload.On(Channels.TimeScale, onTimeScale)
 	VisualOffload.On(Channels.Sync, onSync)
-	-- ProjMove / ProjHitBatch arrive packed (see ProjectileCodec); a plain
+	-- ProjMove / ProjHitBatch arrive packed (see Projectile.Codec); a plain
 	-- table batch is still accepted.
 	VisualOffload.On(Channels.Move, function(batch: any)
 		onMove(if typeof(batch) == "buffer" then Codec.DecodeMoves(batch) else batch)
@@ -12516,5 +12532,5 @@ end
 
 return ProjectileClient
 -- =============================================================================
--- END FILE: src/shared/ProjectileClient/init.luau
+-- END FILE: src/shared/Projectile/Client/init.luau
 -- =============================================================================

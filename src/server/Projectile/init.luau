@@ -99,7 +99,7 @@
 	 Projectile.SetDefaultMaxRealLifetime(seconds) -- default 60; see MaxRealLifetime below
 	 Projectile.SetDebugSync(enabled)            -- see Projectile/Replication.luau
 	 (Rendering API -- EnableClientRendering(), SetImpactHandler(fn) -- moved to
-	 ProjectileClient in ReplicatedStorage.Shared; require that from client code.)
+	 ProjectileClient (ReplicatedStorage.Shared.Projectile.Client); require that from client code.)
 
 	 Query (server-only -- projectiles only ever live in the server's `active`
 	 list. Every result is the LIVE projectile object, not a copy, so an
@@ -313,8 +313,8 @@ local Shared = game:GetService("ReplicatedStorage"):WaitForChild("Shared")
 local Heartbeat = require(Shared:WaitForChild("Heartbeat"))
 local ChunkManager = require(Shared:WaitForChild("ChunkManager"))
 local Entity = require(Shared:WaitForChild("Entity"))
-local ProjectileMotion = require(Shared:WaitForChild("ProjectileMotion"))
-local Planner = require(Shared:WaitForChild("ProjectileStepPlanner"))
+local ProjectileMotion = require(Shared:WaitForChild("Projectile"):WaitForChild("Motion"))
+local Planner = require(Shared:WaitForChild("Projectile"):WaitForChild("StepPlanner"))
 local SafeMath = require(Shared:WaitForChild("SafeMath"))
 local Signal = require(Shared:WaitForChild("Signal"))
 local BeamPath = require(Shared:WaitForChild("Projectile"):WaitForChild("BeamPath"))

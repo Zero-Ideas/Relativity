@@ -2,7 +2,7 @@
 --!strict
 --!optimize 2
 --[[
-	ProjectileClient/Prediction.luau
+	Projectile/Client/Prediction.luau
 	Client dead-reckoning: the mirror of the server's Projectile Step minus
 	hit detection. Substeps are chosen by the same ProjectileStepPlanner the
 	server uses, and time that is too small to integrate is carried exactly
@@ -13,10 +13,10 @@
 	returns (alive, moved).
 ]]
 
-local Shared = script.Parent.Parent
+local Shared = script.Parent.Parent.Parent
 local ChunkManager = require(Shared:WaitForChild("ChunkManager"))
-local ProjectileMotion = require(Shared:WaitForChild("ProjectileMotion"))
-local Planner = require(Shared:WaitForChild("ProjectileStepPlanner"))
+local ProjectileMotion = require(Shared:WaitForChild("Projectile"):WaitForChild("Motion"))
+local Planner = require(Shared:WaitForChild("Projectile"):WaitForChild("StepPlanner"))
 local SafeMath = require(Shared:WaitForChild("SafeMath"))
 
 local Types = require(script.Parent.Types)
