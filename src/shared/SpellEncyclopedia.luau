@@ -31,6 +31,10 @@ Encyclopedia.Elements = {
 	{ Id = "Fire", Name = "Fire", Description = "Burns what it hits.", Price = 0 },
 	{ Id = "Arcane", Name = "Arcane", Description = "Raw magic.", Price = 0 },
 	{ Id = "Shock", Name = "Shock", Description = "Stuns what it hits.", Price = 0 },
+	-- (groups, not elements: magic that moves, guards and mends; and circles
+	-- built from several parts)
+	{ Id = "Utility", Name = "Utility", Description = "Barriers, movement and body magic.", Price = 0 },
+	{ Id = "Combo", Name = "Combos", Description = "Circles that compose: conjured circles, traps, chains.", Price = 0 },
 } :: { Element }
 
 -- A Mana -> element -> vessel circle with modifiers, laid out like the
@@ -228,14 +232,17 @@ add("HuntersSigil", "Hunter's Sigil", "Combo", "A bullet that scans where it lan
 		{ "each", "each", "bolt", "in" },
 		{ "speed", "mod", "bolt", "mods" },
 	}))
--- A circle opens high over the cursor and rains a ring of fireballs on it.
-add("Starfall", "Starfall", "Combo", "A circle opens high above your mouse and rains fire down on the spot.", 0,
+-- A circle opens high over the cursor and rains fireballs that burst where
+-- they land.
+add("Starfall", "Starfall", "Combo", "A circle opens high above your mouse and rains bursting fireballs down on the spot.", 0,
 	circle("Starfall", {
 		{ { "mana", "Mana", { Amount = 160 } } },
 		{ { "fire", "Fire" } },
 		{ { "cursor", "Cursor" } },
-		{ { "sky", "Conjure", { Height = 28, Delay = 0.8, Size = 1.6 } }, { "rain", "Repeat", { Count = 4, Interval = 0.25 } } },
-		{ { "orb", "Orb" }, { "ring", "Quantity", { Count = 5, Pattern = "Ring", Spread = 30 } }, { "size", "Size", { Level = 1 } } },
+		{ { "sky", "Conjure", { Height = 28, Delay = 0.8, Size = 1.6 } }, { "rain", "Repeat", { Count = 4, Interval = 0.3 } } },
+		{ { "orb", "Orb" }, { "ring", "Quantity", { Count = 4, Pattern = "Ring", Spread = 14 } } },
+		{ { "impact", "OnImpact", { Share = 70 } } },
+		{ { "burst", "Explosion" }, { "size", "Size", { Level = 1 } } },
 	}, {
 		{ "mana", "out", "fire", "in" },
 		{ "fire", "out", "sky", "in" },
@@ -243,7 +250,9 @@ add("Starfall", "Starfall", "Combo", "A circle opens high above your mouse and r
 		{ "sky", "out", "rain", "in" },
 		{ "rain", "each", "orb", "in" },
 		{ "ring", "mod", "orb", "mods" },
-		{ "size", "mod", "orb", "mods" },
+		{ "orb", "vessel", "impact", "vessel" },
+		{ "impact", "out", "burst", "in" },
+		{ "size", "mod", "burst", "mods" },
 	}))
 -- A mine: a circle on the ground that waits for an enemy, then erupts.
 add("Snare", "Snare", "Combo", "Plants a circle on the ground at your mouse. When an enemy steps near, it erupts and roots them.", 0,
@@ -279,6 +288,28 @@ add("Phase", "Phase Step", "Combo", "Blinks you toward your mouse and blasts the
 		{ "arcane", "out", "boom", "in" },
 		{ "caster", "entity", "boom", "aim" },
 		{ "split", "b", "blink", "in" },
+	}))
+add("Float", "Float", "Utility", "Gravity lets go of you: you drift down slowly for a while.", 0,
+	circle("Float", {
+		{ { "mana", "Mana", { Amount = 40 } } },
+		{ { "float", "Effect", { Effect = "Levitate", Duration = 8 } } },
+	}, {
+		{ "mana", "out", "float", "in" },
+	}))
+-- A wall that blows up when it breaks or fades.
+add("VolatileWard", "Volatile Ward", "Combo", "A barrier where you aim that explodes in fire when it breaks or fades.", 0,
+	circle("Volatile Ward", {
+		{ { "mana", "Mana", { Amount = 100 } } },
+		{ { "ward", "Barrier", { Shape = "Wall", Duration = 6 } } },
+		{ { "expire", "OnExpire", { Share = 50 } } },
+		{ { "fire", "Fire" } },
+		{ { "boom", "Explosion" }, { "size", "Size", { Level = 2 } } },
+	}, {
+		{ "mana", "out", "ward", "in" },
+		{ "ward", "vessel", "expire", "vessel" },
+		{ "expire", "out", "fire", "in" },
+		{ "fire", "out", "boom", "in" },
+		{ "size", "mod", "boom", "mods" },
 	}))
 
 Encyclopedia.Spells = spells

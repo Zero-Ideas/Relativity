@@ -35,6 +35,7 @@
 
 local RunService = game:GetService("RunService")
 local ManaTier = require(game:GetService("ReplicatedStorage").Shared.SpellManaTier)
+local Presentation = require(game:GetService("ReplicatedStorage").Shared.ClientPresentation)
 
 local Glint = {}
 
@@ -464,7 +465,8 @@ local function step()
 		-- turning
 		local shimmer = 0.5 + 0.5 * math.sin(age * 38 + entry.seed) * math.sin(age * 23)
 		local flare = 1.5 * math.max(0, 1 - age / RISE)
-		entry.gui.Brightness = ((2.2 + entry.tier * 0.35) * (1 + shimmer) + flare) * shown
+		entry.gui.Brightness = if Presentation.ReducedFlashes then 0 else
+			((2.2 + entry.tier * 0.35) * (1 + shimmer) + flare) * shown
 		local sweep = -1 + 2 * ((age * 2.6 + entry.seed * 0.01) % 1)
 		for _, gradient in entry.sweeps do
 			gradient.Offset = Vector2.new(sweep * 0.5, 0)
@@ -537,7 +539,7 @@ function Glint.Play(caster: Model, manaCost: number, target: Vector3?): Handle?
 	table.insert(active, entry)
 	step() -- placed on the input frame
 	if entry.sparkles then
-		entry.sparkles:Emit(if tier >= 5 then 26 else 14)
+		entry.sparkles:Emit(Presentation.BurstCount(if tier >= 5 then 26 else 14))
 	end
 	if not connection then
 		connection = RunService.RenderStepped:Connect(step)

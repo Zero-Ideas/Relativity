@@ -50,7 +50,8 @@ local FADE_OUT = 0.35
 local PILLAR_RISE = 0.5
 local PANEL_THICKNESS = 0.6
 local HIT_FLASH = 0.12
-local SHOVE_HOLD_MIN, SHOVE_HOLD_MAX = 0.08, 0.22 -- seconds a horizontal shove is held
+local SHOVE_HOLD_MIN, SHOVE_HOLD_MAX = 0.12, 0.35 -- seconds a horizontal shove is held (longer when faster)
+local SHOVE_HOLD_PER_SPEED = 1 / 350
 local RAGDOLL_MIN, RAGDOLL_MAX = 0.8, 2.5
 local MAX_LOOSE_PARTS = 40
 local MAX_THINGS_PER_PLAYER = 24 -- live barriers + fields per caster; the oldest goes first
@@ -511,7 +512,7 @@ local function shove(root: BasePart, deltaV: Vector3, scale: number, humanoid: H
 		hold.VectorVelocity = velocity
 		hold.Parent = root
 		humanoid:ChangeState(Enum.HumanoidStateType.Freefall)
-		task.delay(math.clamp(sideways / 900, SHOVE_HOLD_MIN, SHOVE_HOLD_MAX), function()
+		task.delay(math.clamp(sideways * SHOVE_HOLD_PER_SPEED, SHOVE_HOLD_MIN, SHOVE_HOLD_MAX), function()
 			attachment:Destroy()
 			hold:Destroy()
 		end)

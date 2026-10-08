@@ -27,6 +27,15 @@ local SCHEMA: { [string]: any } = {
 	MaxUpdates = { 100, 20000 },
 	Glints = "boolean",
 	UiMode = { "Mode 1", "Mode 2" }, -- (a choice)
+	HudScale = { 70, 130 },
+	EffectsIntensity = { 0, 100 },
+	ReducedFlashes = "boolean",
+	CameraShake = { 0, 100 },
+	MasterVolume = { 0, 100 },
+	SpellVolume = { 0, 100 },
+	ImpactVolume = { 0, 100 },
+	UiVolume = { 0, 100 },
+	MusicVolume = { 0, 100 },
 }
 
 local store: DataStore? = nil

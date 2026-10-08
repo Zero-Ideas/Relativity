@@ -9,6 +9,7 @@
 --     src/shared/Signal.luau (100 lines)
 --     src/shared/Heartbeat.luau (208 lines)
 --     src/shared/VisualOffload.luau (117 lines)
+--     src/shared/ClientPresentation.luau (44 lines)
 --     src/shared/ChunkManager.luau (642 lines)
 --     src/shared/Entity.luau (1011 lines)
 --   Shared projectile motion and protocol
@@ -42,7 +43,7 @@
 --     src/shared/Projectile/Client/View.luau (55 lines)
 --     src/shared/Projectile/Client/DebugRays.luau (42 lines)
 --     src/shared/Projectile/Client/Impact.luau (90 lines)
---     src/shared/Projectile/Client/VisualModel.luau (571 lines)
+--     src/shared/Projectile/Client/VisualModel.luau (577 lines)
 --     src/shared/Projectile/Client/BeamGeometry.luau (116 lines)
 --     src/shared/Projectile/Client/BeamVisual.luau (520 lines)
 --     src/shared/Projectile/Client/init.luau (841 lines)
@@ -612,6 +613,57 @@ end
 return VisualOffload
 -- =============================================================================
 -- END FILE: src/shared/VisualOffload.luau
+-- =============================================================================
+
+-- =============================================================================
+-- BEGIN FILE: src/shared/ClientPresentation.luau
+-- =============================================================================
+--!strict
+-- Cosmetic preferences only. No workspace listeners or per-projectile
+-- frame callbacks; emitter properties refresh only when preferences change.
+local Presentation = {
+	EffectsIntensity = 1,
+	ReducedFlashes = false,
+	CameraShake = 1,
+}
+type EmitterDefaults = {Rate: number, Brightness: number, LightEmission: number, Flash: boolean}
+local emitters: {[ParticleEmitter]: EmitterDefaults} = setmetatable({}, {__mode = "k"}) :: any
+
+local function applyEmitter(emitter: ParticleEmitter, original: EmitterDefaults)
+	emitter.Rate = original.Rate * Presentation.EffectsIntensity * (if Presentation.ReducedFlashes and original.Flash then 0 else 1)
+	emitter.Brightness = if Presentation.ReducedFlashes then math.min(original.Brightness, 0.5) else original.Brightness
+	emitter.LightEmission = if Presentation.ReducedFlashes then math.min(original.LightEmission, 0.25) else original.LightEmission
+	if Presentation.ReducedFlashes and original.Flash then emitter:Clear() end
+end
+
+function Presentation.TrackEmitter(emitter: ParticleEmitter, flash: boolean?)
+	local original = emitters[emitter]
+	if not original then
+		original = {Rate = emitter.Rate, Brightness = emitter.Brightness, LightEmission = emitter.LightEmission, Flash = flash == true}
+		emitters[emitter] = original
+	end
+	applyEmitter(emitter, original)
+end
+
+function Presentation.BurstCount(count: number): number
+	return math.max(0, math.floor(count * Presentation.EffectsIntensity + 0.5))
+end
+
+function Presentation.Set(intensity: number, reducedFlashes: boolean, shake: number)
+	local changed = Presentation.EffectsIntensity ~= intensity or Presentation.ReducedFlashes ~= reducedFlashes
+	Presentation.EffectsIntensity = math.clamp(intensity, 0, 1)
+	Presentation.ReducedFlashes = reducedFlashes
+	Presentation.CameraShake = math.clamp(shake, 0, 1)
+	if changed then
+		for emitter, original in emitters do
+			if emitter.Parent then applyEmitter(emitter, original) else emitters[emitter] = nil end
+		end
+	end
+end
+
+return Presentation
+-- =============================================================================
+-- END FILE: src/shared/ClientPresentation.luau
 -- =============================================================================
 
 -- =============================================================================
@@ -10714,6 +10766,7 @@ return Impact
 
 local Protocol = require(script.Parent.Parent.Parent:WaitForChild("Projectile"):WaitForChild("Protocol"))
 local SafeMath = require(script.Parent.Parent.Parent:WaitForChild("SafeMath"))
+local Presentation = require(script.Parent.Parent.Parent:WaitForChild("ClientPresentation"))
 
 local Types = require(script.Parent.Types)
 local BeamVisual = require(script.Parent.BeamVisual)
@@ -10961,6 +11014,8 @@ function VisualModel.Build(data: Protocol.SpawnPayload): (Instance, Rig?)
 		forSelfAndDescendants(model, function(instance)
 			if instance:IsA("BasePart") then
 				makeCosmetic(instance)
+			elseif instance:IsA("ParticleEmitter") then
+				Presentation.TrackEmitter(instance)
 			end
 		end)
 	elseif model:IsA("BasePart") then
@@ -10970,6 +11025,9 @@ function VisualModel.Build(data: Protocol.SpawnPayload): (Instance, Rig?)
 		root = model
 		pivot = model.CFrame
 		makeCosmetic(model)
+		for _, instance in model:GetDescendants() do
+			if instance:IsA("ParticleEmitter") then Presentation.TrackEmitter(instance) end
+		end
 	else
 		pivot = CFrame.identity
 	end
@@ -11227,11 +11285,11 @@ function VisualModel.ActivateParticles(model: Instance)
 			if emitDelay > 0 then
 				task.delay(emitDelay, function()
 					if inst.Parent then
-						inst:Emit(emitCount)
+						inst:Emit(Presentation.BurstCount(emitCount))
 					end
 				end)
 			else
-				inst:Emit(emitCount)
+				inst:Emit(Presentation.BurstCount(emitCount))
 			end
 		end
 	end)

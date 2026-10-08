@@ -1,11 +1,10 @@
 --!strict
 --[[
 	The Settings window (ReGui; the topbar's gear): a dropdown, slider or
-	checkbox for each ClientSettings setting, grouped into sections (the UI
-	mode is under Interface), and Reset to
-	defaults. Changes apply at once and are saved for next time. The window
+	checkbox for each ClientSettings setting, in Interface, Effects, Audio,
+	and Advanced tabs. Changes apply at once and are saved for next time. The window
 	keeps its place and follows changes made elsewhere (a reset, the saved
-	settings arriving).
+	settings arriving); closing hides it instead of destroying its controls.
 ]]
 
 local ReGuiLoader = require(script.Parent.ReGuiLoader)
@@ -17,45 +16,40 @@ local open = false
 local window: any = nil
 local position: UDim2? = nil
 local controls: { [string]: any } = {}
+local loading = false
 
 local function close()
 	open = false
 	if window then
 		position = window.WindowFrame.Position
-		window:Remove()
-		window = nil
+		window:SetVisible(false)
 	end
-	table.clear(controls)
 end
 
 local function build(ReGui: any)
 	local created: any
-	created = ReGui:Window({
+	created = ReGui:TabsWindow({
 		Title = "Settings",
-		Size = UDim2.fromOffset(440, 330),
+		Size = UDim2.fromOffset(520, 400),
 		NoCollapse = true,
 		NoWindowRegistor = true,
 		CloseCallback = function()
-			if window == created then
-				position = created.WindowFrame.Position
-				window = nil
-				table.clear(controls)
-			end
-			open = false
-			return true
+			close()
+			return false
 		end,
 	})
 	window = created
 	created.WindowFrame.Position = position or UDim2.fromOffset(16, 70)
-	local section = nil
+	local sections: {[string]: any} = {}
 	for _, spec in ClientSettings.Specs do
-		if spec.Section ~= section then
-			section = spec.Section
-			created:Separator({ Text = section })
+		local section = sections[spec.Section]
+		if not section then
+			section = created:CreateTab({Name = spec.Section})
+			sections[spec.Section] = section
 		end
 		local key = spec.Key
 		if spec.Kind == "choice" then
-			controls[key] = created:Combo({
+			controls[key] = section:Combo({
 				Label = spec.Label,
 				Items = spec.Options,
 				Selected = ClientSettings.Get(key),
@@ -65,7 +59,7 @@ local function build(ReGui: any)
 				end,
 			})
 		elseif spec.Kind == "boolean" then
-			controls[key] = created:Checkbox({
+			controls[key] = section:Checkbox({
 				Label = spec.Label,
 				Value = ClientSettings.Get(key) == true,
 				-- (ReGui also runs this on creation; Set ignores no-op changes)
@@ -74,7 +68,7 @@ local function build(ReGui: any)
 				end,
 			})
 		else
-			controls[key] = created:SliderInt({
+			controls[key] = section:SliderInt({
 				Label = spec.Label,
 				Minimum = spec.Min,
 				Maximum = spec.Max,
@@ -84,9 +78,14 @@ local function build(ReGui: any)
 				end,
 			})
 		end
+		if spec.Description then
+			section:Label({Text = spec.Description, TextWrapped = true, Size = UDim2.new(1, 0, 0, 0), AutomaticSize = Enum.AutomaticSize.Y})
+		end
 	end
-	created:Separator()
-	created:Button({ Text = "Reset to defaults", Callback = ClientSettings.Reset })
+	for _, section in sections do
+		section:Separator()
+		section:Button({ Text = "Reset all settings to defaults", Callback = ClientSettings.Reset })
+	end
 end
 
 -- Follows changes made elsewhere (reset, saved settings loading).
@@ -118,11 +117,16 @@ function SettingsWindow.Open()
 		return
 	end
 	open = true
+	if window then window:SetVisible(true); return end
+	if loading then return end
+	loading = true
 	task.spawn(function()
 		local ReGui = ReGuiLoader.Get()
 		if ReGui and open and not window then
 			build(ReGui)
 		end
+		loading = false
+		if not ReGui then open = false end
 	end)
 end
 

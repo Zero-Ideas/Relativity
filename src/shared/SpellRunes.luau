@@ -129,7 +129,7 @@ SpellRunes.Elements = {
 }
 -- The look of energy that never passed a Transform (utility vessels don't
 -- need one).
-SpellRunes.Raw = { Color = Color3.fromRGB(150, 225, 255), Core = Color3.fromRGB(240, 252, 255), Glyph = "✧" }
+SpellRunes.Raw = { Color = Color3.fromRGB(150, 225, 255), Core = Color3.fromRGB(240, 252, 255), Glyph = "○" }
 
 local FILTERS = { "Any", "Enemy", "Player" }
 -- Server-evaluated filters may also ask who you can hurt: Hostile (anything
@@ -188,7 +188,7 @@ local defs: { RuneDef } = {
 
 	-- Targeting -----------------------------------------------------------------
 	{
-		Id = "Target", Name = "Aim", Glyph = "⊣", Category = "Targeting", Zones = { "Targeting" },
+		Id = "Target", Name = "Aim", Glyph = "⊕", Category = "Targeting", Zones = { "Targeting" },
 		Description = "Where a vessel points: wire Aim into a vessel's Aim port. With nothing in Aim at it aims at your mouse; feed it a point or entity (e.g. Nearest Entity) to aim there instead, falling back to the mouse when that's empty.",
 		Inputs = { { Name = "point", Type = "point", Label = "Aim at", Optional = true } },
 		Outputs = { { Name = "point", Type = "point", Label = "Aim" } },
@@ -235,7 +235,7 @@ local defs: { RuneDef } = {
 		},
 	},
 	{
-		Id = "Scan", Name = "Scan Area", Glyph = "⊛", Category = "Sensor", Zones = VALUE_ZONES,
+		Id = "Scan", Name = "Scan Area", Glyph = "☼", Category = "Sensor", Zones = VALUE_ZONES,
 		Description = "Every living entity within Radius of From (default Here), sorted, up to Max. Feed the list to For Each to act on each one; First is the top of the list, Count how many there are.",
 		Inputs = { { Name = "from", Type = "point", Label = "From", Optional = true } },
 		Outputs = {
@@ -277,7 +277,7 @@ local defs: { RuneDef } = {
 		Outputs = { { Name = "value", Type = "bool", Label = "Yes" } }, Params = {},
 	},
 	{
-		Id = "Is", Name = "Check Entity", Glyph = "≟", Category = "Sensor", Zones = VALUE_ZONES,
+		Id = "Is", Name = "Check Entity", Glyph = "≡", Category = "Sensor", Zones = VALUE_ZONES,
 		Description = "True when the entity is what Check asks: who it is to you (Ally, Hostile, You), how it's moving (Grounded, Airborne, Moving) or what's on it (Burning, Stunned, Shielded, Hasted, Slowed, Rooted, Levitating).",
 		Inputs = { { Name = "entity", Type = "entity", Label = "Entity" } },
 		Outputs = { { Name = "value", Type = "bool", Label = "Yes" } },
@@ -289,7 +289,7 @@ local defs: { RuneDef } = {
 		},
 	},
 	{
-		Id = "Motion", Name = "Motion", Glyph = "↝", Category = "Sensor", Zones = VALUE_ZONES,
+		Id = "Motion", Name = "Motion", Glyph = "∂", Category = "Sensor", Zones = VALUE_ZONES,
 		Description = "How an entity is moving: its Velocity (studs/s), Speed, and the way it Faces. Lead a target with Point Math: position + velocity × time.",
 		Inputs = { { Name = "entity", Type = "entity", Label = "Entity" } },
 		Outputs = {
@@ -300,7 +300,7 @@ local defs: { RuneDef } = {
 		Params = {},
 	},
 	{
-		Id = "Raycast", Name = "Raycast", Glyph = "⇢", Category = "Sensor", Zones = VALUE_ZONES,
+		Id = "Raycast", Name = "Raycast", Glyph = "↘", Category = "Sensor", Zones = VALUE_ZONES,
 		Description = "Casts a ray from From (default Here) along Direction (default straight down) up to Distance studs. Point is where it hit (or where it ended), Surface the hit's normal, Entity what it hit. Find the ground, a wall, line of sight...",
 		Inputs = {
 			{ Name = "from", Type = "point", Label = "From", Optional = true },
@@ -316,7 +316,7 @@ local defs: { RuneDef } = {
 		Params = { num("Distance", "Distance", 100, 1, 500, 1, " st") },
 	},
 	{
-		Id = "Clock", Name = "Clock", Glyph = "◴", Category = "Sensor", Zones = VALUE_ZONES,
+		Id = "Clock", Name = "Clock", Glyph = "◑", Category = "Sensor", Zones = VALUE_ZONES,
 		Description = "Seconds since the spell was cast, and how long the vessel had been flying when the current trigger fired (0 at cast time).",
 		Inputs = {},
 		Outputs = {
@@ -326,7 +326,7 @@ local defs: { RuneDef } = {
 		Params = {},
 	},
 	{
-		Id = "Recall", Name = "Recall", Glyph = "⊟", Category = "Sensor", Zones = VALUE_ZONES,
+		Id = "Recall", Name = "Recall", Glyph = "▤", Category = "Sensor", Zones = VALUE_ZONES,
 		Description = "Reads a memory Slot written by Store -- by this spell or any other of yours this session. Mark a spot with one spell and blink back to it with another.",
 		Inputs = {},
 		Outputs = {
@@ -399,7 +399,7 @@ local defs: { RuneDef } = {
 		Outputs = { { Name = "value", Type = "bool", Label = "Result" } }, Params = {},
 	},
 	{
-		Id = "Select", Name = "Choose Point", Glyph = "⌖", Category = "Logic", Zones = VALUE_ZONES,
+		Id = "Select", Name = "Choose Point", Glyph = "◇", Category = "Logic", Zones = VALUE_ZONES,
 		Description = "Then if the condition holds, otherwise Else. Handy for targeting fallbacks.",
 		Inputs = {
 			{ Name = "cond", Type = "bool", Label = "If" },
@@ -409,7 +409,7 @@ local defs: { RuneDef } = {
 		Outputs = { { Name = "point", Type = "point", Label = "Point" } }, Params = {},
 	},
 	{
-		Id = "SelectNumber", Name = "Choose Number", Glyph = "⋔", Category = "Logic", Zones = VALUE_ZONES,
+		Id = "SelectNumber", Name = "Choose Number", Glyph = "◆", Category = "Logic", Zones = VALUE_ZONES,
 		Description = "Then if the condition holds, otherwise Else. Unwired, they use the values set here.",
 		Inputs = {
 			{ Name = "cond", Type = "bool", Label = "If" },
@@ -420,7 +420,7 @@ local defs: { RuneDef } = {
 		Params = { num("A", "Then", 1, -10000, 10000, 0.1), num("B", "Else", 0, -10000, 10000, 0.1) },
 	},
 	{
-		Id = "SelectEntity", Name = "Choose Entity", Glyph = "⋉", Category = "Logic", Zones = VALUE_ZONES,
+		Id = "SelectEntity", Name = "Choose Entity", Glyph = "◈", Category = "Logic", Zones = VALUE_ZONES,
 		Description = "Then if the condition holds, otherwise Else.",
 		Inputs = {
 			{ Name = "cond", Type = "bool", Label = "If" },
@@ -430,7 +430,7 @@ local defs: { RuneDef } = {
 		Outputs = { { Name = "entity", Type = "entity", Label = "Entity" } }, Params = {},
 	},
 	{
-		Id = "Random", Name = "Random", Glyph = "⚄", Category = "Logic", Zones = VALUE_ZONES,
+		Id = "Random", Name = "Random", Glyph = "※", Category = "Logic", Zones = VALUE_ZONES,
 		Description = "Rolled afresh each moment this part of the circle runs (every Repeat round, every trigger...): a number from Min to Max, a coin flip that's true Chance% of the time, and a random direction.",
 		Inputs = {},
 		Outputs = {
@@ -443,7 +443,7 @@ local defs: { RuneDef } = {
 
 	-- Vectors -------------------------------------------------------------------
 	{
-		Id = "Vector", Name = "Vector", Glyph = "⇀", Category = "Vector", Zones = VALUE_ZONES,
+		Id = "Vector", Name = "Vector", Glyph = "→", Category = "Vector", Zones = VALUE_ZONES,
 		Description = "Builds a vector from X, Y and Z (each from a wire, or the value set here). Facing axes are relative to Heading: X right, Y up, Z forward.",
 		Inputs = {
 			{ Name = "x", Type = "number", Label = "X", Optional = true, Param = "X" },
@@ -454,7 +454,7 @@ local defs: { RuneDef } = {
 		Params = { num("X", "X", 0, -1000, 1000, 0.5), num("Y", "Y", 1, -1000, 1000, 0.5), num("Z", "Z", 0, -1000, 1000, 0.5), SPACE },
 	},
 	{
-		Id = "Offset", Name = "Offset", Glyph = "⊕", Category = "Vector", Zones = VALUE_ZONES,
+		Id = "Offset", Name = "Offset", Glyph = "±", Category = "Vector", Zones = VALUE_ZONES,
 		Description = "Point (default Here) moved by By, or by X/Y/Z. \"Above the impact point\" is Offset with Y. Facing axes are relative to Heading: X right, Y up, Z forward.",
 		Inputs = {
 			{ Name = "point", Type = "point", Label = "Point", Optional = true },
@@ -464,7 +464,7 @@ local defs: { RuneDef } = {
 		Params = { num("X", "X", 0, -500, 500, 0.5), num("Y", "Y", 10, -500, 500, 0.5), num("Z", "Z", 0, -500, 500, 0.5), SPACE },
 	},
 	{
-		Id = "VecMath", Name = "Point Math", Glyph = "⊹", Category = "Vector", Zones = VALUE_ZONES,
+		Id = "VecMath", Name = "Point Math", Glyph = "×", Category = "Vector", Zones = VALUE_ZONES,
 		Description = "A op B on points and vectors: add, subtract, scale A by N, Lerp from A to B by N (0..1), Midpoint, Unit (A's direction), Cross, or Rotate A about the vertical axis by N degrees.",
 		Inputs = {
 			{ Name = "a", Type = "point", Label = "A" },
@@ -488,7 +488,7 @@ local defs: { RuneDef } = {
 		Params = {},
 	},
 	{
-		Id = "Split", Name = "Split", Glyph = "⋮", Category = "Vector", Zones = VALUE_ZONES,
+		Id = "Split", Name = "Split", Glyph = "⋯", Category = "Vector", Zones = VALUE_ZONES,
 		Description = "A point's X, Y and Z, and its length.",
 		Inputs = { { Name = "point", Type = "point", Label = "Point" } },
 		Outputs = {
@@ -515,14 +515,14 @@ local defs: { RuneDef } = {
 		Params = { { Name = "Share", Label = "Share to A", Type = "number", Default = 50, Min = 5, Max = 95, Step = 5, Suffix = "%" } },
 	},
 	{
-		Id = "Delay", Name = "Delay", Glyph = "◷", Category = "Branch", Zones = { "Branch" }, Pass = true,
+		Id = "Delay", Name = "Delay", Glyph = "◐", Category = "Branch", Zones = { "Branch" }, Pass = true,
 		Description = "Waits, then passes the energy on. Everything after it senses the world afresh. Time dilation slows the wait.",
 		Inputs = { flowIn(), { Name = "seconds", Type = "number", Label = "Seconds", Optional = true, Param = "Seconds" } },
 		Outputs = { flowOut() },
 		Params = { num("Seconds", "Wait", 0.5, 0, 10, 0.05, "s") },
 	},
 	{
-		Id = "Repeat", Name = "Repeat", Glyph = "↻", Category = "Branch", Zones = { "Branch" }, Pass = true,
+		Id = "Repeat", Name = "Repeat", Glyph = "∞", Category = "Branch", Zones = { "Branch" }, Pass = true,
 		Description = "Runs what follows Count times, Interval apart, sharing the energy evenly. Index counts 1, 2, 3... Each time senses the world afresh.",
 		Inputs = { flowIn(), { Name = "count", Type = "number", Label = "Count", Optional = true, Param = "Count" } },
 		Outputs = { flowOut("each", "Each time"), { Name = "index", Type = "number", Label = "Index" } },
@@ -542,7 +542,7 @@ local defs: { RuneDef } = {
 		Params = { num("Max", "Max", 8, 1, 24, 1), num("Interval", "Interval", 0, 0, 1, 0.02, "s") },
 	},
 	{
-		Id = "Await", Name = "Wait Until", Glyph = "⧖", Category = "Branch", Zones = { "Branch" }, Pass = true,
+		Id = "Await", Name = "Wait Until", Glyph = "∵", Category = "Branch", Zones = { "Branch" }, Pass = true,
 		Description = "Holds the energy, checking the condition every Every seconds; Then runs the moment it's true, Timed out if it never is. Traps, mines and ambushes.",
 		Inputs = { flowIn(), { Name = "cond", Type = "bool", Label = "Condition" } },
 		Outputs = { flowOut("then", "Then"), flowOut("timeout", "Timed out") },
@@ -560,7 +560,7 @@ local defs: { RuneDef } = {
 		Params = { num("Height", "Height", 12, -20, 60, 0.5, " st"), num("Delay", "Draw time", 0.6, 0, 5, 0.05, "s"), num("Size", "Size", 1, 0.5, 3, 0.1, "×") },
 	},
 	{
-		Id = "Store", Name = "Store", Glyph = "⊡", Category = "Branch", Zones = { "Branch" }, Pass = true,
+		Id = "Store", Name = "Store", Glyph = "▣", Category = "Branch", Zones = { "Branch" }, Pass = true,
 		Description = "Writes whatever is wired into a memory Slot of yours (Recall reads it, in any of your spells), then passes the energy on.",
 		Inputs = {
 			flowIn(),
@@ -574,7 +574,7 @@ local defs: { RuneDef } = {
 
 	-- Transform -----------------------------------------------------------------
 	{
-		Id = "Fire", Name = "Fire", Glyph = "☲", Category = "Transform", Zones = { "Transform" }, Element = "Fire",
+		Id = "Fire", Name = "Fire", Glyph = "△", Category = "Transform", Zones = { "Transform" }, Element = "Fire",
 		Description = "80% of energy on impact, plus a burn worth 35% over 3s.",
 		Inputs = { flowIn() }, Outputs = { flowOut() }, Params = {},
 	},
@@ -584,7 +584,7 @@ local defs: { RuneDef } = {
 		Inputs = { flowIn() }, Outputs = { flowOut() }, Params = {},
 	},
 	{
-		Id = "Shock", Name = "Shock", Glyph = "☇", Category = "Transform", Zones = { "Transform" }, Element = "Shock",
+		Id = "Shock", Name = "Shock", Glyph = "ϟ", Category = "Transform", Zones = { "Transform" }, Element = "Shock",
 		Description = "70% of energy on impact, and stuns 0.01s per energy (max 1s).",
 		Inputs = { flowIn() }, Outputs = { flowOut() }, Params = {},
 	},
@@ -606,12 +606,12 @@ local defs: { RuneDef } = {
 		Inputs = {}, Outputs = { modOut() }, Params = { LEVEL },
 	},
 	{
-		Id = "Bounce", Name = "Bounce", Glyph = "ꓘ", Category = "Modifier", Zones = { "Modifier" }, ModifierCost = 0.05,
+		Id = "Bounce", Name = "Bounce", Glyph = "∠", Category = "Modifier", Zones = { "Modifier" }, ModifierCost = 0.05,
 		Description = "Ricochets off walls Level times. Beams reflect too.",
 		Inputs = {}, Outputs = { modOut() }, Params = { LEVEL },
 	},
 	{
-		Id = "Pierce", Name = "Pierce", Glyph = "↦", Category = "Modifier", Zones = { "Modifier" }, ModifierCost = 0.06,
+		Id = "Pierce", Name = "Pierce", Glyph = "‡", Category = "Modifier", Zones = { "Modifier" }, ModifierCost = 0.06,
 		Description = "Passes through Level enemies (15% less damage each).",
 		Inputs = {}, Outputs = { modOut() }, Params = { LEVEL },
 	},
@@ -646,10 +646,10 @@ local defs: { RuneDef } = {
 
 	-- Vessels (the form the magic takes) ---------------------------------------
 	vesselDef("Orb", "Orb", "◯", "A slow, heavy sphere of magic with a big hitbox. Flies at your mouse unless something is wired into Aim."),
-	vesselDef("Bullet", "Bullet", "➤", "A fast, thin tracer. Flies at your mouse unless something is wired into Aim."),
+	vesselDef("Bullet", "Bullet", "▶", "A fast, thin tracer. Flies at your mouse unless something is wired into Aim."),
 	vesselDef("Beam", "Beam", "═", "A cylinder of magic traveling at 2000 studs/s. Supports all flight modifiers and triggers; Sustain emits a continuous cursor-following beam."),
 	{
-		Id = "Explosion", Name = "Explosion", Glyph = "✸", Category = "Vessel", Zones = { "Output" }, Vessel = true, Damaging = true, Instant = true,
+		Id = "Explosion", Name = "Explosion", Glyph = "✽", Category = "Vessel", Zones = { "Output" }, Vessel = true, Damaging = true, Instant = true,
 		Description = "Bursts on the spot, hitting everything within 8 studs (Size widens it): full damage at the centre, half at the edge. Fed by On Impact it goes off at the impact point; cast directly it goes off at At, or your mouse. Only Size applies.",
 		Inputs = {
 			flowIn(),
@@ -674,7 +674,7 @@ local defs: { RuneDef } = {
 		},
 	},
 	{
-		Id = "Force", Name = "Force", Glyph = "⇶", Category = "Vessel", Zones = { "Output" }, Vessel = true, Instant = true,
+		Id = "Force", Name = "Force", Glyph = "»", Category = "Vessel", Zones = { "Output" }, Vessel = true, Instant = true,
 		Description = "Shoves bodies -- characters, dummies and loose parts. Along: the way Direction points (default: your aim / the vessel's heading). Push / Pull: away from / toward Here. Up: skyward. Hits Target (default: you at cast time -- a dash -- or the struck entity in a trigger), or with Radius above 0 everything within Radius of Here, sharing the energy. 2.5 studs/s per energy. Ragdoll flings them limp.",
 		Inputs = {
 			flowIn(),
@@ -690,7 +690,7 @@ local defs: { RuneDef } = {
 		},
 	},
 	{
-		Id = "Blink", Name = "Blink", Glyph = "⤳", Category = "Vessel", Zones = { "Output" }, Vessel = true, Instant = true,
+		Id = "Blink", Name = "Blink", Glyph = "β", Category = "Vessel", Zones = { "Output" }, Vessel = true, Instant = true,
 		Description = "Teleports Who (default: you) toward To (cast: your mouse; in a trigger: Here), stopping short of walls. Reaches 2 studs per energy (Range reaches further).",
 		Inputs = {
 			flowIn(),
@@ -718,7 +718,7 @@ local defs: { RuneDef } = {
 		},
 	},
 	{
-		Id = "TimeField", Name = "Time Field", Glyph = "◔", Category = "Vessel", Zones = { "Output" }, Vessel = true,
+		Id = "TimeField", Name = "Time Field", Glyph = "◒", Category = "Vessel", Zones = { "Output" }, Vessel = true,
 		Description = "A bubble of bent time at At (cast: your mouse; in a trigger: Here): everything inside -- bodies, projectiles, spells -- runs at Scale speed for Duration seconds. Its radius grows with energy and Size; Range lengthens it.",
 		Inputs = {
 			flowIn(),
@@ -748,7 +748,7 @@ local defs: { RuneDef } = {
 		Inputs = { vesselIn() }, Outputs = { flowOut(), { Name = "point", Type = "point", Label = "Point" } }, Params = { SHARE },
 	},
 	{
-		Id = "OnTimer", Name = "On Timer", Glyph = "⧗", Category = "Trigger", Zones = { "Trigger" },
+		Id = "OnTimer", Name = "On Timer", Glyph = "◓", Category = "Trigger", Zones = { "Trigger" },
 		Description = "After Delay seconds, releases Share of the energy -- or, with Pulses above 1, a slice of it every Delay seconds. Detonate ends the vessel after the last pulse.",
 		Inputs = { vesselIn() }, Outputs = { flowOut(), { Name = "point", Type = "point", Label = "Point" }, { Name = "pulse", Type = "number", Label = "Pulse" } },
 		Params = {
@@ -759,7 +759,7 @@ local defs: { RuneDef } = {
 		},
 	},
 	{
-		Id = "OnProximity", Name = "On Proximity", Glyph = "⊚", Category = "Trigger", Zones = { "Trigger" },
+		Id = "OnProximity", Name = "On Proximity", Glyph = "◌", Category = "Trigger", Zones = { "Trigger" },
 		Description = "When an entity comes within Radius of the vessel, releases Share of the energy. Struck Entity is that entity; what it fires aims at it.",
 		Inputs = { vesselIn() },
 		Outputs = { flowOut(), { Name = "point", Type = "point", Label = "Point" }, { Name = "entity", Type = "entity", Label = "Entity" } },

@@ -416,6 +416,19 @@ local function cycleActive(direction: number)
 	end
 end
 
+-- Frames the whole circle once the board has its size (just after opening).
+local function frameSoon()
+	if not board then
+		return
+	end
+	task.defer(function()
+		task.wait()
+		if board then
+			board:frameAll()
+		end
+	end)
+end
+
 local function loadSlot(slot: number)
 	selectedSlot = slot
 	libraryMode, editingSpellId = false, nil
@@ -431,7 +444,7 @@ local function loadSlot(slot: number)
 		if nameBox then nameBox.Text = record.name end
 		if board then
 			board.selection = nil
-			board:frameAll()
+			frameSoon()
 		end
 		savedSignature = signature()
 		setStatus(`Loaded "{record.name}".`)
@@ -448,7 +461,7 @@ local function newSpell()
 	savedSignature = nil
 	if board then
 		board.selection = nil
-		board:frameAll()
+		frameSoon()
 	end
 	refresh()
 end
@@ -573,6 +586,19 @@ local function iconButton(parent: Instance, text: string, order: number, callbac
 	return button
 end
 
+local function textButton(parent: Instance, text: string, order: number, callback: () -> ()): TextButton
+	local button = Theme.button(parent, text, {
+		Size = UDim2.fromOffset(0, 32),
+		AutomaticSize = Enum.AutomaticSize.X,
+		LayoutOrder = order,
+		BackgroundColor3 = Colors.panel2,
+		TextSize = 12,
+	})
+	Theme.make("UIPadding", { PaddingLeft = UDim.new(0, 10), PaddingRight = UDim.new(0, 10) }, button)
+	button.Activated:Connect(callback)
+	return button
+end
+
 local function setHelpVisible(on: boolean)
 	if helpFrame then
 		helpFrame.Visible = on
@@ -590,11 +616,11 @@ local function buildTopBar(parent: Frame)
 
 	-- left: back to the library, the spell's name, what's being edited
 	local RIGHT_WIDTH = 500
-	local leftGroup = Theme.make("Frame", { BackgroundTransparency = 1, Size = UDim2.new(1, -RIGHT_WIDTH, 1, 0), ClipsDescendants = true }, bar)
+	local leftGroup = Theme.make("Frame", { Name = "LeftGroup", BackgroundTransparency = 1, Size = UDim2.new(1, -RIGHT_WIDTH, 1, 0), ClipsDescendants = true }, bar)
 	local leftList = Theme.list(leftGroup, 10, true)
 	leftList.VerticalAlignment = Enum.VerticalAlignment.Center
 	Theme.make("UIPadding", { PaddingLeft = UDim.new(0, 12) }, leftGroup)
-	local library = Theme.button(leftGroup, "☰  Library", { Size = UDim2.fromOffset(96, 32), LayoutOrder = 1, BackgroundColor3 = Colors.panel2 })
+	local library = Theme.button(leftGroup, "≡  Library", { Size = UDim2.fromOffset(96, 32), LayoutOrder = 1, BackgroundColor3 = Colors.panel2 })
 	library.Activated:Connect(function()
 		SpellAssemblerGui.Close()
 		if libraryOpener then libraryOpener() end
@@ -627,6 +653,7 @@ local function buildTopBar(parent: Frame)
 
 	-- right: status, history, panels, save, guide, close
 	local rightGroup = Theme.make("Frame", {
+		Name = "RightGroup",
 		AnchorPoint = Vector2.new(1, 0),
 		Position = UDim2.new(1, -12, 0, 0),
 		Size = UDim2.new(0, RIGHT_WIDTH - 12, 1, 0),
@@ -653,13 +680,13 @@ local function buildTopBar(parent: Frame)
 	end)
 	statusChip = chip
 	Theme.make("Frame", { BackgroundTransparency = 1, Size = UDim2.fromOffset(6, 1), LayoutOrder = 2 }, rightGroup)
-	iconButton(rightGroup, "↶", 3, function() if doc:undo() then refresh() end end)
-	iconButton(rightGroup, "↷", 4, function() if doc:redo() then refresh() end end)
-	iconButton(rightGroup, "◧", 5, function()
+	textButton(rightGroup, "Undo", 3, function() if doc:undo() then refresh() end end)
+	textButton(rightGroup, "Redo", 4, function() if doc:redo() then refresh() end end)
+	textButton(rightGroup, "Runes", 5, function()
 		panelState.leftOpen = not panelState.leftOpen
 		relayout()
 	end)
-	iconButton(rightGroup, "◨", 6, function()
+	textButton(rightGroup, "Info", 6, function()
 		panelState.rightOpen = not panelState.rightOpen
 		relayout()
 	end)
@@ -669,7 +696,7 @@ local function buildTopBar(parent: Frame)
 	iconButton(rightGroup, "?", 8, function()
 		setHelpVisible(not (helpFrame and helpFrame.Visible))
 	end)
-	iconButton(rightGroup, "✕", 9, function() SpellAssemblerGui.Close() end)
+	iconButton(rightGroup, "×", 9, function() SpellAssemblerGui.Close() end).TextSize = 22
 end
 
 -- The guide (? in the top bar): how spells work, the building blocks, how
@@ -677,14 +704,14 @@ end
 local GUIDE: { { string } } = {
 	{ "The idea",
 		"Mana is energy. A Mana Well pushes it along the gold wires; every rune it passes shapes it, and a Vessel at the end turns it into magic. A cast costs the sum of your wells.",
-		"Damage vessels (Orb, Bullet, Beam, Explosion) need a Transform -- Fire, Arcane or Shock -- on the way. Utility vessels (Barrier, Force, Blink, Body Effect, Time Field) work on raw energy; a Transform only colours them.",
+		"Damage vessels (Orb, Bullet, Beam, Explosion) need a Transform — Fire, Arcane or Shock — on the way. Utility vessels (Barrier, Force, Blink, Body Effect, Time Field) work on raw energy; a Transform only colours them.",
 		"Every rune sits inside a zone of its colour. Pick a pen under Zones and drag on the board to draw one." },
-	{ "Flow -- when and where",
+	{ "Flow — when and where",
 		"If sends all the energy one way; Divide splits it (A runs first, then B).",
-		"Delay waits. Repeat runs what follows several times. For Each runs it once per entity of a list (Scan Area makes lists). Wait Until holds the energy until a condition is true -- traps and mines.",
-		"Conjure Circle opens a new circle somewhere else -- above an impact, over your cursor, on the ground -- and everything after it fires from there.",
+		"Delay waits. Repeat runs what follows several times. For Each runs it once per entity of a list (Scan Area makes lists). Wait Until holds the energy until a condition is true — traps and mines.",
+		"Conjure Circle opens a new circle somewhere else — above an impact, over your cursor, on the ground — and everything after it fires from there.",
 		"Store and Recall are your memory: a point, number and entity per slot, kept for the session and shared by all your spells." },
-	{ "Values -- what and where",
+	{ "Values — what and where",
 		"Coloured wires carry values: numbers (blue), true/false (pink), entities (orange), points and directions (green), lists of entities (tan). An entity works as a point (its position) or as a list of one.",
 		"Sensors read the world at the moment their part of the circle runs; Logic and Vector runes compute with them. Inputs marked 'or the setting' use the rune's own setting when nothing is wired.",
 		"Triggers and flow runes output what they saw: On Impact's Point, Surface and Struck, Repeat's Index, For Each's Entity, a conjured Circle's position. Wire them into anything that comes after them." },
@@ -698,7 +725,7 @@ local GUIDE: { { string } } = {
 		"Drag a rune from the left onto a zone, or click it to drop it mid-board. Drag from a port to wire; drag a connected input to pick its wire up.",
 		"Del: delete · Ctrl+D: duplicate · L: lock · Ctrl+Z / Ctrl+Y: undo / redo · Ctrl+S: save",
 		"Double-click a zone's tab to move it with its runes; drag an edge or corner to resize.",
-		"E outside the editor edits your equipped spell; E or ✕ closes it." },
+		"E outside the editor edits your equipped spell; E or × closes it." },
 }
 
 local function buildHelp(view: Frame)
@@ -722,10 +749,12 @@ local function buildHelp(view: Frame)
 		Size = UDim2.new(1, -70, 0, 26),
 		ZIndex = 31,
 	})
-	local close = Theme.button(frame, "✕", {
+	local close = Theme.button(frame, "×", {
+		Name = "Close",
 		AnchorPoint = Vector2.new(1, 0),
 		Position = UDim2.new(1, -12, 0, 10),
 		Size = UDim2.fromOffset(30, 30),
+		TextSize = 22,
 		ZIndex = 31,
 	})
 	close.Activated:Connect(function() setHelpVisible(false) end)
@@ -830,7 +859,14 @@ local function buildGui()
 		Active = true, -- keeps clicks/wheel away from the camera
 		Visible = false,
 	}, screen)
-	Theme.make("UIPadding", { PaddingTop = UDim.new(0, GuiService:GetGuiInset().Y) }, editor)
+	-- keep clear of Roblox's own top bar (it swallows clicks there); its
+	-- height is only known once the CoreGui has laid it out
+	local inset = Theme.make("UIPadding", {}, editor)
+	local function fitInset()
+		inset.PaddingTop = UDim.new(0, math.max(GuiService:GetGuiInset().Y, GuiService.TopbarInset.Height))
+	end
+	GuiService:GetPropertyChangedSignal("TopbarInset"):Connect(fitInset)
+	fitInset()
 	root = editor
 	buildTopBar(editor)
 
@@ -1386,7 +1422,7 @@ function SpellAssemblerGui.EditSpell(id: string)
 	if nameBox then nameBox.Text = spell.name end
 	if board then
 		board.selection = nil
-		board:frameAll()
+		frameSoon()
 	end
 	savedSignature = signature()
 	setStatus(`Editing "{spell.name}" from your library.`)
@@ -1404,7 +1440,7 @@ function SpellAssemblerGui.NewLibrarySpell(graph: any?, name: string?)
 		if nameBox then nameBox.Text = name or "" end
 		if board then
 			board.selection = nil
-			board:frameAll()
+			frameSoon()
 		end
 		refresh()
 		setStatus(`Editing a copy of "{name or "spell"}": Save adds it to your library.`)

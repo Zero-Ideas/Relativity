@@ -9,7 +9,7 @@
 	Topbar icons:
 	  Region  (left, first) -- where the server is (server/ServerRegion);
 	                     opens the server browser (ServerBrowser.luau)
-	  Menu    (left)  -- dropdown: show/hide the party panel
+	  Menu    (left)  -- dropdown: show/hide the party panel, Credits
 	  Party   (left)  -- the Party window (PartyWindow: Invite, Parties,
 	                     Friends and Settings tabs)
 	  Spells  (left)  -- the Spells window (SpellLibrary: loadout, library,
@@ -38,6 +38,7 @@ local ServerBrowser = require(script.Parent.ServerBrowser)
 local SpellLibrary = require(script.Parent.SpellLibrary)
 local ClientSettings = require(script.Parent.ClientSettings)
 local SettingsWindow = require(script.Parent.SettingsWindow)
+local CreditsWindow = require(script.Parent.CreditsWindow)
 local Notifications = require(script.Parent.Notifications)
 local DebugPanel = require(script.Parent.DebugPanel)
 local SpellAssemblerGui = require(script.Parent.SpellAssemblerGui)
@@ -45,6 +46,7 @@ local SpellAssemblerGui = require(script.Parent.SpellAssemblerGui)
 local SoundService = game:GetService("SoundService")
 local TweenService = game:GetService("TweenService")
 local UserInputService = game:GetService("UserInputService")
+local ContextActionService = game:GetService("ContextActionService")
 
 local player = Players.LocalPlayer
 
@@ -121,10 +123,12 @@ local function buildTopbar()
 		:setLabel("Show party panel", "Selected")
 	panelItem.selected:Connect(function() GameHud.SetPartyPanelVisible(false) end)
 	panelItem.deselected:Connect(function() GameHud.SetPartyPanelVisible(true) end)
+	local creditsItem = Icon.new():setName("Credits"):setLabel("Credits"):oneClick()
+	creditsItem.selected:Connect(CreditsWindow.Toggle)
 	Icon.new()
 		:setName("Menu")
 		:setLabel("Menu")
-		:setDropdown({ panelItem })
+		:setDropdown({ panelItem, creditsItem })
 
 	-- Party: the Party window (Invite / Parties / Whitelist tabs)
 	local party = Icon.new():setName("Party"):setLabel("Party"):oneClick()
@@ -197,7 +201,8 @@ local function buildTopbar()
 	settingsIcon.selected:Connect(SettingsWindow.Toggle)
 end
 
--- N: Messages, . : Settings (not while typing)
+-- N: Messages, . : Settings (not while typing). The default camera binds
+-- . to rotate, so it's taken (and sunk) at a higher priority.
 local function bindKeys()
 	UserInputService.InputBegan:Connect(function(input, processed)
 		if processed or UserInputService:GetFocusedTextBox() then
@@ -208,10 +213,17 @@ local function bindKeys()
 				inboxIcon:clearNotices()
 			end
 			Notifications.Toggle()
-		elseif input.KeyCode == Enum.KeyCode.Period then
-			SettingsWindow.Toggle()
 		end
 	end)
+	ContextActionService:BindActionAtPriority("SettingsHotkey", function(_, state: Enum.UserInputState)
+		if UserInputService:GetFocusedTextBox() then
+			return Enum.ContextActionResult.Pass
+		end
+		if state == Enum.UserInputState.Begin then
+			SettingsWindow.Toggle()
+		end
+		return Enum.ContextActionResult.Sink
+	end, false, Enum.ContextActionPriority.High.Value, Enum.KeyCode.Period)
 end
 
 function UiMode.start()

@@ -271,7 +271,7 @@ function Toolbox:filter(query: string)
 		local open = if searching then true else entry.open
 		entry.header.Visible = shown
 		entry.body.Visible = shown and open
-		entry.title.Text = `{if open then "▾" else "▸"}  {string.upper(entry.label)}   {found}`
+		entry.title.Text = `{if open then "▼" else "▶"}  {string.upper(entry.label)}   {found}`
 	end
 end
 
@@ -403,7 +403,7 @@ end
 
 -- A collapsible sub-heading; returns whether it's open.
 function Inspector:fold(title: string, open: boolean, toggle: () -> ()): boolean
-	local header = Theme.button(self.scroll, `{if open then "▾" else "▸"}  {string.upper(title)}`, {
+	local header = Theme.button(self.scroll, `{if open then "▼" else "▶"}  {string.upper(title)}`, {
 		Size = UDim2.new(1, 0, 0, 22),
 		BackgroundTransparency = 1,
 		Font = Theme.FontBold,
@@ -501,7 +501,7 @@ function Inspector:enumParam(rune: any, param: any)
 		local row = Theme.make("Frame", { BackgroundTransparency = 1, Size = UDim2.new(1, 0, 0, 28), LayoutOrder = self:nextOrder() }, self.scroll)
 		Theme.label(row, param.Label, 12, { Size = UDim2.new(0.4, 0, 1, 0), TextColor3 = Colors.muted })
 		local open = self.dropdown == param.Name
-		local button = Theme.button(row, `{current}   {if open then "▴" else "▾"}`, {
+		local button = Theme.button(row, `{current}   {if open then "▲" else "▼"}`, {
 			AnchorPoint = Vector2.new(1, 0),
 			Position = UDim2.fromScale(1, 0),
 			Size = UDim2.new(0.6, 0, 1, 0),
@@ -730,7 +730,7 @@ function Inspector:showWire(wire: any)
 	local fromPort = fromDef and SpellRunes.FindPort(fromDef.Outputs, wire.fromPort)
 	local toPort = toDef and SpellRunes.FindPort(toDef.Inputs, wire.toPort)
 	local color = if fromPort then SpellRunes.PortColors[fromPort.Type] else Colors.text
-	self:header("⟶", "Wire", if fromPort then `carries {fromPort.Type}` else "", color, {
+	self:header("→", "Wire", if fromPort then `carries {fromPort.Type}` else "", color, {
 		{ "🗑", self.hooks.delete, Color3.fromRGB(110, 40, 58) },
 	})
 	self:text(`{if fromDef then fromDef.Name else wire.from} · {if fromPort then fromPort.Label else wire.fromPort}`, 13)
@@ -743,7 +743,7 @@ function Inspector:showOverview(context: any)
 	local doc = self.hooks.doc()
 	local analysis = context.analysis
 	local name = if doc.graph.name ~= "" then doc.graph.name else "Untitled spell"
-	self:header("✦", name, "Nothing selected · the whole spell", Colors.accent)
+	self:header("◉", name, "Nothing selected · the whole spell", Colors.accent)
 	local tags = {}
 	if analysis then
 		table.insert(tags, { `{analysis.manaCost} mana`, SpellRunes.PortColors.flow })
@@ -879,7 +879,7 @@ function Problems:show(errors: { any }, summary: string)
 		self.header.TextColor3 = Colors.good
 		self.stroke.Color = Colors.good
 	else
-		self.header.Text = `✖  {count} problem{if count == 1 then "" else "s"}   {if self.expanded then "▾" else "▸"}`
+		self.header.Text = `✖  {count} problem{if count == 1 then "" else "s"}   {if self.expanded then "▼" else "▶"}`
 		self.header.TextColor3 = Colors.bad
 		self.stroke.Color = Colors.bad
 	end

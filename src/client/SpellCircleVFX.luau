@@ -16,7 +16,10 @@
 	 { Phase = "Begin" | "Cast" | "Cancel" | "End" | "Freeze" | "FireFrozen"
 	   | "ClearFrozen" | "Conjure", Caster = Model, Spec = Spec?, Target = Vector3?,
 	   Charge = number?, Sustain = boolean?, Position = Vector3?, Direction = Vector3?,
-	   Duration = number?, Size = number? }
+	   Duration = number?, Size = number?, Id = number? }
+	A conjured circle that a Wait Until is holding (a trap) idles after it
+	has drawn ("ConjureHold" { Id, Duration }) until "ConjureRelease" { Id }
+	or the duration runs out; unheld, it releases once drawn.
 	Freeze (R while charging) pins the charging circle in world space;
 	FireFrozen (T) turns the caster's oldest frozen circle to the target and
 	releases it. Conjure (the Conjure Circle rune, server only -- the caster's
@@ -40,6 +43,7 @@ local Heartbeat = require(Shared.Heartbeat)
 local ChunkManager = require(Shared.ChunkManager)
 local SpellRunes = require(Shared.SpellRunes)
 local CastGlint = require(script.Parent.SpellCastGlint)
+local Presentation = require(Shared.ClientPresentation)
 
 local SpellCircleVFX = {}
 
@@ -174,6 +178,8 @@ type CastState = {
 	AssembleStart: number?, -- os.clock when a frozen cloud began reassembling (T)
 	ConjureTime: number?, -- (conjured circles) seconds it takes to draw in
 	SizeScale: number?, -- (conjured circles) size multiplier
+	ConjureId: number?, -- (conjured circles) the server's id, for hold / release
+	HoldUntil: number?, -- (held conjured circles) os.clock it gives up waiting
 	Emitter: Attachment, -- where this cast's sounds play from (follows the main circle)
 	ChargeSound: Sound?,
 	Hum: Sound?,
@@ -185,6 +191,8 @@ type CastState = {
 }
 
 local casts: { CastState } = {}
+local conjured: { [number]: CastState } = {} -- by the server's conjure id
+local CONJURE_GRACE = 0.3 -- seconds a drawn circle waits for a hold before it fires
 local current: { [Model]: CastState } = {}
 -- Frozen (R) spells per caster, oldest first; FireFrozen (T) releases the head.
 local frozen: { [Model]: { CastState } } = {}
@@ -644,6 +652,9 @@ local function destroyCast(cast: CastState)
 	if current[cast.Caster] == cast then
 		current[cast.Caster] = nil
 	end
+	if cast.ConjureId and conjured[cast.ConjureId] == cast then
+		conjured[cast.ConjureId] = nil
+	end
 end
 
 local function createCast(caster: Model, spec: any, target: Vector3?, isLocal: boolean): CastState?
@@ -857,7 +868,19 @@ local function step(dt: number)
 			progress = f
 			spinBoost = 1 + 2 * f
 			flash = f * f
-			if f >= 1 then
+			local held = cast.HoldUntil ~= nil
+			if held and f >= 1 then
+				cast.State, cast.StateAge = "held", 0
+			elseif f >= 1 and cast.StateAge >= (cast.ConjureTime or 0.5) + CONJURE_GRACE then
+				cast.State, cast.StateAge = "release", 0
+				playSound(cast, SOUND_FIRE)
+			end
+		elseif cast.State == "held" then
+			-- a trap: drawn, idling and pulsing until it goes off
+			spinBoost = 0.7
+			flash = 0.3 + math.sin(cast.Age * 3) * 0.3
+			if not cast.HoldUntil or os.clock() >= cast.HoldUntil then
+				cast.HoldUntil = nil
 				cast.State, cast.StateAge = "release", 0
 				playSound(cast, SOUND_FIRE)
 			end
@@ -951,6 +974,7 @@ local function step(dt: number)
 				end
 			end
 			local pieceBrightness = if circle.Ghost then brightness * 0.6 else brightness
+			if Presentation.ReducedFlashes then pieceBrightness = math.min(pieceBrightness, 0.8) end
 			for index, piece in circle.Pieces do
 				local placed = frame * CFrame.new(0, 0, -PIECE_GAP * (index - 1))
 				if cloud > 0 then
@@ -1131,10 +1155,14 @@ end
 
 -- A circle conjured at `position` facing `direction` (the Conjure Circle
 -- rune): draws in over `duration` seconds, then releases.
-function SpellCircleVFX.Conjure(caster: Model, position: Vector3, direction: Vector3, spec: any, duration: number, size: number?)
+function SpellCircleVFX.Conjure(caster: Model, position: Vector3, direction: Vector3, spec: any, duration: number, size: number?, id: number?)
 	local cast = createCast(caster, spec, nil, false)
 	if not cast then
 		return
+	end
+	if id then
+		cast.ConjureId = id
+		conjured[id] = cast
 	end
 	cast.FrozenDirection = direction
 	cast.FrozenOrigin = position - direction * HAND_DISTANCE
@@ -1143,6 +1171,20 @@ function SpellCircleVFX.Conjure(caster: Model, position: Vector3, direction: Vec
 	cast.State, cast.StateAge = "conjure", 0
 	playSound(cast, SOUND_MANIFEST)
 	ensureRunning()
+end
+
+-- A Wait Until holds conjured circle `id` (until `seconds` from now), or
+-- lets it go.
+function SpellCircleVFX.HoldConjured(id: number, seconds: number?)
+	local cast = conjured[id]
+	if not cast then
+		return
+	end
+	if seconds then
+		cast.HoldUntil = os.clock() + seconds
+	else
+		cast.HoldUntil = nil
+	end
 end
 
 -- Drops every frozen circle of the caster (death, respawn, leaving).
@@ -1216,7 +1258,13 @@ VisualOffload.On("SpellCircle", function(data)
 		if typeof(position) == "Vector3" and typeof(direction) == "Vector3" and direction.Magnitude > 1e-3 then
 			SpellCircleVFX.Conjure(caster, position, direction.Unit, data.Spec,
 				if typeof(data.Duration) == "number" then data.Duration else 0.5,
-				if typeof(data.Size) == "number" then math.clamp(data.Size, 0.25, 4) else nil)
+				if typeof(data.Size) == "number" then math.clamp(data.Size, 0.25, 4) else nil,
+				if typeof(data.Id) == "number" then data.Id else nil)
+		end
+		return
+	elseif data.Phase == "ConjureHold" or data.Phase == "ConjureRelease" then
+		if typeof(data.Id) == "number" then
+			SpellCircleVFX.HoldConjured(data.Id, if data.Phase == "ConjureHold" then math.clamp(if typeof(data.Duration) == "number" then data.Duration else 5, 0, 60) else nil)
 		end
 		return
 	end

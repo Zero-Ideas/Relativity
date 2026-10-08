@@ -8,6 +8,7 @@
 
 local Protocol = require(script.Parent.Parent.Parent:WaitForChild("Projectile"):WaitForChild("Protocol"))
 local SafeMath = require(script.Parent.Parent.Parent:WaitForChild("SafeMath"))
+local Presentation = require(script.Parent.Parent.Parent:WaitForChild("ClientPresentation"))
 
 local Types = require(script.Parent.Types)
 local BeamVisual = require(script.Parent.BeamVisual)
@@ -255,6 +256,8 @@ function VisualModel.Build(data: Protocol.SpawnPayload): (Instance, Rig?)
 		forSelfAndDescendants(model, function(instance)
 			if instance:IsA("BasePart") then
 				makeCosmetic(instance)
+			elseif instance:IsA("ParticleEmitter") then
+				Presentation.TrackEmitter(instance)
 			end
 		end)
 	elseif model:IsA("BasePart") then
@@ -264,6 +267,9 @@ function VisualModel.Build(data: Protocol.SpawnPayload): (Instance, Rig?)
 		root = model
 		pivot = model.CFrame
 		makeCosmetic(model)
+		for _, instance in model:GetDescendants() do
+			if instance:IsA("ParticleEmitter") then Presentation.TrackEmitter(instance) end
+		end
 	else
 		pivot = CFrame.identity
 	end
@@ -521,11 +527,11 @@ function VisualModel.ActivateParticles(model: Instance)
 			if emitDelay > 0 then
 				task.delay(emitDelay, function()
 					if inst.Parent then
-						inst:Emit(emitCount)
+						inst:Emit(Presentation.BurstCount(emitCount))
 					end
 				end)
 			else
-				inst:Emit(emitCount)
+				inst:Emit(Presentation.BurstCount(emitCount))
 			end
 		end
 	end)

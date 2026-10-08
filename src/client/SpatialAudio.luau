@@ -19,6 +19,7 @@ local ReplicatedStorage = game:GetService("ReplicatedStorage")
 
 local Shared = ReplicatedStorage:WaitForChild("Shared")
 local ProjectileClient = require(Shared:WaitForChild("Projectile"):WaitForChild("Client"))
+local ClientAudio = require(script.Parent.ClientAudio)
 
 local SpatialAudio = {}
 
@@ -79,6 +80,7 @@ local function emit(folderName: string, name: string, position: Vector3, gain: n
 		attachment.Position = position -- Terrain sits at the origin
 		attachment.Parent = workspace.Terrain
 		local sound = source:Clone()
+		ClientAudio.Route(sound, if folderName == EXPLOSIONS then "Impact" else "Spell")
 		sound.Volume = source.Volume * math.clamp(gain, 0, 2)
 		sound.RollOffMode = Enum.RollOffMode.Linear
 		sound.RollOffMaxDistance = NO_ROLLOFF

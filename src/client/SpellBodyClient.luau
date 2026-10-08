@@ -34,7 +34,8 @@ local SpellBodyClient = {}
 local player = Players.LocalPlayer
 local MODIFIER = "SpellBody"
 local LIFT = 0.92 -- share of your gravity levitation cancels
-local HOLD_MIN, HOLD_MAX = 0.08, 0.22
+local HOLD_MIN, HOLD_MAX = 0.12, 0.35 -- seconds a sideways shove is held (longer when faster)
+local HOLD_PER_SPEED = 1 / 350
 local AURA_FADE = 0.4
 
 --------------------------------------------------------------------------------
@@ -82,7 +83,7 @@ VisualOffload.On("SpellImpulse", function(data)
 		hold.VectorVelocity = velocity
 		hold.Parent = root
 		humanoid:ChangeState(Enum.HumanoidStateType.Freefall)
-		task.delay(math.clamp(sideways / 900, HOLD_MIN, HOLD_MAX), function()
+		task.delay(math.clamp(sideways * HOLD_PER_SPEED, HOLD_MIN, HOLD_MAX), function()
 			attachment:Destroy()
 			hold:Destroy()
 		end)

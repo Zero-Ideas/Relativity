@@ -15,6 +15,7 @@ SECTIONS = [
         "src/shared/Signal.luau",
         "src/shared/Heartbeat.luau",
         "src/shared/VisualOffload.luau",
+        "src/shared/ClientPresentation.luau",
         "src/shared/ChunkManager.luau",
         "src/shared/Entity.luau",
     ]),

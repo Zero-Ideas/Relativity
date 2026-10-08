@@ -114,6 +114,8 @@ export type Context = {
 	-- Cast-time only: hold-to-charge copy multiplier (>= 1) for the vessels
 	-- the cast fires directly; see SpellRunes.Charge.
 	copyMultiplier: number?,
+	-- The conjured circle this part runs from (Wait Until keeps it showing).
+	conjureId: number?,
 }
 
 local rng = Random.new()
@@ -752,6 +754,7 @@ local function fireTrigger(compiled: any, parent: Context, triggerId: string, en
 	ctx.sizeScale = sizeScale or 1
 	ctx.surfaceNormal = normal
 	ctx.flight = flight or 0
+	ctx.conjureId = nil
 	ctx.vars[triggerId] = {
 		point = eventPoint,
 		normal = normal,
@@ -1437,6 +1440,7 @@ end
 type FlowHandler = (compiled: any, ctx: Context, id: string, params: any, energy: number, element: string?) -> ()
 
 local FLOW: { [string]: FlowHandler } = {}
+local nextConjure = 0
 
 FLOW.If = function(compiled, ctx, id, _params, energy, element)
 	local taken = if input(compiled, ctx, id, "cond") == true then "yes" else "no"
@@ -1510,13 +1514,29 @@ end
 
 FLOW.Await = function(compiled, ctx, id, params, energy, element)
 	local waited = 0
+	local holding = false
+	-- a conjured circle that's waiting (a trap) stays up until it goes off
+	local function hold(on: boolean)
+		if ctx.conjureId and on ~= holding then
+			holding = on
+			VisualOffload.Fire("SpellCircle", {
+				Phase = if on then "ConjureHold" else "ConjureRelease",
+				Caster = ctx.character,
+				Id = ctx.conjureId,
+				Duration = params.Timeout + 1,
+			})
+		end
+	end
 	local function check()
 		local probe = derive(liveContext(ctx))
 		if input(compiled, probe, id, "cond") == true then
+			hold(false)
 			runFlow(compiled, probe, id, "then", energy, element)
 		elseif waited >= params.Timeout then
+			hold(false)
 			runFlow(compiled, probe, id, "timeout", energy, element)
 		else
+			hold(true)
 			waited += params.Every
 			later(ctx, params.Every, probe.origin, check)
 		end
@@ -1533,9 +1553,12 @@ FLOW.Conjure = function(compiled, ctx, id, params, energy, element)
 	-- time, else back down at where it was conjured from
 	local look = face or ctx.focus or (if ctx.isCast then ctx.cursorPoint else nil) or (if raised then anchor else nil)
 	local direction = if look and (look - position).Magnitude > 1e-3 then (look - position).Unit else ctx.heading
+	nextConjure += 1
+	local conjureId = nextConjure
 	VisualOffload.Fire("SpellCircle", {
 		Phase = "Conjure",
 		Caster = ctx.character,
+		Id = conjureId,
 		Position = position,
 		Direction = direction,
 		Spec = conjureSpec(compiled, id),
@@ -1549,6 +1572,7 @@ FLOW.Conjure = function(compiled, ctx, id, params, energy, element)
 		child.heading = direction
 		child.focus = face or ctx.focus or (if not ctx.isCast and raised then anchor else nil)
 		child.fixedOrigin = true
+		child.conjureId = conjureId
 		child.spawnOffset = CONJURE_SPAWN_OFFSET
 		child.vars[id] = { point = position }
 		runFlow(compiled, child, id, "out", energy, element)

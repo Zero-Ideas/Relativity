@@ -60,6 +60,7 @@ local ChunkManager = require(Shared.ChunkManager)
 local Heartbeat = require(Shared.Heartbeat)
 local SpatialAudio = require(script.Parent.SpatialAudio)
 local Crater = require(script.Parent.Crater)
+local Presentation = require(Shared.ClientPresentation)
 
 local ExplosionVFX = {}
 
@@ -230,6 +231,7 @@ type Shot = {
 	Delay: number,
 	Duration: number,
 	Count: number,
+	Flash: boolean,
 	Fired: boolean,
 	StopAt: number?,
 	FiredAt: number,
@@ -270,8 +272,8 @@ local function updateBlast(blast: Blast, dt: number): boolean
 			if shot.Duration > 0 then
 				emitter.Enabled = true
 				shot.StopAt = age + shot.Duration
-			elseif shot.Count > 0 then
-				emitter:Emit(shot.Count)
+			elseif shot.Count > 0 and not (shot.Flash and Presentation.ReducedFlashes) then
+				emitter:Emit(Presentation.BurstCount(shot.Count))
 			end
 		end
 		if shot.StopAt and age >= shot.StopAt then
@@ -291,7 +293,8 @@ local function updateBlast(blast: Blast, dt: number): boolean
 
 	-- the light flashes with the blast and decays over its first second
 	local spec = blast.Spec
-	blast.Light.Brightness = (2 + 8 * spec.Intensity) * math.clamp(1 - age / (0.4 + 0.8 * spec.Intensity), 0, 1) ^ 2
+	blast.Light.Brightness = if Presentation.ReducedFlashes then 0 else
+		(2 + 8 * spec.Intensity) * Presentation.EffectsIntensity * math.clamp(1 - age / (0.4 + 0.8 * spec.Intensity), 0, 1) ^ 2
 
 	if age >= blast.Life or blast.RealAge >= MAX_REAL_LIFETIME then
 		blast.Root:Destroy()
@@ -336,6 +339,7 @@ local function applyShake()
 			strength = math.max(strength, blast.Shake * envelope * envelope * falloff)
 		end
 	end
+	strength *= Presentation.CameraShake * (if Presentation.ReducedFlashes then 0.25 else 1)
 	if strength > 0.001 then
 		local now = os.clock() * 37
 		local amplitude = math.rad(MAX_SHAKE_DEGREES) * strength
@@ -489,6 +493,8 @@ function ExplosionVFX.Play(position: Vector3, options: PlayOptions?)
 				emitter.Color = tinted(emitter.Color, opts.Color, 0.6)
 			end
 			emitter.Parent = attachmentFor(group, (original:GetAttribute("SourceHeight") :: number?) or 0)
+			local flash = group == "Energy" or group == "Shockwaves"
+			Presentation.TrackEmitter(emitter, flash)
 
 			local delay = (original:GetAttribute("EmitDelay") :: number?) or 0
 			local rampDuration = (original:GetAttribute("TimeScale_Duration") :: number?) or 0
@@ -497,6 +503,7 @@ function ExplosionVFX.Play(position: Vector3, options: PlayOptions?)
 				Delay = delay,
 				Duration = duration,
 				Count = count,
+				Flash = flash,
 				Fired = false,
 				StopAt = nil,
 				FiredAt = 0,
