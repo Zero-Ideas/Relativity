@@ -9,6 +9,7 @@
 
 local Players = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local Signal = require(ReplicatedStorage:WaitForChild("Shared"):WaitForChild("Signal"))
 local CollectionService = game:GetService("CollectionService")
 
 local Notifications = require(script.Parent.Notifications)
@@ -23,9 +24,8 @@ local DUMMY_TAG = "PartyDummy"
 export type Member = Instance
 
 local PartyClient = {}
-local changedEvent = Instance.new("BindableEvent")
-changedEvent.Name = "PartyClientChanged" -- (shows up by name in debugging tools)
-PartyClient.Changed = changedEvent.Event
+local changedEvent = Signal.new()
+PartyClient.Changed = changedEvent
 
 local started = false
 -- your requests still waiting for an answer (server "Pending" messages):

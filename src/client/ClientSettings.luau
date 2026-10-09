@@ -30,6 +30,7 @@
 ]]
 
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local Signal = require(ReplicatedStorage:WaitForChild("Shared"):WaitForChild("Signal"))
 
 local ProjectileClient = require(ReplicatedStorage:WaitForChild("Shared"):WaitForChild("Projectile"):WaitForChild("Client"))
 local Glint = require(script.Parent.SpellCastGlint)
@@ -94,9 +95,8 @@ end
 local pending: { [string]: any } = {} -- changes not saved yet
 local saveQueued = false
 
-local changedEvent = Instance.new("BindableEvent")
-changedEvent.Name = "ClientSettingsChanged" -- (shows up by name in debugging tools)
-ClientSettings.Changed = changedEvent.Event
+local changedEvent = Signal.new()
+ClientSettings.Changed = changedEvent
 
 local function apply(key: string?)
 	if not key or key == "HideUnintegratedUi" then

@@ -12,6 +12,7 @@
 	the spell editor covers the screen).
 ]]
 
+local Signal = require(game:GetService("ReplicatedStorage"):WaitForChild("Shared"):WaitForChild("Signal"))
 local ContextActionService = game:GetService("ContextActionService")
 local UserInputService = game:GetService("UserInputService")
 
@@ -56,9 +57,8 @@ local suspended = false
 function Keybinds.SetSuspended(on: boolean)
 	suspended = on
 end
-local changed = Instance.new("BindableEvent")
-changed.Name = "KeybindsChanged" -- (shows up by name in debugging tools)
-Keybinds.Changed = changed.Event -- (setting) a key moved: update hints
+local changed = Signal.new()
+Keybinds.Changed = changed -- (setting) a key moved: update hints
 
 local function actionName(setting: string): string
 	return "Keybind_" .. setting
