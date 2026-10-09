@@ -126,9 +126,6 @@ local function ignoreSetFor(params: RaycastParams): { [Instance]: boolean }
 	return set
 end
 
--- (BeamChain: the set a sleeping beam sample's box test ignores)
-Raycast.ignoreSetFor = ignoreSetFor
-
 function Raycast.castMovement(projectile: State, origin: Vector3, displacement: Vector3, overrideParams: RaycastParams?, nearEntities: boolean?): Types.Contact?
 	-- Provably empty space: the cast would find nothing, so don't make it
 	-- (see Occupancy -- it only says yes when nothing could be in the way).
