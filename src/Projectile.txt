@@ -9,7 +9,7 @@
 --     src/shared/Signal.luau (100 lines)
 --     src/shared/Heartbeat.luau (237 lines)
 --     src/shared/VisualOffload.luau (157 lines)
---     src/shared/ClientPresentation.luau (44 lines)
+--     src/shared/ClientPresentation.luau (62 lines)
 --     src/shared/ChunkManager.luau (651 lines)
 --     src/shared/Entity.luau (1101 lines)
 --   Shared projectile motion and protocol
@@ -42,16 +42,16 @@
 --     src/server/ProjectileQuota.luau (41 lines)
 --     src/server/ProjectileWorkerBootstrap.server.luau (201 lines)
 --   Client prediction and visuals
---     src/shared/Projectile/Client/Types.luau (81 lines)
+--     src/shared/Projectile/Client/Types.luau (105 lines)
 --     src/shared/Projectile/Client/Prediction.luau (147 lines)
 --     src/shared/Projectile/Client/View.luau (55 lines)
 --     src/shared/Projectile/Client/DebugRays.luau (42 lines)
 --     src/shared/Projectile/Client/Impact.luau (90 lines)
---     src/shared/Projectile/Client/VisualModel.luau (577 lines)
---     src/shared/Projectile/Client/BeamGeometry.luau (116 lines)
---     src/shared/Projectile/Client/BeamVisual.luau (537 lines)
---     src/shared/Projectile/Client/BeamChainVisual.luau (840 lines)
---     src/shared/Projectile/Client/init.luau (853 lines)
+--     src/shared/Projectile/Client/VisualModel.luau (771 lines)
+--     src/shared/Projectile/Client/BeamGeometry.luau (121 lines)
+--     src/shared/Projectile/Client/BeamVisual.luau (565 lines)
+--     src/shared/Projectile/Client/BeamChainVisual.luau (854 lines)
+--     src/shared/Projectile/Client/init.luau (951 lines)
 
 -- =============================================================================
 -- SECTION: Shared foundations
@@ -700,11 +700,14 @@ local Presentation = {
 	ReducedFlashes = false,
 	CameraShake = 1,
 }
-type EmitterDefaults = {Rate: number, Brightness: number, LightEmission: number, Flash: boolean}
+-- Scale: a per-emitter multiplier on top of the preferences (the projectile
+-- renderer's effects budget, see Projectile/Client).
+type EmitterDefaults = {Rate: number, Brightness: number, LightEmission: number, Flash: boolean, Scale: number}
 local emitters: {[ParticleEmitter]: EmitterDefaults} = setmetatable({}, {__mode = "k"}) :: any
 
 local function applyEmitter(emitter: ParticleEmitter, original: EmitterDefaults)
-	emitter.Rate = original.Rate * Presentation.EffectsIntensity * (if Presentation.ReducedFlashes and original.Flash then 0 else 1)
+	emitter.Rate = original.Rate * Presentation.EffectsIntensity * original.Scale
+		* (if Presentation.ReducedFlashes and original.Flash then 0 else 1)
 	emitter.Brightness = if Presentation.ReducedFlashes then math.min(original.Brightness, 0.5) else original.Brightness
 	emitter.LightEmission = if Presentation.ReducedFlashes then math.min(original.LightEmission, 0.25) else original.LightEmission
 	if Presentation.ReducedFlashes and original.Flash then emitter:Clear() end
@@ -713,10 +716,25 @@ end
 function Presentation.TrackEmitter(emitter: ParticleEmitter, flash: boolean?)
 	local original = emitters[emitter]
 	if not original then
-		original = {Rate = emitter.Rate, Brightness = emitter.Brightness, LightEmission = emitter.LightEmission, Flash = flash == true}
+		original = {Rate = emitter.Rate, Brightness = emitter.Brightness, LightEmission = emitter.LightEmission, Flash = flash == true,
+			Scale = 1}
 		emitters[emitter] = original
 	end
 	applyEmitter(emitter, original)
+end
+
+-- Scales a tracked emitter's rate (0 stops new particles; ones already out
+-- finish naturally). Only writes when the scale changes.
+function Presentation.ScaleEmitter(emitter: ParticleEmitter, scale: number)
+	local original = emitters[emitter]
+	if not original then
+		Presentation.TrackEmitter(emitter)
+		original = emitters[emitter]
+	end
+	if original.Scale ~= scale then
+		original.Scale = scale
+		applyEmitter(emitter, original)
+	end
 end
 
 function Presentation.BurstCount(count: number): number
@@ -12578,7 +12596,27 @@ export type Rig = {
 	model: Instance,
 	root: BasePart,
 	poolKey: string?,
+	-- where `driver` sits (it's never rotated or moved after building, so a
+	-- pose's Transform is just pose - origin, no Instance read)
+	origin: Vector3?,
+	identityOffset: boolean?, -- rootOffset is the identity
 	beam: any?, -- bounded cylindrical path geometry (BeamVisual)
+	effects: Effects?, -- a styled / authored model's effects (VisualModel)
+}
+
+-- Everything in a model the effects budget and retirement touch, gathered
+-- once per model (a pooled model keeps it), plus what to restore on reuse.
+export type Effects = {
+	parts: { BasePart },
+	emitters: { ParticleEmitter },
+	trails: { Trail },
+	lights: { Light },
+	decor: { BasePart }, -- parts tagged LodDecor: hidden at the lowest detail
+	restoreInstances: { Instance },
+	restoreProperties: { string },
+	restoreValues: { any },
+	lifetime: number, -- see VisualModel.GetLongestEffectLifetime
+	pendingTrails: { Trail }?, -- a reused model's trails, held until it's placed
 }
 
 -- One rendered projectile. Physics fields mirror the server projectile and
@@ -12631,6 +12669,10 @@ export type Visual = {
 	transformElapsed: number,
 	transformDuration: number,
 	suspendedTrails: { Trail }?,
+	-- effects budget (ProjectileClient refreshDetail / VisualModel.SetDetail)
+	lodTier: number?, -- 1 full, 2 reduced, 3 bare
+	lodLight: boolean?,
+	lodOff: { Instance }?, -- emitters / trails the bare tier switched off
 
 	-- pass-by sound tracking (ProjectileClient.SetPassByHandler)
 	passApproaching: boolean?, -- closing on the camera, on a line within the pass radius
@@ -13049,12 +13091,19 @@ local function forSelfAndDescendants(model: Instance, fn: (Instance) -> ())
 	end
 end
 
--- Built-in (non-Model) visuals are pooled per appearance: a burst otherwise
--- creates two Parts and a Motor6D per projectile and destroys them all on
--- impact. Custom Models aren't pooled -- their effects/transparency state is
--- mutated by FadeOut and would need a full restore.
+-- Built-in visuals are pooled per appearance: a burst otherwise creates the
+-- parts, joints and effects of every projectile and destroys them all on
+-- impact. Styled ones (Orb / Bullet: a dozen instances each) are pooled too,
+-- with everything FadeOut changes recorded at construction and restored on
+-- reuse (see gatherEffects). Authored Models aren't pooled.
 local POOL_LIMIT = 4096
+local STYLED_POOL_LIMIT = 512
 local pools: { [string]: { Rig } } = {}
+
+-- Particle rate per detail tier (see VisualModel.SetDetail; the bare tier
+-- switches emitters off outright: an enabled emitter at rate 0 still costs
+-- nearly as much to render as a busy one).
+local PARTICLE_SCALE = { 1, 0.25 }
 
 local function builtinPoolKey(data: Protocol.SpawnPayload): string
 	local spec = data.Visual
@@ -13138,6 +13187,7 @@ local function buildOrb(core: Color3, glow: Color3): Model
 	shell.Parent = model
 	weld(shell, center)
 	local halo = effectPart({ Name = "Halo", Shape = Enum.PartType.Ball, Size = Vector3.one * 3, Color = glow, Transparency = 0.85 })
+	halo:SetAttribute("LodDecor", true) -- (dropped at the lowest detail)
 	halo.Parent = model
 	weld(halo, center)
 	light(center, glow, 14, 3)
@@ -13191,10 +13241,15 @@ local function buildBullet(core: Color3, glow: Color3): Model
 	return model
 end
 
+local function styledKey(spec: Protocol.VisualSpec): string
+	local core = spec.Core or Color3.new(1, 1, 1)
+	return `{spec.Style}|{core}|{spec.Color or core}`
+end
+
 local function styledModel(spec: Protocol.VisualSpec): Model?
 	local core = spec.Core or Color3.new(1, 1, 1)
 	local glow = spec.Color or core
-	local key = `{spec.Style}|{core}|{glow}`
+	local key = styledKey(spec)
 	local template = styledTemplates[key]
 	if not template then
 		if spec.Style == "Orb" then
@@ -13235,24 +13290,101 @@ local function makeCosmetic(part: BasePart)
 	part.CastShadow = false
 end
 
+-- One pass over a new model: makes its parts cosmetic, tracks its emitters,
+-- and records its effects and everything FadeOut will change.
+local function gatherEffects(model: Instance): Types.Effects
+	local effects: Types.Effects = {
+		parts = {}, emitters = {}, trails = {}, lights = {}, decor = {},
+		restoreInstances = {}, restoreProperties = {}, restoreValues = {},
+		lifetime = 0,
+	}
+	local function remember(instance: Instance, property: string, value: any)
+		table.insert(effects.restoreInstances, instance)
+		table.insert(effects.restoreProperties, property)
+		table.insert(effects.restoreValues, value)
+	end
+	forSelfAndDescendants(model, function(instance)
+		if instance:IsA("BasePart") then
+			makeCosmetic(instance)
+			table.insert(effects.parts, instance)
+			remember(instance, "Transparency", instance.Transparency)
+			if instance:GetAttribute("LodDecor") == true then
+				table.insert(effects.decor, instance)
+			end
+		elseif instance:IsA("ParticleEmitter") then
+			Presentation.TrackEmitter(instance)
+			table.insert(effects.emitters, instance)
+			remember(instance, "Enabled", instance.Enabled)
+			local rawDelay = instance:GetAttribute("EmitDelay")
+			local emitDelay = if typeof(rawDelay) == "number" then math.max(rawDelay, 0) else 0
+			effects.lifetime = math.max(effects.lifetime, emitDelay + instance.Lifetime.Max)
+		elseif instance:IsA("Trail") then
+			table.insert(effects.trails, instance)
+			remember(instance, "Enabled", instance.Enabled)
+			effects.lifetime = math.max(effects.lifetime, instance.Lifetime)
+		elseif instance:IsA("Light") then
+			table.insert(effects.lights, instance)
+			remember(instance, "Enabled", instance.Enabled)
+		elseif instance:IsA("Beam") then
+			remember(instance, "Enabled", instance.Enabled)
+		end
+	end)
+	return effects
+end
+
+-- A pooled model back as it was built. Its trails stay off (and cleared)
+-- until the visual is placed, or they'd draw a streak from where it was.
+local function restoreEffects(effects: Types.Effects)
+	local instances, properties, values = effects.restoreInstances, effects.restoreProperties, effects.restoreValues
+	local pending = {}
+	for index = 1, #instances do
+		local instance = instances[index] :: any
+		if instance:IsA("Trail") then
+			instance:Clear()
+			if values[index] then
+				table.insert(pending, instance)
+			end
+		else
+			instance[properties[index]] = values[index]
+		end
+	end
+	for _, part in effects.decor do
+		part.LocalTransparencyModifier = 0
+	end
+	effects.pendingTrails = if #pending > 0 then pending else nil
+end
+
 function VisualModel.Build(data: Protocol.SpawnPayload): (Instance, Rig?)
 	if data.Beam then return BeamVisual.Build(data) end
 	local spec = data.Visual
 	local authored = data.Model
-	local styled = if spec and spec.Style and not authored then styledModel(spec) else nil
-	local poolKey = if authored or styled then nil else builtinPoolKey(data)
+	local style = spec and not authored and spec.Style
+	local styledPool = if style == "Orb" or style == "Bullet"
+		then `styled|{styledKey(spec :: Protocol.VisualSpec)}|{math.clamp(data.VisualScale or 1, 0.05, 20)}`
+		else nil
+	local poolKey = if authored then nil else styledPool or builtinPoolKey(data)
 
 	local pool = if poolKey then pools[poolKey] else nil
 	local pooledRig = if pool then table.remove(pool) else nil
 	if pooledRig then
 		pooledRig.driver.CFrame = CFrame.new(data.Position)
+		pooledRig.origin = data.Position
 		pooledRig.motor.Transform =
 			pooledRig.driver.CFrame:ToObjectSpace(poseFrom(data.Position, data.Velocity) * pooledRig.rootOffset)
-		pooledRig.root.Transparency = 0
+		local effects = pooledRig.effects
+		if effects then
+			restoreEffects(effects)
+		else
+			pooledRig.root.Transparency = 0
+		end
 		pooledRig.model.Parent = workspace
 		return pooledRig.model, pooledRig
 	end
 
+	local styled = if styledPool then styledModel(spec :: Protocol.VisualSpec) else nil
+	if styledPool and not styled then
+		poolKey = builtinPoolKey(data)
+	end
 	local model: Instance = styled or (if authored then authored:Clone() else builtinPart(spec))
 
 	-- Scale the cloned presentation once at construction. This does not add
@@ -13260,19 +13392,14 @@ function VisualModel.Build(data: Protocol.SpawnPayload): (Instance, Rig?)
 	local visualScale = math.clamp(data.VisualScale or 1, 0.05, 20)
 	local root: BasePart?
 	local pivot: CFrame
+	local effects: Types.Effects? = nil
 	if model:IsA("Model") then
 		if visualScale ~= 1 then
 			pcall(model.ScaleTo, model, model:GetScale() * visualScale)
 		end
 		root = model.PrimaryPart or model:FindFirstChildWhichIsA("BasePart", true)
 		pivot = model:GetPivot()
-		forSelfAndDescendants(model, function(instance)
-			if instance:IsA("BasePart") then
-				makeCosmetic(instance)
-			elseif instance:IsA("ParticleEmitter") then
-				Presentation.TrackEmitter(instance)
-			end
-		end)
+		effects = gatherEffects(model)
 	elseif model:IsA("BasePart") then
 		if visualScale ~= 1 then
 			model.Size *= visualScale
@@ -13320,6 +13447,9 @@ function VisualModel.Build(data: Protocol.SpawnPayload): (Instance, Rig?)
 			model = model,
 			root = root,
 			poolKey = poolKey,
+			effects = effects,
+			origin = data.Position,
+			identityOffset = rootOffset == CFrame.identity,
 		}
 	end
 
@@ -13328,6 +13458,11 @@ function VisualModel.Build(data: Protocol.SpawnPayload): (Instance, Rig?)
 end
 
 local function transformFor(rig: Rig, pose: CFrame): CFrame
+	local origin = rig.origin
+	if origin then
+		-- (the driver is a pure translation: no Instance read, no inverse)
+		return (if rig.identityOffset then pose else pose * rig.rootOffset) - origin
+	end
 	return rig.driver.CFrame:ToObjectSpace(pose * rig.rootOffset)
 end
 
@@ -13343,7 +13478,9 @@ function VisualModel.Place(visual: Visual, position: Vector3, velocity: Vector3)
 	visual.transformFrom = nil
 	visual.transformTo = nil
 	BeamVisual.Update(visual, position, velocity)
-	if visual.rig and visual.rig.beam and visual.rig.beam.group then return end
+	-- (a beam draws its own cylinders; its head part is invisible, so posing
+	-- it every frame was a joint update for nothing)
+	if visual.rig and visual.rig.beam then return end
 
 	local pose = poseFrom(position, velocity)
 	local rig = visual.rig
@@ -13363,7 +13500,8 @@ function VisualModel.SuspendTrails(visual: Visual)
 		return
 	end
 	local suspended: { Trail } = {}
-	for _, instance in visual.model:GetDescendants() do
+	local effects = visual.rig and visual.rig.effects
+	for _, instance in (if effects then effects.trails else visual.model:GetDescendants()) :: { Instance } do
 		if instance:IsA("Trail") and instance.Enabled then
 			instance.Enabled = false
 			instance:Clear()
@@ -13390,7 +13528,10 @@ end
 -- Returns the real-time grace period a visual should remain alive and
 -- emitting after it first leaves the viewport. EmitDelay is included because
 -- one-shot particle bursts may not have fired yet when the projectile exits.
-function VisualModel.GetLongestEffectLifetime(model: Instance): number
+function VisualModel.GetLongestEffectLifetime(model: Instance, rig: Rig?): number
+	if rig and rig.effects then
+		return rig.effects.lifetime
+	end
 	local longest = 0
 	for _, instance in model:GetDescendants() do
 		if instance:IsA("ParticleEmitter") then
@@ -13413,7 +13554,8 @@ function VisualModel.SuspendEffects(visual: Visual)
 		return
 	end
 	local suspended: { ParticleEmitter } = {}
-	for _, instance in visual.model:GetDescendants() do
+	local effects = visual.rig and visual.rig.effects
+	for _, instance in (if effects then effects.emitters else visual.model:GetDescendants()) :: { Instance } do
 		if instance:IsA("ParticleEmitter") and instance.Enabled then
 			instance.Enabled = false
 			table.insert(suspended, instance)
@@ -13495,7 +13637,7 @@ local function release(visual: Visual)
 			pool = {}
 			pools[poolKey] = pool
 		end
-		if #pool < POOL_LIMIT then
+		if #pool < (if rig.effects then STYLED_POOL_LIMIT else POOL_LIMIT) then
 			visual.model.Parent = nil
 			table.insert(pool, rig)
 			return
@@ -13510,12 +13652,15 @@ function VisualModel.Retire(visual: Visual, destroyDelay: number)
 	if BeamVisual.Retire(visual, destroyDelay) then return end
 	local rig = visual.rig
 	local delay = destroyDelay
-	if rig and rig.poolKey then
+	if rig and rig.poolKey and not rig.effects then
 		-- Built-in visuals are a bare Part: nothing to fade, only to hide.
 		if delay > 0 then
 			rig.root.Transparency = 1
 		end
 	else
+		if rig and rig.effects and not (visual.waitForParticles and visual.waitForTrails) then
+			rig.poolKey = nil -- (FadeOut destroys those effects: not reusable)
+		end
 		delay = math.max(delay, VisualModel.FadeOut(visual.model, visual.waitForParticles, visual.waitForTrails))
 	end
 	if delay > 0 then
@@ -13548,6 +13693,97 @@ function VisualModel.ActivateParticles(model: Instance)
 			end
 		end
 	end)
+end
+
+-- Bare tier: its emitters and trails off. One already off because the
+-- visual is suspended (off screen, see SuspendEffects) moves from that list
+-- to this one, so resuming can't switch it back on behind the budget's back.
+local function switchOff(visual: Visual, effects: Types.Effects)
+	local off: { Instance } = {}
+	local function take(instance: Instance, suspended: { Instance }?)
+		local enabled = (instance :: any).Enabled
+		if enabled then
+			(instance :: any).Enabled = false
+			table.insert(off, instance)
+		elseif suspended then
+			local index = table.find(suspended, instance)
+			if index then
+				table.remove(suspended, index)
+				table.insert(off, instance)
+			end
+		end
+	end
+	for _, emitter in effects.emitters do
+		take(emitter, visual.suspendedParticles :: any)
+	end
+	for _, trail in effects.trails do
+		take(trail, visual.suspendedTrails :: any)
+		trail:Clear()
+	end
+	visual.lodOff = off
+end
+
+-- Out of the bare tier: back on, or back to the suspended lists if the
+-- visual is still suspended.
+local function switchOn(visual: Visual)
+	local off = visual.lodOff
+	if not off then
+		return
+	end
+	visual.lodOff = nil
+	for _, instance in off do
+		if not instance.Parent then
+			continue
+		end
+		if instance:IsA("ParticleEmitter") then
+			local suspended = visual.suspendedParticles
+			if suspended then
+				table.insert(suspended, instance)
+			else
+				instance.Enabled = true
+			end
+		elseif instance:IsA("Trail") then
+			local suspended = visual.suspendedTrails
+			if suspended then
+				table.insert(suspended, instance)
+			else
+				instance:Clear()
+				instance.Enabled = true
+			end
+		end
+	end
+end
+
+-- The effects budget (see ProjectileClient's refreshDetail): tier 1 full,
+-- 2 a quarter of the particles, 3 no particles, trails or LodDecor parts;
+-- `light` says whether its lights may shine. Only writes what changed.
+function VisualModel.SetDetail(visual: Visual, tier: number, light: boolean)
+	local effects = visual.rig and visual.rig.effects
+	if not effects then
+		return
+	end
+	if visual.lodTier ~= tier then
+		visual.lodTier = tier
+		if tier >= 3 then
+			switchOff(visual, effects)
+		else
+			switchOn(visual)
+			local scale = PARTICLE_SCALE[tier] or 1
+			for _, emitter in effects.emitters do
+				Presentation.ScaleEmitter(emitter, scale)
+			end
+		end
+		local hide = if tier >= 3 then 1 else 0
+		for _, part in effects.decor do
+			part.LocalTransparencyModifier = hide
+		end
+	end
+	if visual.lodLight ~= light then
+		visual.lodLight = light
+		for _, effect in effects.lights do
+			effect.Enabled = light
+		end
+	end
 end
 
 -- Starts a linear pose interpolation for a server-synced visual. The render
@@ -13601,7 +13837,12 @@ return VisualModel
 -- tails become one cylinder, not stacked bars/glow. Distinct paths stay
 -- distinct: never invent a connecting chord through untraveled geometry.
 local Geometry = {}
-Geometry.MaxSegmentLength = 12
+-- Every piece is a pooled cylinder pair on its own Motor6D, and the joints
+-- are what a crowd of beams costs (client physics): 12-stud pieces made a
+-- 24-stud beam ten parts. Size and pose are applied together before the
+-- engine runs (BeamVisual.ApplyGroups), so a longer piece can't flash at a
+-- stale angle.
+Geometry.MaxSegmentLength = 48
 
 -- Tessellate after union, so overlaps are removed but no pooled cylinder can
 -- grow into an enormous bar on a flick or a stretched time-field boundary.
@@ -13741,6 +13982,7 @@ local retired: { any } = {}
 local retireCursor = 1
 local clock = 0
 local ROTATION = CFrame.Angles(0, math.pi / 2, 0) -- cylinder's X axis -> path Z
+local SIZE_SLACK = 0.02 -- studs a cylinder may be off before its Size is rewritten
 local groups: { [number]: any } = {}
 local pending: { [any]: any } = {}
 local applyConnection: RBXScriptConnection? = nil
@@ -13813,6 +14055,7 @@ local function part(parent: Instance, name: string, color: Color3, transparency:
 	p.Size = Vector3.one * 0.05
 	p.Material = Enum.Material.Neon
 	p.CanCollide, p.CanQuery, p.CanTouch, p.CastShadow = false, false, false, false
+	p.Massless = true -- (cosmetic: no mass to recompute when it's resized)
 	-- Motor6D.Transform is applied in the engine's simulation phase. New
 	-- cylinders need their correct world pose BEFORE being made visible;
 	-- otherwise their default X-axis orientation flashes for one frame.
@@ -13830,26 +14073,50 @@ local function motor(driver: BasePart, p: BasePart, initialPose: CFrame?): Motor
 	return joint
 end
 
+-- Writes only what changed: a Size write makes the engine rebuild the part
+-- (and its assembly), and one per cylinder per frame was most of what a
+-- crowd of beams cost. The driver never moves and a pair's C0 never changes,
+-- so both inverses are kept instead of read back every frame.
 local function shape(group: any, pool: any, index: number, pose: CFrame, size: Vector3, ball: boolean)
 	local pair = pool[index]
 	if not pair then
 		local core = part(group.model, if ball then "BeamJointCore" else "BeamCore", group.core, 1, pose)
 		local glow = part(group.model, if ball then "BeamJointGlow" else "BeamGlow", group.color, 1, pose)
 		if ball then core.Shape = Enum.PartType.Ball; glow.Shape = Enum.PartType.Ball end
-		pair = { core = core, glow = glow, coreMotor = motor(group.driver, core, pose), glowMotor = motor(group.driver, glow, pose) }
+		local coreMotor = motor(group.driver, core, pose)
+		pair = { core = core, glow = glow, coreMotor = coreMotor, glowMotor = motor(group.driver, glow, pose),
+			inverse = coreMotor.C0:Inverse() }
 		pool[index] = pair
 	end
-	local transform = group.driver.CFrame:ToObjectSpace(pose)
-	pair.core.Size = if ball then size * .55 else Vector3.new(size.X, size.Y * .55, size.Z * .55)
-	pair.glow.Size = size
-	pair.coreMotor.Transform = pair.coreMotor.C0:Inverse() * transform
-	pair.glowMotor.Transform = pair.glowMotor.C0:Inverse() * transform
-	pair.core.Transparency, pair.glow.Transparency = 0, .5
+	local driverInverse = group.driverInverse
+	if not driverInverse or group.driverInverseOf ~= group.driver then
+		driverInverse = group.driver.CFrame:Inverse()
+		group.driverInverse, group.driverInverseOf = driverInverse, group.driver
+	end
+	local last = pair.size
+	if not last or math.abs(last.X - size.X) > SIZE_SLACK or math.abs(last.Y - size.Y) > SIZE_SLACK then
+		-- (a beam's length jitters by float error every frame; changes this
+		-- small are invisible, and each write rebuilds the part)
+		pair.size = size
+		pair.core.Size = if ball then size * .55 else Vector3.new(size.X, size.Y * .55, size.Z * .55)
+		pair.glow.Size = size
+	end
+	local transform = pair.inverse * (driverInverse * pose)
+	pair.coreMotor.Transform = transform
+	pair.glowMotor.Transform = transform
+	if not pair.shown then
+		pair.shown = true
+		pair.core.Transparency, pair.glow.Transparency = 0, .5
+	end
 end
 
 local function hideAfter(pool: any, used: number)
 	for index = used + 1, #pool do
-		pool[index].core.Transparency, pool[index].glow.Transparency = 1, 1
+		local pair = pool[index]
+		if pair.shown ~= false then
+			pair.shown = false
+			pair.core.Transparency, pair.glow.Transparency = 1, 1
+		end
 	end
 end
 
@@ -13857,6 +14124,7 @@ end
 -- Reusing a long cylinder at a new angle during Heartbeat otherwise exposes
 -- its new length at the old orientation for a rendered frame.
 function BeamVisual.ApplyGroups()
+	debug.profilebegin("BeamVisual.ApplyGroups")
 	for group, geometry in pending do
 		pending[group] = nil
 		if not group.model.Parent then continue end
@@ -13873,6 +14141,7 @@ function BeamVisual.ApplyGroups()
 		end
 		hideAfter(group.joints, #geometry.joints)
 	end
+	debug.profileend()
 end
 
 -- One aggregation per channel per frame, never one visible bar per packet.
@@ -14313,6 +14582,7 @@ local GHOST_LIFETIME = 1.5 -- a dead sample still named as a link target
 local DRAIN_LIMIT = 5
 local IMPACT_THROTTLE, IMPACT_SPACING = 0.1, 4
 local ROTATION = CFrame.Angles(0, math.pi / 2, 0) -- cylinder X axis -> path Z
+local SIZE_SLACK = 0.02 -- studs a cylinder may be off before its Size is rewritten
 local DEATH_KINDS = { [DeathKind.World] = "world", [DeathKind.Entity] = "entity", [DeathKind.Other] = "detonate" }
 
 type Sample = {
@@ -14355,6 +14625,7 @@ local function part(parent: Instance, name: string, color: Color3, pose: CFrame?
 	p.Size = Vector3.one * 0.05
 	p.Material = Enum.Material.Neon
 	p.CanCollide, p.CanQuery, p.CanTouch, p.CastShadow = false, false, false, false
+	p.Massless = true -- (cosmetic: no mass to recompute when it's resized)
 	-- (posed before becoming visible: no one-frame default-axis flash)
 	if pose then
 		p.CFrame = pose
@@ -14378,17 +14649,29 @@ local function shape(chain: any, pool: { any }, index: number, pose: CFrame, siz
 		if ball then
 			core.Shape, glow.Shape = Enum.PartType.Ball, Enum.PartType.Ball
 		end
-		pair = { core = core, glow = glow, coreMotor = motor(chain.driver, core, pose), glowMotor = motor(chain.driver, glow, pose) }
+		local coreMotor = motor(chain.driver, core, pose)
+		pair = { core = core, glow = glow, coreMotor = coreMotor, glowMotor = motor(chain.driver, glow, pose),
+			inverse = coreMotor.C0:Inverse() }
 		pool[index] = pair
 	end
-	local transform = chain.driver.CFrame:ToObjectSpace(pose)
-	if pair.size ~= size then
+	-- (the driver never moves and a pair's C0 never changes: keep both
+	-- inverses instead of reading them back every frame)
+	local driverInverse = chain.driverInverse
+	if not driverInverse then
+		driverInverse = chain.driver.CFrame:Inverse()
+		chain.driverInverse = driverInverse
+	end
+	local transform = pair.inverse * (driverInverse * pose)
+	local last = pair.size
+	if not last or math.abs(last.X - size.X) > SIZE_SLACK or math.abs(last.Y - size.Y) > SIZE_SLACK then
+		-- (a beam's length jitters by float error every frame; changes this
+		-- small are invisible, and each write rebuilds the part)
 		pair.size = size
 		pair.core.Size = if ball then size * .55 else Vector3.new(size.X, size.Y * .55, size.Z * .55)
 		pair.glow.Size = size
 	end
-	pair.coreMotor.Transform = pair.coreMotor.C0:Inverse() * transform
-	pair.glowMotor.Transform = pair.glowMotor.C0:Inverse() * transform
+	pair.coreMotor.Transform = transform
+	pair.glowMotor.Transform = transform
 	if not pair.shown then
 		pair.shown = true
 		pair.core.Transparency, pair.glow.Transparency = 0, .5
@@ -15208,7 +15491,18 @@ local SMOOTH_SET_REFRESH_INTERVAL = 0.1 -- real seconds; selection is presentati
 --   MaxUpdates  -- on-screen redraws per frame (the round-robin budget;
 --                  presentation only: positions come from elapsed time, so a
 --                  visual left waiting catches up exactly on its next turn)
-local renderSettings = { MaxDistance = 2048, MaxRendered = 5000, MaxSmooth = 500, MaxUpdates = MAX_VISUAL_UPDATES_PER_FRAME }
+--   MaxDetailed -- the effects budget: the nearest this many on-screen
+--                  visuals with effects (orbs, bullets, authored models) get
+--                  full particles; up to DETAIL_REDUCED times as many get a
+--                  quarter of them; the rest none, and drop their LodDecor
+--                  parts (an orb's outer halo). Only the nearest DETAIL_LIGHTS
+--                  keep their lights. Particles were most of what a crowd of
+--                  orbs cost to draw.
+local renderSettings = { MaxDistance = 2048, MaxRendered = 5000, MaxSmooth = 500, MaxUpdates = MAX_VISUAL_UPDATES_PER_FRAME,
+	MaxDetailed = 48 }
+local DETAIL_REFRESH_INTERVAL = 0.1
+local DETAIL_REDUCED = 4
+local DETAIL_LIGHTS = 12
 local PARK_POSITION = Vector3.new(0, -1e5, 0)
 local DEFAULT_SMOOTH_DURATION = 1 / 60
 
@@ -15224,6 +15518,10 @@ local visualTombstones = 0
 local globalSimulationClock = 0
 local smoothVisuals: { Visual } = {}
 local nextSmoothSetRefresh = 0
+local nextDetailRefresh = 0
+local detailDirty = false -- (a visual with effects arrived or came back on screen)
+local detailBuckets: { { Visual } } = {}
+local detailCounts = { 0, 0, 0, 0 } -- full, reduced, bare, lit (last refresh)
 
 local function visualInView(visual: Types.Visual, position: Vector3): boolean
 	if visual.hidden then
@@ -15353,6 +15651,66 @@ local function refreshSmoothVisuals(now: number)
 	debug.profileend()
 end
 
+--------------------------------------------------------------------------------
+-- Effects budget: detail by distance rank (see MaxDetailed)
+--------------------------------------------------------------------------------
+
+local function refreshDetail(now: number)
+	detailDirty = false
+	nextDetailRefresh = now + DETAIL_REFRESH_INTERVAL
+	local camera = workspace.CurrentCamera
+	if not camera then
+		return
+	end
+	debug.profilebegin("ProjectileClient.RefreshDetail")
+	local eye = camera.CFrame.Position
+	for _, list in detailBuckets do
+		table.clear(list)
+	end
+	local bare = 0
+	-- Rank by distance without sorting: 4 buckets per doubling of distance,
+	-- nearest first (order within a bucket is arbitrary: they're within
+	-- ~20% of each other's distance).
+	for _, visual in visuals do
+		local rig = visual.rig
+		if not (rig and rig.effects) then
+			continue
+		end
+		if visual.hidden or visual.culled or not visual.inView then
+			VisualModel.SetDetail(visual, 3, false)
+			bare += 1
+			continue
+		end
+		local bucket = math.min(math.floor(math.log((visual.position - eye).Magnitude + 1, 2) * 4), 63) + 1
+		local list = detailBuckets[bucket]
+		if not list then
+			list = {}
+			detailBuckets[bucket] = list
+		end
+		table.insert(list, visual)
+	end
+	local full = renderSettings.MaxDetailed
+	local rank, counts = 0, { 0, 0, bare, 0 }
+	for bucket = 1, 64 do
+		local list = detailBuckets[bucket]
+		if not list or #list == 0 then
+			continue
+		end
+		for _, visual in list do
+			local tier = if rank < full then 1 elseif rank < full * DETAIL_REDUCED then 2 else 3
+			rank += 1
+			local lit = tier == 1 and counts[4] < DETAIL_LIGHTS
+			VisualModel.SetDetail(visual, tier, lit)
+			counts[tier] += 1
+			if lit then
+				counts[4] += 1
+			end
+		end
+	end
+	detailCounts = counts
+	debug.profileend()
+end
+
 local function setSmoothTarget(visual: Visual, now: number)
 	local previousTarget = visual.lastSmoothTarget
 	local duration = if previousTarget
@@ -15466,7 +15824,7 @@ local function onSpawn(data: Protocol.SpawnPayload)
 		inView = inView,
 		offscreenSince = if inView then nil else now,
 		culled = false,
-		effectCullDelay = VisualModel.GetLongestEffectLifetime(model),
+		effectCullDelay = VisualModel.GetLongestEffectLifetime(model, rig),
 		smoothTransform = false,
 		transformElapsed = 0,
 		transformDuration = 0,
@@ -15474,6 +15832,17 @@ local function onSpawn(data: Protocol.SpawnPayload)
 		parked = false,
 	}
 	BeamVisual.Attach(visual)
+	local effects = rig and rig.effects
+	if effects then
+		if effects.pendingTrails then
+			-- a reused model: its trails start once it has been placed
+			visual.suspendedTrails, effects.pendingTrails = effects.pendingTrails, nil
+			visual.resumeEffectsOnNextUpdate = now
+		end
+		-- Bare until this frame's detail pass ranks it (no burst of lights).
+		VisualModel.SetDetail(visual, 3, false)
+		detailDirty = true
+	end
 	if data.ActivateParticlesOnCreate then
 		VisualModel.ActivateParticles(model)
 	end
@@ -15621,13 +15990,16 @@ local function reenterView(visual: Visual, now: number)
 	visual.parked = false
 	visual.resumeEffectsOnNextUpdate = now
 	visual.offscreenSince = nil
+	detailDirty = true
 end
 
 -- Roblox performs draw culling. Keep the rig parented; after the authored
 -- effects' grace period we suspend emission and prediction/interpolation work.
 local function recoverStalePose(visual: Visual, position: Vector3, now: number)
 	local rig = visual.rig
-	if rig and rig.beam and rig.beam.group then return end -- shared geometry is flushed once per channel
+	-- (beams draw their own cylinders from their path, and their head part
+	-- isn't posed: see VisualModel.Place)
+	if rig and rig.beam then return end
 	if visual.parked then return end -- (hidden by the render limits: already out of sight)
 	-- Native culling uses the Instance's last rendered bounds. If a camera turn
 	-- exposes those stale bounds while the current trajectory is still outside
@@ -15803,6 +16175,9 @@ local function renderStep(globalDt: number)
 	View.refresh()
 	BeamChainVisual.Step(globalDt)
 	refreshSmoothVisuals(now)
+	if detailDirty or now >= nextDetailRefresh then
+		refreshDetail(now)
+	end
 
 	local slotCount = #visualOrder
 	local inspected = 0
@@ -15927,11 +16302,16 @@ function ProjectileClient.GetStats()
 		BeamSamples = beamSamples,
 		VisualUpdatesPerFrame = renderSettings.MaxUpdates,
 		SmoothLimit = renderSettings.MaxSmooth,
+		-- effects budget: visuals at full / reduced / bare detail, and lit
+		DetailFull = detailCounts[1],
+		DetailReduced = detailCounts[2],
+		DetailBare = detailCounts[3],
+		DetailLit = detailCounts[4],
 	}
 end
 
 -- Changes the render limits (any of MaxDistance, MaxRendered, MaxSmooth,
--- MaxUpdates);
+-- MaxUpdates, MaxDetailed);
 -- they apply from the next selection refresh (~0.1 s).
 function ProjectileClient.SetRenderSettings(settings: { [string]: number })
 	for key in renderSettings do
@@ -15955,6 +16335,7 @@ function ProjectileClient.SetRenderSettings(settings: { [string]: number })
 		smoothVisuals = retained
 	end
 	nextSmoothSetRefresh = 0
+	detailDirty = true
 end
 
 function ProjectileClient.GetRenderSettings(): { [string]: number }

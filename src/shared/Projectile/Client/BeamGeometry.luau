@@ -4,7 +4,12 @@
 -- tails become one cylinder, not stacked bars/glow. Distinct paths stay
 -- distinct: never invent a connecting chord through untraveled geometry.
 local Geometry = {}
-Geometry.MaxSegmentLength = 12
+-- Every piece is a pooled cylinder pair on its own Motor6D, and the joints
+-- are what a crowd of beams costs (client physics): 12-stud pieces made a
+-- 24-stud beam ten parts. Size and pose are applied together before the
+-- engine runs (BeamVisual.ApplyGroups), so a longer piece can't flash at a
+-- stale angle.
+Geometry.MaxSegmentLength = 48
 
 -- Tessellate after union, so overlaps are removed but no pooled cylinder can
 -- grow into an enormous bar on a flick or a stretched time-field boundary.

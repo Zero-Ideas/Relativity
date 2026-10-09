@@ -49,6 +49,7 @@ local GHOST_LIFETIME = 1.5 -- a dead sample still named as a link target
 local DRAIN_LIMIT = 5
 local IMPACT_THROTTLE, IMPACT_SPACING = 0.1, 4
 local ROTATION = CFrame.Angles(0, math.pi / 2, 0) -- cylinder X axis -> path Z
+local SIZE_SLACK = 0.02 -- studs a cylinder may be off before its Size is rewritten
 local DEATH_KINDS = { [DeathKind.World] = "world", [DeathKind.Entity] = "entity", [DeathKind.Other] = "detonate" }
 
 type Sample = {
@@ -91,6 +92,7 @@ local function part(parent: Instance, name: string, color: Color3, pose: CFrame?
 	p.Size = Vector3.one * 0.05
 	p.Material = Enum.Material.Neon
 	p.CanCollide, p.CanQuery, p.CanTouch, p.CastShadow = false, false, false, false
+	p.Massless = true -- (cosmetic: no mass to recompute when it's resized)
 	-- (posed before becoming visible: no one-frame default-axis flash)
 	if pose then
 		p.CFrame = pose
@@ -114,17 +116,29 @@ local function shape(chain: any, pool: { any }, index: number, pose: CFrame, siz
 		if ball then
 			core.Shape, glow.Shape = Enum.PartType.Ball, Enum.PartType.Ball
 		end
-		pair = { core = core, glow = glow, coreMotor = motor(chain.driver, core, pose), glowMotor = motor(chain.driver, glow, pose) }
+		local coreMotor = motor(chain.driver, core, pose)
+		pair = { core = core, glow = glow, coreMotor = coreMotor, glowMotor = motor(chain.driver, glow, pose),
+			inverse = coreMotor.C0:Inverse() }
 		pool[index] = pair
 	end
-	local transform = chain.driver.CFrame:ToObjectSpace(pose)
-	if pair.size ~= size then
+	-- (the driver never moves and a pair's C0 never changes: keep both
+	-- inverses instead of reading them back every frame)
+	local driverInverse = chain.driverInverse
+	if not driverInverse then
+		driverInverse = chain.driver.CFrame:Inverse()
+		chain.driverInverse = driverInverse
+	end
+	local transform = pair.inverse * (driverInverse * pose)
+	local last = pair.size
+	if not last or math.abs(last.X - size.X) > SIZE_SLACK or math.abs(last.Y - size.Y) > SIZE_SLACK then
+		-- (a beam's length jitters by float error every frame; changes this
+		-- small are invisible, and each write rebuilds the part)
 		pair.size = size
 		pair.core.Size = if ball then size * .55 else Vector3.new(size.X, size.Y * .55, size.Z * .55)
 		pair.glow.Size = size
 	end
-	pair.coreMotor.Transform = pair.coreMotor.C0:Inverse() * transform
-	pair.glowMotor.Transform = pair.glowMotor.C0:Inverse() * transform
+	pair.coreMotor.Transform = transform
+	pair.glowMotor.Transform = transform
 	if not pair.shown then
 		pair.shown = true
 		pair.core.Transparency, pair.glow.Transparency = 0, .5

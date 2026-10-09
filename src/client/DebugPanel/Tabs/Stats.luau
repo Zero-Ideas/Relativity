@@ -232,8 +232,9 @@ return function(window)
 		cMemory(fmt("%.0f MB", Stats:GetTotalMemoryUsageMb()))
 		cInstances(fmt("%d", readStat("InstanceCount")))
 		local clientStats = ProjectileClient.GetStats()
-		cVisuals(fmt("%d  (+ %d beam chains, %d samples)", clientStats.Visuals, clientStats.BeamChains or 0,
-			clientStats.BeamSamples or 0))
+		cVisuals(string.format("%d  (+ %d beam chains, %d samples; effects full %d / reduced %d / bare %d, %d lit)",
+			clientStats.Visuals, clientStats.BeamChains or 0, clientStats.BeamSamples or 0, clientStats.DetailFull or 0,
+			clientStats.DetailReduced or 0, clientStats.DetailBare or 0, clientStats.DetailLit or 0))
 	end
 
 	return { Active = setActive, Tick = sample }

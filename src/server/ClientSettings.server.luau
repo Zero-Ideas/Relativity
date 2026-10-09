@@ -25,6 +25,7 @@ local SCHEMA: { [string]: any } = {
 	MaxRendered = { 0, 50000 },
 	MaxSmooth = { 0, 5000 },
 	MaxUpdates = { 100, 20000 },
+	MaxDetailed = { 0, 1000 },
 	Glints = "boolean",
 	LensFlare = "boolean",
 	-- the Lighting tab's overrides (client/LightingSettings):

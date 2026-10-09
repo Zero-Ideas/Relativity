@@ -15,7 +15,27 @@ export type Rig = {
 	model: Instance,
 	root: BasePart,
 	poolKey: string?,
+	-- where `driver` sits (it's never rotated or moved after building, so a
+	-- pose's Transform is just pose - origin, no Instance read)
+	origin: Vector3?,
+	identityOffset: boolean?, -- rootOffset is the identity
 	beam: any?, -- bounded cylindrical path geometry (BeamVisual)
+	effects: Effects?, -- a styled / authored model's effects (VisualModel)
+}
+
+-- Everything in a model the effects budget and retirement touch, gathered
+-- once per model (a pooled model keeps it), plus what to restore on reuse.
+export type Effects = {
+	parts: { BasePart },
+	emitters: { ParticleEmitter },
+	trails: { Trail },
+	lights: { Light },
+	decor: { BasePart }, -- parts tagged LodDecor: hidden at the lowest detail
+	restoreInstances: { Instance },
+	restoreProperties: { string },
+	restoreValues: { any },
+	lifetime: number, -- see VisualModel.GetLongestEffectLifetime
+	pendingTrails: { Trail }?, -- a reused model's trails, held until it's placed
 }
 
 -- One rendered projectile. Physics fields mirror the server projectile and
@@ -68,6 +88,10 @@ export type Visual = {
 	transformElapsed: number,
 	transformDuration: number,
 	suspendedTrails: { Trail }?,
+	-- effects budget (ProjectileClient refreshDetail / VisualModel.SetDetail)
+	lodTier: number?, -- 1 full, 2 reduced, 3 bare
+	lodLight: boolean?,
+	lodOff: { Instance }?, -- emitters / trails the bare tier switched off
 
 	-- pass-by sound tracking (ProjectileClient.SetPassByHandler)
 	passApproaching: boolean?, -- closing on the camera, on a line within the pass radius

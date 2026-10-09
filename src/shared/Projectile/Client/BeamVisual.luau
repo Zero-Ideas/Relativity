@@ -21,6 +21,7 @@ local retired: { any } = {}
 local retireCursor = 1
 local clock = 0
 local ROTATION = CFrame.Angles(0, math.pi / 2, 0) -- cylinder's X axis -> path Z
+local SIZE_SLACK = 0.02 -- studs a cylinder may be off before its Size is rewritten
 local groups: { [number]: any } = {}
 local pending: { [any]: any } = {}
 local applyConnection: RBXScriptConnection? = nil
@@ -93,6 +94,7 @@ local function part(parent: Instance, name: string, color: Color3, transparency:
 	p.Size = Vector3.one * 0.05
 	p.Material = Enum.Material.Neon
 	p.CanCollide, p.CanQuery, p.CanTouch, p.CastShadow = false, false, false, false
+	p.Massless = true -- (cosmetic: no mass to recompute when it's resized)
 	-- Motor6D.Transform is applied in the engine's simulation phase. New
 	-- cylinders need their correct world pose BEFORE being made visible;
 	-- otherwise their default X-axis orientation flashes for one frame.
@@ -110,26 +112,50 @@ local function motor(driver: BasePart, p: BasePart, initialPose: CFrame?): Motor
 	return joint
 end
 
+-- Writes only what changed: a Size write makes the engine rebuild the part
+-- (and its assembly), and one per cylinder per frame was most of what a
+-- crowd of beams cost. The driver never moves and a pair's C0 never changes,
+-- so both inverses are kept instead of read back every frame.
 local function shape(group: any, pool: any, index: number, pose: CFrame, size: Vector3, ball: boolean)
 	local pair = pool[index]
 	if not pair then
 		local core = part(group.model, if ball then "BeamJointCore" else "BeamCore", group.core, 1, pose)
 		local glow = part(group.model, if ball then "BeamJointGlow" else "BeamGlow", group.color, 1, pose)
 		if ball then core.Shape = Enum.PartType.Ball; glow.Shape = Enum.PartType.Ball end
-		pair = { core = core, glow = glow, coreMotor = motor(group.driver, core, pose), glowMotor = motor(group.driver, glow, pose) }
+		local coreMotor = motor(group.driver, core, pose)
+		pair = { core = core, glow = glow, coreMotor = coreMotor, glowMotor = motor(group.driver, glow, pose),
+			inverse = coreMotor.C0:Inverse() }
 		pool[index] = pair
 	end
-	local transform = group.driver.CFrame:ToObjectSpace(pose)
-	pair.core.Size = if ball then size * .55 else Vector3.new(size.X, size.Y * .55, size.Z * .55)
-	pair.glow.Size = size
-	pair.coreMotor.Transform = pair.coreMotor.C0:Inverse() * transform
-	pair.glowMotor.Transform = pair.glowMotor.C0:Inverse() * transform
-	pair.core.Transparency, pair.glow.Transparency = 0, .5
+	local driverInverse = group.driverInverse
+	if not driverInverse or group.driverInverseOf ~= group.driver then
+		driverInverse = group.driver.CFrame:Inverse()
+		group.driverInverse, group.driverInverseOf = driverInverse, group.driver
+	end
+	local last = pair.size
+	if not last or math.abs(last.X - size.X) > SIZE_SLACK or math.abs(last.Y - size.Y) > SIZE_SLACK then
+		-- (a beam's length jitters by float error every frame; changes this
+		-- small are invisible, and each write rebuilds the part)
+		pair.size = size
+		pair.core.Size = if ball then size * .55 else Vector3.new(size.X, size.Y * .55, size.Z * .55)
+		pair.glow.Size = size
+	end
+	local transform = pair.inverse * (driverInverse * pose)
+	pair.coreMotor.Transform = transform
+	pair.glowMotor.Transform = transform
+	if not pair.shown then
+		pair.shown = true
+		pair.core.Transparency, pair.glow.Transparency = 0, .5
+	end
 end
 
 local function hideAfter(pool: any, used: number)
 	for index = used + 1, #pool do
-		pool[index].core.Transparency, pool[index].glow.Transparency = 1, 1
+		local pair = pool[index]
+		if pair.shown ~= false then
+			pair.shown = false
+			pair.core.Transparency, pair.glow.Transparency = 1, 1
+		end
 	end
 end
 
@@ -137,6 +163,7 @@ end
 -- Reusing a long cylinder at a new angle during Heartbeat otherwise exposes
 -- its new length at the old orientation for a rendered frame.
 function BeamVisual.ApplyGroups()
+	debug.profilebegin("BeamVisual.ApplyGroups")
 	for group, geometry in pending do
 		pending[group] = nil
 		if not group.model.Parent then continue end
@@ -153,6 +180,7 @@ function BeamVisual.ApplyGroups()
 		end
 		hideAfter(group.joints, #geometry.joints)
 	end
+	debug.profileend()
 end
 
 -- One aggregation per channel per frame, never one visible bar per packet.

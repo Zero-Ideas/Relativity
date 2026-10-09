@@ -13,6 +13,8 @@
 	  MaxUpdates   projectile redraws per frame (purely visual: positions come
 	               from elapsed time, so a visual left waiting catches up
 	               exactly when next redrawn -- never out of sync)
+	  MaxDetailed  projectiles with full effects (particles, lights, glow);
+	               farther ones get fewer or none
 	  (MaxDistance / MaxRendered / MaxUpdates also apply to beams; see
 	  Projectile/Client BeamVisual and BeamChainVisual)
 	  Glints       the cast glint on spell circles (off by default)
@@ -84,6 +86,7 @@ ClientSettings.Specs = {
 	{ Key = "MaxDistance", Label = "Projectile render distance (studs)", Kind = "number", Default = 2048, Min = 50, Max = 10000, Step = 50, Section = "Advanced", Description = "Beams too: the parts of a beam past this distance aren't drawn." },
 	{ Key = "MaxRendered", Label = "Max rendered projectiles", Kind = "number", Default = 5000, Min = 0, Max = 50000, Step = 100, Section = "Advanced", Description = "WARNING: Projectiles rejected at this cap stay invisible but can still deal damage. Also caps the pieces drawn for sustained beams." },
 	{ Key = "MaxSmooth", Label = "Max high-resolution projectiles (tweened)", Kind = "number", Default = 500, Min = 0, Max = 5000, Step = 25, Section = "Advanced" },
+	{ Key = "MaxDetailed", Label = "Projectiles with full effects", Kind = "number", Default = 48, Min = 0, Max = 1000, Step = 8, Section = "Advanced", Description = "The nearest this many on screen get full particles, lights and glow; a few times as many farther ones get some; the rest none. Lower it if crowds of spells slow you down." },
 	{ Key = "MaxUpdates", Label = "Projectile updates per frame", Kind = "number", Default = 2500, Min = 100, Max = 20000, Step = 100, Section = "Advanced", Description = "Sustained beams count each piece; past this they redraw in turns." },
 } :: { Spec }
 
@@ -102,12 +105,14 @@ local function apply(key: string?)
 	if not key or key == "HideUnintegratedUi" then
 		UiVisibility.SetEnabled(values.HideUnintegratedUi == true)
 	end
-	if not key or key == "MaxDistance" or key == "MaxRendered" or key == "MaxSmooth" or key == "MaxUpdates" then
+	if not key or key == "MaxDistance" or key == "MaxRendered" or key == "MaxSmooth" or key == "MaxUpdates"
+		or key == "MaxDetailed" then
 		ProjectileClient.SetRenderSettings({
 			MaxDistance = values.MaxDistance,
 			MaxRendered = values.MaxRendered,
 			MaxSmooth = values.MaxSmooth,
 			MaxUpdates = values.MaxUpdates,
+			MaxDetailed = values.MaxDetailed,
 		})
 	end
 	Presentation.Set(values.EffectsIntensity / 100, values.ReducedFlashes == true, values.CameraShake / 100)

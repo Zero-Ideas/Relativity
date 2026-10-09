@@ -97,7 +97,18 @@ local SMOOTH_SET_REFRESH_INTERVAL = 0.1 -- real seconds; selection is presentati
 --   MaxUpdates  -- on-screen redraws per frame (the round-robin budget;
 --                  presentation only: positions come from elapsed time, so a
 --                  visual left waiting catches up exactly on its next turn)
-local renderSettings = { MaxDistance = 2048, MaxRendered = 5000, MaxSmooth = 500, MaxUpdates = MAX_VISUAL_UPDATES_PER_FRAME }
+--   MaxDetailed -- the effects budget: the nearest this many on-screen
+--                  visuals with effects (orbs, bullets, authored models) get
+--                  full particles; up to DETAIL_REDUCED times as many get a
+--                  quarter of them; the rest none, and drop their LodDecor
+--                  parts (an orb's outer halo). Only the nearest DETAIL_LIGHTS
+--                  keep their lights. Particles were most of what a crowd of
+--                  orbs cost to draw.
+local renderSettings = { MaxDistance = 2048, MaxRendered = 5000, MaxSmooth = 500, MaxUpdates = MAX_VISUAL_UPDATES_PER_FRAME,
+	MaxDetailed = 48 }
+local DETAIL_REFRESH_INTERVAL = 0.1
+local DETAIL_REDUCED = 4
+local DETAIL_LIGHTS = 12
 local PARK_POSITION = Vector3.new(0, -1e5, 0)
 local DEFAULT_SMOOTH_DURATION = 1 / 60
 
@@ -113,6 +124,10 @@ local visualTombstones = 0
 local globalSimulationClock = 0
 local smoothVisuals: { Visual } = {}
 local nextSmoothSetRefresh = 0
+local nextDetailRefresh = 0
+local detailDirty = false -- (a visual with effects arrived or came back on screen)
+local detailBuckets: { { Visual } } = {}
+local detailCounts = { 0, 0, 0, 0 } -- full, reduced, bare, lit (last refresh)
 
 local function visualInView(visual: Types.Visual, position: Vector3): boolean
 	if visual.hidden then
@@ -242,6 +257,66 @@ local function refreshSmoothVisuals(now: number)
 	debug.profileend()
 end
 
+--------------------------------------------------------------------------------
+-- Effects budget: detail by distance rank (see MaxDetailed)
+--------------------------------------------------------------------------------
+
+local function refreshDetail(now: number)
+	detailDirty = false
+	nextDetailRefresh = now + DETAIL_REFRESH_INTERVAL
+	local camera = workspace.CurrentCamera
+	if not camera then
+		return
+	end
+	debug.profilebegin("ProjectileClient.RefreshDetail")
+	local eye = camera.CFrame.Position
+	for _, list in detailBuckets do
+		table.clear(list)
+	end
+	local bare = 0
+	-- Rank by distance without sorting: 4 buckets per doubling of distance,
+	-- nearest first (order within a bucket is arbitrary: they're within
+	-- ~20% of each other's distance).
+	for _, visual in visuals do
+		local rig = visual.rig
+		if not (rig and rig.effects) then
+			continue
+		end
+		if visual.hidden or visual.culled or not visual.inView then
+			VisualModel.SetDetail(visual, 3, false)
+			bare += 1
+			continue
+		end
+		local bucket = math.min(math.floor(math.log((visual.position - eye).Magnitude + 1, 2) * 4), 63) + 1
+		local list = detailBuckets[bucket]
+		if not list then
+			list = {}
+			detailBuckets[bucket] = list
+		end
+		table.insert(list, visual)
+	end
+	local full = renderSettings.MaxDetailed
+	local rank, counts = 0, { 0, 0, bare, 0 }
+	for bucket = 1, 64 do
+		local list = detailBuckets[bucket]
+		if not list or #list == 0 then
+			continue
+		end
+		for _, visual in list do
+			local tier = if rank < full then 1 elseif rank < full * DETAIL_REDUCED then 2 else 3
+			rank += 1
+			local lit = tier == 1 and counts[4] < DETAIL_LIGHTS
+			VisualModel.SetDetail(visual, tier, lit)
+			counts[tier] += 1
+			if lit then
+				counts[4] += 1
+			end
+		end
+	end
+	detailCounts = counts
+	debug.profileend()
+end
+
 local function setSmoothTarget(visual: Visual, now: number)
 	local previousTarget = visual.lastSmoothTarget
 	local duration = if previousTarget
@@ -355,7 +430,7 @@ local function onSpawn(data: Protocol.SpawnPayload)
 		inView = inView,
 		offscreenSince = if inView then nil else now,
 		culled = false,
-		effectCullDelay = VisualModel.GetLongestEffectLifetime(model),
+		effectCullDelay = VisualModel.GetLongestEffectLifetime(model, rig),
 		smoothTransform = false,
 		transformElapsed = 0,
 		transformDuration = 0,
@@ -363,6 +438,17 @@ local function onSpawn(data: Protocol.SpawnPayload)
 		parked = false,
 	}
 	BeamVisual.Attach(visual)
+	local effects = rig and rig.effects
+	if effects then
+		if effects.pendingTrails then
+			-- a reused model: its trails start once it has been placed
+			visual.suspendedTrails, effects.pendingTrails = effects.pendingTrails, nil
+			visual.resumeEffectsOnNextUpdate = now
+		end
+		-- Bare until this frame's detail pass ranks it (no burst of lights).
+		VisualModel.SetDetail(visual, 3, false)
+		detailDirty = true
+	end
 	if data.ActivateParticlesOnCreate then
 		VisualModel.ActivateParticles(model)
 	end
@@ -510,13 +596,16 @@ local function reenterView(visual: Visual, now: number)
 	visual.parked = false
 	visual.resumeEffectsOnNextUpdate = now
 	visual.offscreenSince = nil
+	detailDirty = true
 end
 
 -- Roblox performs draw culling. Keep the rig parented; after the authored
 -- effects' grace period we suspend emission and prediction/interpolation work.
 local function recoverStalePose(visual: Visual, position: Vector3, now: number)
 	local rig = visual.rig
-	if rig and rig.beam and rig.beam.group then return end -- shared geometry is flushed once per channel
+	-- (beams draw their own cylinders from their path, and their head part
+	-- isn't posed: see VisualModel.Place)
+	if rig and rig.beam then return end
 	if visual.parked then return end -- (hidden by the render limits: already out of sight)
 	-- Native culling uses the Instance's last rendered bounds. If a camera turn
 	-- exposes those stale bounds while the current trajectory is still outside
@@ -692,6 +781,9 @@ local function renderStep(globalDt: number)
 	View.refresh()
 	BeamChainVisual.Step(globalDt)
 	refreshSmoothVisuals(now)
+	if detailDirty or now >= nextDetailRefresh then
+		refreshDetail(now)
+	end
 
 	local slotCount = #visualOrder
 	local inspected = 0
@@ -816,11 +908,16 @@ function ProjectileClient.GetStats()
 		BeamSamples = beamSamples,
 		VisualUpdatesPerFrame = renderSettings.MaxUpdates,
 		SmoothLimit = renderSettings.MaxSmooth,
+		-- effects budget: visuals at full / reduced / bare detail, and lit
+		DetailFull = detailCounts[1],
+		DetailReduced = detailCounts[2],
+		DetailBare = detailCounts[3],
+		DetailLit = detailCounts[4],
 	}
 end
 
 -- Changes the render limits (any of MaxDistance, MaxRendered, MaxSmooth,
--- MaxUpdates);
+-- MaxUpdates, MaxDetailed);
 -- they apply from the next selection refresh (~0.1 s).
 function ProjectileClient.SetRenderSettings(settings: { [string]: number })
 	for key in renderSettings do
@@ -844,6 +941,7 @@ function ProjectileClient.SetRenderSettings(settings: { [string]: number })
 		smoothVisuals = retained
 	end
 	nextSmoothSetRefresh = 0
+	detailDirty = true
 end
 
 function ProjectileClient.GetRenderSettings(): { [string]: number }
