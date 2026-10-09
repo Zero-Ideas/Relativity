@@ -45,6 +45,7 @@ local View = require(script.View)
 local VisualModel = require(script.VisualModel)
 local BeamVisual = require(script.BeamVisual)
 local BeamChainVisual = require(script.BeamChainVisual)
+local BeamFlowVisual = require(script.BeamFlowVisual)
 
 type Visual = Types.Visual
 
@@ -780,6 +781,7 @@ local function renderStep(globalDt: number)
 	local now = os.clock()
 	View.refresh()
 	BeamChainVisual.Step(globalDt)
+	BeamFlowVisual.Step(globalDt)
 	refreshSmoothVisuals(now)
 	if detailDirty or now >= nextDetailRefresh then
 		refreshDetail(now)
@@ -896,16 +898,20 @@ function ProjectileClient.EnableClientRendering()
 	end)
 
 	BeamChainVisual.Enable()
+	BeamFlowVisual.Enable()
 	View.refresh()
 	Heartbeat.Connect(renderStep, { Name = "ProjectileSystem.ClientSimulate", Priority = 5 })
 end
 
 function ProjectileClient.GetStats()
 	local beamChains, beamSamples = BeamChainVisual.GetStats()
+	local flowBeams, flowPoints = BeamFlowVisual.GetStats()
 	return {
 		Visuals = visualCount,
 		BeamChains = beamChains,
 		BeamSamples = beamSamples,
+		FlowBeams = flowBeams, -- flowing beams (BeamFlowVisual) and their points
+		FlowPoints = flowPoints,
 		VisualUpdatesPerFrame = renderSettings.MaxUpdates,
 		SmoothLimit = renderSettings.MaxSmooth,
 		-- effects budget: visuals at full / reduced / bare detail, and lit
@@ -927,6 +933,7 @@ function ProjectileClient.SetRenderSettings(settings: { [string]: number })
 		end
 	end
 	BeamChainVisual.SetRenderSettings(renderSettings)
+	BeamFlowVisual.SetRenderSettings(renderSettings)
 	-- Lowering the cap takes effect now. Keep oldest admissions; retire the
 	-- newest excess without impact VFX, and never keep hidden simulation slots.
 	if visualCount > renderSettings.MaxRendered then

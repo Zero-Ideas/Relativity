@@ -7,6 +7,7 @@ local ChunkManager = require(script.Parent.Parent.Parent.ChunkManager)
 local Types = require(script.Parent.Types)
 local Protocol = require(script.Parent.Parent.Parent.Projectile.Protocol)
 local Geometry = require(script.Parent.BeamGeometry)
+local Ribbon = require(script.Parent.BeamRibbon)
 local View = require(script.Parent.View)
 local RunService = game:GetService("RunService")
 local Planner = require(script.Parent.Parent.Parent.Projectile.StepPlanner)
@@ -20,8 +21,7 @@ local MAX_RETIRE_UPDATES = 128
 local retired: { any } = {}
 local retireCursor = 1
 local clock = 0
-local ROTATION = CFrame.Angles(0, math.pi / 2, 0) -- cylinder's X axis -> path Z
-local SIZE_SLACK = 0.02 -- studs a cylinder may be off before its Size is rewritten
+local SIZE_SLACK = 0.02 -- studs a joint ball may be off before its Size is rewritten
 local groups: { [number]: any } = {}
 local pending: { [any]: any } = {}
 local applyConnection: RBXScriptConnection? = nil
@@ -167,14 +167,12 @@ function BeamVisual.ApplyGroups()
 	for group, geometry in pending do
 		pending[group] = nil
 		if not group.model.Parent then continue end
+		-- (one ribbon per straight piece: see BeamRibbon)
+		group.ribbons = group.ribbons or {}
 		for index, span in geometry.segments do
-			local a, b = span[1], span[2]
-			local length = (b - a).Magnitude
-			local up = if math.abs((b - a).Y / length) > .99 then Vector3.xAxis else Vector3.yAxis
-			shape(group, group.segments, index, CFrame.lookAt((a + b) * .5, b, up) * ROTATION,
-				Vector3.new(math.min(length, Geometry.MaxSegmentLength), group.radius * 2, group.radius * 2), false)
+			Ribbon.Set(group.ribbons, index, group.model, span[1], span[2], group.radius * 2, group.core, group.color)
 		end
-		hideAfter(group.segments, #geometry.segments)
+		Ribbon.HideAfter(group.ribbons, #geometry.segments)
 		for index, point in geometry.joints do
 			shape(group, group.joints, index, CFrame.new(point), Vector3.one * group.radius * 2, true)
 		end
@@ -247,9 +245,11 @@ local function releaseState(visual: Types.Visual)
 		group.byId[state.id] = nil
 		if next(group.members) == nil then
 			groups[group.id], pending[group] = nil, nil
+			Ribbon.Clear(group.ribbons) -- (their attachments are on Terrain)
 			group.model:Destroy()
 		end
 	end
+	Ribbon.Clear(state.ribbons)
 	visual.model:Destroy()
 end
 

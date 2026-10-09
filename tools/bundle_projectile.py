@@ -46,6 +46,7 @@ SECTIONS = [
         "src/server/Projectile/init.luau",
         "src/server/Projectile/BeamProjectileHandler.luau",
         "src/server/Projectile/BeamChain.luau",
+        "src/server/Projectile/BeamFlow.luau",
         "src/server/Projectile/Beams.luau",
         "src/server/ProjectileQuota.luau",
         "src/server/ProjectileWorkerBootstrap.server.luau",
@@ -60,6 +61,8 @@ SECTIONS = [
         "src/shared/Projectile/Client/BeamGeometry.luau",
         "src/shared/Projectile/Client/BeamVisual.luau",
         "src/shared/Projectile/Client/BeamChainVisual.luau",
+        "src/shared/Projectile/Client/BeamRibbon.luau",
+        "src/shared/Projectile/Client/BeamFlowVisual.luau",
         "src/shared/Projectile/Client/init.luau",
     ]),
 ]

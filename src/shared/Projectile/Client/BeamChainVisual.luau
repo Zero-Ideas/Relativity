@@ -8,8 +8,10 @@
 	constant acceleration, the chain's time scale, chunk dilation) between the
 	server's events. Every frame each sample's body is rebuilt the way the
 	server builds it: to the sample ahead through the bounce corners
-	(BeamPath.Plan), else its clipped / fragment / tail body. One pooled set of
-	cylinders per chain, posed through Motor6D.Transform like BeamVisual.
+	(BeamPath.Plan), else its clipped / fragment / tail body. Each straight leg
+	is one ribbon (BeamRibbon: two Roblox Beams between two attachments on
+	Terrain -- no parts or joints), with a pooled ball wherever a body ends or
+	bends sharply (those are still parts on the chain's motor root).
 
 	Timing: a chain keeps one clock offset (the smallest transit seen), so
 	samples from late messages catch up by exactly their extra delay and stay
@@ -17,9 +19,9 @@
 
 	Drawing: bodies are joined end to end into strands (a sample's body ends
 	where the one ahead of it starts) and vertices that are straight to within
-	a fraction of the radius are dropped, so a steady beam is a handful of
-	long cylinders however many samples it has. Cylinders are cut at fixed
-	lengths from the back, so only the front piece of a strand changes size.
+	a fraction of the radius are dropped, so a steady beam -- or one long link
+	the server keeps whole -- is one ribbon however long it is and however
+	many samples it has.
 ]]
 
 local RunService = game:GetService("RunService")
@@ -33,23 +35,22 @@ local BeamPath = require(ProjectileShared:WaitForChild("BeamPath"))
 local BeamWire = require(ProjectileShared:WaitForChild("BeamWire"))
 local View = require(script.Parent.View)
 local Impact = require(script.Parent.Impact)
+local Ribbon = require(script.Parent.BeamRibbon)
 
 local Op, Section, DeathKind, Flag = BeamWire.Op, BeamWire.Section, BeamWire.Death, BeamWire.SpawnFlag
 local ReadU8, ReadU32, ReadF32, ReadF64, ReadV3 = BeamWire.ReadU8, BeamWire.ReadU32, BeamWire.ReadF32, BeamWire.ReadF64, BeamWire.ReadV3
 
 local BeamChainVisual = {}
 
-local MAX_SEGMENT = 128 -- studs per pooled cylinder
 local STRAIGHT = 0.15 -- of the radius: how far a merged straight run may stray from a dropped vertex
 local EXPIRE_GRACE = 0.5 -- seconds a sample out of life waits for the server's death before dying here
-local MAX_PARTS_PER_FRAME = 3000 -- cylinders + joint balls shown at once, all chains (about where a live server starts to lag)
+local MAX_PARTS_PER_FRAME = 3000 -- ribbons + joint balls shown at once, all chains
 local JOINT_COS = math.cos(math.rad(12)) -- bends sharper than this get a ball
 local DEAD_GRACE = 0.25 -- real seconds a dead sample is kept for in-flight messages
 local GHOST_LIFETIME = 1.5 -- a dead sample still named as a link target
 local DRAIN_LIMIT = 5
 local IMPACT_THROTTLE, IMPACT_SPACING = 0.1, 4
-local ROTATION = CFrame.Angles(0, math.pi / 2, 0) -- cylinder X axis -> path Z
-local SIZE_SLACK = 0.02 -- studs a cylinder may be off before its Size is rewritten
+local SIZE_SLACK = 0.02 -- studs a joint ball may be off before its Size is rewritten
 local DEATH_KINDS = { [DeathKind.World] = "world", [DeathKind.Entity] = "entity", [DeathKind.Other] = "detonate" }
 
 type Sample = {
@@ -73,7 +74,7 @@ local chains: { [number]: any } = {}
 local pending: { [any]: any } = {}
 -- The player's projectile render limits (ClientSettings, via
 -- ProjectileClient.SetRenderSettings): nothing past MaxDistance studs from
--- the camera is drawn, at most MaxRendered pieces (cylinders + joint balls)
+-- the camera is drawn, at most MaxRendered pieces (ribbons + joint balls)
 -- are shown across all chains, and about MaxUpdates pieces are rebuilt per
 -- frame -- chains past that keep their last pose and go first next frame.
 local limits = { MaxDistance = 2048, MaxRendered = 5000, MaxUpdates = 2500 }
@@ -165,14 +166,10 @@ local function apply()
 		local diameter = chain.radius * 2
 		local segments = geometry.segments
 		for index = 1, #segments, 2 do
-			local a, b = segments[index], segments[index + 1]
-			local offset = b - a
-			local length = offset.Magnitude
-			local up = if math.abs(offset.Y / length) > .99 then Vector3.xAxis else Vector3.yAxis
-			shape(chain, chain.segments, (index + 1) // 2, CFrame.lookAt((a + b) * .5, b, up) * ROTATION,
-				Vector3.new(length, diameter, diameter), false)
+			Ribbon.Set(chain.ribbons, (index + 1) // 2, chain.model, segments[index], segments[index + 1], diameter,
+				chain.core, chain.color)
 		end
-		hideAfter(chain.segments, #segments // 2)
+		Ribbon.HideAfter(chain.ribbons, #segments // 2)
 		for index, point in geometry.joints do
 			shape(chain, chain.joints, index, CFrame.new(point), Vector3.one * diameter, true)
 		end
@@ -199,7 +196,7 @@ local function newChain(id: number): any
 		timeScale = 1,
 		offset = nil :: number?,
 		samples = {} :: { [number]: Sample },
-		segments = {},
+		ribbons = {},
 		joints = {},
 		drains = {},
 		ended = false,
@@ -213,6 +210,7 @@ end
 local function destroyChain(chain: any)
 	chains[chain.id] = nil
 	pending[chain] = nil
+	Ribbon.Clear(chain.ribbons) -- (their attachments are on Terrain)
 	chain.model:Destroy()
 end
 
@@ -661,8 +659,8 @@ function BeamChainVisual.Step(globalDt: number)
 		end
 		local partsBefore = partsLeft
 
-		-- Geometry: every visible piece, split into pooled cylinders, with a
-		-- ball wherever a body ends or bends sharply.
+		-- Geometry: every visible straight leg (one ribbon each), with a ball
+		-- wherever a body ends or bends sharply.
 		local segments: { Vector3 } = scratch.segments
 		local jointPoints: { Vector3 } = scratch.joints
 		local ends: { [Vector3]: number } = scratch.ends
@@ -711,13 +709,9 @@ function BeamChainVisual.Step(globalDt: number)
 				if from > 0 or to < length then
 					a, b, length = a + direction * from, a + direction * to, to - from
 				end
-				-- fixed-length pieces from the back; only the last one varies
-				local pieces = math.max(1, math.ceil(length / MAX_SEGMENT - 1e-6))
-				for piece = 1, pieces do
-					table.insert(segments, a + direction * ((piece - 1) * MAX_SEGMENT))
-					table.insert(segments, if piece == pieces then b else a + direction * (piece * MAX_SEGMENT))
-				end
-				partsLeft -= pieces
+				table.insert(segments, a)
+				table.insert(segments, b)
+				partsLeft -= 1
 			end
 			if lastDirection then
 				local tip = points[#points]

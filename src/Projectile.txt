@@ -18,7 +18,7 @@
 --     src/shared/Projectile/Protocol.luau (112 lines)
 --     src/shared/Projectile/Codec.luau (222 lines)
 --     src/shared/Projectile/BeamPath.luau (86 lines)
---     src/shared/Projectile/BeamWire.luau (149 lines)
+--     src/shared/Projectile/BeamWire.luau (171 lines)
 --   Server simulation
 --     src/server/Projectile/Types.luau (241 lines)
 --     src/server/Projectile/Config.luau (192 lines)
@@ -37,7 +37,8 @@
 --     src/server/Projectile/Parallel.luau (1076 lines)
 --     src/server/Projectile/init.luau (1589 lines)
 --     src/server/Projectile/BeamProjectileHandler.luau (377 lines)
---     src/server/Projectile/BeamChain.luau (1772 lines)
+--     src/server/Projectile/BeamChain.luau (1820 lines)
+--     src/server/Projectile/BeamFlow.luau (1243 lines)
 --     src/server/Projectile/Beams.luau (9 lines)
 --     src/server/ProjectileQuota.luau (41 lines)
 --     src/server/ProjectileWorkerBootstrap.server.luau (201 lines)
@@ -48,10 +49,12 @@
 --     src/shared/Projectile/Client/DebugRays.luau (42 lines)
 --     src/shared/Projectile/Client/Impact.luau (90 lines)
 --     src/shared/Projectile/Client/VisualModel.luau (771 lines)
---     src/shared/Projectile/Client/BeamGeometry.luau (121 lines)
+--     src/shared/Projectile/Client/BeamGeometry.luau (119 lines)
 --     src/shared/Projectile/Client/BeamVisual.luau (565 lines)
---     src/shared/Projectile/Client/BeamChainVisual.luau (854 lines)
---     src/shared/Projectile/Client/init.luau (951 lines)
+--     src/shared/Projectile/Client/BeamChainVisual.luau (848 lines)
+--     src/shared/Projectile/Client/BeamRibbon.luau (115 lines)
+--     src/shared/Projectile/Client/BeamFlowVisual.luau (418 lines)
+--     src/shared/Projectile/Client/init.luau (958 lines)
 
 -- =============================================================================
 -- SECTION: Shared foundations
@@ -3340,6 +3343,20 @@ return BeamPath
 	  Op.Scale  := f32 timeScale (the chain's personal/local dilation)
 	Section.End: the chain is gone on the server (every death already sent).
 	Section.Exit: this client left the chain's range; drop it without drains.
+
+	Flowing beams (server Projectile/BeamFlow -> client BeamFlowVisual) use
+	FlowChannel, with the same Section framing plus an f32 beam clock after
+	the server time:
+	  Header    := f32 radius, f32 lifetime, u8x3 color, u8x3 core, f32x3 accel, f32 timeScale
+	  FlowOp.Add    := u32 id, u32 olderId (0: the front), u8 kind, u8 flags, v3 pos, v3 vel, f32 age, f32 tau
+	  FlowOp.Pin    := u32 id, v3 pos, f32 tau        (a pinned / source point moved)
+	  FlowOp.State  := u32 id, u8 kind, u8 flags, v3 pos, v3 vel, f32 age, f32 tau
+	  FlowOp.Remove := u32 id
+	  FlowOp.Order  := u32 id, u32 olderId           (flowed past a pinned point)
+	  FlowOp.Scale  := f32 timeScale
+	  FlowOp.Impact := v3 pos, v3 normal, u8 kind (Death kinds)
+	Points are ordered oldest (the front) to newest; material joins each
+	point to the next older one unless the newer has FlowFlag.Gap.
 ]]
 
 local BeamWire = {}
@@ -3350,6 +3367,14 @@ BeamWire.Op = table.freeze({ End = 0, Spawn = 1, Pose = 2, Bounce = 3, Link = 4,
 BeamWire.Death = table.freeze({ Expire = 0, World = 1, Entity = 2, Other = 3 })
 -- Stopped: a sample already parked at a wall (dead), still anchoring followers.
 BeamWire.SpawnFlag = table.freeze({ Fragment = 1, Origin = 2, Joiner = 4, EverLinked = 8, Stopped = 16 })
+
+BeamWire.FlowChannel = "ProjBeamFlow"
+BeamWire.FlowOp = table.freeze({ End = 0, Add = 1, Pin = 2, State = 3, Remove = 4, Order = 5, Scale = 6, Impact = 7 })
+-- Free: moves with the beam. Source: the caster's end. Cut: pinned where the
+-- beam meets something that stops it. Corner: pinned where it bounces. In /
+-- Out: pinned where it enters / leaves something it passes through.
+BeamWire.AnchorKind = table.freeze({ Free = 0, Source = 1, Cut = 2, Corner = 3, In = 4, Out = 5 })
+BeamWire.FlowFlag = table.freeze({ Gap = 1 })
 
 export type Writer = { buf: buffer, n: number }
 
@@ -10558,6 +10583,13 @@ return Handler
 	 - Clients get one compact event stream per chain (see BeamWire): a new
 	   sample, a bounce, a link change, a clipped body, a death. Samples move
 	   deterministically in between, so nothing is sent per sample per frame.
+
+	Most sustained beams don't use samples at all any more: a lazy chain (no
+	homing, constant acceleration, no positional triggers) is a flowing beam
+	(BeamFlow) -- continuous material cut, bent and passed through where it
+	meets things, its packets reduced to energy tickets. Samples remain for
+	the rest, and for every chain when ServerScriptService has the
+	LegacyBeamPackets attribute set (read at startup).
 ]]
 
 local Players = game:GetService("Players")
@@ -10576,6 +10608,9 @@ local Projectile = require(script.Parent)
 local Config = require(script.Parent.Config)
 local Raycast = require(script.Parent.Raycast)
 local Profile = require(script.Parent.Profile)
+local Flow = require(script.Parent.BeamFlow)
+
+local FLOWING = game:GetService("ServerScriptService"):GetAttribute("LegacyBeamPackets") ~= true
 
 local Op, Section, DeathKind, Flag = BeamWire.Op, BeamWire.Section, BeamWire.Death, BeamWire.SpawnFlag
 local U8, U32, F32, F64, V3 = BeamWire.U8, BeamWire.U32, BeamWire.F32, BeamWire.F64, BeamWire.V3
@@ -10955,6 +10990,16 @@ function Chain.Launch(config: any, deferred: any?): any
 	local chain = chains[id] or newChain(id, config, settings)
 	if not chain.template or chain.template._raw ~= config.IgnoreInstances then
 		keepTemplate(chain, config, settings)
+	end
+	if FLOWING and chain.lazy and deferred and (chain.flow or #chain.samples == 0) then
+		-- a flowing beam: this packet is a point where the aim is and a ticket
+		chain.flow = chain.flow or Flow.New(chain, settings)
+		local point = Flow.Launch(chain.flow, settings, deferred)
+		chain.last = point
+		chain.lastLaunch = os.clock()
+		Profile.Add("Spawn", os.clock() - started)
+		Profile.Count("Spawned", 1)
+		return point
 	end
 	local s = fromSettings(chain, settings)
 	local previous = chain.last
@@ -11909,8 +11954,8 @@ local function replicate(globalDt: number)
 	end
 	for _, id in chainOrder do
 		local chain = chains[id]
-		if not chain then
-			continue
+		if not chain or chain.flow then
+			continue -- (flowing beams stream themselves: Flow.Replicate)
 		end
 		if not chain.visualize then
 			table.clear(chain.deaths)
@@ -12033,10 +12078,22 @@ Projectile.SetBeamSpanStep(function(globalDt: number)
 	local linkStarted = os.clock()
 	local now = os.clock()
 	local ended = {}
+	local endedFlows = {}
 	for offset = 1, orderCount do
 		local id = chainOrder[offset]
 		local chain = chains[id]
 		if not chain then
+			continue
+		end
+		local flow = chain.flow
+		if flow then
+			local flowStarted = os.clock()
+			Flow.Step(flow, globalDt)
+			Profile.Add("BeamFlow", os.clock() - flowStarted)
+			if Flow.Finished(flow) then
+				chain.finished = true
+				table.insert(endedFlows, chain)
+			end
 			continue
 		end
 		-- Drop the dead (their deaths are already queued for the stream).
@@ -12074,6 +12131,10 @@ Projectile.SetBeamSpanStep(function(globalDt: number)
 
 	local replicateStarted = os.clock()
 	replicate(globalDt)
+	Flow.Replicate()
+	for _, chain in endedFlows do
+		table.insert(ended, chain)
+	end
 	if #ended > 0 then
 		for _, chain in ended do
 			chains[chain.id] = nil
@@ -12108,6 +12169,8 @@ function Chain.GetJoinerStats()
 		end)(),
 		LazyLinks = lastStats.Lazy,
 		Chains = #chainOrder,
+		-- flowing beams: beams, points, tickets, casts / contacts since the last call
+		Flow = Flow.TakeStats(),
 		Created = lastStats.Created,
 		Updated = lastStats.Joiners,
 		BudgetSplits = lastStats.BudgetSplits,
@@ -12152,8 +12215,13 @@ local function tick(channel: any, slice: number, final: boolean)
 	local shot, origin, direction = channel.Aim()
 	channel.Carry += slice
 	local chain = chains[channel.Id]
+	if chain and chain.flow then
+		Flow.Aim(chain.flow, origin, direction) -- (the caster's end follows the aim between points)
+	end
 	local last = channel.Last
+	-- (a curved beam -- gravity -- keeps a point every tick: its arc is made of them)
 	if not final and last and chain and chain.lazy and chain.last == last.sample and not last.sample.Dead
+		and chain.header.gravity.Magnitude < 1e-6
 		and (channel.Carry + channel.Interval) * channel.Speed <= SKIP_SPACING
 		and direction:Dot(last.direction) >= SKIP_TURN and (origin - last.origin).Magnitude <= SKIP_SHIFT then
 		channel.Pending = { shot, direction }
@@ -12172,6 +12240,11 @@ local function flush(channel: any, castable: boolean)
 		fire(channel, pending[1], pending[2])
 	end
 	channel.Pending = nil
+	-- (the channel is over: a flowing beam's end lets go of the caster)
+	local chain = chains[channel.Id]
+	if chain and chain.flow then
+		Flow.Close(chain.flow)
+	end
 end
 
 function Chain.IsActive(player: Player): boolean
@@ -12298,6 +12371,1256 @@ end)
 return Chain
 -- =============================================================================
 -- END FILE: src/server/Projectile/BeamChain.luau
+-- =============================================================================
+
+-- =============================================================================
+-- BEGIN FILE: src/server/Projectile/BeamFlow.luau
+-- =============================================================================
+--!strict
+--[[
+	Projectile/BeamFlow.luau
+	Sustained beams as continuous material. No beamlets.
+
+	A beam is an ordered list of points, oldest (the front) to newest (the
+	caster's end). Material joins each point to the next older one unless
+	the newer point says Gap. Every bit of material left the caster at some
+	moment tau and flies at the beam's speed; a point carries the tau of the
+	material at it.
+
+	 - Free points move with the material (velocity + constant
+	   acceleration, chunk dilation). The caster emits one wherever the aim
+	   turned (BeamChain's channel skips the rest), so a steady beam is two
+	   points however long it is, and a sweep keeps its curve.
+	 - The Source point is the caster's end while the channel runs; when it
+	   stops, it becomes the free back end of the beam.
+	 - Pinned points sit on surfaces. Each frame the beam is cast from the
+	   point behind toward where its material would be had nothing stopped
+	   it -- a cut or a pass-through keeps a ghost of the material it took
+	   in flying on past the surface; a corner mirrors the reflected side
+	   back through it -- so a pinned point slides wherever that line meets
+	   the surface, and lets go (becomes free, where the material then is)
+	   once it doesn't:
+	     Cut     the beam runs into something that stops it. Material
+	             reaching it is absorbed; the next older point is the free
+	             back end of whatever got through before (Gap between them).
+	     Corner  it bounces: material reaching it turns (the points past it
+	             are mirrored), so it bends the beam without making another.
+	     In/Out  it passes through (pierce, penetration): material between
+	             them is inside the thing.
+	   Each frame the beam is cast from the caster's end toward its front,
+	   one cast per straight leg. Where a leg enters something, one more
+	   cast from the far side against only that thing finds where it comes
+	   out, and casting carries on from there -- so sweeping across two
+	   objects leaves a middle piece between them.
+
+	Damage and triggers: every packet the channel fires is a ticket -- its
+	energy and SpellRuntime's trigger binding (bound only when needed) --
+	at the tau in the middle of the material it was emitted with. A ticket
+	fires exactly as its packet would have: when its material is absorbed
+	(OnHit + OnDestroy entity/world: damage, On Impact), passes through
+	something (OnHit, pierce falloff), bounces (OnHit), or runs out
+	(OnDestroy, On Expire; or just gives its quota back).
+
+	Homing beams and positional triggers (On Timer / On Proximity) need
+	every bit of material's own path: those stay on BeamChain's packets.
+]]
+
+local Players = game:GetService("Players")
+local Shared = game:GetService("ReplicatedStorage"):WaitForChild("Shared")
+local ChunkManager = require(Shared:WaitForChild("ChunkManager"))
+local VisualOffload = require(Shared:WaitForChild("VisualOffload"))
+local SafeMath = require(Shared:WaitForChild("SafeMath"))
+local Entity = require(Shared:WaitForChild("Entity"))
+local ProjectileShared = Shared:WaitForChild("Projectile")
+local Planner = require(ProjectileShared:WaitForChild("StepPlanner"))
+local BeamWire = require(ProjectileShared:WaitForChild("BeamWire"))
+
+local Raycast = require(script.Parent.Raycast)
+local Profile = require(script.Parent.Profile)
+
+local Kind, FlowOp, FlowFlag, Section, DeathKind =
+	BeamWire.AnchorKind, BeamWire.FlowOp, BeamWire.FlowFlag, BeamWire.Section, BeamWire.Death
+local FREE, SOURCE, CUT, CORNER, IN, OUT = Kind.Free, Kind.Source, Kind.Cut, Kind.Corner, Kind.In, Kind.Out
+local U8, U32, F32, F64, V3 = BeamWire.U8, BeamWire.U32, BeamWire.F32, BeamWire.F64, BeamWire.V3
+
+local Flow = {}
+
+-- How far past a pinned point its recast looks (a surface sliding away from
+-- the beam is followed this far before the point lets go).
+local PIN_REACH = 2
+-- A pinned point's position is re-sent once it moves this far.
+local PIN_RESEND = 0.1
+-- Casts are cut at this length (shape casts stop at 1024).
+local MAX_CAST = 1000
+-- Where a cast resumes past an exit (so it doesn't find the same surface).
+local EXIT_STEP = 0.05
+-- Cuts at most this many points into a beam per frame (a pathological
+-- crowd of thin things).
+local MAX_CONTACTS = 64
+
+local function pinned(kind: number): boolean
+	return kind == CUT or kind == CORNER or kind == IN or kind == OUT
+end
+
+local function reflect(v: Vector3, normal: Vector3): Vector3
+	return v - 2 * v:Dot(normal) * normal
+end
+
+--------------------------------------------------------------------------------
+-- Beams
+--------------------------------------------------------------------------------
+
+local flows: { any } = {}
+local stats = { Beams = 0, Points = 0, Tickets = 0, Casts = 0, Contacts = 0 }
+
+local function newPoint(flow: any, kind: number, pos: Vector3, vel: Vector3, tau: number, age: number): any
+	local id = flow.nextId
+	flow.nextId += 1
+	return { id = id, kind = kind, pos = pos, vel = vel, tau = tau, age = age, gap = false, Dead = false }
+end
+
+local function insertAt(flow: any, index: number, point: any)
+	table.insert(flow.points, index, point)
+end
+
+local function removeAt(flow: any, index: number)
+	local point = table.remove(flow.points, index)
+	if point then
+		point.Dead = true
+		if point._rep then
+			table.insert(flow.removed, point.id)
+		end
+	end
+end
+
+local function dirty(point: any)
+	point._dirty = true
+end
+
+-- Material at `position` on the leg from `newer` to `older`.
+local function materialAt(newer: any, older: any, position: Vector3): (number, Vector3, number)
+	local offset = older.pos - newer.pos
+	local lengthSq = offset:Dot(offset)
+	local t = if lengthSq > 1e-8 then math.clamp((position - newer.pos):Dot(offset) / lengthSq, 0, 1) else 0
+	return newer.tau + (older.tau - newer.tau) * t, newer.vel:Lerp(older.vel, t), newer.age + (older.age - newer.age) * t
+end
+
+local function sourceScale(flow: any): number
+	local source = flow.sourceEntity
+	return SafeMath.number(source and source.TimeScale, 1, 0)
+end
+
+function Flow.New(chain: any, settings: any): any
+	local header = chain.header
+	local flow = {
+		chain = chain,
+		id = chain.id,
+		points = {},
+		tickets = {},
+		removed = {},
+		events = {},
+		impacts = {},
+		observers = {},
+		nextId = 1,
+		clock = 0,
+		lastLaunchTau = nil :: number?,
+		radius = settings.Radius,
+		speed = settings.Speed,
+		lifetime = settings.Lifetime,
+		accel = header.gravity,
+		bounces = settings.Bounces or 0,
+		restitution = settings.Restitution or 1,
+		penetration = settings.Penetration or 0,
+		pierces = settings.MaxPierces or 0,
+		falloff = settings.PierceFalloff or 0,
+		filter = settings.Filter,
+		sourceEntity = settings.Source,
+		rayParams = settings._rayParams or Raycast.buildRayParams(settings.Source, settings.IgnoreInstances),
+		visualize = settings.Visualize,
+		visualRange = settings.VisualRange or 800,
+		scale = 1,
+		header = header,
+		source = nil :: any,
+		finished = false,
+	}
+	flow.proxy = { Radius = flow.radius, _rayParams = flow.rayParams }
+	table.insert(flows, flow)
+	return flow
+end
+
+--------------------------------------------------------------------------------
+-- Tickets (a packet's energy and triggers)
+--------------------------------------------------------------------------------
+
+local Event = {}
+Event.__index = Event
+
+function Event.Connect(self: any, fn: (any) -> ())
+	table.insert(self, fn)
+	return {
+		Connected = true,
+		Disconnect = function(connection)
+			connection.Connected = false
+			local index = table.find(self, fn)
+			if index then
+				table.remove(self, index)
+			end
+		end,
+	}
+end
+
+function Event.Fire(self: any, info: any)
+	for index = 1, #self do
+		local fn = self[index]
+		if fn then
+			fn(info)
+		end
+	end
+end
+
+local Packet = {}
+Packet.__index = Packet
+function Packet.Destroy(_self: any) end
+function Packet.SetTimeScale(_self: any) end
+
+-- The projectile-shaped stand-in SpellRuntime's binding expects, made the
+-- first time the ticket's material does something.
+local function bound(flow: any, ticket: any, position: Vector3): any
+	local packet = ticket.packet
+	if not packet then
+		packet = setmetatable({
+			Damage = ticket.damage,
+			DamageMultiplier = 1,
+			Age = 0,
+			Velocity = ticket.velocity,
+			Position = position,
+			Dead = false,
+			Source = flow.sourceEntity,
+		}, Packet)
+		packet.OnHit = setmetatable({}, Event)
+		packet.OnDestroy = setmetatable({}, Event)
+		ticket.packet = packet
+		local bind = ticket.bind
+		ticket.bind, ticket.discard = nil, nil
+		if bind then
+			bind(packet)
+		end
+	end
+	packet.Position = position
+	packet.Age = math.max(flow.clock - ticket.tau, 0)
+	return packet
+end
+
+local function hitInfo(position: Vector3, normal: Vector3, part: Instance?, entity: any?): any
+	local hurtbox = nil
+	if entity then
+		hurtbox = "Body"
+		local head = entity:GetHeadPosition()
+		if head and (position - head).Magnitude <= entity.HeadRadius then
+			hurtbox = "Head"
+		end
+	end
+	return Raycast.buildHitInfo({ Position = position, Normal = normal, Instance = part, Distance = 0 } :: any, entity,
+		hurtbox)
+end
+
+-- The ticket is spent: its packet "died" with `kind` (nil: ran out).
+local function finish(flow: any, ticket: any, position: Vector3, normal: Vector3, kind: string?)
+	ticket.done = true
+	if not ticket.packet and kind == nil and not flow.chain.expireTriggers then
+		local discard = ticket.discard
+		ticket.bind, ticket.discard = nil, nil
+		if discard then
+			discard() -- (nothing to fire: just its quota slot back)
+		end
+		return
+	end
+	local packet = bound(flow, ticket, position)
+	packet.Dead = true
+	packet.OnDestroy:Fire({ Position = position, Normal = normal, Kind = kind })
+end
+
+-- Applies this frame's events to the tickets whose tau they cover.
+local function settleTickets(flow: any)
+	local tickets = flow.tickets
+	if #tickets == 0 then
+		table.clear(flow.events)
+		return
+	end
+	for _, event in flow.events do
+		local lo, hi = event.lo, event.hi
+		if not (hi > lo) then
+			continue
+		end
+		for _, ticket in tickets do
+			local tau = ticket.tau
+			if ticket.done or tau <= lo or tau > hi then
+				continue
+			end
+			local position, normal = event.pos, event.normal
+			if event.kind == "absorb" then
+				local packet = bound(flow, ticket, position)
+				packet.OnHit:Fire(hitInfo(position, normal, event.part, event.entity))
+				finish(flow, ticket, position, normal, if event.entity then "entity" else "world")
+			elseif event.kind == "pierce" then
+				local seen = ticket.passed
+				if not seen then
+					seen = {}
+					ticket.passed = seen
+				end
+				if not seen[event.entity] then
+					seen[event.entity] = true
+					local packet = bound(flow, ticket, position)
+					packet.OnHit:Fire(hitInfo(position, normal, event.part, event.entity))
+					packet.DamageMultiplier *= 1 - flow.falloff
+				end
+			elseif event.kind == "pass" or event.kind == "bounce" then
+				local packet = bound(flow, ticket, position)
+				packet.OnHit:Fire(hitInfo(position, normal, event.part, nil))
+			end
+		end
+	end
+	table.clear(flow.events)
+	-- spent tickets out
+	local kept = 0
+	for index = 1, #tickets do
+		local ticket = tickets[index]
+		if not ticket.done then
+			kept += 1
+			tickets[kept] = ticket
+		end
+	end
+	for index = kept + 1, #tickets do
+		tickets[index] = nil
+	end
+end
+
+-- Tickets whose material is older than the beam's front ran out.
+local function expireTickets(flow: any, frontTau: number?, position: Vector3?)
+	for _, ticket in flow.tickets do
+		if not ticket.done and (frontTau == nil or ticket.tau < frontTau) then
+			finish(flow, ticket, position or ticket.origin, Vector3.yAxis, nil)
+		end
+	end
+end
+
+--------------------------------------------------------------------------------
+-- Launch (one per packet the channel fires)
+--------------------------------------------------------------------------------
+
+-- `settings`: the packet's normalized config; `deferred`: SpellRuntime's
+-- binding { Bind, Discard }. Adds a free point where the aim turned and a
+-- ticket for the material emitted since the last launch.
+function Flow.Launch(flow: any, settings: any, deferred: any): any
+	local clock = flow.clock
+	local origin = settings.Origin
+	local velocity = settings.Direction * settings.Speed
+	local points = flow.points
+	local source = flow.source
+	if not source then
+		source = newPoint(flow, SOURCE, origin, velocity, clock, 0)
+		table.insert(points, source)
+		flow.source = source
+	end
+	-- the knot sits just older than the source (the source stays newest)
+	local knot = newPoint(flow, FREE, origin, velocity, clock, 0)
+	local index = table.find(points, source) or (#points + 1)
+	insertAt(flow, index, knot)
+	source.pos, source.vel, source.tau, source.age = origin, velocity, clock, 0
+	dirty(source)
+	local from = flow.lastLaunchTau or clock
+	flow.lastLaunchTau = clock
+	table.insert(flow.tickets, {
+		tau = (from + clock) * .5,
+		damage = settings.Damage or 0,
+		velocity = velocity,
+		origin = origin,
+		bind = deferred and deferred.Bind,
+		discard = deferred and deferred.Discard,
+	})
+	return knot
+end
+
+-- The caster's end follows the live aim between launches.
+function Flow.Aim(flow: any, origin: Vector3, direction: Vector3)
+	local source = flow.source
+	if source and source.kind == SOURCE then
+		source.pos, source.vel = origin, direction * flow.speed
+	end
+end
+
+-- The channel stopped: its end becomes the free back of the beam.
+function Flow.Close(flow: any)
+	local source = flow.source
+	if source and source.kind == SOURCE then
+		source.kind = FREE
+		dirty(source)
+	end
+	flow.source = nil
+	flow.closed = true
+end
+
+--------------------------------------------------------------------------------
+-- Casting
+--------------------------------------------------------------------------------
+
+local includeParams: { [Instance]: RaycastParams } = setmetatable({}, { __mode = "k" }) :: any
+
+local function only(target: Instance): RaycastParams
+	local params = includeParams[target]
+	if not params then
+		params = RaycastParams.new()
+		params.FilterType = Enum.RaycastFilterType.Include
+		params.FilterDescendantsInstances = { target }
+		includeParams[target] = params
+	end
+	return params
+end
+
+-- First thing the beam's body meets from `from` along `direction` within
+-- `length`: (distance, contact) or nil.
+local function cast(flow: any, from: Vector3, direction: Vector3, length: number): (number?, any?)
+	local traveled = 0
+	while traveled < length - 1e-4 do
+		local distance = math.min(length - traveled, MAX_CAST)
+		stats.Casts += 1
+		local contact = Raycast.castMovement(flow.proxy, from + direction * traveled, direction * distance)
+		if contact then
+			return traveled + (contact.Distance or 0), contact
+		end
+		traveled += distance
+	end
+	return nil, nil
+end
+
+-- What a contact belongs to for "is it the same thing": its entity's
+-- model, else the part.
+local function targetOf(part: Instance): (Instance, any?)
+	local entity = Entity.Get(part)
+	if entity and entity.Instance then
+		return entity.Instance, entity
+	end
+	return part, nil
+end
+
+-- Where the run of points older than `index` (from `entry` on) comes back out
+-- of `target`: (index of the older point of the leg it's on, point), or nil
+-- when it never does before the run ends.
+local function exitOf(flow: any, index: number, entry: Vector3, target: Instance): (number?, Vector3?)
+	local points = flow.points
+	local params = only(target)
+	local newer = entry
+	local k = index
+	while k >= 1 do
+		local older = points[k].pos
+		local offset = newer - older
+		local length = offset.Magnitude
+		if length > 1e-4 then
+			stats.Casts += 1
+			local result = workspace:Raycast(older, offset.Unit * math.min(length, MAX_CAST), params)
+			if result then
+				return k, older + offset.Unit * result.Distance
+			end
+		end
+		if k == 1 or points[k].gap then
+			return nil, nil
+		end
+		newer = older
+		k -= 1
+	end
+	return nil, nil
+end
+
+--------------------------------------------------------------------------------
+-- Frame
+--------------------------------------------------------------------------------
+
+local function event(flow: any, kind: string, lo: number, hi: number, pos: Vector3, normal: Vector3, part: Instance?,
+	entity: any?)
+	table.insert(flow.events, { kind = kind, lo = lo, hi = hi, pos = pos, normal = normal, part = part, entity = entity })
+end
+
+-- Material that flowed through a pinned point since last frame.
+local function flowedThrough(flow: any, point: any)
+	local previous = point.prevTau or point.tau
+	if point.tau > previous then
+		local kind = if point.kind == CUT then "absorb"
+			elseif point.kind == CORNER then "bounce"
+			elseif point.passKind == "pierce" then "pierce"
+			elseif point.passKind == "penetrate" then "pass"
+			else nil
+		if kind then
+			event(flow, kind, previous, point.tau, point.pos, point.normal or Vector3.yAxis, point.part, point.entity)
+		end
+	end
+	point.prevTau = point.tau
+end
+
+local function mirror(position: Vector3, planePoint: Vector3, normal: Vector3): Vector3
+	return position - 2 * (position - planePoint):Dot(normal) * normal
+end
+
+-- The material just past pinned point `b` as if nothing had stopped it:
+-- (position, velocity, tau), or nil.
+local function beyond(flow: any, b: any, older: any?): (Vector3?, Vector3?, number?)
+	if older and not b.gap then
+		if b.kind == CORNER then
+			return mirror(older.pos, b.pos, b.normal), reflect(older.vel, b.normal), older.tau
+		elseif b.kind == IN and older.kind == FREE then
+			return older.pos, older.vel, older.tau -- (the material inside)
+		end
+	end
+	local ghost = b.ghost
+	if ghost then
+		return ghost.pos, ghost.vel, ghost.tau
+	end
+	return nil, nil, nil
+end
+
+-- A frozen copy of material state that keeps flying (see `beyond`).
+local function ghostOf(pos: Vector3, vel: Vector3, tau: number): any
+	return { pos = pos, vel = vel, tau = tau }
+end
+
+-- A free point that flowed past the pinned point ahead of it this frame:
+-- absorbed (cut), turned (corner), or now on the other side (in / out).
+local function flowPast(flow: any)
+	local points = flow.points
+	local index = 2
+	local guard = 0
+	while index <= #points and guard < 4096 do
+		guard += 1
+		local x, y = points[index], points[index - 1]
+		if x.kind == FREE and not x.gap and pinned(y.kind) then
+			local speed = x.vel.Magnitude
+			if speed > 1e-4 and (x.pos - y.pos):Dot(x.vel / speed) > 0 then
+				if y.kind == CUT then
+					-- absorbed; it's now the material the cut aims along
+					y.ghost = ghostOf(x.pos, x.vel, x.tau)
+					removeAt(flow, index)
+					continue
+				end
+				if y.kind == CORNER then
+					local normal = y.normal
+					x.pos = x.pos - 2 * (x.pos - y.pos):Dot(normal) * normal
+					x.vel = reflect(x.vel, normal) * flow.restitution
+				elseif y.kind == OUT and y.entry then
+					-- out the far side: the entry now aims along it
+					y.entry.ghost = ghostOf(x.pos, x.vel, x.tau)
+				end
+				points[index], points[index - 1] = y, x
+				x._reordered, y._reordered = true, true
+				dirty(x)
+				index = math.max(index - 1, 2)
+				continue
+			end
+		end
+		index += 1
+	end
+end
+
+-- Lets go of pinned point `index` (its surface is gone from the beam).
+local function release(flow: any, index: number)
+	local points = flow.points
+	local point = points[index]
+	local newer = points[index + 1]
+	local incoming = if newer then newer.vel else point.vel
+	-- Where its material is now: along the line from the point behind to
+	-- the material beyond, at its tau (not stuck where it last touched).
+	local farPos, farVel, farTau = beyond(flow, point, points[index - 1])
+	if newer and farPos and farVel and farTau and newer.tau ~= farTau then
+		local t = math.clamp((newer.tau - point.tau) / (newer.tau - farTau), 0, 1)
+		point.pos = newer.pos:Lerp(farPos, t)
+		incoming = newer.vel:Lerp(farVel, t)
+	end
+	point.ghost = nil
+	if point.kind == CUT then
+		point.kind, point.vel = FREE, incoming
+	elseif point.kind == CORNER then
+		-- the reflected material's back end, and the incoming beam's new front
+		-- (nothing between them: they part ways)
+		point.kind, point.vel = FREE, reflect(incoming, point.normal) * flow.restitution
+		point.marker = "bounce"
+		local front = newPoint(flow, FREE, point.pos, incoming, point.tau + 1e-6, point.age)
+		front.gap = true
+		insertAt(flow, index + 1, front)
+	elseif point.kind == IN then
+		local out = point.pair
+		removeAt(flow, index)
+		if out and not out.Dead then
+			out.kind = FREE
+			out.vel = incoming
+			dirty(out)
+		end
+		return
+	elseif point.kind == OUT then
+		point.kind, point.vel = FREE, incoming
+	end
+	point.age = math.max(flow.clock - point.tau, 0)
+	dirty(point)
+end
+
+-- Material state just older than point `point`: what it has passed.
+local function note(state: any, point: any, frame: number)
+	if point._noted == frame then
+		return
+	end
+	point._noted = frame
+	local marker = point.marker
+	if marker == "pierce" then
+		state.pierces += 1
+		if point.entity then
+			state.passed[point.entity] = true
+		end
+	elseif marker == "penetrate" then
+		state.penetration += point.thickness or 0
+	elseif marker == "bounce" or point.kind == CORNER then
+		state.bounces += 1
+	end
+end
+
+-- The lowest tau in the run of points from `index` down to its front.
+local function runFront(points: { any }, index: number): (number, number)
+	local lowest, k = math.huge, index
+	while k >= 1 do
+		lowest = math.min(lowest, points[k].tau)
+		if k == 1 or points[k].gap then
+			break
+		end
+		k -= 1
+	end
+	return lowest, k
+end
+
+-- The beam met something on the leg from points[index] to points[index - 1]
+-- at `distance` along `direction`. Cuts / bends / passes it there; returns
+-- the index to carry on from.
+local function contactAt(flow: any, index: number, distance: number, direction: Vector3, contact: any, state: any): number
+	local points = flow.points
+	local a, b = points[index], points[index - 1]
+	stats.Contacts += 1
+	local position = a.pos + direction * distance
+	local tau, vel, age = materialAt(a, b, position)
+	local part = contact.Instance
+	local target, entity = targetOf(part)
+	local normal = SafeMath.unit(contact.Normal, -direction)
+	local impactKind = if entity then DeathKind.Entity else DeathKind.World
+
+	-- Where it comes back out, and the material there (on the leg the exit
+	-- is on: from `position` itself, or from the point that leg starts at).
+	local exitIndex, exitPoint = exitOf(flow, index - 1, position, target)
+	local exitTau, exitVel, exitAge, exitDirection = 0, vel, age, direction
+	if exitIndex and exitPoint then
+		local older = points[exitIndex]
+		local newer = if exitIndex == index - 1 then { pos = position, tau = tau, vel = vel, age = age } else points[exitIndex + 1]
+		exitTau, exitVel, exitAge = materialAt(newer, older, exitPoint)
+		local leg = older.pos - newer.pos
+		if leg.Magnitude > 1e-4 then
+			exitDirection = leg.Unit
+		end
+	end
+
+	local reaction
+	if entity then
+		local wanted = entity ~= flow.sourceEntity and (not flow.filter or flow.filter(entity))
+		reaction = if not wanted or state.passed[entity] then "ghost"
+			elseif state.pierces < flow.pierces then "pierce"
+			else "cut"
+	else
+		local thickness = if exitPoint then (exitPoint - position).Magnitude else math.huge
+		reaction = if flow.penetration - state.penetration >= thickness then "penetrate"
+			elseif state.bounces < flow.bounces then "bounce"
+			else "cut"
+	end
+
+	-- What keeps flying past the surface, for re-aiming the pinned point:
+	-- the material at the exit, else the far end of this leg. (A cut's ghost
+	-- then moves on to each point the surface takes in: see flowPast.)
+	local ghost = if exitPoint then ghostOf(exitPoint, exitVel, exitTau) else ghostOf(b.pos, b.vel, b.tau)
+
+	if reaction == "bounce" then
+		local corner = newPoint(flow, CORNER, position, vel, tau, age)
+		corner.normal, corner.part, corner.prevTau, corner.plane = normal, part, tau, position
+		insertAt(flow, index, corner)
+		-- material already past the surface turns back out of it
+		local lowest = tau
+		local k = index - 1
+		while k >= 1 do
+			local p = points[k]
+			if (p.pos - position):Dot(normal) < 0 then
+				p.pos = p.pos - 2 * (p.pos - position):Dot(normal) * normal
+				p.vel = reflect(p.vel, normal) * flow.restitution
+				lowest = math.min(lowest, p.tau)
+				dirty(p)
+			end
+			if k == 1 or p.gap then
+				break
+			end
+			k -= 1
+		end
+		event(flow, "bounce", lowest - 1e-6, tau, position, normal, part, nil)
+		table.insert(flow.impacts, { position, normal, DeathKind.World })
+		return index -- (next: the corner's leg)
+	end
+
+	if reaction == "cut" then
+		local cut = newPoint(flow, CUT, position, vel, tau, age)
+		cut.normal, cut.part, cut.entity, cut.prevTau, cut.ghost = normal, part, entity, tau, ghost
+		table.insert(flow.impacts, { position, normal, impactKind })
+		if exitIndex and exitPoint then
+			-- the points between the entry and the exit's leg are inside it
+			for k = index - 1, exitIndex + 1, -1 do
+				removeAt(flow, k)
+			end
+			local back = newPoint(flow, FREE, exitPoint + exitDirection * EXIT_STEP, exitVel, exitTau, exitAge)
+			insertAt(flow, exitIndex + 1, back) -- (the older piece's new back end)
+			insertAt(flow, exitIndex + 2, cut)
+			cut.gap = true
+			event(flow, "absorb", exitTau, tau, position, normal, part, entity)
+			return exitIndex + 1
+		end
+		-- never comes out: everything older in this run is inside
+		local lowest, front = runFront(points, index - 1)
+		for k = index - 1, front, -1 do
+			removeAt(flow, k)
+		end
+		insertAt(flow, front, cut)
+		cut.gap = front > 1
+		event(flow, "absorb", lowest - 1e-6, tau, position, normal, part, entity)
+		return front
+	end
+
+	-- passes through (pierce / penetrate / ghost: something it ignores)
+	local entry = newPoint(flow, IN, position, vel, tau, age)
+	entry.normal, entry.part, entry.entity, entry.prevTau, entry.passKind = normal, part, entity, tau, reaction
+	entry.ghost = ghost
+	local eventKind = if reaction == "pierce" then "pierce" elseif reaction == "penetrate" then "pass" else nil
+	insertAt(flow, index, entry)
+	if not (exitIndex and exitPoint) then
+		-- its front is still inside: the exit appears once material leaves
+		if eventKind then
+			local lowest = runFront(points, index - 1)
+			event(flow, eventKind, lowest - 1e-6, tau, position, normal, part, entity)
+		end
+		return index - 1
+	end
+	local out = newPoint(flow, OUT, exitPoint, exitVel, exitTau, exitAge)
+	out.part, out.entity, out.marker, out.normal = part, entity, reaction, -exitDirection
+	out.thickness = (exitPoint - position).Magnitude
+	insertAt(flow, exitIndex + 1, out)
+	entry.pair, out.entry = out, entry
+	if eventKind then
+		event(flow, eventKind, exitTau, tau, position, normal, part, entity)
+	end
+	return exitIndex + 1
+end
+
+-- Re-finds a pass-through's exit: back along the line from its ghost
+-- (the material beyond) toward `from`, against only what it passes through.
+local function reexit(flow: any, entry: any, from: Vector3)
+	local out = entry.pair
+	if not out or out.Dead then
+		return
+	end
+	local points = flow.points
+	local outIndex = table.find(points, out)
+	local past = outIndex and outIndex > 1 and not out.gap and points[outIndex - 1] or nil
+	local start = if past then past.pos elseif entry.ghost then entry.ghost.pos else nil
+	if not start then
+		return
+	end
+	local offset = from - start
+	local length = offset.Magnitude
+	if length < 1e-4 then
+		return
+	end
+	stats.Casts += 1
+	local result = workspace:Raycast(start, offset.Unit * math.min(length, MAX_CAST), only(targetOf(entry.part)))
+	if result then
+		local point = start + offset.Unit * result.Distance
+		out.pos = point
+		out.thickness = (point - entry.pos).Magnitude
+	end
+end
+
+local frameNumber = 0
+
+local function collide(flow: any)
+	frameNumber += 1
+	local points = flow.points
+	local state = { pierces = 0, penetration = 0, bounces = 0, passed = {} }
+	local index = #points
+	local contacts = 0
+	local guard = 0
+	while index >= 2 and guard < 8192 do
+		guard += 1
+		local a = points[index]
+		note(state, a, frameNumber)
+		local b = points[index - 1]
+		if a.gap then
+			index -= 1
+			continue
+		end
+		if a.kind == IN then
+			-- inside what it passes through: no casts until its exit
+			local out = a.pair
+			local k = index - 1
+			while k >= 1 and points[k] ~= out do
+				if points[k].gap then
+					break
+				end
+				k -= 1
+			end
+			index = if k >= 1 and points[k] == out then k else index - 1
+			continue
+		end
+		local offset = b.pos - a.pos
+		local length = offset.Magnitude
+		local direction = if length > 1e-4 then offset / length
+			elseif a.vel.Magnitude > 1e-4 then a.vel.Unit
+			else nil
+		if not direction then
+			index -= 1
+			continue
+		end
+		if b.kind == CUT or b.kind == CORNER or b.kind == IN then
+			-- Cast toward where the material would be without the surface
+			-- (never toward the pinned spot itself: that always hits, and
+			-- the beam would stay strung to it).
+			local farPos, _, farTau = beyond(flow, b, points[index - 2])
+			local aim = if farPos then farPos - a.pos else direction * (length + PIN_REACH)
+			local reach = aim.Magnitude
+			if reach < 1e-4 then
+				index -= 1
+				continue
+			end
+			local heading = aim / reach
+			local distance, contact = cast(flow, a.pos, heading, reach + (if farPos then 0 else PIN_REACH))
+			if contact and distance then
+				local target = targetOf(contact.Instance)
+				local same = target == targetOf(b.part)
+				local before = (b.pos - a.pos).Magnitude
+				if same or distance >= before - 1e-3 then
+					local point = a.pos + heading * distance
+					b.pos = point
+					b.normal = SafeMath.unit(contact.Normal, b.normal or -heading)
+					b.part = if same then b.part else contact.Instance
+					local tau = if farTau then a.tau + (farTau - a.tau) * math.clamp(distance / reach, 0, 1)
+						else a.tau - distance / math.max(a.vel.Magnitude, 1e-3)
+					b.tau = math.max(tau, b.tau)
+					b.age = math.max(flow.clock - b.tau, 0)
+					if b.kind == IN then
+						reexit(flow, b, a.pos)
+					end
+					flowedThrough(flow, b)
+					index -= 1
+					continue
+				elseif contacts < MAX_CONTACTS then
+					-- something new came between
+					contacts += 1
+					index = contactAt(flow, index, distance, heading, contact, state)
+					continue
+				end
+			end
+			release(flow, index - 1)
+			continue -- (same leg again, now to a free point)
+		end
+		-- a leg of plain material
+		local distance, contact = cast(flow, a.pos, direction, length)
+		if contact and distance and contacts < MAX_CONTACTS then
+			contacts += 1
+			index = contactAt(flow, index, distance, direction, contact, state)
+			continue
+		end
+		index -= 1
+	end
+end
+
+local function unpin(flow: any)
+	local points = flow.points
+	local clock = flow.clock
+	-- Pinned points nothing flows into any more (the beam's back end went
+	-- in, bounced or passed through): a cut is just a spot on a wall, gone;
+	-- a corner becomes the free back end of the reflected beam, which flies
+	-- off at its full length instead of staying strung to the wall; a
+	-- pass-through's entry goes and its exit flies on with the material.
+	local index = 1
+	while index <= #points do
+		local point = points[index]
+		local newer = points[index + 1]
+		local fed = newer ~= nil and not newer.gap
+		if not fed and point.kind == CUT then
+			removeAt(flow, index)
+			if newer then
+				newer.gap = index > 1 and newer.gap
+				dirty(newer)
+			end
+			continue
+		elseif not fed and point.kind == CORNER then
+			local older = points[index - 1]
+			point.kind = FREE
+			point.vel = if older and not point.gap then older.vel
+				else reflect(point.vel, point.normal) * flow.restitution
+			point.marker, point.ghost = "bounce", nil
+			point.age = math.max(clock - point.tau, 0)
+			dirty(point)
+		elseif not fed and point.kind == IN then
+			local out = point.pair
+			removeAt(flow, index)
+			if out and not out.Dead then
+				local outIndex = table.find(points, out)
+				local past = outIndex and outIndex > 1 and points[outIndex - 1]
+				out.kind = FREE
+				out.vel = if past and not out.gap then past.vel else out.vel
+				out.age = math.max(clock - out.tau, 0)
+				dirty(out)
+			end
+			continue
+		end
+		index += 1
+	end
+end
+
+-- Moves every free point, follows the source, trims the front.
+local function advance(flow: any, dt: number)
+	local points = flow.points
+	local accel = flow.accel
+	local uniform = ChunkManager.IsTimeUniform()
+	local clock = flow.clock
+	for _, point in points do
+		local kind = point.kind
+		if kind == FREE then
+			local step = if uniform then dt else dt * Planner.ChunkTimeScaleAt(point.pos)
+			point.pos += point.vel * step + accel * (.5 * step * step)
+			point.vel += accel * step
+			point.age += step
+		elseif kind == SOURCE then
+			point.tau, point.age = clock, 0
+		else
+			point.age = math.max(clock - point.tau, 0)
+			local ghost = point.ghost
+			if ghost then
+				local step = if uniform then dt else dt * Planner.ChunkTimeScaleAt(ghost.pos)
+				ghost.pos += ghost.vel * step + accel * (.5 * step * step)
+				ghost.vel += accel * step
+			end
+		end
+	end
+	-- The front: material older than the lifetime is gone. The front point
+	-- slides back along its leg to where the material is exactly that old.
+	local lifetime = flow.lifetime
+	while #points > 0 do
+		local front = points[1]
+		if front.age < lifetime then
+			break
+		end
+		local nextPoint = points[2]
+		if not nextPoint or nextPoint.gap or nextPoint.age >= lifetime then
+			removeAt(flow, 1)
+			if points[1] then
+				points[1].gap = false
+			end
+			continue
+		end
+		local t = math.clamp((front.age - lifetime) / math.max(front.age - nextPoint.age, 1e-6), 0, 1)
+		front.pos = front.pos:Lerp(nextPoint.pos, t)
+		front.vel = front.vel:Lerp(nextPoint.vel, t)
+		front.tau = front.tau + (nextPoint.tau - front.tau) * t
+		front.age = lifetime
+		if front.kind ~= FREE then
+			front.kind = FREE
+			dirty(front)
+		end
+		break
+	end
+end
+
+function Flow.Step(flow: any, globalDt: number)
+	local scale = sourceScale(flow)
+	if scale ~= flow.scale then
+		flow.scale = scale
+		flow.scaleChanged = true
+	end
+	local dt = globalDt * scale
+	if dt > 0 then
+		flow.clock += dt
+		advance(flow, dt)
+		flowPast(flow)
+		unpin(flow) -- (right after: a back end that just bounced lets its corner go now)
+		collide(flow)
+	end
+	local points = flow.points
+	local front = points[1]
+	-- (this frame's absorptions first: material that stopped at a wall
+	-- this frame mustn't read as having run out)
+	settleTickets(flow)
+	expireTickets(flow, if front then front.tau else (if flow.closed then nil else -math.huge), front and front.pos)
+	if flow.closed and #points <= 1 then
+		if points[1] then
+			removeAt(flow, 1)
+		end
+		expireTickets(flow, nil, nil)
+		flow.finished = true
+	end
+end
+
+function Flow.Finished(flow: any): boolean
+	return flow.finished
+end
+
+--------------------------------------------------------------------------------
+-- Stream (BeamWire.FlowChannel)
+--------------------------------------------------------------------------------
+
+local function writeAdd(w: BeamWire.Writer, points: { any }, index: number)
+	local point = points[index]
+	U8(w, FlowOp.Add)
+	U32(w, point.id)
+	U32(w, if index > 1 then points[index - 1].id else 0)
+	U8(w, point.kind)
+	U8(w, if point.gap then FlowFlag.Gap else 0)
+	V3(w, point.pos)
+	V3(w, point.vel)
+	F32(w, point.age)
+	F32(w, point.tau)
+	point._rep, point._repKind, point._repGap, point._repPos = true, point.kind, point.gap, point.pos
+	point._dirty, point._reordered = nil, nil
+end
+
+local function writeHeader(w: BeamWire.Writer, flow: any)
+	local header = flow.header
+	F32(w, flow.radius)
+	F32(w, flow.lifetime)
+	for index = 1, 3 do
+		U8(w, header.color[index])
+	end
+	for index = 1, 3 do
+		U8(w, header.core[index])
+	end
+	V3(w, flow.accel)
+	F32(w, flow.scale)
+end
+
+local function sectionStart(w: BeamWire.Writer, flow: any, kind: number, now: number)
+	U32(w, flow.id)
+	U8(w, kind)
+	F64(w, now)
+	F32(w, flow.clock)
+end
+
+local function encodeDelta(flow: any, now: number): BeamWire.Writer?
+	local w = BeamWire.Writer(256)
+	sectionStart(w, flow, Section.Delta, now)
+	local start = w.n
+	if flow.scaleChanged then
+		U8(w, FlowOp.Scale)
+		F32(w, flow.scale)
+	end
+	for _, id in flow.removed do
+		U8(w, FlowOp.Remove)
+		U32(w, id)
+	end
+	local points = flow.points
+	for index, point in points do
+		if not point._rep then
+			writeAdd(w, points, index)
+			continue
+		end
+		if point._reordered then
+			point._reordered = nil
+			U8(w, FlowOp.Order)
+			U32(w, point.id)
+			U32(w, if index > 1 then points[index - 1].id else 0)
+		end
+		if point._dirty or point._repKind ~= point.kind or point._repGap ~= point.gap then
+			U8(w, FlowOp.State)
+			U32(w, point.id)
+			U8(w, point.kind)
+			U8(w, if point.gap then FlowFlag.Gap else 0)
+			V3(w, point.pos)
+			V3(w, point.vel)
+			F32(w, point.age)
+			F32(w, point.tau)
+			point._dirty, point._repKind, point._repGap, point._repPos = nil, point.kind, point.gap, point.pos
+		elseif (point.kind ~= FREE) and (point.pos - point._repPos).Magnitude > PIN_RESEND then
+			U8(w, FlowOp.Pin)
+			U32(w, point.id)
+			V3(w, point.pos)
+			F32(w, point.tau)
+			point._repPos = point.pos
+		end
+	end
+	for _, impact in flow.impacts do
+		U8(w, FlowOp.Impact)
+		V3(w, impact[1])
+		V3(w, impact[2])
+		U8(w, impact[3])
+	end
+	if w.n == start then
+		return nil
+	end
+	U8(w, FlowOp.End)
+	return w
+end
+
+local function encodeSnapshot(flow: any, now: number): BeamWire.Writer
+	local w = BeamWire.Writer(512)
+	sectionStart(w, flow, Section.Snapshot, now)
+	writeHeader(w, flow)
+	local points = flow.points
+	for index = 1, #points do
+		writeAdd(w, points, index)
+	end
+	U8(w, FlowOp.End)
+	return w
+end
+
+local function closed(flow: any, kind: number, now: number): BeamWire.Writer
+	local w = BeamWire.Writer(24)
+	sectionStart(w, flow, kind, now)
+	U8(w, FlowOp.End)
+	return w
+end
+
+local function bounds(flow: any): (Vector3?, Vector3?)
+	local low, high = nil, nil
+	for _, point in flow.points do
+		low = if low then low:Min(point.pos) else point.pos
+		high = if high then high:Max(point.pos) else point.pos
+	end
+	return low, high
+end
+
+-- Every beam's messages this frame, one buffer per player.
+function Flow.Replicate()
+	local now = workspace:GetServerTimeNow()
+	local roots: { [Player]: Vector3 } = {}
+	for _, player in Players:GetPlayers() do
+		local character = player.Character
+		local root = character and character.PrimaryPart
+		if root then
+			roots[player] = root.Position
+		end
+	end
+	local outgoing: { [Player]: BeamWire.Writer } = {}
+	local function send(player: Player, section: BeamWire.Writer)
+		local out = outgoing[player]
+		if not out then
+			out = BeamWire.Writer(section.n + 64)
+			outgoing[player] = out
+		end
+		BeamWire.Append(out, section)
+	end
+	for _, flow in flows do
+		if not flow.visualize then
+			table.clear(flow.removed)
+			table.clear(flow.impacts)
+			continue
+		end
+		local observers = flow.observers
+		if flow.finished then
+			if next(observers) then
+				local delta = encodeDelta(flow, now)
+				local section = closed(flow, Section.End, now)
+				for player in observers do
+					if player.Parent then
+						if delta then
+							send(player, delta)
+						end
+						send(player, section)
+					end
+				end
+			end
+		else
+			local low, high = bounds(flow)
+			local range = flow.visualRange
+			local delta = if next(observers) then encodeDelta(flow, now) else nil
+			local snapshot, exit = nil, nil
+			for player, position in roots do
+				local watching = observers[player]
+				local distance = if low and high then (position - position:Max(low):Min(high)).Magnitude else math.huge
+				if watching and distance > range * 1.1 + 8 then
+					observers[player] = nil
+					exit = exit or closed(flow, Section.Exit, now)
+					send(player, exit)
+				elseif watching then
+					if delta then
+						send(player, delta)
+					end
+				elseif distance <= range then
+					observers[player] = true
+					snapshot = snapshot or encodeSnapshot(flow, now)
+					send(player, snapshot)
+				end
+			end
+			for player in observers do
+				if not roots[player] then
+					observers[player] = nil
+				end
+			end
+			if not next(observers) then
+				-- (nobody watching: the next snapshot carries everything)
+				for _, point in flow.points do
+					point._rep = nil
+				end
+			end
+		end
+		flow.scaleChanged = nil
+		table.clear(flow.removed)
+		table.clear(flow.impacts)
+	end
+	for player, out in outgoing do
+		if player.Parent then
+			VisualOffload.FireClient(player, BeamWire.FlowChannel, BeamWire.Finish(out))
+		end
+	end
+	-- drop finished beams
+	local live = {}
+	for _, flow in flows do
+		if not flow.finished then
+			table.insert(live, flow)
+		end
+	end
+	flows = live
+end
+
+-- Every beam's points, front to back, as "<kind><gap?>" (F free, S source,
+-- C cut, B corner, I in, O out; "|" marks a gap toward the front) -- for
+-- debugging from a Script / the command bar.
+function Flow.Describe(): { string }
+	local letters = { [FREE] = "F", [SOURCE] = "S", [CUT] = "C", [CORNER] = "B", [IN] = "I", [OUT] = "O" }
+	local lines = {}
+	for _, flow in flows do
+		local parts = {}
+		for _, point in flow.points do
+			table.insert(parts, (if point.gap then "|" else "") .. (letters[point.kind] or "?"))
+		end
+		table.insert(lines, string.format("beam %d (%s): %s", flow.id, if flow.closed then "closed" else "open",
+			table.concat(parts, " ")))
+	end
+	return lines
+end
+
+function Flow.TakeStats(): { [string]: number }
+	local points, tickets = 0, 0
+	for _, flow in flows do
+		points += #flow.points
+		tickets += #flow.tickets
+	end
+	local snapshot = { Beams = #flows, Points = points, Tickets = tickets, Casts = stats.Casts, Contacts = stats.Contacts }
+	stats.Casts, stats.Contacts = 0, 0
+	return snapshot
+end
+
+Players.PlayerRemoving:Connect(function(player)
+	for _, flow in flows do
+		flow.observers[player] = nil
+	end
+end)
+
+return Flow
+-- =============================================================================
+-- END FILE: src/server/Projectile/BeamFlow.luau
 -- =============================================================================
 
 -- =============================================================================
@@ -13837,12 +15160,10 @@ return VisualModel
 -- tails become one cylinder, not stacked bars/glow. Distinct paths stay
 -- distinct: never invent a connecting chord through untraveled geometry.
 local Geometry = {}
--- Every piece is a pooled cylinder pair on its own Motor6D, and the joints
--- are what a crowd of beams costs (client physics): 12-stud pieces made a
--- 24-stud beam ten parts. Size and pose are applied together before the
--- engine runs (BeamVisual.ApplyGroups), so a longer piece can't flash at a
--- stale angle.
-Geometry.MaxSegmentLength = 48
+-- Pieces are ribbons now (BeamRibbon: two Roblox Beams between two
+-- attachments, no parts or joints), so a straight run needn't be cut up; this
+-- only guards against a degenerate giant span.
+Geometry.MaxSegmentLength = 4096
 
 -- Tessellate after union, so overlaps are removed but no pooled cylinder can
 -- grow into an enormous bar on a flick or a stretched time-field boundary.
@@ -13968,6 +15289,7 @@ local ChunkManager = require(script.Parent.Parent.Parent.ChunkManager)
 local Types = require(script.Parent.Types)
 local Protocol = require(script.Parent.Parent.Parent.Projectile.Protocol)
 local Geometry = require(script.Parent.BeamGeometry)
+local Ribbon = require(script.Parent.BeamRibbon)
 local View = require(script.Parent.View)
 local RunService = game:GetService("RunService")
 local Planner = require(script.Parent.Parent.Parent.Projectile.StepPlanner)
@@ -13981,8 +15303,7 @@ local MAX_RETIRE_UPDATES = 128
 local retired: { any } = {}
 local retireCursor = 1
 local clock = 0
-local ROTATION = CFrame.Angles(0, math.pi / 2, 0) -- cylinder's X axis -> path Z
-local SIZE_SLACK = 0.02 -- studs a cylinder may be off before its Size is rewritten
+local SIZE_SLACK = 0.02 -- studs a joint ball may be off before its Size is rewritten
 local groups: { [number]: any } = {}
 local pending: { [any]: any } = {}
 local applyConnection: RBXScriptConnection? = nil
@@ -14128,14 +15449,12 @@ function BeamVisual.ApplyGroups()
 	for group, geometry in pending do
 		pending[group] = nil
 		if not group.model.Parent then continue end
+		-- (one ribbon per straight piece: see BeamRibbon)
+		group.ribbons = group.ribbons or {}
 		for index, span in geometry.segments do
-			local a, b = span[1], span[2]
-			local length = (b - a).Magnitude
-			local up = if math.abs((b - a).Y / length) > .99 then Vector3.xAxis else Vector3.yAxis
-			shape(group, group.segments, index, CFrame.lookAt((a + b) * .5, b, up) * ROTATION,
-				Vector3.new(math.min(length, Geometry.MaxSegmentLength), group.radius * 2, group.radius * 2), false)
+			Ribbon.Set(group.ribbons, index, group.model, span[1], span[2], group.radius * 2, group.core, group.color)
 		end
-		hideAfter(group.segments, #geometry.segments)
+		Ribbon.HideAfter(group.ribbons, #geometry.segments)
 		for index, point in geometry.joints do
 			shape(group, group.joints, index, CFrame.new(point), Vector3.one * group.radius * 2, true)
 		end
@@ -14208,9 +15527,11 @@ local function releaseState(visual: Types.Visual)
 		group.byId[state.id] = nil
 		if next(group.members) == nil then
 			groups[group.id], pending[group] = nil, nil
+			Ribbon.Clear(group.ribbons) -- (their attachments are on Terrain)
 			group.model:Destroy()
 		end
 	end
+	Ribbon.Clear(state.ribbons)
 	visual.model:Destroy()
 end
 
@@ -14541,8 +15862,10 @@ return BeamVisual
 	constant acceleration, the chain's time scale, chunk dilation) between the
 	server's events. Every frame each sample's body is rebuilt the way the
 	server builds it: to the sample ahead through the bounce corners
-	(BeamPath.Plan), else its clipped / fragment / tail body. One pooled set of
-	cylinders per chain, posed through Motor6D.Transform like BeamVisual.
+	(BeamPath.Plan), else its clipped / fragment / tail body. Each straight leg
+	is one ribbon (BeamRibbon: two Roblox Beams between two attachments on
+	Terrain -- no parts or joints), with a pooled ball wherever a body ends or
+	bends sharply (those are still parts on the chain's motor root).
 
 	Timing: a chain keeps one clock offset (the smallest transit seen), so
 	samples from late messages catch up by exactly their extra delay and stay
@@ -14550,9 +15873,9 @@ return BeamVisual
 
 	Drawing: bodies are joined end to end into strands (a sample's body ends
 	where the one ahead of it starts) and vertices that are straight to within
-	a fraction of the radius are dropped, so a steady beam is a handful of
-	long cylinders however many samples it has. Cylinders are cut at fixed
-	lengths from the back, so only the front piece of a strand changes size.
+	a fraction of the radius are dropped, so a steady beam -- or one long link
+	the server keeps whole -- is one ribbon however long it is and however
+	many samples it has.
 ]]
 
 local RunService = game:GetService("RunService")
@@ -14566,23 +15889,22 @@ local BeamPath = require(ProjectileShared:WaitForChild("BeamPath"))
 local BeamWire = require(ProjectileShared:WaitForChild("BeamWire"))
 local View = require(script.Parent.View)
 local Impact = require(script.Parent.Impact)
+local Ribbon = require(script.Parent.BeamRibbon)
 
 local Op, Section, DeathKind, Flag = BeamWire.Op, BeamWire.Section, BeamWire.Death, BeamWire.SpawnFlag
 local ReadU8, ReadU32, ReadF32, ReadF64, ReadV3 = BeamWire.ReadU8, BeamWire.ReadU32, BeamWire.ReadF32, BeamWire.ReadF64, BeamWire.ReadV3
 
 local BeamChainVisual = {}
 
-local MAX_SEGMENT = 128 -- studs per pooled cylinder
 local STRAIGHT = 0.15 -- of the radius: how far a merged straight run may stray from a dropped vertex
 local EXPIRE_GRACE = 0.5 -- seconds a sample out of life waits for the server's death before dying here
-local MAX_PARTS_PER_FRAME = 3000 -- cylinders + joint balls shown at once, all chains (about where a live server starts to lag)
+local MAX_PARTS_PER_FRAME = 3000 -- ribbons + joint balls shown at once, all chains
 local JOINT_COS = math.cos(math.rad(12)) -- bends sharper than this get a ball
 local DEAD_GRACE = 0.25 -- real seconds a dead sample is kept for in-flight messages
 local GHOST_LIFETIME = 1.5 -- a dead sample still named as a link target
 local DRAIN_LIMIT = 5
 local IMPACT_THROTTLE, IMPACT_SPACING = 0.1, 4
-local ROTATION = CFrame.Angles(0, math.pi / 2, 0) -- cylinder X axis -> path Z
-local SIZE_SLACK = 0.02 -- studs a cylinder may be off before its Size is rewritten
+local SIZE_SLACK = 0.02 -- studs a joint ball may be off before its Size is rewritten
 local DEATH_KINDS = { [DeathKind.World] = "world", [DeathKind.Entity] = "entity", [DeathKind.Other] = "detonate" }
 
 type Sample = {
@@ -14606,7 +15928,7 @@ local chains: { [number]: any } = {}
 local pending: { [any]: any } = {}
 -- The player's projectile render limits (ClientSettings, via
 -- ProjectileClient.SetRenderSettings): nothing past MaxDistance studs from
--- the camera is drawn, at most MaxRendered pieces (cylinders + joint balls)
+-- the camera is drawn, at most MaxRendered pieces (ribbons + joint balls)
 -- are shown across all chains, and about MaxUpdates pieces are rebuilt per
 -- frame -- chains past that keep their last pose and go first next frame.
 local limits = { MaxDistance = 2048, MaxRendered = 5000, MaxUpdates = 2500 }
@@ -14698,14 +16020,10 @@ local function apply()
 		local diameter = chain.radius * 2
 		local segments = geometry.segments
 		for index = 1, #segments, 2 do
-			local a, b = segments[index], segments[index + 1]
-			local offset = b - a
-			local length = offset.Magnitude
-			local up = if math.abs(offset.Y / length) > .99 then Vector3.xAxis else Vector3.yAxis
-			shape(chain, chain.segments, (index + 1) // 2, CFrame.lookAt((a + b) * .5, b, up) * ROTATION,
-				Vector3.new(length, diameter, diameter), false)
+			Ribbon.Set(chain.ribbons, (index + 1) // 2, chain.model, segments[index], segments[index + 1], diameter,
+				chain.core, chain.color)
 		end
-		hideAfter(chain.segments, #segments // 2)
+		Ribbon.HideAfter(chain.ribbons, #segments // 2)
 		for index, point in geometry.joints do
 			shape(chain, chain.joints, index, CFrame.new(point), Vector3.one * diameter, true)
 		end
@@ -14732,7 +16050,7 @@ local function newChain(id: number): any
 		timeScale = 1,
 		offset = nil :: number?,
 		samples = {} :: { [number]: Sample },
-		segments = {},
+		ribbons = {},
 		joints = {},
 		drains = {},
 		ended = false,
@@ -14746,6 +16064,7 @@ end
 local function destroyChain(chain: any)
 	chains[chain.id] = nil
 	pending[chain] = nil
+	Ribbon.Clear(chain.ribbons) -- (their attachments are on Terrain)
 	chain.model:Destroy()
 end
 
@@ -15194,8 +16513,8 @@ function BeamChainVisual.Step(globalDt: number)
 		end
 		local partsBefore = partsLeft
 
-		-- Geometry: every visible piece, split into pooled cylinders, with a
-		-- ball wherever a body ends or bends sharply.
+		-- Geometry: every visible straight leg (one ribbon each), with a ball
+		-- wherever a body ends or bends sharply.
 		local segments: { Vector3 } = scratch.segments
 		local jointPoints: { Vector3 } = scratch.joints
 		local ends: { [Vector3]: number } = scratch.ends
@@ -15244,13 +16563,9 @@ function BeamChainVisual.Step(globalDt: number)
 				if from > 0 or to < length then
 					a, b, length = a + direction * from, a + direction * to, to - from
 				end
-				-- fixed-length pieces from the back; only the last one varies
-				local pieces = math.max(1, math.ceil(length / MAX_SEGMENT - 1e-6))
-				for piece = 1, pieces do
-					table.insert(segments, a + direction * ((piece - 1) * MAX_SEGMENT))
-					table.insert(segments, if piece == pieces then b else a + direction * (piece * MAX_SEGMENT))
-				end
-				partsLeft -= pieces
+				table.insert(segments, a)
+				table.insert(segments, b)
+				partsLeft -= 1
 			end
 			if lastDirection then
 				local tip = points[#points]
@@ -15390,6 +16705,553 @@ return BeamChainVisual
 -- =============================================================================
 
 -- =============================================================================
+-- BEGIN FILE: src/shared/Projectile/Client/BeamRibbon.luau
+-- =============================================================================
+--!strict
+--[[
+	Projectile/Client/BeamRibbon.luau
+	A straight piece of beam drawn as two Roblox Beams (a white-hot core and
+	a wider translucent glow) between two Attachments -- however long the
+	piece. No parts at all: the attachments live on workspace.Terrain (at the
+	world origin, so their Position is their world position) and the Beams in
+	the caller's container. Terrain outlives every beam, so whoever made a
+	pool must Clear it when its beam goes.
+
+	This replaced a pair of neon cylinder parts per piece, each on its own
+	Motor6D, capped in length (a long straight link was several of them).
+	Moving a piece is now two Attachment writes; nothing is resized or
+	rebuilt. FaceCamera ribbons read as round from any side but end-on.
+]]
+
+local Ribbon = {}
+
+export type Piece = {
+	a0: Attachment,
+	a1: Attachment,
+	core: Beam,
+	glow: Beam,
+	from: Vector3?,
+	to: Vector3?,
+	shown: boolean,
+}
+
+local function newBeam(name: string, a0: Attachment, a1: Attachment, color: Color3, width: number,
+	transparency: number, parent: Instance): Beam
+	local beam = Instance.new("Beam")
+	beam.Name = name
+	beam.Attachment0, beam.Attachment1 = a0, a1
+	beam.Color = ColorSequence.new(color)
+	beam.Transparency = NumberSequence.new(transparency)
+	beam.Width0, beam.Width1 = width, width
+	beam.FaceCamera = true
+	beam.Segments = 1
+	beam.LightEmission = 1
+	beam.LightInfluence = 0
+	beam.Texture = ""
+	beam.Enabled = false
+	beam.Parent = parent
+	return beam
+end
+
+-- Poses piece `index` of `pool` from `a` to `b` (making it if needed);
+-- only writes what moved. `container` (in workspace) holds the Beams;
+-- `diameter` and the colours are fixed per pool.
+function Ribbon.Set(pool: { Piece }, index: number, container: Instance, a: Vector3, b: Vector3, diameter: number,
+	core: Color3, glow: Color3)
+	local piece = pool[index]
+	if not piece then
+		local terrain = workspace.Terrain
+		local a0 = Instance.new("Attachment")
+		a0.Name = "BeamFrom"
+		a0.Position = a
+		a0.Parent = terrain
+		local a1 = Instance.new("Attachment")
+		a1.Name = "BeamTo"
+		a1.Position = b
+		a1.Parent = terrain
+		piece = {
+			a0 = a0,
+			a1 = a1,
+			from = a,
+			to = b,
+			glow = newBeam("BeamGlow", a0, a1, glow, diameter, .5, container),
+			core = newBeam("BeamCore", a0, a1, core, diameter * .55, 0, container),
+			shown = false,
+		}
+		pool[index] = piece
+	end
+	-- (Terrain sits at the origin: Position is the world position)
+	if piece.from ~= a then
+		piece.from = a
+		piece.a0.Position = a
+	end
+	if piece.to ~= b then
+		piece.to = b
+		piece.a1.Position = b
+	end
+	if not piece.shown then
+		piece.shown = true
+		piece.core.Enabled, piece.glow.Enabled = true, true
+	end
+end
+
+-- Hides every piece of `pool` past the first `used`.
+function Ribbon.HideAfter(pool: { Piece }, used: number)
+	for index = used + 1, #pool do
+		local piece = pool[index]
+		if piece.shown then
+			piece.shown = false
+			piece.core.Enabled, piece.glow.Enabled = false, false
+		end
+	end
+end
+
+-- Destroys every piece of `pool` (its attachments are on Terrain, which a
+-- beam's own container going away doesn't clean up).
+function Ribbon.Clear(pool: { Piece }?)
+	if not pool then
+		return
+	end
+	for _, piece in pool do
+		piece.core:Destroy()
+		piece.glow:Destroy()
+		piece.a0:Destroy()
+		piece.a1:Destroy()
+	end
+	table.clear(pool)
+end
+
+return Ribbon
+-- =============================================================================
+-- END FILE: src/shared/Projectile/Client/BeamRibbon.luau
+-- =============================================================================
+
+-- =============================================================================
+-- BEGIN FILE: src/shared/Projectile/Client/BeamFlowVisual.luau
+-- =============================================================================
+--!strict
+--[[
+	Projectile/Client/BeamFlowVisual.luau
+	Draws flowing beams from the server's BeamWire.FlowChannel stream
+	(sending side: ServerScriptService Projectile/BeamFlow). Purely cosmetic.
+
+	A beam is an ordered list of points, oldest (the front) to newest (the
+	caster's end); material joins each point to the next older one unless
+	the newer has a gap. Free points move on their own (velocity + constant
+	acceleration, the beam's time scale, chunk dilation) and the front trims
+	itself by the lifetime exactly as on the server; pinned points (where the
+	beam is cut, bends or passes through something) and the caster's end
+	only move when the server says. Every joined pair is one ribbon
+	(BeamRibbon), straight runs merged.
+
+	Timing: a beam keeps one clock offset (the smallest transit seen), so
+	points from late messages catch up by exactly their extra delay.
+]]
+
+local RunService = game:GetService("RunService")
+local Shared = script.Parent.Parent.Parent
+local ChunkManager = require(Shared:WaitForChild("ChunkManager"))
+local Heartbeat = require(Shared:WaitForChild("Heartbeat"))
+local VisualOffload = require(Shared:WaitForChild("VisualOffload"))
+local ProjectileShared = Shared:WaitForChild("Projectile")
+local Planner = require(ProjectileShared:WaitForChild("StepPlanner"))
+local BeamWire = require(ProjectileShared:WaitForChild("BeamWire"))
+local View = require(script.Parent.View)
+local Impact = require(script.Parent.Impact)
+local Ribbon = require(script.Parent.BeamRibbon)
+
+local FlowOp, FlowFlag, Section, Kind, DeathKind =
+	BeamWire.FlowOp, BeamWire.FlowFlag, BeamWire.Section, BeamWire.AnchorKind, BeamWire.Death
+local ReadU8, ReadU32, ReadF32, ReadF64, ReadV3 = BeamWire.ReadU8, BeamWire.ReadU32, BeamWire.ReadF32, BeamWire.ReadF64, BeamWire.ReadV3
+
+local BeamFlowVisual = {}
+
+local MAX_PIECES = 3000 -- ribbons shown at once, all beams
+local STRAIGHT = 0.15 -- of the radius: how far a merged straight run may stray from a dropped point
+local IMPACT_THROTTLE, IMPACT_SPACING = 0.1, 4
+local IMPACT_KINDS = { [DeathKind.World] = "world", [DeathKind.Entity] = "entity", [DeathKind.Other] = "detonate" }
+
+type Point = {
+	id: number,
+	kind: number,
+	gap: boolean,
+	pos: Vector3,
+	vel: Vector3,
+	age: number,
+	tau: number,
+}
+
+local beams: { [number]: any } = {}
+local pending: { [any]: { Vector3 } } = {}
+local limits = { MaxDistance = 2048, MaxRendered = 5000 }
+local enabled = false
+local uniform = true
+
+local function newBeam(id: number): any
+	local folder = Instance.new("Folder")
+	folder.Name = "BeamFlow_" .. id
+	folder.Parent = workspace
+	local beam = {
+		id = id,
+		folder = folder,
+		ribbons = {},
+		points = {} :: { Point },
+		byId = {} :: { [number]: Point },
+		radius = .35,
+		lifetime = 3,
+		color = Color3.fromRGB(255, 96, 28),
+		core = Color3.new(1, 1, 1),
+		accel = Vector3.zero,
+		timeScale = 1,
+		clock = 0,
+		offset = nil :: number?,
+		lastImpact = 0,
+		impactPoint = Vector3.zero,
+	}
+	beams[id] = beam
+	return beam
+end
+
+local function destroyBeam(beam: any)
+	beams[beam.id] = nil
+	pending[beam] = nil
+	Ribbon.Clear(beam.ribbons) -- (their attachments are on Terrain)
+	beam.folder:Destroy()
+end
+
+local function simulated(beam: any, seconds: number): number
+	return seconds * Heartbeat.GetGlobalTimeScale() * beam.timeScale
+end
+
+local function move(beam: any, point: Point, dt: number)
+	if dt <= 0 or point.kind ~= Kind.Free then
+		return
+	end
+	if not uniform then
+		dt *= Planner.ChunkTimeScaleAt(point.pos)
+	end
+	local accel = beam.accel
+	point.pos += point.vel * dt + accel * (.5 * dt * dt)
+	point.vel += accel * dt
+	point.age += dt
+end
+
+-- The extra delay of a section stamped `serverTime` over the beam's
+-- fastest-seen transit (re-baselining everything if this one was faster).
+local function lagOf(beam: any, serverTime: number): number
+	local transit = math.max(workspace:GetServerTimeNow() - serverTime, 0)
+	local offset = beam.offset
+	if not offset then
+		beam.offset = transit
+		return 0
+	end
+	if transit < offset then
+		local catchUp = simulated(beam, offset - transit)
+		for _, point in beam.points do
+			move(beam, point, catchUp)
+		end
+		beam.offset = transit
+		return 0
+	end
+	return transit - offset
+end
+
+local function indexOf(beam: any, id: number): number?
+	local point = beam.byId[id]
+	return if point then table.find(beam.points, point) else nil
+end
+
+-- Puts `point` just newer than point `olderId` (0: the front), or by its tau
+-- when that one is already gone here.
+local function place(beam: any, point: Point, olderId: number)
+	local points = beam.points
+	local at: number
+	if olderId == 0 then
+		at = 1
+	else
+		local index = indexOf(beam, olderId)
+		if index then
+			at = index + 1
+		else
+			at = #points + 1
+			for index2, other in points do
+				if other.tau > point.tau then
+					at = index2
+					break
+				end
+			end
+		end
+	end
+	table.insert(points, at, point)
+end
+
+local function playImpact(beam: any, position: Vector3, normal: Vector3, kind: number)
+	if not View.contains(position) then
+		return
+	end
+	local now = os.clock()
+	if now - beam.lastImpact < IMPACT_THROTTLE and (position - beam.impactPoint).Magnitude < IMPACT_SPACING then
+		return
+	end
+	beam.lastImpact, beam.impactPoint = now, position
+	Impact.Play(position, normal, IMPACT_KINDS[kind] or "world")
+end
+
+local function readSection(r: BeamWire.Reader)
+	local id = ReadU32(r)
+	local kind = ReadU8(r)
+	local serverTime = ReadF64(r)
+	local clock = ReadF32(r)
+	local beam = beams[id]
+	if kind == Section.Snapshot then
+		if beam then
+			table.clear(beam.points)
+			table.clear(beam.byId)
+			beam.offset = nil
+		else
+			beam = newBeam(id)
+		end
+		beam.radius = math.max(ReadF32(r), .025)
+		beam.lifetime = ReadF32(r)
+		beam.color = Color3.fromRGB(ReadU8(r), ReadU8(r), ReadU8(r))
+		beam.core = Color3.fromRGB(ReadU8(r), ReadU8(r), ReadU8(r))
+		beam.accel = ReadV3(r)
+		beam.timeScale = ReadF32(r)
+	elseif kind == Section.Exit or kind == Section.End then
+		if beam then
+			destroyBeam(beam)
+		end
+		beam = nil
+	end
+	if beam then
+		beam.clock = clock
+	end
+	local lag = if beam then lagOf(beam, serverTime) else 0
+	while true do
+		local op = ReadU8(r)
+		if op == FlowOp.End then
+			return
+		elseif op == FlowOp.Add then
+			local pointId, olderId, pointKind, flags = ReadU32(r), ReadU32(r), ReadU8(r), ReadU8(r)
+			local pos, vel, age, tau = ReadV3(r), ReadV3(r), ReadF32(r), ReadF32(r)
+			if beam and not beam.byId[pointId] then
+				local point: Point = { id = pointId, kind = pointKind, gap = bit32.btest(flags, FlowFlag.Gap),
+					pos = pos, vel = vel, age = age, tau = tau }
+				beam.byId[pointId] = point
+				place(beam, point, olderId)
+				move(beam, point, simulated(beam, lag))
+			end
+		elseif op == FlowOp.Pin then
+			local pointId, pos, tau = ReadU32(r), ReadV3(r), ReadF32(r)
+			local point = beam and beam.byId[pointId]
+			if point then
+				point.pos, point.tau = pos, tau
+				point.age = math.max(beam.clock - tau, 0)
+			end
+		elseif op == FlowOp.State then
+			local pointId, pointKind, flags = ReadU32(r), ReadU8(r), ReadU8(r)
+			local pos, vel, age, tau = ReadV3(r), ReadV3(r), ReadF32(r), ReadF32(r)
+			local point = beam and beam.byId[pointId]
+			if point then
+				point.kind, point.gap = pointKind, bit32.btest(flags, FlowFlag.Gap)
+				point.pos, point.vel, point.age, point.tau = pos, vel, age, tau
+				move(beam, point, simulated(beam, lag))
+			end
+		elseif op == FlowOp.Remove then
+			local pointId = ReadU32(r)
+			if beam then
+				local index = indexOf(beam, pointId)
+				if index then
+					table.remove(beam.points, index)
+				end
+				beam.byId[pointId] = nil
+			end
+		elseif op == FlowOp.Order then
+			local pointId, olderId = ReadU32(r), ReadU32(r)
+			if beam then
+				local index = indexOf(beam, pointId)
+				if index then
+					local point = table.remove(beam.points, index) :: Point
+					place(beam, point, olderId)
+				end
+			end
+		elseif op == FlowOp.Scale then
+			local scale = ReadF32(r)
+			if beam then
+				beam.timeScale = scale
+			end
+		elseif op == FlowOp.Impact then
+			local pos, normal, impactKind = ReadV3(r), ReadV3(r), ReadU8(r)
+			if beam then
+				playImpact(beam, pos, normal, impactKind)
+			end
+		else
+			warn("[BeamFlowVisual] unknown op", op)
+			r.n = buffer.len(r.buf)
+			return
+		end
+	end
+end
+
+local function onMessage(payload: any)
+	if typeof(payload) ~= "buffer" then
+		return
+	end
+	local r = BeamWire.Reader(payload)
+	while BeamWire.More(r) do
+		readSection(r)
+	end
+end
+
+-- The front: material older than the lifetime is gone (as on the server).
+local function trim(beam: any)
+	local points = beam.points
+	local lifetime = beam.lifetime
+	while #points > 0 do
+		local front = points[1]
+		if front.age < lifetime then
+			return
+		end
+		local nextPoint = points[2]
+		if not nextPoint or nextPoint.gap or nextPoint.age >= lifetime then
+			table.remove(points, 1)
+			beam.byId[front.id] = nil
+			if points[1] then
+				points[1].gap = false
+			end
+			continue
+		end
+		local t = math.clamp((front.age - lifetime) / math.max(front.age - nextPoint.age, 1e-6), 0, 1)
+		front.pos = front.pos:Lerp(nextPoint.pos, t)
+		front.vel = front.vel:Lerp(nextPoint.vel, t)
+		front.tau += (nextPoint.tau - front.tau) * t
+		front.age = lifetime
+		front.kind = Kind.Free
+		return
+	end
+end
+
+function BeamFlowVisual.Step(globalDt: number)
+	if not enabled then
+		return
+	end
+	uniform = ChunkManager.IsTimeUniform()
+	local camera = workspace.CurrentCamera
+	local eye = if camera then camera.CFrame.Position else Vector3.zero
+	local reach = limits.MaxDistance
+	local piecesLeft = math.min(MAX_PIECES, limits.MaxRendered)
+	for _, beam in beams do
+		local dt = simulated(beam, globalDt)
+		beam.clock += dt
+		for _, point in beam.points do
+			if point.kind == Kind.Free then
+				move(beam, point, dt)
+			else
+				point.age = math.max(beam.clock - point.tau, 0)
+			end
+		end
+		trim(beam)
+
+		-- every joined pair, straight runs merged, newest first
+		local segments: { Vector3 } = {}
+		local points = beam.points
+		local tolerance = math.max(beam.radius * STRAIGHT, 1e-3)
+		local function flush(run: { Vector3 })
+			for index = 1, #run - 1 do
+				local a, b = run[index], run[index + 1]
+				local mid = (a + b) * .5
+				local half = (b - a).Magnitude * .5
+				if piecesLeft > 0 and View.contains(mid, half + beam.radius) and (mid - eye).Magnitude - half <= reach then
+					table.insert(segments, a)
+					table.insert(segments, b)
+					piecesLeft -= 1
+				end
+			end
+		end
+		local run: { Vector3 } = {}
+		local anchor, heading: Vector3? = nil, nil
+		for index = #points, 1, -1 do
+			local point = points[index]
+			local position = point.pos
+			if #run == 0 then
+				run[1], anchor, heading = position, position, nil
+			else
+				local offset = position - (anchor :: Vector3)
+				if not heading then
+					if offset.Magnitude > 1e-3 then
+						heading = offset.Unit
+					end
+					run[#run + 1] = position
+				else
+					local along = offset:Dot(heading)
+					if along > 0 and (offset - heading * along).Magnitude <= tolerance and #run >= 2 then
+						run[#run] = position -- (still on the line: extend it)
+					else
+						anchor = run[#run]
+						local leg = position - anchor
+						heading = if leg.Magnitude > 1e-3 then leg.Unit else nil
+						run[#run + 1] = position
+					end
+				end
+			end
+			if point.gap or index == 1 then
+				flush(run)
+				run, anchor, heading = {}, nil, nil
+			end
+		end
+		pending[beam] = segments
+	end
+end
+
+-- Attachment moves land before the frame renders.
+local function apply()
+	for beam, segments in pending do
+		pending[beam] = nil
+		if not beam.folder.Parent then
+			continue
+		end
+		local diameter = beam.radius * 2
+		for index = 1, #segments, 2 do
+			Ribbon.Set(beam.ribbons, (index + 1) // 2, beam.folder, segments[index], segments[index + 1], diameter,
+				beam.core, beam.color)
+		end
+		Ribbon.HideAfter(beam.ribbons, #segments // 2)
+	end
+end
+
+function BeamFlowVisual.SetRenderSettings(settings: { [string]: number })
+	for key in limits do
+		local value = settings[key]
+		if typeof(value) == "number" and value == value and value >= 0 then
+			limits[key] = value
+		end
+	end
+end
+
+function BeamFlowVisual.GetStats(): (number, number)
+	local beamCount, pointCount = 0, 0
+	for _, beam in beams do
+		beamCount += 1
+		pointCount += #beam.points
+	end
+	return beamCount, pointCount
+end
+
+function BeamFlowVisual.Enable()
+	if enabled or RunService:IsServer() then
+		return
+	end
+	enabled = true
+	VisualOffload.On(BeamWire.FlowChannel, onMessage)
+	RunService.PreSimulation:Connect(apply)
+end
+
+return BeamFlowVisual
+-- =============================================================================
+-- END FILE: src/shared/Projectile/Client/BeamFlowVisual.luau
+-- =============================================================================
+
+-- =============================================================================
 -- BEGIN FILE: src/shared/Projectile/Client/init.luau
 -- =============================================================================
 --!native
@@ -15439,6 +17301,7 @@ local View = require(script.View)
 local VisualModel = require(script.VisualModel)
 local BeamVisual = require(script.BeamVisual)
 local BeamChainVisual = require(script.BeamChainVisual)
+local BeamFlowVisual = require(script.BeamFlowVisual)
 
 type Visual = Types.Visual
 
@@ -16174,6 +18037,7 @@ local function renderStep(globalDt: number)
 	local now = os.clock()
 	View.refresh()
 	BeamChainVisual.Step(globalDt)
+	BeamFlowVisual.Step(globalDt)
 	refreshSmoothVisuals(now)
 	if detailDirty or now >= nextDetailRefresh then
 		refreshDetail(now)
@@ -16290,16 +18154,20 @@ function ProjectileClient.EnableClientRendering()
 	end)
 
 	BeamChainVisual.Enable()
+	BeamFlowVisual.Enable()
 	View.refresh()
 	Heartbeat.Connect(renderStep, { Name = "ProjectileSystem.ClientSimulate", Priority = 5 })
 end
 
 function ProjectileClient.GetStats()
 	local beamChains, beamSamples = BeamChainVisual.GetStats()
+	local flowBeams, flowPoints = BeamFlowVisual.GetStats()
 	return {
 		Visuals = visualCount,
 		BeamChains = beamChains,
 		BeamSamples = beamSamples,
+		FlowBeams = flowBeams, -- flowing beams (BeamFlowVisual) and their points
+		FlowPoints = flowPoints,
 		VisualUpdatesPerFrame = renderSettings.MaxUpdates,
 		SmoothLimit = renderSettings.MaxSmooth,
 		-- effects budget: visuals at full / reduced / bare detail, and lit
@@ -16321,6 +18189,7 @@ function ProjectileClient.SetRenderSettings(settings: { [string]: number })
 		end
 	end
 	BeamChainVisual.SetRenderSettings(renderSettings)
+	BeamFlowVisual.SetRenderSettings(renderSettings)
 	-- Lowering the cap takes effect now. Keep oldest admissions; retire the
 	-- newest excess without impact VFX, and never keep hidden simulation slots.
 	if visualCount > renderSettings.MaxRendered then

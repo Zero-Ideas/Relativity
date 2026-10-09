@@ -24,6 +24,20 @@
 	  Op.Scale  := f32 timeScale (the chain's personal/local dilation)
 	Section.End: the chain is gone on the server (every death already sent).
 	Section.Exit: this client left the chain's range; drop it without drains.
+
+	Flowing beams (server Projectile/BeamFlow -> client BeamFlowVisual) use
+	FlowChannel, with the same Section framing plus an f32 beam clock after
+	the server time:
+	  Header    := f32 radius, f32 lifetime, u8x3 color, u8x3 core, f32x3 accel, f32 timeScale
+	  FlowOp.Add    := u32 id, u32 olderId (0: the front), u8 kind, u8 flags, v3 pos, v3 vel, f32 age, f32 tau
+	  FlowOp.Pin    := u32 id, v3 pos, f32 tau        (a pinned / source point moved)
+	  FlowOp.State  := u32 id, u8 kind, u8 flags, v3 pos, v3 vel, f32 age, f32 tau
+	  FlowOp.Remove := u32 id
+	  FlowOp.Order  := u32 id, u32 olderId           (flowed past a pinned point)
+	  FlowOp.Scale  := f32 timeScale
+	  FlowOp.Impact := v3 pos, v3 normal, u8 kind (Death kinds)
+	Points are ordered oldest (the front) to newest; material joins each
+	point to the next older one unless the newer has FlowFlag.Gap.
 ]]
 
 local BeamWire = {}
@@ -34,6 +48,14 @@ BeamWire.Op = table.freeze({ End = 0, Spawn = 1, Pose = 2, Bounce = 3, Link = 4,
 BeamWire.Death = table.freeze({ Expire = 0, World = 1, Entity = 2, Other = 3 })
 -- Stopped: a sample already parked at a wall (dead), still anchoring followers.
 BeamWire.SpawnFlag = table.freeze({ Fragment = 1, Origin = 2, Joiner = 4, EverLinked = 8, Stopped = 16 })
+
+BeamWire.FlowChannel = "ProjBeamFlow"
+BeamWire.FlowOp = table.freeze({ End = 0, Add = 1, Pin = 2, State = 3, Remove = 4, Order = 5, Scale = 6, Impact = 7 })
+-- Free: moves with the beam. Source: the caster's end. Cut: pinned where the
+-- beam meets something that stops it. Corner: pinned where it bounces. In /
+-- Out: pinned where it enters / leaves something it passes through.
+BeamWire.AnchorKind = table.freeze({ Free = 0, Source = 1, Cut = 2, Corner = 3, In = 4, Out = 5 })
+BeamWire.FlowFlag = table.freeze({ Gap = 1 })
 
 export type Writer = { buf: buffer, n: number }
 

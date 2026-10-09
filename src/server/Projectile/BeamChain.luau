@@ -32,6 +32,13 @@
 	 - Clients get one compact event stream per chain (see BeamWire): a new
 	   sample, a bounce, a link change, a clipped body, a death. Samples move
 	   deterministically in between, so nothing is sent per sample per frame.
+
+	Most sustained beams don't use samples at all any more: a lazy chain (no
+	homing, constant acceleration, no positional triggers) is a flowing beam
+	(BeamFlow) -- continuous material cut, bent and passed through where it
+	meets things, its packets reduced to energy tickets. Samples remain for
+	the rest, and for every chain when ServerScriptService has the
+	LegacyBeamPackets attribute set (read at startup).
 ]]
 
 local Players = game:GetService("Players")
@@ -50,6 +57,9 @@ local Projectile = require(script.Parent)
 local Config = require(script.Parent.Config)
 local Raycast = require(script.Parent.Raycast)
 local Profile = require(script.Parent.Profile)
+local Flow = require(script.Parent.BeamFlow)
+
+local FLOWING = game:GetService("ServerScriptService"):GetAttribute("LegacyBeamPackets") ~= true
 
 local Op, Section, DeathKind, Flag = BeamWire.Op, BeamWire.Section, BeamWire.Death, BeamWire.SpawnFlag
 local U8, U32, F32, F64, V3 = BeamWire.U8, BeamWire.U32, BeamWire.F32, BeamWire.F64, BeamWire.V3
@@ -429,6 +439,16 @@ function Chain.Launch(config: any, deferred: any?): any
 	local chain = chains[id] or newChain(id, config, settings)
 	if not chain.template or chain.template._raw ~= config.IgnoreInstances then
 		keepTemplate(chain, config, settings)
+	end
+	if FLOWING and chain.lazy and deferred and (chain.flow or #chain.samples == 0) then
+		-- a flowing beam: this packet is a point where the aim is and a ticket
+		chain.flow = chain.flow or Flow.New(chain, settings)
+		local point = Flow.Launch(chain.flow, settings, deferred)
+		chain.last = point
+		chain.lastLaunch = os.clock()
+		Profile.Add("Spawn", os.clock() - started)
+		Profile.Count("Spawned", 1)
+		return point
 	end
 	local s = fromSettings(chain, settings)
 	local previous = chain.last
@@ -1383,8 +1403,8 @@ local function replicate(globalDt: number)
 	end
 	for _, id in chainOrder do
 		local chain = chains[id]
-		if not chain then
-			continue
+		if not chain or chain.flow then
+			continue -- (flowing beams stream themselves: Flow.Replicate)
 		end
 		if not chain.visualize then
 			table.clear(chain.deaths)
@@ -1507,10 +1527,22 @@ Projectile.SetBeamSpanStep(function(globalDt: number)
 	local linkStarted = os.clock()
 	local now = os.clock()
 	local ended = {}
+	local endedFlows = {}
 	for offset = 1, orderCount do
 		local id = chainOrder[offset]
 		local chain = chains[id]
 		if not chain then
+			continue
+		end
+		local flow = chain.flow
+		if flow then
+			local flowStarted = os.clock()
+			Flow.Step(flow, globalDt)
+			Profile.Add("BeamFlow", os.clock() - flowStarted)
+			if Flow.Finished(flow) then
+				chain.finished = true
+				table.insert(endedFlows, chain)
+			end
 			continue
 		end
 		-- Drop the dead (their deaths are already queued for the stream).
@@ -1548,6 +1580,10 @@ Projectile.SetBeamSpanStep(function(globalDt: number)
 
 	local replicateStarted = os.clock()
 	replicate(globalDt)
+	Flow.Replicate()
+	for _, chain in endedFlows do
+		table.insert(ended, chain)
+	end
 	if #ended > 0 then
 		for _, chain in ended do
 			chains[chain.id] = nil
@@ -1582,6 +1618,8 @@ function Chain.GetJoinerStats()
 		end)(),
 		LazyLinks = lastStats.Lazy,
 		Chains = #chainOrder,
+		-- flowing beams: beams, points, tickets, casts / contacts since the last call
+		Flow = Flow.TakeStats(),
 		Created = lastStats.Created,
 		Updated = lastStats.Joiners,
 		BudgetSplits = lastStats.BudgetSplits,
@@ -1626,8 +1664,13 @@ local function tick(channel: any, slice: number, final: boolean)
 	local shot, origin, direction = channel.Aim()
 	channel.Carry += slice
 	local chain = chains[channel.Id]
+	if chain and chain.flow then
+		Flow.Aim(chain.flow, origin, direction) -- (the caster's end follows the aim between points)
+	end
 	local last = channel.Last
+	-- (a curved beam -- gravity -- keeps a point every tick: its arc is made of them)
 	if not final and last and chain and chain.lazy and chain.last == last.sample and not last.sample.Dead
+		and chain.header.gravity.Magnitude < 1e-6
 		and (channel.Carry + channel.Interval) * channel.Speed <= SKIP_SPACING
 		and direction:Dot(last.direction) >= SKIP_TURN and (origin - last.origin).Magnitude <= SKIP_SHIFT then
 		channel.Pending = { shot, direction }
@@ -1646,6 +1689,11 @@ local function flush(channel: any, castable: boolean)
 		fire(channel, pending[1], pending[2])
 	end
 	channel.Pending = nil
+	-- (the channel is over: a flowing beam's end lets go of the caster)
+	local chain = chains[channel.Id]
+	if chain and chain.flow then
+		Flow.Close(chain.flow)
+	end
 end
 
 function Chain.IsActive(player: Player): boolean

@@ -693,6 +693,7 @@ local function buildStats()
 		BeamJoiners = beams.Active,
 		BeamLazyLinks = beams.LazyLinks,
 		BeamDormant = beams.Dormant,
+		BeamFlow = beams.Flow,
 		BeamMadeReal = beams.MadeReal,
 		StepMs = timing.StepMs,
 		StepWorstMs = timing.StepWorstMs,
