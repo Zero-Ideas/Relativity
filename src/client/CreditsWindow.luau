@@ -54,4 +54,9 @@ function CreditsWindow.Toggle()
 	if open then CreditsWindow.Close() else CreditsWindow.Open() end
 end
 
+
+function CreditsWindow.IsOpen(): boolean
+	return open
+end
+
 return CreditsWindow
