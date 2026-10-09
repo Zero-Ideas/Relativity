@@ -10,6 +10,14 @@
 	part of the pool key (colours quantized, time scales bucketed). Speed and
 	spread only touch new particles, so they vary per emit.
 
+	Textures: the spark and dust layers borrow their texture (and flipbook,
+	if any) from the matching group of the hand-authored explosion template,
+	ReplicatedStorage.Effects.ExplosionBase (its Sparks and Dust attachments),
+	so impacts match the explosions. Only the look is borrowed: sizes,
+	speeds and counts stay this module's, since the template is authored at
+	explosion scale. Without the template they fall back to Roblox's
+	built-in sparkle / smoke textures.
+
 	A layer can be authored instead of built here: put a ParticleEmitter
 	named after the layer in ReplicatedStorage.Effects.Layers. Its colour is
 	still replaced by the effect's tint unless it has a KeepColor attribute.
@@ -141,6 +149,18 @@ local LAYERS: { [string]: Layer } = {
 	},
 }
 
+-- Which explosion-template group each layer takes its texture from.
+local BORROW: { [string]: string } = {
+	Sparks = "Sparks",
+	Streaks = "Sparks",
+	Embers = "Sparks",
+	Glint = "Sparks",
+	Dust = "Dust",
+	DustFall = "Dust",
+	Mist = "Dust",
+	Murk = "Dust",
+}
+
 local TIME_BUCKETS = { 1, 0.6, 0.3, 0.12, 0.04, 0 }
 local MAX_EMITTERS = 120
 
@@ -163,6 +183,48 @@ local function authored(name: string): ParticleEmitter?
 		return template
 	end
 	return nil
+end
+
+-- The template emitter a layer borrows from: for sparks one that streaks
+-- along its velocity (like ours), else any; a flipbook beats a still either
+-- way. Looked up per build, so a template that streams in late still counts.
+local function borrowed(name: string, layer: Layer?): ParticleEmitter?
+	local groupName = BORROW[name]
+	if not groupName then
+		return nil
+	end
+	local effects = ReplicatedStorage:FindFirstChild("Effects")
+	local template = effects and effects:FindFirstChild("ExplosionBase")
+	local group = template and template:FindFirstChild(groupName)
+	if not group then
+		return nil
+	end
+	local best: ParticleEmitter? = nil
+	local bestScore = -1
+	for _, child in group:GetChildren() do
+		if child:IsA("ParticleEmitter") and child.Texture ~= "" then
+			local score = 0
+			if child.FlipbookLayout ~= Enum.ParticleFlipbookLayout.None then
+				score += 1
+			end
+			local parallel = child.Orientation == Enum.ParticleOrientation.VelocityParallel
+			if layer and layer.Parallel == parallel then
+				score += 2
+			end
+			if score > bestScore then
+				best, bestScore = child, score
+			end
+		end
+	end
+	return best
+end
+
+local function applyLook(emitter: ParticleEmitter, source: ParticleEmitter)
+	emitter.Texture = source.Texture
+	emitter.FlipbookLayout = source.FlipbookLayout
+	emitter.FlipbookMode = source.FlipbookMode
+	emitter.FlipbookFramerate = source.FlipbookFramerate
+	emitter.FlipbookStartRandom = source.FlipbookStartRandom
 end
 
 local function colorSequence(layer: Layer?, color: Color3): ColorSequence
@@ -216,6 +278,14 @@ local function build(name: string, color: Color3, timeScale: number): Entry?
 		end
 		emitter.ZOffset = spec.ZOffset or 0
 		emitter.Color = colorSequence(spec, spec.Tint or color)
+		local source = borrowed(name, spec)
+		if source then
+			applyLook(emitter, source)
+			if spec.Parallel and source.Orientation == Enum.ParticleOrientation.VelocityParallel then
+				-- an authored streak is already long: take its stretch, not ours on top
+				emitter.Squash = source.Squash
+			end
+		end
 	end
 	emitter.Name = name
 	emitter.Enabled = false
