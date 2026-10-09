@@ -312,10 +312,10 @@ function VisualModel.Build(data: Protocol.SpawnPayload): (Instance, Rig?)
 	local pool = if poolKey then pools[poolKey] else nil
 	local pooledRig = if pool then table.remove(pool) else nil
 	if pooledRig then
-		pooledRig.driver.CFrame = CFrame.new(data.Position)
+		-- (C0 is the spawn point: no part to move, just the joint's offset)
+		pooledRig.motor.C0 = CFrame.new(data.Position)
 		pooledRig.origin = data.Position
-		pooledRig.motor.Transform =
-			pooledRig.driver.CFrame:ToObjectSpace(poseFrom(data.Position, data.Velocity) * pooledRig.rootOffset)
+		pooledRig.motor.Transform = poseFrom(data.Position, data.Velocity) * pooledRig.rootOffset - data.Position
 		local effects = pooledRig.effects
 		if effects then
 			restoreEffects(effects)
@@ -359,34 +359,28 @@ function VisualModel.Build(data: Protocol.SpawnPayload): (Instance, Rig?)
 		pivot = CFrame.identity
 	end
 
-	-- Drive the visual as an assembly from one stationary, invisible root. A
-	-- Motor6D Transform is considerably cheaper to update every render frame
-	-- than creating/cancelling Tween instances or repeatedly moving a model
-	-- pivot. rootOffset preserves a custom Model's authored pivot.
+	-- Drive the visual from Terrain with one Motor6D: Part0 = Terrain (always
+	-- there, anchored, at the world origin), Part1 = the visual's root. No
+	-- per-projectile driver part. C0 holds the spawn point, so the joint's
+	-- frame is a pure translation and a pose's Transform is just pose -
+	-- origin (see transformFor); and until the engine applies the first
+	-- Transform, the visual already sits at its spawn point, not at the
+	-- world origin. A Motor6D Transform is far cheaper to update every
+	-- render frame than tweens or moving a model pivot. rootOffset preserves
+	-- a custom Model's authored pivot.
 	local rig: Rig? = nil
 	if root then
-		local driver = Instance.new("Part")
-		driver.Name = "ProjectileMotorRoot"
-		driver.Size = Vector3.one * 0.05
-		driver.Transparency = 1
-		driver.Anchored = true
-		driver.CanCollide = false
-		driver.CanQuery = false
-		driver.CanTouch = false
-		driver.CastShadow = false
-		driver.CFrame = CFrame.new(data.Position)
-		driver.Parent = model
-
+		local terrain = workspace.Terrain
+		local rootOffset = pivot:ToObjectSpace(root.CFrame)
 		local motor = Instance.new("Motor6D")
 		motor.Name = "ProjectileTransform"
-		motor.Part0 = driver
+		motor.C0 = CFrame.new(data.Position)
+		motor.Transform = poseFrom(data.Position, data.Velocity) * rootOffset - data.Position
+		motor.Part0 = terrain
 		motor.Part1 = root
-		motor.Parent = driver
-
-		local rootOffset = pivot:ToObjectSpace(root.CFrame)
-		motor.Transform = driver.CFrame:ToObjectSpace(poseFrom(data.Position, data.Velocity) * rootOffset)
+		motor.Parent = root -- (inside the model: destroyed and pooled with it)
 		rig = {
-			driver = driver :: BasePart,
+			driver = terrain,
 			motor = motor,
 			rootOffset = rootOffset,
 			model = model,
@@ -405,7 +399,8 @@ end
 local function transformFor(rig: Rig, pose: CFrame): CFrame
 	local origin = rig.origin
 	if origin then
-		-- (the driver is a pure translation: no Instance read, no inverse)
+		-- (the joint frame is a pure translation, Terrain + C0: no Instance
+		-- read, no inverse)
 		return (if rig.identityOffset then pose else pose * rig.rootOffset) - origin
 	end
 	return rig.driver.CFrame:ToObjectSpace(pose * rig.rootOffset)
