@@ -44,6 +44,7 @@
 
 local Players = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local Signal = require(ReplicatedStorage:WaitForChild("Shared"):WaitForChild("Signal"))
 local RunService = game:GetService("RunService")
 
 local Shared = ReplicatedStorage:WaitForChild("Shared")
@@ -60,8 +61,8 @@ local started = false
 local localPlayer = Players.LocalPlayer
 local panelWindow: any = nil -- the built ReGui window, once allowed
 local anyTabVisible = true -- false when every tab has been taken from this player
-local accessEvent = Instance.new("BindableEvent") -- (DebugPanel.AccessChanged)
-DebugPanel.AccessChanged = accessEvent.Event
+local accessEvent = Signal.new() -- (DebugPanel.AccessChanged)
+DebugPanel.AccessChanged = accessEvent
 
 local function listed(): boolean
 	return localPlayer:GetAttribute("DebugListed") == true

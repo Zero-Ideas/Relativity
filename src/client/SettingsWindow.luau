@@ -2,7 +2,8 @@
 --[[
 	The Settings window (ReGui; the topbar's gear): a dropdown, slider,
 	checkbox or key button for each ClientSettings setting, in Interface,
-	Controls, Effects, Audio and Advanced tabs. A key button rebinds: click
+	Effects, Lighting, Controls, Audio and Advanced tabs (Lighting also holds
+	LightingSettings' overrides of everything under Lighting). A key button rebinds: click
 	it, then press the new key (Esc cancels, Backspace unbinds); menu keys
 	are paused meanwhile so the press doesn't also open something. Changes apply at once and are saved for next time. The window
 	keeps its place and follows changes made elsewhere (a reset, the saved
@@ -14,6 +15,7 @@ local UserInputService = game:GetService("UserInputService")
 local ReGuiLoader = require(script.Parent.ReGuiLoader)
 local ClientSettings = require(script.Parent.ClientSettings)
 local Keybinds = require(script.Parent.Keybinds)
+local LightingSettings = require(script.Parent.LightingSettings)
 
 local SettingsWindow = {}
 
@@ -134,6 +136,10 @@ local function build(ReGui: any)
 		if spec.Description then
 			section:Label({Text = spec.Description, TextWrapped = true, Size = UDim2.new(1, 0, 0, 0), AutomaticSize = Enum.AutomaticSize.Y})
 		end
+	end
+	-- the Lighting tab: the lens flare setting above, then every Lighting override
+	if sections.Lighting then
+		LightingSettings.Build(sections.Lighting)
 	end
 	for _, section in sections do
 		section:Separator()

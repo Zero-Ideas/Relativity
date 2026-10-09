@@ -16,10 +16,14 @@
 	backwards. Everything is measured from the character's root each frame,
 	so it all keeps up with a moving character.
 
-	Each Tool gets a separate quadcopter with one underside weapon. Switching
-	Tools sends the old drone home and launches a fresh one, never rearming an
-	existing drone. It hovers with a slow bob and turns to
-	face where its owner aims: the mouse for your own drone, the
+	Each Tool gets a separate quadcopter holding its weapon in a small arm.
+	Switching Tools sends the old drone home and launches a fresh one, never
+	rearming an existing drone. Out of the portal it follows its hover point
+	(DroneRig.Follow: a spring with a top speed, the same motion the server
+	fires from), leaning into its movement, with a slow bob. Its body only
+	turns to face the aim; the arm points the weapon. Aiming above it, the
+	drone rolls upside down so the arm can reach up, and rolls back once the
+	aim drops again. The aim is the mouse for your own drone, the
 	character's facing for everyone else's.
 
 	Summon(character) / Dismiss(character) also work without a gun (the
@@ -43,6 +47,12 @@ local CLOSE_TIME = 0.25
 local START_DEPTH = 7 -- studs behind the portal's plane the drone starts
 local BOB, BOB_SPEED = 0.15, 2.2
 local TURN_RATE = 12 -- how quickly it turns to its aim (1/s)
+-- Flipping: aim this far above level (sine of the angle) rolls it upside
+-- down, back below this rolls it upright again; how fast it rolls (1/s).
+local FLIP_UP, FLIP_DOWN = 0.3, 0.1
+local ROLL_RATE = 9
+-- Leaning into its movement: radians per (studs/s), and the most it leans.
+local LEAN_PER_SPEED, MAX_LEAN = 0.012, 0.35
 local MAX_RETURNING = 2 -- rapid tool switching must not accumulate drone copies
 
 type State = "summoning" | "hovering" | "dismissing"
@@ -60,7 +70,13 @@ type Drone = {
 	portal: any?,
 	state: State,
 	t: number, -- seconds into the current summon / dismiss
-	look: Vector3,
+	look: Vector3, -- (level: the body only yaws)
+	follow: DroneRig.FollowState,
+	departure: Vector3?, -- dismissing: where it set off from, in the root's space
+	flipped: boolean,
+	roll: number, -- 0 upright .. pi upside down
+	rig: DroneVisual.Rig,
+	ghostRig: DroneVisual.Rig,
 	hidden: { [Instance]: number }, -- the gun's parts: their old LocalTransparencyModifier
 	tool: Tool?,
 }
@@ -103,8 +119,8 @@ local function aimOf(drone: Drone, from: Vector3): Vector3
 	return drone.root.CFrame.LookVector
 end
 
--- The path out of the portal: from START_DEPTH behind its plane to the
--- hover point. `alpha` 0..1.
+-- The path out of the portal: from START_DEPTH behind its plane to `hover`
+-- (the hover point, or where a dismissed drone set off from). `alpha` 0..1.
 local function pathPoint(portalFrame: CFrame, hover: Vector3, alpha: number): Vector3
 	local start = portalFrame * CFrame.new(0, 0, START_DEPTH)
 	local mouth = portalFrame.Position
@@ -176,12 +192,20 @@ local function step(dt: number)
 		end
 		local position: Vector3
 		if drone.state == "hovering" then
-			position = hover
+			DroneRig.Follow(drone.follow, hover, dt)
+			position = drone.follow.position
 		else
 			drone.t += dt
 			local travel = math.clamp((drone.t - OPEN_TIME * 0.6) / TRAVEL_TIME, 0, 1)
 			local alpha = if drone.state == "summoning" then ease(travel) else 1 - ease(travel)
-			position = pathPoint(portalFrame, hover, alpha)
+			local anchor = if drone.state == "dismissing" and drone.departure
+				then rootFrame:PointToWorldSpace(drone.departure) else hover
+			position = pathPoint(portalFrame, anchor, alpha)
+			-- (so following picks up from here, at this speed)
+			if dt > 0 then
+				drone.follow.velocity = (position - drone.follow.position) / dt
+			end
+			drone.follow.position = position
 			if travel >= 1 then
 				if drone.state == "summoning" then
 					drone.state = "hovering"
@@ -202,11 +226,31 @@ local function step(dt: number)
 				end
 			end
 		end
-		-- turn toward the aim (while travelling: along the path)
-		local wanted = if drone.state == "hovering" then aimOf(drone, position) else (hover - portalFrame.Position).Unit
-		drone.look = drone.look:Lerp(wanted, 1 - math.exp(-TURN_RATE * dt))
+		-- The aim (while travelling: along the path). The body only turns
+		-- level toward it; the arm points the weapon.
+		local aim = if drone.state == "hovering" then aimOf(drone, position) else (hover - portalFrame.Position).Unit
+		local level = Vector3.new(aim.X, 0, aim.Z)
+		if level.Magnitude > 1e-3 then
+			drone.look = drone.look:Lerp(level.Unit, 1 - math.exp(-TURN_RATE * dt))
+		end
 		local look = if drone.look.Magnitude > 1e-3 then drone.look.Unit else rootFrame.LookVector
-		local frame = CFrame.lookAt(position, position + look)
+		-- aiming above itself: roll upside down (arm on top), back once it drops
+		if drone.state ~= "hovering" then
+			drone.flipped = false
+		elseif drone.flipped then
+			drone.flipped = aim.Y > FLIP_DOWN
+		else
+			drone.flipped = aim.Y > FLIP_UP
+		end
+		local roll = if drone.flipped then math.pi else 0
+		drone.roll += (roll - drone.roll) * (1 - math.exp(-ROLL_RATE * dt))
+		-- lean into its movement: nose down going forward, bank going sideways
+		local yaw = CFrame.lookAt(position, position + look)
+		local velocity = yaw:VectorToObjectSpace(drone.follow.velocity)
+		local pitch = math.clamp(velocity.Z * LEAN_PER_SPEED, -MAX_LEAN, MAX_LEAN)
+		local bank = math.clamp(-velocity.X * LEAN_PER_SPEED, -MAX_LEAN, MAX_LEAN)
+		local frame = yaw * CFrame.Angles(pitch, 0, bank) * CFrame.Angles(0, 0, drone.roll)
+		local armAim = if drone.state == "hovering" then aim else frame.LookVector
 		-- the real drone shows once its centre is through the portal's plane;
 		-- before that it's only seen through the opening (its ghost inside)
 		local depth = (position - portalFrame.Position):Dot(-portalFrame.LookVector) -- >0: behind the plane
@@ -216,9 +260,11 @@ local function step(dt: number)
 			DroneVisual.SetHidden(drone.parts, behind)
 		end
 		drone.part:PivotTo(frame)
+		DroneVisual.Pose(drone.rig, frame, armAim)
 		if not behind then DroneVisual.Spin(drone.rotors, frame, now) end
 		if drone.portal then
 			drone.ghost:PivotTo(frame)
+			DroneVisual.Pose(drone.ghostRig, frame, armAim)
 			DroneVisual.Spin(drone.ghostRotors, frame, now)
 		end
 	end
@@ -260,6 +306,7 @@ function DroneClient.Summon(character: Model, tool: Tool?)
 		if existing.state == "dismissing" then
 			-- turned back mid-dismiss: fly out again from where it is
 			existing.state = "summoning"
+			existing.departure = nil
 			existing.t = OPEN_TIME * 0.6 + TRAVEL_TIME * (1 - math.clamp((existing.t - OPEN_TIME * 0.6) / TRAVEL_TIME, 0, 1))
 			if not existing.portal then
 				existing.portal = openPortal(DroneRig.Portal(root.CFrame), 0.15)
@@ -292,6 +339,12 @@ function DroneClient.Summon(character: Model, tool: Tool?)
 		state = "summoning",
 		t = 0,
 		look = (DroneRig.Hover(root.CFrame) - portal.CFrame.Position).Unit,
+		follow = { position = (portal.CFrame * CFrame.new(0, 0, START_DEPTH)).Position, velocity = Vector3.zero },
+		departure = nil,
+		flipped = false,
+		roll = 0,
+		rig = DroneVisual.Rig(part),
+		ghostRig = DroneVisual.Rig(ghost),
 		hidden = {},
 		tool = nil,
 	}
@@ -324,6 +377,8 @@ function DroneClient.Dismiss(character: Model)
 		travelled = 1
 	end
 	drone.state = "dismissing"
+	-- (it heads home from wherever it has followed to)
+	drone.departure = drone.root.CFrame:PointToObjectSpace(drone.follow.position)
 	-- (pick up from wherever a summon had got to)
 	drone.t = OPEN_TIME * 0.6 + TRAVEL_TIME * (1 - travelled)
 	if not drone.portal then

@@ -183,6 +183,44 @@ local function findEquippedWeapon(character: Model): (Tool?, Weapons.WeaponDef?)
 	return nil, nil
 end
 
+-- Each equipped drone, followed exactly as clients fly it (DroneRig.Follow,
+-- minus their cosmetic bob), so shots leave the drone even while it's
+-- catching up with a moving character instead of a fixed point beside it.
+local drones: { [Model]: DroneRig.FollowState } = {}
+RunService.Heartbeat:Connect(function(dt: number)
+	local seen: { [Model]: boolean } = {}
+	for _, player in Players:GetPlayers() do
+		local character = player.Character
+		local root = character and character:FindFirstChild("HumanoidRootPart")
+		if not character or not root or not root:IsA("BasePart") then
+			continue
+		end
+		local armed = false
+		for _, child in character:GetChildren() do
+			if DroneRig.IsDroneTool(child) then
+				armed = true
+				break
+			end
+		end
+		if not armed then
+			continue
+		end
+		seen[character] = true
+		local target = DroneRig.Hover(root.CFrame)
+		local state = drones[character]
+		if state then
+			DroneRig.Follow(state, target, dt)
+		else
+			drones[character] = { position = target, velocity = Vector3.zero }
+		end
+	end
+	for character in drones do
+		if not seen[character] then
+			drones[character] = nil
+		end
+	end
+end)
+
 -- Where a shot spawns from: a drone weapon's drone (see DroneRig), else the
 -- equipped weapon's own "Tip" Attachment if
 -- it has one (searched recursively, so it can live under a muzzle model
@@ -193,7 +231,8 @@ end
 local function resolveMuzzleOrigin(tool: Tool, character: Model, root: BasePart): Vector3
 	-- a drone weapon isn't held: its drone fires (shared/DroneRig)
 	if DroneRig.IsDroneTool(tool) then
-		return DroneRig.Hover(root.CFrame)
+		local drone = drones[character]
+		return if drone then drone.position else DroneRig.Hover(root.CFrame)
 	end
 	local tip = tool:FindFirstChild(TIP_ATTACHMENT_NAME, true)
 	if tip and tip:IsA("Attachment") then

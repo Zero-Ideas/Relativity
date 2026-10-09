@@ -42,6 +42,7 @@
 
 local Players = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local Signal = require(ReplicatedStorage:WaitForChild("Shared"):WaitForChild("Signal"))
 local StarterGui = game:GetService("StarterGui")
 
 local Icon = require(ReplicatedStorage:WaitForChild("Packages"):WaitForChild("TopbarPlus"))
@@ -81,7 +82,7 @@ local editorOpen = false -- (the HUD hides behind the editor's glass)
 local START_MENU = "startmenu" -- (matched without regard to case)
 local startMenuOpen = false -- (the game UI stays off while it's up)
 local uiLoaded = false
-local startMenuClosed = Instance.new("BindableEvent")
+local startMenuClosed = Signal.new()
 
 -- SetCoreGuiEnabled errors until the CoreScripts have registered it.
 local function hideBackpack()
@@ -382,7 +383,7 @@ function UiMode.start()
 	-- Nothing of the game UI loads while the start menu is up.
 	watchStartMenu()
 	while startMenuOpen do
-		startMenuClosed.Event:Wait()
+		startMenuClosed:Wait()
 	end
 	uiLoaded = true
 	task.spawn(MainHud.start) -- (waits for the authored MainGui)

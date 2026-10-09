@@ -7,17 +7,24 @@
 
 	  Weapons        tool names that are drone weapons (the shooting weapons
 	                 in server/Weapons)
-	  Hover(root)    where a character's drone hovers: over its right
-	                 shoulder, a little behind -- the server spawns the
-	                 weapon's shots from here (Shooter.server's muzzle), the
-	                 clients draw the drone here (plus a small bob)
+	  Hover(root)    where a character's drone wants to hover: over its
+	                 right shoulder, a little behind. The drone follows it
+	                 (Follow); the server spawns the weapon's shots from
+	                 where its followed drone is (Shooter.server's muzzle)
 	  Portal(root)   where its portal opens: up and out to the right, ahead
 	                 of the character, facing back at the hover point -- so
 	                 its opening faces the (usually trailing) camera and the
 	                 drone flies out toward it
-	  WeaponMountOffset  underside socket in the drone chassis's local space.
+	  Follow(state, target, dt)  how the drone chases its hover point: a
+	                 damped spring with a top speed (FollowSpeed), snapping if
+	                 it ends up absurdly far behind (a teleport). Clients fly
+	                 the drone with it and the server runs the same motion to
+	                 fire from where the drone actually is.
+	  WeaponMountOffset  underside socket in the drone chassis's local space,
+	                 where its arm's shoulder sits.
 	                 Tools may supply a DroneMountOffset CFrame attribute to
-	                 align their visual to that socket (otherwise Grip inverse).
+	                 align their visual to the arm's hand (otherwise Grip
+	                 inverse).
 ]]
 
 local DroneRig = {}
@@ -33,6 +40,35 @@ DroneRig.HoverOffset = CFrame.new(2.6, 2.3, 1.2)
 DroneRig.PortalOffset = Vector3.new(5, 3.6, -4.5)
 DroneRig.PortalRadius = 2.4 -- clearance for four prop guards
 DroneRig.WeaponMountOffset = CFrame.new(0, -0.42, 0)
+-- Following: spring stiffness (1/s: higher = snappier), top speed (studs/s)
+-- and how far behind it may fall before it snaps to its hover point.
+DroneRig.FollowStiffness = 7
+DroneRig.FollowSpeed = 70
+DroneRig.FollowSnapDistance = 80
+
+export type FollowState = { position: Vector3, velocity: Vector3 }
+
+-- Advances `state` toward `target` by `dt` seconds (critically damped,
+-- speed-capped; substepped so a long frame stays stable).
+function DroneRig.Follow(state: FollowState, target: Vector3, dt: number)
+	if (target - state.position).Magnitude > DroneRig.FollowSnapDistance then
+		state.position, state.velocity = target, Vector3.zero
+		return
+	end
+	local omega = DroneRig.FollowStiffness
+	local steps = math.clamp(math.ceil(dt * 120), 1, 12)
+	local h = dt / steps
+	for _ = 1, steps do
+		local accel = (target - state.position) * (omega * omega) - state.velocity * (2 * omega)
+		local velocity = state.velocity + accel * h
+		local speed = velocity.Magnitude
+		if speed > DroneRig.FollowSpeed then
+			velocity *= DroneRig.FollowSpeed / speed
+		end
+		state.velocity = velocity
+		state.position += velocity * h
+	end
+end
 
 function DroneRig.IsDroneTool(instance: Instance?): boolean
 	return instance ~= nil and instance:IsA("Tool") and DroneRig.Weapons[instance.Name] == true

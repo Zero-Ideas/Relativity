@@ -16,6 +16,9 @@
 	  (MaxDistance / MaxRendered / MaxUpdates also apply to beams; see
 	  Projectile/Client BeamVisual and BeamChainVisual)
 	  Glints       the cast glint on spell circles (off by default)
+	  LensFlare    the sun's lens flare (PlayerGui.Lensflare.Frame). The
+	               rest of the Lighting tab is LightingSettings: per-property
+	               overrides of Lighting, saved as the "Lighting" entry.
 	  EffectsIntensity / ReducedFlashes / CameraShake: local cosmetics only.
 	  HudScale     both HUD modes, 70..130 percent.
 	  EditorOpacity / EditorBlur  the spell editor's holographic glass: how
@@ -27,12 +30,14 @@
 ]]
 
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local Signal = require(ReplicatedStorage:WaitForChild("Shared"):WaitForChild("Signal"))
 
 local ProjectileClient = require(ReplicatedStorage:WaitForChild("Shared"):WaitForChild("Projectile"):WaitForChild("Client"))
 local Glint = require(script.Parent.SpellCastGlint)
 local Presentation = require(ReplicatedStorage.Shared.ClientPresentation)
 local ClientAudio = require(script.Parent.ClientAudio)
 local HudScale = require(script.Parent.HudScale)
+local LightingSettings = require(script.Parent.LightingSettings)
 local UiVisibility = require(script.Parent.UiVisibility)
 
 local remote = ReplicatedStorage:WaitForChild("ClientSettings") :: RemoteFunction
@@ -63,6 +68,7 @@ ClientSettings.Specs = {
 	{ Key = "ReducedFlashes", Label = "Reduced flashes", Kind = "boolean", Default = false, Section = "Effects", Description = "Dims explosion lighting and spell circles; suppresses cast glints." },
 	{ Key = "CameraShake", Label = "Explosion camera shake (%)", Kind = "number", Default = 100, Min = 0, Max = 100, Step = 5, Section = "Effects" },
 	{ Key = "Glints", Label = "Cast glints", Kind = "boolean", Default = false, Section = "Effects" },
+	{ Key = "LensFlare", Label = "Lens flare", Kind = "boolean", Default = true, Section = "Lighting", Description = "The sun's lens flare. Everything under Lighting can be tuned below." },
 	{ Key = "KeySpells", Label = "Spells menu", Kind = "key", Default = "B", Section = "Controls" },
 	{ Key = "KeyEditor", Label = "Spell editor", Kind = "key", Default = "V", Section = "Controls" },
 	{ Key = "KeyHotbar", Label = "Switch hotbar (spells / items)", Kind = "key", Default = "E", Section = "Controls" },
@@ -89,8 +95,8 @@ end
 local pending: { [string]: any } = {} -- changes not saved yet
 local saveQueued = false
 
-local changedEvent = Instance.new("BindableEvent")
-ClientSettings.Changed = changedEvent.Event
+local changedEvent = Signal.new()
+ClientSettings.Changed = changedEvent
 
 local function apply(key: string?)
 	if not key or key == "HideUnintegratedUi" then
@@ -108,6 +114,7 @@ local function apply(key: string?)
 	Glint.SetEnabled(values.Glints == true and not values.ReducedFlashes)
 	ClientAudio.SetVolumes(values.MasterVolume / 100, values.SpellVolume / 100, values.ImpactVolume / 100, values.UiVolume / 100, values.MusicVolume / 100)
 	HudScale.Set(values.HudScale)
+	LightingSettings.SetLensFlare(values.LensFlare ~= false)
 end
 
 local function specOf(key: string): Spec?
@@ -203,6 +210,7 @@ function ClientSettings.start()
 		if not ok or typeof(saved) ~= "table" then
 			return
 		end
+		LightingSettings.Load(saved.Lighting)
 		for key, value in saved do
 			local spec = specOf(key)
 			if not spec then

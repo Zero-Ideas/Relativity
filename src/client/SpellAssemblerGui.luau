@@ -27,6 +27,7 @@
 
 local Players = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local Signal = require(ReplicatedStorage:WaitForChild("Shared"):WaitForChild("Signal"))
 local UserInputService = game:GetService("UserInputService")
 local ContextActionService = game:GetService("ContextActionService")
 local HttpService = game:GetService("HttpService")
@@ -58,13 +59,13 @@ local Panels = require(EditorFolder:WaitForChild("Panels"))
 
 local Colors = Theme.Colors
 local SpellAssemblerGui = {}
-local stateEvent = Instance.new("BindableEvent")
-SpellAssemblerGui.StateChanged = stateEvent.Event
+local stateEvent = Signal.new()
+SpellAssemblerGui.StateChanged = stateEvent
 -- (fires true / false as the editor opens and closes)
-local openEvent = Instance.new("BindableEvent")
-SpellAssemblerGui.OpenChanged = openEvent.Event
-local firedEvent = Instance.new("BindableEvent")
-SpellAssemblerGui.SpellFired = firedEvent.Event
+local openEvent = Signal.new()
+SpellAssemblerGui.OpenChanged = openEvent
+local firedEvent = Signal.new()
+SpellAssemblerGui.SpellFired = firedEvent
 local cooldownDeadlines: { [number]: number } = {}
 function SpellAssemblerGui.GetCooldownRemaining(slot: number?): number
 	local key = slot or SpellAssemblerGui.GetSelectedSlot()
@@ -109,8 +110,8 @@ local equippedTool: Tool? = nil
 local toolRequired = false
 local compactEnabled = true
 -- fired with the cost when a cast is refused for lack of mana (GameHud)
-local manaShortEvent = Instance.new("BindableEvent")
-SpellAssemblerGui.ManaShort = manaShortEvent.Event
+local manaShortEvent = Signal.new()
+SpellAssemblerGui.ManaShort = manaShortEvent
 local castingPaused = false -- (the HUD's items bar is up)
 local function canCast(): boolean
 	if castingPaused then return false end
@@ -294,7 +295,7 @@ end
 -- background GetState must not make an interactive command fail as busy
 -- or hit the server's 0.15-second command limit.
 local COMMAND_GAP = 0.2
-local commandReleased = Instance.new("BindableEvent")
+local commandReleased = Signal.new()
 local lastCommandAt = -math.huge
 local lastCommandWasSelection = false
 local commandSequence = 0
@@ -314,7 +315,7 @@ local function invoke(action: string, payload: any?): any
 	-- two library swaps (or let a newer command overtake an earlier one).
 	commandSequence += 1
 	local sequence = commandSequence
-	while sequence ~= nextCommandSequence do commandReleased.Event:Wait() end
+	while sequence ~= nextCommandSequence do commandReleased:Wait() end
 	local isSelection = action == "SetActive" or action == "ClearActive"
 	local gap = if isSelection and lastCommandWasSelection then 0.08 else COMMAND_GAP
 	local remaining = gap - (os.clock() - lastCommandAt)

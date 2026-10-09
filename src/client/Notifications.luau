@@ -21,6 +21,7 @@
 	Added fires on every Push; Changed whenever the list changes.
 ]]
 
+local Signal = require(game:GetService("ReplicatedStorage"):WaitForChild("Shared"):WaitForChild("Signal"))
 local ReGuiLoader = require(script.Parent.ReGuiLoader)
 local ReGuiLive = require(script.Parent.ReGuiLive)
 
@@ -37,10 +38,10 @@ local WIDTH = 320
 local MAX_KEPT = 50
 
 local Notifications = {}
-local addedEvent = Instance.new("BindableEvent")
-Notifications.Added = addedEvent.Event
-local changedEvent = Instance.new("BindableEvent")
-Notifications.Changed = changedEvent.Event
+local addedEvent = Signal.new()
+Notifications.Added = addedEvent
+local changedEvent = Signal.new()
+Notifications.Changed = changedEvent
 
 local entries: { Entry } = {} -- oldest first
 local nextId = 0
