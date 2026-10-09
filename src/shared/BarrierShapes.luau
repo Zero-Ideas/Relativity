@@ -2,7 +2,7 @@
 --!native
 --!optimize 2
 --[[
-	BarrierShapes.luau (server)
+	BarrierShapes.luau (shared: the server judges, clients watch -- client/BarrierWatch)
 	Spots phallic sculptures built out of spell barriers (one player's or
 	several players' together). Barriers are the only thing looked at -- the
 	map never is -- and only when new ones appear, so it costs nothing per
@@ -36,6 +36,11 @@
 
 	BarrierShapes.Analyze(primitives) -> (flagged, report)
 	  primitive: { Frame: CFrame, Shape: "Box"|"Dome"|"Sphere"|"Ring", Size: Vector3 }
+	BarrierShapes.AnalyzeLayout(primitives) -> (flagged, report)
+	  splits a whole layout (every barrier one spell would raise) into
+	  touching clusters and judges each: SpellService's per-spell check
+	BarrierShapes.Clusters(primitives) -> { { index } }
+	  the touching clusters themselves (indices into primitives)
 	BarrierShapes.Bound(primitive) -> number   -- bounding-sphere radius
 ]]
 
@@ -393,6 +398,63 @@ function BarrierShapes.Analyze(primitives: { Primitive }): (boolean, Report)
 	end
 	report.Ms = (os.clock() - started) * 1000
 	return flagged, report
+end
+
+-- The touching clusters of `primitives` (bounding spheres within GAP,
+-- transitively), as lists of indices; at most MAX_LAYOUT primitives looked at.
+local MAX_LAYOUT = 200
+function BarrierShapes.Clusters(primitives: { Primitive }): { { number } }
+	local count = math.min(#primitives, MAX_LAYOUT)
+	local bounds = table.create(count, 0)
+	for i = 1, count do
+		bounds[i] = BarrierShapes.Bound(primitives[i])
+	end
+	local clusters = {}
+	local seen = table.create(count, false)
+	for seed = 1, count do
+		if seen[seed] then
+			continue
+		end
+		seen[seed] = true
+		local members = { seed }
+		local index = 1
+		while index <= #members do
+			local current = members[index]
+			local position = primitives[current].Frame.Position
+			for other = 1, count do
+				if not seen[other] and (primitives[other].Frame.Position - position).Magnitude
+					<= bounds[current] + bounds[other] + BarrierShapes.GAP then
+					seen[other] = true
+					table.insert(members, other)
+				end
+			end
+			index += 1
+		end
+		table.insert(clusters, members)
+	end
+	return clusters
+end
+
+-- Every touching cluster of `primitives`, each judged on its own; flagged
+-- if any one is.
+function BarrierShapes.AnalyzeLayout(primitives: { Primitive }): (boolean, Report)
+	local report: Report = { Voxels = 0, Voxel = 0, Ms = 0 }
+	if not BarrierShapes.Enabled or #primitives < BarrierShapes.MIN_PARTS then
+		return false, report
+	end
+	for _, members in BarrierShapes.Clusters(primitives) do
+		if #members >= BarrierShapes.MIN_PARTS then
+			local cluster = table.create(#members)
+			for _, index in members do
+				table.insert(cluster, primitives[index])
+			end
+			local flagged, clusterReport = BarrierShapes.Analyze(cluster)
+			if flagged then
+				return true, clusterReport
+			end
+		end
+	end
+	return false, report
 end
 
 return BarrierShapes

@@ -54,7 +54,7 @@ local Signal = require(Shared:WaitForChild("Signal"))
 local StatusEffectSys = require(Shared:WaitForChild("StatusEffectSys"))
 local VisualOffload = require(Shared:WaitForChild("VisualOffload"))
 local Ragdoll = require(script.Parent:WaitForChild("Ragdoll"))
-local BarrierShapes = require(script.Parent:WaitForChild("BarrierShapes"))
+local BarrierShapes = require(Shared:WaitForChild("BarrierShapes"))
 
 local SpellWorld = {}
 
@@ -97,6 +97,9 @@ export type Thing = {
 	_size: Vector3?, -- (barriers) width, height, depth as built
 	_offset: CFrame?, -- (following) its frame relative to the entity
 	_relative: { [BasePart]: CFrame }?, -- (barriers) each part relative to _frame
+	_id: number?, -- (barriers) the BarrierId clients report it by
+	_judgedAt: number?, -- (barriers) os.clock of its cluster's last shape verdict
+	_cleanFrame: CFrame?, -- (barriers) _frame when its cluster was last judged clean
 	_zoneRadius: number?,
 	_zoneScale: number?,
 	_lastSent: number?,
@@ -320,10 +323,16 @@ local function track(thing: Thing, owner: Player?)
 	end
 end
 
+local barrierById: { [number]: Thing } = {}
+local nextBarrierId = 0
+
 local function untrack(thing: Thing)
 	local index = table.find(things, thing)
 	if index then
 		table.remove(things, index)
+	end
+	if thing._id then
+		barrierById[thing._id] = nil
 	end
 	local owner = thing.Owner
 	local list = owner and thingsByOwner[owner]
@@ -434,13 +443,11 @@ local function passList(player: Player?, caster: any?): string
 	return "," .. table.concat(ids, ",") .. ","
 end
 
-function SpellWorld.CreateBarrier(options: BarrierOptions): Thing
+-- Where a barrier with these options stands, and its clamped size.
+local function barrierPlacement(options: BarrierOptions): (CFrame, number, number, number)
 	local width = math.clamp(options.size.X, 0.3, 120)
 	local height = math.clamp(options.size.Y, 0.3, 120)
 	local depth = math.clamp(options.size.Z, 0.3, 60)
-	local color = options.color
-	local shape = options.shape
-	local blocks = options.blocks or "Hostile"
 	local at = options.position
 	if options.ground then
 		local ground = groundBelow(at, 60)
@@ -453,7 +460,26 @@ function SpellWorld.CreateBarrier(options: BarrierOptions): Thing
 	local rotation = CFrame.lookAt(Vector3.zero, toward) * CFrame.Angles(-math.rad(options.tilt or 0), 0, 0)
 	local half = height / 2
 	local lift = if options.anchor == "Top" then -half elseif options.anchor == "Centre" then 0 else half - (if options.ground then 0.3 else 0)
-	local frame = CFrame.new(at + rotation.UpVector * lift) * rotation
+	return CFrame.new(at + rotation.UpVector * lift) * rotation, width, height, depth
+end
+
+local function primitiveShape(shape: string): string
+	return if shape == "Dome" or shape == "Sphere" or shape == "Ring" then shape else "Box"
+end
+
+-- The barrier these options would raise, as BarrierShapes sees it, without
+-- raising it (SpellRuntime's shape probe).
+function SpellWorld.BarrierPrimitive(options: BarrierOptions): BarrierShapes.Primitive
+	local frame, width, height, depth = barrierPlacement(options)
+	return { Frame = frame, Shape = primitiveShape(options.shape), Size = Vector3.new(width, height, depth) }
+end
+
+function SpellWorld.CreateBarrier(options: BarrierOptions): Thing
+	local frame, width, height, depth = barrierPlacement(options)
+	local color = options.color
+	local shape = options.shape
+	local blocks = options.blocks or "Hostile"
+	local half = height / 2
 
 	local model = Instance.new("Model")
 	model.Name = "Barrier"
@@ -471,6 +497,16 @@ function SpellWorld.CreateBarrier(options: BarrierOptions): Thing
 	else
 		parts = { makePanel(model, frame, Vector3.new(width, height, depth), color) }
 		radius = math.max(width, height, depth) / 2
+	end
+	-- what clients need to run the shape check on it (client/BarrierWatch):
+	-- its id, shape and size, and where its frame is from its first panel
+	nextBarrierId += 1
+	local barrierId = nextBarrierId
+	model:SetAttribute("BarrierId", barrierId)
+	model:SetAttribute("BarrierShape", primitiveShape(shape))
+	model:SetAttribute("BarrierSize", Vector3.new(width, height, depth))
+	if parts[1] then
+		parts[1]:SetAttribute("BarrierFrame", parts[1].CFrame:ToObjectSpace(frame))
 	end
 
 	local pass = options.pass or "Allies"
@@ -518,10 +554,12 @@ function SpellWorld.CreateBarrier(options: BarrierOptions): Thing
 		_parts = parts,
 		_color = color,
 		_frame = frame,
-		_shape = if shape == "Dome" or shape == "Sphere" or shape == "Ring" then shape else "Box",
+		_shape = primitiveShape(shape),
 		_size = Vector3.new(width, height, depth),
 		_relative = relative,
+		_id = barrierId,
 	}
+	barrierById[barrierId] = thing
 	local carrier = carrierFrame(options.follow)
 	if carrier then
 		thing._follow = options.follow
@@ -604,6 +642,50 @@ local function strike(player: Player)
 	end
 end
 
+-- Judges `thing`'s cluster now: a flagged one is dissolved (its casters
+-- told and struck), a clean one remembered as clean where it stands.
+-- `reporters`: the players whose reports asked for it (logged).
+local function judgeCluster(thing: Thing, cluster: { Thing }, reporters: { Player }?): boolean
+	local primitives = {}
+	for _, member in cluster do
+		table.insert(primitives, primitiveOf(member))
+	end
+	local flagged, report = BarrierShapes.Analyze(primitives)
+	local now = os.clock()
+	for _, member in cluster do
+		member._judgedAt = now
+		member._cleanFrame = if flagged then nil else member._frame
+	end
+	if not flagged then
+		return false
+	end
+	local owners: { [Player]: boolean } = {}
+	for _, member in cluster do
+		if member.Owner then
+			owners[member.Owner] = true
+		end
+		member:Destroy(nil, "moderated")
+	end
+	local names = {}
+	for owner in owners do
+		table.insert(names, `{owner.Name} ({owner.UserId})`)
+		notice(owner, "A barrier build was removed for its shape.")
+		strike(owner)
+	end
+	local reportedBy = ""
+	if reporters and #reporters > 0 then
+		local who = {}
+		for _, reporter in reporters do
+			table.insert(who, reporter.Name)
+		end
+		reportedBy = ", reported by " .. table.concat(who, ", ")
+	end
+	warn(string.format("[BarrierShapes] removed %d barriers by %s at %s (length %.0f, shaft %.1f, base %.1f; %.2f ms%s)",
+		#cluster, table.concat(names, ", "), tostring((thing._frame :: CFrame).Position),
+		report.Length or 0, report.ShaftWidth or 0, report.BaseWidth or 0, report.Ms, reportedBy))
+	return true
+end
+
 local function runShapeChecks()
 	shapeCheckQueued = false
 	local batch = pendingShapes
@@ -617,29 +699,7 @@ local function runShapeChecks()
 		for _, member in cluster do
 			judged[member] = true
 		end
-		local primitives = {}
-		for _, member in cluster do
-			table.insert(primitives, primitiveOf(member))
-		end
-		local flagged, report = BarrierShapes.Analyze(primitives)
-		if flagged then
-			local owners: { [Player]: boolean } = {}
-			for _, member in cluster do
-				if member.Owner then
-					owners[member.Owner] = true
-				end
-				member:Destroy(nil, "moderated")
-			end
-			local names = {}
-			for owner in owners do
-				table.insert(names, `{owner.Name} ({owner.UserId})`)
-				notice(owner, "A barrier build was removed for its shape.")
-				strike(owner)
-			end
-			warn(string.format("[BarrierShapes] removed %d barriers by %s at %s (length %.0f, shaft %.1f, base %.1f; %.2f ms)",
-				#cluster, table.concat(names, ", "), tostring((thing._frame :: CFrame).Position),
-				report.Length or 0, report.ShaftWidth or 0, report.BaseWidth or 0, report.Ms))
-		end
+		judgeCluster(thing, cluster, nil)
 	end
 end
 
@@ -662,9 +722,153 @@ function SpellWorld.CheckBarrierShape(thing: Thing)
 	end
 end
 
+--------------------------------------------------------------------------------
+-- Client reports (client/BarrierWatch)
+--------------------------------------------------------------------------------
+-- The check above runs when barriers appear; barriers that follow an entity
+-- can come together into a shape later. Every client runs the same check on
+-- the barriers it sees as they move, hides a flagged group locally at once
+-- and reports one barrier of it here. A report is only a hint: the server
+-- rebuilds the cluster from its own state and judges it itself. Spamming
+-- reports can't make that expensive:
+--  - a report is read for at most MAX_REPORT_IDS ids; anything that isn't a
+--    live barrier's id is ignored
+--  - each player has a token bucket: REPORT_BURST reports, one more every
+--    REPORT_REFILL seconds; the rest are dropped unread
+--  - duplicates are ignored: a barrier already queued just adds the reporter
+--    to that entry, and a cluster judged within CLUSTER_COOLDOWN seconds
+--    isn't judged again, however many players report it
+--  - a cluster where nothing moved since it was judged clean is never
+--    analysed again (that verdict stands)
+--  - judging runs from one server-wide queue (QUEUE_MAX entries, the rest
+--    dropped): at most JUDGE_PER_FRAME a frame and JUDGE_MS_PER_SECOND of
+--    analysis a second
+--  - a player whose reports keep coming back clean (FALSE_LIMIT within
+--    FALSE_WINDOW seconds) has their reports ignored for MUTE_SECONDS
+local MAX_REPORT_IDS = 8
+local REPORT_BURST, REPORT_REFILL = 4, 2
+local CLUSTER_COOLDOWN = 1
+local QUEUE_MAX = 32
+local JUDGE_PER_FRAME = 2
+local JUDGE_MS_PER_SECOND = 12
+local FALSE_LIMIT, FALSE_WINDOW, MUTE_SECONDS = 6, 60, 120
+
+local remotes = ReplicatedStorage:FindFirstChild("SpellRemotes") or Instance.new("Folder")
+remotes.Name = "SpellRemotes"
+remotes.Parent = ReplicatedStorage
+local reportRemote = remotes:FindFirstChild("BarrierReport") or Instance.new("RemoteEvent")
+reportRemote.Name = "BarrierReport"
+reportRemote.Parent = remotes
+
+type Reporter = { tokens: number, refilled: number, falses: { number }, mutedUntil: number }
+type ReportEntry = { thing: Thing, reporters: { Player } }
+local reporters: { [Player]: Reporter } = {}
+local reportQueue: { ReportEntry } = {}
+local queuedEntry: { [Thing]: ReportEntry } = {}
+local judgeBudget = JUDGE_MS_PER_SECOND -- ms of analysis left; refills over time
+
+local function falseReport(player: Player)
+	local reporter = reporters[player]
+	if not reporter then
+		return
+	end
+	local now = os.clock()
+	local falses = reporter.falses
+	table.insert(falses, now)
+	while falses[1] and now - falses[1] > FALSE_WINDOW do
+		table.remove(falses, 1)
+	end
+	if #falses >= FALSE_LIMIT then
+		table.clear(falses)
+		reporter.mutedUntil = now + MUTE_SECONDS
+	end
+end
+
+reportRemote.OnServerEvent:Connect(function(player: Player, ids: any)
+	local now = os.clock()
+	local reporter = reporters[player]
+	if not reporter then
+		reporter = { tokens = REPORT_BURST, refilled = now, falses = {}, mutedUntil = 0 }
+		reporters[player] = reporter
+	end
+	if now < reporter.mutedUntil then
+		return
+	end
+	reporter.tokens = math.min(REPORT_BURST, reporter.tokens + (now - reporter.refilled) / REPORT_REFILL)
+	reporter.refilled = now
+	if reporter.tokens < 1 or typeof(ids) ~= "table" then
+		return
+	end
+	reporter.tokens -= 1
+	for index = 1, MAX_REPORT_IDS do
+		local id = ids[index]
+		if typeof(id) ~= "number" then
+			break
+		end
+		local thing = barrierById[id]
+		if not thing or thing.Dead or (thing._judgedAt and now - thing._judgedAt < CLUSTER_COOLDOWN) then
+			continue
+		end
+		local entry = queuedEntry[thing]
+		if entry then
+			if not table.find(entry.reporters, player) then
+				table.insert(entry.reporters, player)
+			end
+		elseif #reportQueue < QUEUE_MAX then
+			entry = { thing = thing, reporters = { player } }
+			queuedEntry[thing] = entry
+			table.insert(reportQueue, entry)
+		end
+	end
+end)
+
+local function judgeReport(entry: ReportEntry)
+	local thing = entry.thing
+	if thing.Dead then
+		return
+	end
+	local now = os.clock()
+	local cluster = clusterOf(thing)
+	local unchanged = true
+	for _, member in cluster do
+		if member._judgedAt and now - member._judgedAt < CLUSTER_COOLDOWN then
+			return -- (judged moments ago, through another of its barriers)
+		end
+		if member._cleanFrame ~= member._frame then
+			unchanged = false
+		end
+	end
+	local flagged = false
+	if not unchanged and #cluster >= BarrierShapes.MIN_PARTS then
+		flagged = judgeCluster(thing, cluster, entry.reporters)
+	end
+	if not flagged then
+		for _, reporter in entry.reporters do
+			falseReport(reporter)
+		end
+	end
+end
+
+Heartbeat.Connect(function(dt)
+	judgeBudget = math.min(judgeBudget + dt * JUDGE_MS_PER_SECOND, JUDGE_MS_PER_SECOND)
+	local judged = 0
+	while reportQueue[1] and judged < JUDGE_PER_FRAME and judgeBudget > 0 do
+		local entry = table.remove(reportQueue, 1) :: ReportEntry
+		queuedEntry[entry.thing] = nil
+		judged += 1
+		local started = os.clock()
+		local ok, err = pcall(judgeReport, entry)
+		if not ok then
+			warn(`[BarrierShapes] judging a report failed: {tostring(err)}`)
+		end
+		judgeBudget -= (os.clock() - started) * 1000
+	end
+end, { Name = "SpellWorld.BarrierReports", Priority = 5 })
+
 Players.PlayerRemoving:Connect(function(player)
 	strikes[player] = nil
 	lockedUntil[player] = nil
+	reporters[player] = nil
 end)
 
 local function flash(thing: Thing)

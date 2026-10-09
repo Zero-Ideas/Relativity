@@ -90,7 +90,12 @@ export type CastInfo = {
 	pending: number,
 	dead: boolean,
 	memory: { [string]: any },
+	-- A shape probe (SpellRuntime.ProbeBarriers): nothing happens in the
+	-- world; barriers are recorded, other vessels skipped, waits queued.
+	probe: Probe?,
 }
+
+export type Probe = { barriers: { any }, queue: { () -> () } }
 
 export type Context = {
 	player: Player,
@@ -201,8 +206,8 @@ end
 local memory: { [Player]: { [string]: any } } = {}
 
 local function memoryOf(ctx: Context, scope: string): { [string]: any }
-	if scope == "This cast" then
-		return ctx.cast.memory
+	if scope == "This cast" or ctx.cast.probe then
+		return ctx.cast.memory -- (a probe never touches the caster's real memory)
 	end
 	local slots = memory[ctx.player]
 	if not slots then
@@ -848,7 +853,9 @@ local function spend(ctx: Context): boolean
 	cast.steps += 1
 	if cast.steps > SpellRunes.Budget.Steps then
 		cast.dead = true
-		warn(`[SpellRuntime] {cast.player.Name}'s spell ran out of steps and fizzled`)
+		if not cast.probe then
+			warn(`[SpellRuntime] {cast.player.Name}'s spell ran out of steps and fizzled`)
+		end
 		return false
 	end
 	return true
@@ -867,6 +874,11 @@ local function later(ctx: Context, seconds: number, position: Vector3, run: () -
 	end
 	if seconds <= 0 then
 		run()
+		return
+	end
+	if cast.probe then
+		-- (no waiting in a probe: run it next, after what's running now)
+		table.insert(cast.probe.queue, run)
 		return
 	end
 	local budget: { pending: number } = ctx.eventPending or cast
@@ -1726,7 +1738,7 @@ local function fireUtility(compiled: any, ctx: Context, id: string, energy: numb
 		local at = placement(compiled, ctx, id, base.MaxCastRange)
 		local follow = input(compiled, ctx, id, "follow")
 		local fed = fedBy(own, SpellRunes.BarrierCost(p))
-		local thing = SpellWorld.CreateBarrier({
+		local options: SpellWorld.BarrierOptions = {
 			player = ctx.player,
 			caster = ctx.caster,
 			position = at,
@@ -1744,7 +1756,13 @@ local function fireUtility(compiled: any, ctx: Context, id: string, energy: numb
 			blocks = p.Blocks,
 			follow = if alive(follow) then follow else nil,
 			color = look.Color,
-		})
+		}
+		local probe = ctx.cast.probe
+		if probe then
+			table.insert(probe.barriers, SpellWorld.BarrierPrimitive(options))
+			return
+		end
+		local thing = SpellWorld.CreateBarrier(options)
 		watchThing(compiled, ctx, id, thing, energy, element)
 	elseif kind == "TimeField" then
 		local at = placement(compiled, ctx, id, base.MaxCastRange)
@@ -1865,6 +1883,9 @@ local function fireVessel(compiled: any, ctx: Context, id: string, energy: numbe
 		if cast.vessels > SpellRunes.Budget.Vessels then
 			return
 		end
+	end
+	if cast.probe and vessel ~= "Barrier" then
+		return -- (a shape probe only places barriers)
 	end
 	local def = SpellRunes.Runes[vessel]
 	if not def.Damaging then
@@ -2065,7 +2086,7 @@ FLOW.Await = function(compiled, ctx, id, params, energy, element)
 	local holding = false
 	-- a conjured circle that's waiting (a trap) stays up until it goes off
 	local function hold(on: boolean)
-		if ctx.conjureId and on ~= holding then
+		if ctx.conjureId and on ~= holding and not ctx.cast.probe then
 			holding = on
 			VisualOffload.Fire("SpellCircle", {
 				Phase = if on then "ConjureHold" else "ConjureRelease",
@@ -2103,16 +2124,18 @@ FLOW.Conjure = function(compiled, ctx, id, params, energy, element)
 	local direction = if look and (look - position).Magnitude > 1e-3 then (look - position).Unit else ctx.heading
 	nextConjure += 1
 	local conjureId = nextConjure
-	VisualOffload.Fire("SpellCircle", {
-		Phase = "Conjure",
-		Caster = ctx.character,
-		Id = conjureId,
-		Position = position,
-		Direction = direction,
-		Spec = conjureSpec(compiled, id),
-		Duration = params.Delay,
-		Size = params.Size,
-	})
+	if not ctx.cast.probe then
+		VisualOffload.Fire("SpellCircle", {
+			Phase = "Conjure",
+			Caster = ctx.character,
+			Id = conjureId,
+			Position = position,
+			Direction = direction,
+			Spec = conjureSpec(compiled, id),
+			Duration = params.Delay,
+			Size = params.Size,
+		})
+	end
 	later(ctx, params.Delay, position, function()
 		-- (a cast-time circle fires at where you're aiming once it's drawn)
 		local child = derive(liveContext(ctx))
@@ -2246,6 +2269,68 @@ function SpellRuntime.Cast(compiled: any, request: CastRequest)
 	for _, rootId in compiled.manaRoots do
 		runFlow(compiled, ctx, rootId, "out", compiled.runes[rootId].params.Amount * energyMultiplier, nil)
 	end
+end
+
+-- Shape probe: runs `compiled` as `player` casting it from a fixed pose in
+-- empty space (feet at PROBE_FEET, aiming at the floor PROBE_REACH studs
+-- ahead), with nothing happening in the world -- every barrier it would
+-- raise is recorded (SpellWorld.BarrierPrimitive) instead, other vessels
+-- are skipped, and Delay / Repeat / Conjure waits run straight away. What
+-- comes back is the layout of barriers the cast itself raises; trigger-fired
+-- ones (impacts, timers, a trap's "then") need the world and aren't in it
+-- (SpellWorld's live check still sees those). For SpellService's
+-- once-per-version barrier check.
+local PROBE_FEET = Vector3.new(0, 30000, 0)
+local PROBE_REACH = 24
+local PROBE_MAX_RUNS = 2000 -- queued (would-wait) parts run per probe
+
+function SpellRuntime.ProbeBarriers(compiled: any, player: Player): { any }
+	local feet = PROBE_FEET
+	local head = feet + Vector3.new(0, 4.5, 0)
+	local cursor = feet - Vector3.zAxis * PROBE_REACH
+	local probe: Probe = { barriers = {}, queue = {} }
+	local stand = {
+		IsDestroyed = false,
+		Health = 100,
+		MaxHealth = 100,
+		GetPosition = function()
+			return feet + Vector3.new(0, 3, 0)
+		end,
+		HasTag = function()
+			return false
+		end,
+	}
+	local ctx: Context = {
+		player = player,
+		caster = stand,
+		character = Instance.new("Model"),
+		origin = head,
+		cursorPoint = cursor,
+		cursorEntity = nil,
+		struck = nil,
+		heading = (cursor - head).Unit,
+		focus = nil,
+		subject = nil,
+		isCast = true,
+		spawnOffset = CAST_SPAWN_OFFSET,
+		memo = {},
+		vars = {},
+		cast = { player = player, started = os.clock(), steps = 0, vessels = 0, pending = 0, dead = false, memory = {}, probe = probe },
+		live = nil,
+		flight = 0,
+		copyMultiplier = 1,
+		depth = 0,
+	}
+	for _, rootId in compiled.manaRoots do
+		runFlow(compiled, ctx, rootId, "out", compiled.runes[rootId].params.Amount, nil)
+	end
+	local runs, index = 0, 1
+	while index <= #probe.queue and runs < PROBE_MAX_RUNS and not ctx.cast.dead do
+		runs += 1
+		probe.queue[index]()
+		index += 1
+	end
+	return probe.barriers
 end
 
 -- Timer / proximity triggers. Age is the vessel's own dilated clock, so a

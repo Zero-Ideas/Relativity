@@ -16,6 +16,7 @@ local SpellCircleLayout = require(Shared:WaitForChild("SpellCircleLayout"))
 local VisualOffload = require(Shared:WaitForChild("VisualOffload"))
 local SpellStore = require(script.Parent:WaitForChild("SpellStore"))
 local SpellRuntime = require(script.Parent:WaitForChild("SpellRuntime"))
+local BarrierShapes = require(Shared:WaitForChild("BarrierShapes"))
 local BeamHandler = require(script.Parent:WaitForChild("Projectile"):WaitForChild("Beams"))
 
 local PlayerResources = require(script.Parent.PlayerResources)
@@ -192,6 +193,42 @@ end
 
 -- Shared spells waiting for an answer: shares[recipient][shareId].
 local SHARE_LIFETIME = 60
+-- Barrier shape check, once per version of a spell: a dry run of the cast
+-- (SpellRuntime.ProbeBarriers) lays out every barrier it would raise and
+-- BarrierShapes judges the layout. A spell that builds a flagged shape
+-- can't be saved, and one already saved won't cast (or be Invoked) -- so
+-- the shape never appears at all. Builds this can't foresee (several casts,
+-- several players, trigger-placed barriers) are still caught live by
+-- SpellWorld's check once they stand.
+local BARRIER_BLOCKED = "This spell's barriers form a shape that isn't allowed."
+local BLOCKED_NOTICE_INTERVAL = 2
+
+local function mayBuildBarriers(compiled: any): boolean
+	for _, rune in compiled.runes do
+		if rune.rune == "Barrier" or rune.rune == "Invoke" then
+			return true
+		end
+	end
+	return false
+end
+
+local function barriersFlagged(player: Player, compiled: any): boolean
+	if not BarrierShapes.Enabled or not mayBuildBarriers(compiled) then
+		return false
+	end
+	local ok, primitives = pcall(SpellRuntime.ProbeBarriers, compiled, player)
+	if not ok then
+		warn(`[SpellService] barrier probe failed: {tostring(primitives)}`)
+		return false
+	end
+	local flagged, report = BarrierShapes.AnalyzeLayout(primitives)
+	if flagged then
+		warn(string.format("[BarrierShapes] blocked a spell by %s (%d): %d barriers (length %.0f, shaft %.1f, base %.1f; %.2f ms)",
+			player.Name, player.UserId, #primitives, report.Length or 0, report.ShaftWidth or 0, report.BaseWidth or 0, report.Ms))
+	end
+	return flagged
+end
+
 type Share = { from: Player, name: string, graph: any, expiry: number, savedId: string? }
 local shares: { [Player]: { [string]: Share } } = {}
 
@@ -214,6 +251,9 @@ local function handleLibraryCommand(player: Player, action: string, payload: any
 		local compiled, errors, normalized = SpellCompiler.Compile(payload.graph)
 		if not compiled or not normalized then
 			return response(false, SpellStore.GetState(player), errors, "The circle is invalid.")
+		end
+		if barriersFlagged(player, compiled) then
+			return response(false, SpellStore.GetState(player), nil, BARRIER_BLOCKED)
 		end
 		local name, nameError = filterName(player, payload.name or normalized.name)
 		if not name then
@@ -402,6 +442,9 @@ local function handleCommand(player: Player, action: any, payload: any)
 		if not compiled or not normalized then
 			return response(false, SpellStore.GetState(player), errors, "The circle is invalid.")
 		end
+		if barriersFlagged(player, compiled) then
+			return response(false, SpellStore.GetState(player), nil, BARRIER_BLOCKED)
+		end
 		local name, nameError = filterName(player, payload.name or normalized.name)
 		if not name then
 			return response(false, SpellStore.GetState(player), nil, nameError)
@@ -459,10 +502,37 @@ local function compiledFor(record: any): any?
 	return cached or nil
 end
 
+-- [record] = flagged (records are immutable: a new save is a new record)
+local barrierVerdicts: { [any]: boolean } = setmetatable({}, { __mode = "k" }) :: any
+
+local function barrierBlocked(player: Player, record: any): boolean
+	local verdict = barrierVerdicts[record]
+	if verdict == nil then
+		barrierVerdicts[record] = false -- (an Invoke loop back into this spell reads "allowed" mid-probe)
+		local compiled = compiledFor(record)
+		verdict = compiled ~= nil and barriersFlagged(player, compiled)
+		barrierVerdicts[record] = verdict
+	end
+	return verdict
+end
+
+local lastBlockedNotice: { [Player]: number } = {}
+local function noticeBlocked(player: Player)
+	local now = os.clock()
+	if lastBlockedNotice[player] and now - lastBlockedNotice[player] < BLOCKED_NOTICE_INTERVAL then
+		return
+	end
+	lastBlockedNotice[player] = now
+	VisualOffload.FireClient(player, "Notice", { Title = "Barriers", Text = BARRIER_BLOCKED })
+end
+Players.PlayerRemoving:Connect(function(player)
+	lastBlockedNotice[player] = nil
+end)
+
 -- Invoke runes cast the spell on one of the caster's hotbar slots.
 SpellRuntime.SetResolver(function(player: Player, slot: number): any?
 	local record = SpellStore.GetSlotRecord(player, slot)
-	return if record then compiledFor(record) else nil
+	return if record and not barrierBlocked(player, record) then compiledFor(record) else nil
 end)
 
 -- Spell circle VFX (client/SpellCircleVFX): the spec is built once per saved
@@ -587,7 +657,7 @@ local function freezeSpell(player: Player, rawPosition: any)
 	end
 	local record = SpellStore.GetActive(player)
 	local compiled = record and compiledFor(record)
-	if not record or not compiled or SpellRunes.HasSustain(compiled) then
+	if not record or not compiled or SpellRunes.HasSustain(compiled) or barrierBlocked(player, record) then
 		return
 	end
 	local held = os.clock() - started
@@ -702,6 +772,10 @@ channel.OnServerEvent:Connect(function(player: Player, action: any, payload: any
 		local record = SpellStore.GetActive(player)
 		local compiled = record and compiledFor(record)
 		if not compiled then return end
+		if barrierBlocked(player, record) then
+			noticeBlocked(player)
+			return
+		end
 		local paid = 0
 		if not SpellRunes.HasSustain(compiled) then
 			-- (Sustain spells don't charge: they pay when cast)
@@ -747,6 +821,10 @@ local function castSpell(player: Player, rawTarget: any): boolean
 	if not record then return false end
 	local compiled = compiledFor(record)
 	if not compiled then return false end
+	if barrierBlocked(player, record) then
+		noticeBlocked(player)
+		return false
+	end
 
 	local now = os.clock()
 	if coolingDown(player) then return false end
