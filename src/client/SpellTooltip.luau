@@ -3,6 +3,7 @@
 local Players = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local RunService = game:GetService("RunService")
+local FrameProfiler = require(game:GetService("ReplicatedStorage"):WaitForChild("Shared"):WaitForChild("FrameProfiler"))
 local TextService = game:GetService("TextService")
 local GuiService = game:GetService("GuiService")
 local Shared = ReplicatedStorage:WaitForChild("Shared")
@@ -171,7 +172,7 @@ function Tooltip.Bind(target: GuiObject, getRecord: () -> any): () -> ()
 	table.insert(binding.connections, target.MouseEnter:Connect(function()
 		active = binding
 		Tooltip.Refresh(target)
-		if active and not connection then connection = RunService.RenderStepped:Connect(position) end
+		if active and not connection then connection = FrameProfiler.Connect(RunService.RenderStepped, "SpellTooltip.RenderStepped", position) end
 	end))
 	table.insert(binding.connections, target.MouseLeave:Connect(function() if active == binding then hide() end end))
 	table.insert(binding.connections, target.Destroying:Connect(cleanup))

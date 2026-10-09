@@ -28,6 +28,7 @@
 
 local Players = game:GetService("Players")
 local RunService = game:GetService("RunService")
+local FrameProfiler = require(game:GetService("ReplicatedStorage"):WaitForChild("Shared"):WaitForChild("FrameProfiler"))
 local UserInputService = game:GetService("UserInputService")
 local ContextActionService = game:GetService("ContextActionService")
 local TweenService = game:GetService("TweenService")
@@ -1371,7 +1372,7 @@ function GameHud.SetEnabled(on: boolean)
 		refreshItems()
 		refreshParty()
 		if not renderConnection then
-			renderConnection = RunService.RenderStepped:Connect(stepBars)
+			renderConnection = FrameProfiler.Connect(RunService.RenderStepped, "GameHud.RenderStepped", stepBars)
 		end
 	else
 		ContextActionService:UnbindAction(SLOT_ACTION)
@@ -1425,7 +1426,7 @@ function GameHud.start()
 	refreshParty()
 	if enabled then
 		bindSlotKeys()
-		renderConnection = RunService.RenderStepped:Connect(stepBars)
+		renderConnection = FrameProfiler.Connect(RunService.RenderStepped, "GameHud.RenderStepped#2", stepBars)
 	end
 end
 

@@ -29,6 +29,7 @@
 
 local Players = game:GetService("Players")
 local RunService = game:GetService("RunService")
+local FrameProfiler = require(game:GetService("ReplicatedStorage"):WaitForChild("Shared"):WaitForChild("FrameProfiler"))
 local TweenService = game:GetService("TweenService")
 
 local Portal = {}
@@ -211,7 +212,7 @@ function Portal.new(cframe: CFrame, radius: number): Portal
 	end)
 	table.insert(live, portal)
 	if not stepping then
-		stepping = RunService.RenderStepped:Connect(step)
+		stepping = FrameProfiler.Connect(RunService.RenderStepped, "Portal.RenderStepped", step)
 	end
 	return portal
 end

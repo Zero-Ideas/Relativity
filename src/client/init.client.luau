@@ -32,10 +32,12 @@ local DroneClient = require(script.DroneClient) -- guns summon a drone through a
 local _AmmoState = require(script.AmmoState)
 local _WeaponEffects = require(script.WeaponEffects)
 local _SpellEffects = require(script.SpellEffects) -- spell Beam visuals
+local Effects = require(script.Effects) -- adaptive impacts, blade swings, speed streaks
 local _DummyEffects = require(script.DummyEffects) -- test dummy damage flashes
 
 ChunkManager.EnableReplication()
 ProjectileClient.EnableClientRendering()
+Effects.start() -- before any projectile spawns, so every visual gets its streak hook
 Entity.EnableHurtboxRendering() -- draws hurtboxes when Entity.ShowHurtboxes is true
 Entity.EnableHurtboxHistoryRendering() -- draws the history trail when Entity.ShowHurtboxHistory is true
 
@@ -52,12 +54,7 @@ DroneClient.start()
 -- MainHud (hotbar) or the classic Backpack UI, switched from the topbar
 task.spawn(function() require(script.UiMode).start() end)
 
--- Optional: custom impact VFX for offloaded projectiles.
--- ProjectileClient.SetImpactHandler(function(position, normal, model)
--- 	local effect = ReplicatedStorage.Effects.Impact:Clone()
--- 	effect.Position = position
--- 	effect.Parent = workspace
--- 	task.delay(1, effect.Destroy, effect)
--- end)
+-- Impacts go through Effects (see client/Effects): it probes what was hit and
+-- adapts. To restyle one surface: Effects.Register("Impact.Metal", fn(surface, context)).
 
 print("[Relativity] client render systems online")

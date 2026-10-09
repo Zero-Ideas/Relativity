@@ -34,6 +34,7 @@
 ]]
 
 local RunService = game:GetService("RunService")
+local FrameProfiler = require(game:GetService("ReplicatedStorage"):WaitForChild("Shared"):WaitForChild("FrameProfiler"))
 local ManaTier = require(game:GetService("ReplicatedStorage").Shared.SpellManaTier)
 local Presentation = require(game:GetService("ReplicatedStorage").Shared.ClientPresentation)
 
@@ -542,7 +543,7 @@ function Glint.Play(caster: Model, manaCost: number, target: Vector3?): Handle?
 		entry.sparkles:Emit(Presentation.BurstCount(if tier >= 5 then 26 else 14))
 	end
 	if not connection then
-		connection = RunService.RenderStepped:Connect(step)
+		connection = FrameProfiler.Connect(RunService.RenderStepped, "SpellCastGlint.RenderStepped", step)
 	end
 
 	local handle = {}

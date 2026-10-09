@@ -22,6 +22,7 @@
 local Players = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local RunService = game:GetService("RunService")
+local FrameProfiler = require(game:GetService("ReplicatedStorage"):WaitForChild("Shared"):WaitForChild("FrameProfiler"))
 local TweenService = game:GetService("TweenService")
 
 local Shared = ReplicatedStorage:WaitForChild("Shared")
@@ -391,7 +392,7 @@ local function throwDebris(surface: RaycastResult, radius: number, intensity: nu
 	end
 	debrisParams = params
 	if not connection and #chunks > 0 then
-		connection = RunService.Heartbeat:Connect(stepDebris)
+		connection = FrameProfiler.Connect(RunService.Heartbeat, "Crater.Heartbeat", stepDebris)
 	end
 end
 

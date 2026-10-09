@@ -25,6 +25,7 @@
 ]]
 
 local RunService = game:GetService("RunService")
+local FrameProfiler = require(game:GetService("ReplicatedStorage"):WaitForChild("Shared"):WaitForChild("FrameProfiler"))
 local Shared = script.Parent.Parent.Parent
 local ChunkManager = require(Shared:WaitForChild("ChunkManager"))
 local Heartbeat = require(Shared:WaitForChild("Heartbeat"))
@@ -842,7 +843,7 @@ function BeamChainVisual.Enable()
 	end
 	enabled = true
 	VisualOffload.On(BeamWire.Channel, onMessage)
-	applyConnection = RunService.PreSimulation:Connect(apply)
+	applyConnection = FrameProfiler.Connect(RunService.PreSimulation, "BeamChainVisual.PreSimulation", apply)
 end
 
 return BeamChainVisual

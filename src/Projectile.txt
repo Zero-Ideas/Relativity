@@ -11,7 +11,7 @@
 --     src/shared/VisualOffload.luau (157 lines)
 --     src/shared/ClientPresentation.luau (62 lines)
 --     src/shared/ChunkManager.luau (651 lines)
---     src/shared/Entity.luau (1101 lines)
+--     src/shared/Entity.luau (1102 lines)
 --   Shared projectile motion and protocol
 --     src/shared/Projectile/Motion.luau (227 lines)
 --     src/shared/Projectile/StepPlanner.luau (101 lines)
@@ -35,7 +35,7 @@
 --     src/server/Projectile/Profile.luau (67 lines)
 --     src/server/Projectile/ApplyPass.luau (89 lines)
 --     src/server/Projectile/Parallel.luau (1076 lines)
---     src/server/Projectile/init.luau (1589 lines)
+--     src/server/Projectile/init.luau (1590 lines)
 --     src/server/Projectile/BeamProjectileHandler.luau (377 lines)
 --     src/server/Projectile/BeamChain.luau (1822 lines)
 --     src/server/Projectile/BeamFlow.luau (1447 lines)
@@ -43,18 +43,18 @@
 --     src/server/ProjectileQuota.luau (41 lines)
 --     src/server/ProjectileWorkerBootstrap.server.luau (201 lines)
 --   Client prediction and visuals
---     src/shared/Projectile/Client/Types.luau (105 lines)
+--     src/shared/Projectile/Client/Types.luau (107 lines)
 --     src/shared/Projectile/Client/Prediction.luau (147 lines)
 --     src/shared/Projectile/Client/View.luau (55 lines)
 --     src/shared/Projectile/Client/DebugRays.luau (42 lines)
---     src/shared/Projectile/Client/Impact.luau (90 lines)
+--     src/shared/Projectile/Client/Impact.luau (93 lines)
 --     src/shared/Projectile/Client/VisualModel.luau (771 lines)
 --     src/shared/Projectile/Client/BeamGeometry.luau (119 lines)
---     src/shared/Projectile/Client/BeamVisual.luau (565 lines)
---     src/shared/Projectile/Client/BeamChainVisual.luau (848 lines)
+--     src/shared/Projectile/Client/BeamVisual.luau (566 lines)
+--     src/shared/Projectile/Client/BeamChainVisual.luau (849 lines)
 --     src/shared/Projectile/Client/BeamRibbon.luau (115 lines)
 --     src/shared/Projectile/Client/BeamFlowVisual.luau (418 lines)
---     src/shared/Projectile/Client/init.luau (958 lines)
+--     src/shared/Projectile/Client/init.luau (986 lines)
 
 -- =============================================================================
 -- SECTION: Shared foundations
@@ -1518,6 +1518,7 @@ return ChunkManager
 ]]
 
 local RunService = game:GetService("RunService")
+local FrameProfiler = require(game:GetService("ReplicatedStorage"):WaitForChild("Shared"):WaitForChild("FrameProfiler"))
 local Players = game:GetService("Players")
 
 local Heartbeat = require(script.Parent.Heartbeat)
@@ -2284,7 +2285,7 @@ if RunService:IsServer() then
 	end
 	-- (real time, not dilated: a frozen or slowed world doesn't stop a fall)
 	local sinceCheck = 0
-	RunService.Heartbeat:Connect(function(dt: number)
+	FrameProfiler.Connect(RunService.Heartbeat, "Entity.Heartbeat", function(dt: number)
 		sinceCheck += dt
 		if sinceCheck < Entity.GroundCheckInterval then
 			return
@@ -9051,6 +9052,7 @@ return Parallel
 
 
 local RunService = game:GetService("RunService")
+local FrameProfiler = require(game:GetService("ReplicatedStorage"):WaitForChild("Shared"):WaitForChild("FrameProfiler"))
 local Shared = game:GetService("ReplicatedStorage"):WaitForChild("Shared")
 
 local Heartbeat = require(Shared:WaitForChild("Heartbeat"))
@@ -10314,7 +10316,7 @@ end, { Name = "ProjectileSystem.Step", Priority = 5 })
 -- Parallel movement dispatch: before physics, so the workers' parallel phase
 -- finishes before the Heartbeat loop above collects it (dt is this frame's,
 -- dilated the same way Heartbeat.Connect callbacks receive it).
-RunService.PreSimulation:Connect(function(dt: number)
+FrameProfiler.Connect(RunService.PreSimulation, "Projectile.PreSimulation", function(dt: number)
 	local started = os.clock()
 	if stepEndedAt > 0 and stepEndedAt > dispatchEndedAt then
 		-- our last step -> this dispatch: replication, other scripts' callbacks,
@@ -14380,6 +14382,8 @@ export type Visual = {
 	passPoint: Vector3?, -- and where on it
 	passDone: boolean?, -- already reported
 	suspendedParticles: { ParticleEmitter }?,
+	tint: Color3?, -- the spec's colour, for impact effects
+	streak: (() -> ())?, -- detaches the speed streak (SetStreakHandler)
 }
 
 -- ModuleScripts must return exactly one non-nil value.
@@ -14674,12 +14678,15 @@ local Impact = {}
 -- handler from SetHandler always runs regardless.
 Impact.DefaultEnabled = false
 
--- Custom impact hook: fn(position, normal, model?, kind). When set, it replaces
--- the built-in effect below. (model is nil for impacts; kind is
--- "entity" | "world" | "bounce" | "detonate".)
-local impactHandler: ((Vector3, Vector3, Instance?, string?) -> ())? = nil
+-- Custom impact hook: fn(position, normal, model?, kind, info?). When set, it
+-- replaces the built-in effect below. (model is nil for impacts; kind is
+-- "entity" | "world" | "bounce" | "detonate"; info, when known, carries the
+-- shot's Velocity and Color so the effect can spray the right way and tint.)
+export type Info = { Velocity: Vector3?, Color: Color3? }
+export type Handler = (Vector3, Vector3, Instance?, string?, Info?) -> ()
+local impactHandler: Handler? = nil
 
-function Impact.SetHandler(fn: ((Vector3, Vector3, Instance?, string?) -> ())?)
+function Impact.SetHandler(fn: Handler?)
 	impactHandler = fn
 end
 
@@ -14736,10 +14743,10 @@ local function defaultImpact(position: Vector3, normal: Vector3, kind: string?)
 	end)
 end
 
-function Impact.Play(position: Vector3, normal: Vector3?, kind: string?)
+function Impact.Play(position: Vector3, normal: Vector3?, kind: string?, info: Info?)
 	local n = normal or Vector3.yAxis
 	if impactHandler then
-		task.spawn(impactHandler, position, n, nil, kind)
+		task.spawn(impactHandler, position, n, nil, kind, info)
 	elseif Impact.DefaultEnabled then
 		defaultImpact(position, n, kind)
 	end
@@ -15669,6 +15676,7 @@ local Geometry = require(script.Parent.BeamGeometry)
 local Ribbon = require(script.Parent.BeamRibbon)
 local View = require(script.Parent.View)
 local RunService = game:GetService("RunService")
+local FrameProfiler = require(game:GetService("ReplicatedStorage"):WaitForChild("Shared"):WaitForChild("FrameProfiler"))
 local Planner = require(script.Parent.Parent.Parent.Projectile.StepPlanner)
 local Prediction = require(script.Parent.Prediction)
 local Heartbeat = require(script.Parent.Parent.Parent.Heartbeat)
@@ -15966,7 +15974,7 @@ local function draw(rig: Types.Rig)
 		for index = 1, #state.points-1 do table.insert(spans, { state.points[index], state.points[index+1] }) end
 	end
 	pending[state] = { segments = Geometry.Split(spans), joints = {} }
-	if not applyConnection then applyConnection = RunService.PreSimulation:Connect(BeamVisual.ApplyGroups) end
+	if not applyConnection then applyConnection = FrameProfiler.Connect(RunService.PreSimulation, "BeamVisual.PreSimulation", BeamVisual.ApplyGroups) end
 end
 function BeamVisual.Build(data: Protocol.SpawnPayload): (Instance, Types.Rig)
 	local beam = assert(data.Beam)
@@ -15986,7 +15994,7 @@ function BeamVisual.Build(data: Protocol.SpawnPayload): (Instance, Types.Rig)
 				radius = math.max(beam.Radius, .025), segments = {}, joints = {}, members = {}, byId = {}, visible = false, dirty = true }
 			groups[beam.ChannelId] = group
 			model.Parent = workspace
-			if not applyConnection then applyConnection = RunService.PreSimulation:Connect(BeamVisual.ApplyGroups) end
+			if not applyConnection then applyConnection = FrameProfiler.Connect(RunService.PreSimulation, "BeamVisual.PreSimulation#2", BeamVisual.ApplyGroups) end
 		end
 		-- Each logical packet owns only metadata, not cylinders/Motor6Ds. Its
 		-- placeholder can retire without deleting another packet's shared rig.
@@ -16256,6 +16264,7 @@ return BeamVisual
 ]]
 
 local RunService = game:GetService("RunService")
+local FrameProfiler = require(game:GetService("ReplicatedStorage"):WaitForChild("Shared"):WaitForChild("FrameProfiler"))
 local Shared = script.Parent.Parent.Parent
 local ChunkManager = require(Shared:WaitForChild("ChunkManager"))
 local Heartbeat = require(Shared:WaitForChild("Heartbeat"))
@@ -17073,7 +17082,7 @@ function BeamChainVisual.Enable()
 	end
 	enabled = true
 	VisualOffload.On(BeamWire.Channel, onMessage)
-	applyConnection = RunService.PreSimulation:Connect(apply)
+	applyConnection = FrameProfiler.Connect(RunService.PreSimulation, "BeamChainVisual.PreSimulation", apply)
 end
 
 return BeamChainVisual
@@ -17686,8 +17695,20 @@ local Channels = Protocol.Channels
 
 local ProjectileClient = {}
 
-function ProjectileClient.SetImpactHandler(fn: (Vector3, Vector3, Instance?, string?) -> ())
+function ProjectileClient.SetImpactHandler(fn: Impact.Handler)
 	Impact.SetHandler(fn)
+end
+
+-- Speed streaks: called once per rigged visual (not beams) with the root part
+-- its pose drives, the root's offset from the pose (which looks down -Z), a
+-- velocity getter (studs per local second, the visual's TimeScale included),
+-- its colour and a width. Returns a detach function (called the moment the
+-- visual is destroyed), or nil for no streak.
+type StreakHandler = (BasePart, CFrame, () -> Vector3, Color3?, number) -> (() -> ())?
+local streakHandler: StreakHandler? = nil
+
+function ProjectileClient.SetStreakHandler(fn: StreakHandler?)
+	streakHandler = fn
 end
 
 -- Pass-by: every frame each visual moving at least passMinSpeed (studs/s,
@@ -17977,6 +17998,10 @@ local function destroyVisual(id: number, discard: boolean?)
 	visuals[id] = nil
 	deferredVisuals[id] = nil
 	visualCount -= 1
+	if visual.streak then
+		visual.streak()
+		visual.streak = nil
+	end
 	visualTombstones += 1
 	if discard then
 		-- Settings eviction is not a hit: no draining beam tail or lingering
@@ -18086,6 +18111,17 @@ local function onSpawn(data: Protocol.SpawnPayload)
 	if data.ActivateParticlesOnCreate then
 		VisualModel.ActivateParticles(model)
 	end
+	local spec = data.Visual
+	visual.tint = spec and (spec.Color or spec.Core)
+	if streakHandler and rig and not rig.beam then
+		local width = 0.35 * (data.VisualScale or 1)
+		if spec and spec.Size then
+			width = math.min(spec.Size.X, spec.Size.Y) * (data.VisualScale or 1)
+		end
+		visual.streak = streakHandler(rig.root, rig.rootOffset, function()
+			return visual.velocity * visual.timeScale
+		end, visual.tint, width)
+	end
 	visuals[data.Id] = visual
 	visualCount += 1
 	table.insert(visualOrder, data.Id)
@@ -18175,7 +18211,8 @@ local function onMove(batch: { Protocol.MovePayload })
 				VisualModel.Place(visual, data.Position, data.Velocity)
 				visual.resumeEffectsOnNextUpdate = now
 				if data.Bounced and BeamVisual.ShouldPlayImpact(visual, data.Point or data.Position) then
-					Impact.Play(data.Point or data.Position, data.Normal, "bounce")
+					Impact.Play(data.Point or data.Position, data.Normal, "bounce",
+						{ Velocity = data.Velocity, Color = visual.tint })
 				end
 			end
 		elseif visual.synced or (visual.rig and visual.rig.beam) then
@@ -18209,7 +18246,7 @@ local function onHit(data: Protocol.HitPayload)
 			VisualModel.Place(visual, data.Position, visual.velocity)
 		end
 		if data.Kind and BeamVisual.ShouldPlayImpact(visual, data.Position) then
-			Impact.Play(data.Position, data.Normal, data.Kind)
+			Impact.Play(data.Position, data.Normal, data.Kind, { Velocity = visual.velocity, Color = visual.tint })
 		end
 	end
 	destroyVisual(data.Id)

@@ -309,6 +309,7 @@
 
 
 local RunService = game:GetService("RunService")
+local FrameProfiler = require(game:GetService("ReplicatedStorage"):WaitForChild("Shared"):WaitForChild("FrameProfiler"))
 local Shared = game:GetService("ReplicatedStorage"):WaitForChild("Shared")
 
 local Heartbeat = require(Shared:WaitForChild("Heartbeat"))
@@ -1572,7 +1573,7 @@ end, { Name = "ProjectileSystem.Step", Priority = 5 })
 -- Parallel movement dispatch: before physics, so the workers' parallel phase
 -- finishes before the Heartbeat loop above collects it (dt is this frame's,
 -- dilated the same way Heartbeat.Connect callbacks receive it).
-RunService.PreSimulation:Connect(function(dt: number)
+FrameProfiler.Connect(RunService.PreSimulation, "Projectile.PreSimulation", function(dt: number)
 	local started = os.clock()
 	if stepEndedAt > 0 and stepEndedAt > dispatchEndedAt then
 		-- our last step -> this dispatch: replication, other scripts' callbacks,

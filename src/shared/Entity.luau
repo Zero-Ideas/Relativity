@@ -94,6 +94,7 @@
 ]]
 
 local RunService = game:GetService("RunService")
+local FrameProfiler = require(game:GetService("ReplicatedStorage"):WaitForChild("Shared"):WaitForChild("FrameProfiler"))
 local Players = game:GetService("Players")
 
 local Heartbeat = require(script.Parent.Heartbeat)
@@ -860,7 +861,7 @@ if RunService:IsServer() then
 	end
 	-- (real time, not dilated: a frozen or slowed world doesn't stop a fall)
 	local sinceCheck = 0
-	RunService.Heartbeat:Connect(function(dt: number)
+	FrameProfiler.Connect(RunService.Heartbeat, "Entity.Heartbeat", function(dt: number)
 		sinceCheck += dt
 		if sinceCheck < Entity.GroundCheckInterval then
 			return

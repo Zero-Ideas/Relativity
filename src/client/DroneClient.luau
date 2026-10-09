@@ -34,6 +34,7 @@
 
 local Players = game:GetService("Players")
 local RunService = game:GetService("RunService")
+local FrameProfiler = require(game:GetService("ReplicatedStorage"):WaitForChild("Shared"):WaitForChild("FrameProfiler"))
 local UserInputService = game:GetService("UserInputService")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 
@@ -316,7 +317,7 @@ end
 
 local function ensureStepping()
 	if not stepping then
-		stepping = RunService.RenderStepped:Connect(step)
+		stepping = FrameProfiler.Connect(RunService.RenderStepped, "DroneClient.RenderStepped", step)
 	end
 end
 
@@ -453,7 +454,7 @@ function DroneClient.Demo(portalFrame: CFrame, radius: number)
 	local OUT, HANG, BACK = TRAVEL_TIME * 1.4, 0.8, TRAVEL_TIME * 1.2
 	local began = os.clock()
 	local connection: RBXScriptConnection
-	connection = RunService.RenderStepped:Connect(function()
+	connection = FrameProfiler.Connect(RunService.RenderStepped, "DroneClient.RenderStepped#2", function()
 		local t = os.clock() - began - OPEN_TIME * 0.6
 		local alpha
 		if t < OUT then
