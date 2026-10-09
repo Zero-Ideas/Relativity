@@ -24,9 +24,9 @@
 	turns to face the aim; the arm points the weapon. Aiming above it, the
 	drone rolls upside down so the arm can reach up, and rolls back once the
 	aim drops again. The aim is the mouse for your own drone (sent to the
-	server a few times a second, see DroneRig "Aim replication"); everyone
-	else's drone follows its owner's replicated aim, smoothed, falling back
-	to the character's facing until one arrives.
+	server only when it changes, see DroneRig "Aim replication"); a nearby
+	player's drone follows the aim relayed for it, smoothed, falling back to
+	the character's facing until one arrives.
 
 	Summon(character) / Dismiss(character) also work without a gun (the
 	debug panel's VFX tab uses them).
@@ -56,9 +56,10 @@ local ROLL_RATE = 9
 -- Leaning into its movement: radians per (studs/s), and the most it leans.
 local LEAN_PER_SPEED, MAX_LEAN = 0.012, 0.35
 local REMOTE_AIM_RATE = 15 -- how quickly another player's drone eases to its new aim (1/s)
-local aimRemote: RemoteEvent? = nil
+local aimRemote: UnreliableRemoteEvent? = nil
 local lastSentAim: Vector3? = nil
 local lastSentAt = 0
+local relayedAim: { [Model]: Vector3 } = setmetatable({}, { __mode = "k" }) :: any
 local MAX_RETURNING = 2 -- rapid tool switching must not accumulate drone copies
 
 type State = "summoning" | "hovering" | "dismissing"
@@ -111,24 +112,26 @@ local function ease(t: number): number
 end
 
 -- Where the drone wants to look: the owner's aim.
--- Tells the server where our drone aims (throttled; only real changes).
+-- Tells the server where our drone aims: only when it has moved enough
+-- (at most every AimSendInterval), or after AimRefresh unchanged.
 local function sendAim(aim: Vector3)
 	local now = os.clock()
-	if now - lastSentAt < DroneRig.AimSendInterval then
+	local since = now - lastSentAt
+	if since < DroneRig.AimSendInterval then
 		return
 	end
-	if lastSentAim and lastSentAim:Dot(aim) > DroneRig.AimSendAngle then
+	if lastSentAim and lastSentAim:Dot(aim) > DroneRig.AimSendAngle and since < DroneRig.AimRefresh then
 		return
 	end
 	if not aimRemote then
 		local found = ReplicatedStorage:FindFirstChild(DroneRig.AimRemote)
-		if not found or not found:IsA("RemoteEvent") then
+		if not found or not found:IsA("UnreliableRemoteEvent") then
 			return
 		end
 		aimRemote = found
 	end
 	lastSentAt, lastSentAim = now, aim;
-	(aimRemote :: RemoteEvent):FireServer(aim)
+	(aimRemote :: UnreliableRemoteEvent):FireServer(aim)
 end
 
 local function aimOf(drone: Drone, from: Vector3, dt: number): Vector3
@@ -145,9 +148,9 @@ local function aimOf(drone: Drone, from: Vector3, dt: number): Vector3
 		end
 		return drone.root.CFrame.LookVector
 	end
-	-- someone else's drone: their replicated aim, eased so updates don't snap
-	local replicated = drone.character:GetAttribute(DroneRig.AimAttribute)
-	if typeof(replicated) ~= "Vector3" or replicated.Magnitude < 1e-3 then
+	-- someone else's drone: the aim relayed for it, eased so updates don't snap
+	local replicated = relayedAim[drone.character]
+	if not replicated then
 		return drone.root.CFrame.LookVector
 	end
 	local current = drone.remoteAim or replicated.Unit
@@ -352,6 +355,9 @@ function DroneClient.Summon(character: Model, tool: Tool?)
 		end
 		return
 	end
+	if character == player.Character then
+		lastSentAim = nil -- (a new drone: send its aim straight away)
+	end
 	local portal = sharedPortal or openPortal(DroneRig.Portal(root.CFrame))
 	if sharedPortal then portal:Retain() end
 	local part = makeDrone(tool)
@@ -521,6 +527,19 @@ end
 function DroneClient.start()
 	if started then return end
 	started = true
+	-- nearby players' drone aims (see DroneRig "Aim replication")
+	task.spawn(function()
+		local relay = ReplicatedStorage:WaitForChild(DroneRig.AimRelay)
+		if not relay:IsA("UnreliableRemoteEvent") then
+			return
+		end
+		relay.OnClientEvent:Connect(function(character: any, aim: any)
+			if typeof(character) == "Instance" and character:IsA("Model") and typeof(aim) == "Vector3"
+				and aim.Magnitude > 1e-3 then
+				relayedAim[character] = aim.Unit
+			end
+		end)
+	end)
 	-- Every client observes ALL players' replicated equipped Tools and builds
 	-- their drones locally, including players already equipped when we join.
 	-- No owner-only rendering or per-frame drone transform remotes.
