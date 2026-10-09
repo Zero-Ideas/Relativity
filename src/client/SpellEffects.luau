@@ -13,7 +13,9 @@
 	 - Normal: Vector3? -- surface normal where it stopped
 	 - Kind: "entity" | "world" | nil -- what stopped it (nil = ran out of range)
 
-	"SpellExplosion" payload (server -> all clients):
+	"SpellExplosions" payload (server -> each client, once a frame): a list of
+	 "SpellExplosion" payloads -- the blasts that client can see or hear.
+	"SpellExplosion" payload (one blast; still accepted):
 	 - Position: Vector3, Radius: number (blast radius), Color: Color3,
 	   Power: number? (centre damage), Normal: Vector3? (struck surface)
 	 Rendered by ExplosionVFX, which scales size/colour/layers with Power.
@@ -108,17 +110,31 @@ VisualOffload.On("SpellBeam", function(data)
 	end
 end)
 
-VisualOffload.On("SpellExplosion", function(data)
+local function playExplosion(data: any)
+	if typeof(data) ~= "table" then
+		return
+	end
 	local position = data.Position
 	if typeof(position) ~= "Vector3" then
 		return
 	end
 	ExplosionVFX.Play(position, {
 		Power = if typeof(data.Power) == "number" then data.Power else nil,
-		Radius = math.max(data.Radius or 6, 1),
-		Color = data.Color,
+		Radius = math.max(if typeof(data.Radius) == "number" then data.Radius else 6, 1),
+		Color = if typeof(data.Color) == "Color3" then data.Color else nil,
 		Normal = if typeof(data.Normal) == "Vector3" then data.Normal else nil,
 	})
+end
+
+VisualOffload.On("SpellExplosion", playExplosion)
+-- (the server's per-frame batch: this frame's blasts in range of us)
+VisualOffload.On("SpellExplosions", function(list)
+	if typeof(list) ~= "table" then
+		return
+	end
+	for _, data in list do
+		playExplosion(data)
+	end
 end)
 
 return SpellEffects

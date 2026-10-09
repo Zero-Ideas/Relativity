@@ -1230,9 +1230,10 @@ SpellRunes.Freeze = {
 }
 
 -- Limits on what one cast may do at runtime (SpellRuntime): flow steps it
--- runs, vessels it fires, how long its delayed parts may wait (real seconds
--- after the cast), how many of them may be waiting at once, and how deep
--- Invoke may nest.
+-- runs (per trigger event, once triggers fire), vessels it fires
+-- (explosions don't count), how long its delayed parts may wait (real
+-- seconds after the cast), how many of them may be waiting at once, and how
+-- deep Invoke may nest.
 SpellRunes.Budget = {
 	Steps = 4000,
 	Vessels = 160,
