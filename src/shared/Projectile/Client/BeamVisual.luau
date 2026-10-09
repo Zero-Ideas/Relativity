@@ -274,7 +274,10 @@ local function draw(rig: Types.Rig)
 	state.model, state.driver = rig.model, rig.driver
 	state.joints = state.joints or {}
 	local spans = {}
-	for index = 1, #state.points-1 do table.insert(spans, { state.points[index], state.points[index+1] }) end
+	-- (past the render distance: drawn as nothing until it comes back)
+	if not state.hidden then
+		for index = 1, #state.points-1 do table.insert(spans, { state.points[index], state.points[index+1] }) end
+	end
 	pending[state] = { segments = Geometry.Split(spans), joints = {} }
 	if not applyConnection then applyConnection = RunService.PreSimulation:Connect(BeamVisual.ApplyGroups) end
 end
@@ -335,6 +338,20 @@ function BeamVisual.Build(data: Protocol.SpawnPayload): (Instance, Types.Rig)
 	draw(rig)
 	model.Parent = workspace
 	return model, rig
+end
+
+-- Past / back within the render distance (ProjectileClient). A beam can't be
+-- parked like other visuals (its head drives its body), so it draws empty.
+function BeamVisual.SetHidden(visual: Types.Visual, hidden: boolean)
+	local rig = visual.rig
+	local state = rig and rig.beam
+	if not state or state.hidden == hidden then return end
+	state.hidden = hidden
+	if state.group then
+		state.group.dirty = true -- (FlushGroups drops it: it's no longer in view)
+	else
+		draw(rig :: Types.Rig)
+	end
 end
 
 function BeamVisual.Attach(visual: Types.Visual)

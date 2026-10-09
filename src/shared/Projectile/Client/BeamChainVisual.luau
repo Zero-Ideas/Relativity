@@ -70,6 +70,12 @@ type Sample = {
 
 local chains: { [number]: any } = {}
 local pending: { [any]: any } = {}
+-- The player's projectile render limits (ClientSettings, via
+-- ProjectileClient.SetRenderSettings): nothing past MaxDistance studs from
+-- the camera is drawn, at most MaxRendered pieces (cylinders + joint balls)
+-- are shown across all chains, and about MaxUpdates pieces are rebuilt per
+-- frame -- chains past that keep their last pose and go first next frame.
+local limits = { MaxDistance = 2048, MaxRendered = 5000, MaxUpdates = 2500 }
 local applyConnection: RBXScriptConnection? = nil
 local enabled = false
 local uniform = true
@@ -546,15 +552,26 @@ function BeamChainVisual.Step(globalDt: number)
 	end
 	uniform = ChunkManager.IsTimeUniform()
 	local now = os.clock()
-	local partsLeft = MAX_PARTS_PER_FRAME
-	-- Oldest chain first: past the part budget the same (newest) chains go
-	-- without pieces every frame, instead of whichever the hash order
-	-- reached last -- which flickered beams in and out under load.
+	local partsLeft = math.min(MAX_PARTS_PER_FRAME, limits.MaxRendered)
+	local updatesLeft = math.max(limits.MaxUpdates, 1)
+	local camera = workspace.CurrentCamera
+	local eye = if camera then camera.CFrame.Position else Vector3.zero
+	local reach = limits.MaxDistance
+	-- Oldest chain first (chains left stale last frame before that): past
+	-- the part budget the same (newest) chains go without pieces every
+	-- frame, instead of whichever the hash order reached last -- which
+	-- flickered beams in and out under load.
 	local order = {}
 	for id in chains do
 		table.insert(order, id)
 	end
-	table.sort(order)
+	table.sort(order, function(a, b)
+		local staleA, staleB = chains[a].stale == true, chains[b].stale == true
+		if staleA ~= staleB then
+			return staleA
+		end
+		return a < b
+	end)
 	for _, id in order do
 		local chain = chains[id]
 		if not chain.driver then
@@ -593,6 +610,14 @@ function BeamChainVisual.Step(globalDt: number)
 			destroyChain(chain)
 			continue
 		end
+		if updatesLeft <= 0 and chain.drawn then
+			-- (over this frame's redraw budget: its last pose stays up, and it
+			-- still counts against the piece cap)
+			chain.stale = true
+			partsLeft -= chain.drawn
+			continue
+		end
+		local partsBefore = partsLeft
 
 		-- Geometry: every visible piece, split into pooled cylinders, with a
 		-- ball wherever a body ends or bends sharply.
@@ -622,6 +647,22 @@ function BeamChainVisual.Step(globalDt: number)
 				lastDirection = direction
 				if partsLeft <= 0 or not View.contains((a + b) * .5, length * .5 + radius) then
 					continue
+				end
+				-- only the part within render distance of the camera
+				local f = eye - a
+				local along = f:Dot(direction) -- (the camera's foot on the line)
+				local miss = f - direction * along
+				local inside = reach * reach - miss:Dot(miss)
+				if inside < 0 then
+					continue
+				end
+				local half = math.sqrt(inside)
+				local from, to = math.max(along - half, 0), math.min(along + half, length)
+				if to - from < 1e-3 then
+					continue
+				end
+				if from > 0 or to < length then
+					a, b, length = a + direction * from, a + direction * to, to - from
 				end
 				-- fixed-length pieces from the back; only the last one varies
 				local pieces = math.max(1, math.ceil(length / MAX_SEGMENT - 1e-6))
@@ -709,12 +750,31 @@ function BeamChainVisual.Step(globalDt: number)
 				end
 			end
 		end
+		for index = #jointPoints, 1, -1 do
+			if (jointPoints[index] - eye).Magnitude > reach then
+				table.remove(jointPoints, index)
+			end
+		end
 		local jointCount = math.min(#jointPoints, math.max(partsLeft, 0))
 		for index = #jointPoints, jointCount + 1, -1 do
 			jointPoints[index] = nil
 		end
 		partsLeft -= jointCount
 		pending[chain] = { segments = segments, joints = jointPoints }
+		chain.drawn = partsBefore - partsLeft
+		chain.stale = nil
+		updatesLeft -= math.max(chain.drawn, 1)
+	end
+end
+
+-- The player's render limits (see `limits`); MaxSmooth doesn't apply (chain
+-- pieces aren't tweened).
+function BeamChainVisual.SetRenderSettings(settings: { [string]: number })
+	for key in limits do
+		local value = settings[key]
+		if typeof(value) == "number" and value == value and value >= 0 then
+			limits[key] = value
+		end
 	end
 end
 

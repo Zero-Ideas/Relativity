@@ -46,7 +46,10 @@
 
 	Every cast has a budget (SpellRunes.Budget): flow steps, vessels fired,
 	parts waiting to run later, how long after the cast they may run, and
-	how deep Invoke may nest.
+	how deep Invoke may nest. Explosions don't count as vessels fired, and
+	each trigger event (an impact, a timer tick...) gets its own allowance
+	of flow steps -- so how many explosions a spell sets off is limited by
+	its energy and projectiles, not by how many have gone off already.
 ]]
 
 local Players = game:GetService("Players")
@@ -124,6 +127,9 @@ export type Context = {
 	copyMultiplier: number?,
 	-- The conjured circle this part runs from (Wait Until keeps it showing).
 	conjureId: number?,
+	-- this trigger event's own flow-step count (see spend), shared by
+	-- everything the event runs
+	eventSteps: { n: number }?,
 	-- Invoke: how deep this spell runs inside others, and what it was handed.
 	depth: number?,
 	args: { point: Vector3?, entity: any?, number: number? }?,
@@ -823,11 +829,18 @@ local function liveContext(ctx: Context): Context
 	return fresh
 end
 
--- Spends one flow step of the cast's budget; false once it's blown.
+-- Spends one flow step: of the trigger event's own allowance inside one
+-- (blowing it stops only that event), else of the cast's budget. False once
+-- it's blown.
 local function spend(ctx: Context): boolean
 	local cast = ctx.cast
 	if cast.dead then
 		return false
+	end
+	local event = ctx.eventSteps
+	if event then
+		event.n += 1
+		return event.n <= SpellRunes.Budget.Steps
 	end
 	cast.steps += 1
 	if cast.steps > SpellRunes.Budget.Steps then
@@ -1000,6 +1013,7 @@ local function fireTrigger(compiled: any, parent: Context, triggerId: string, en
 	ctx.surfaceNormal = normal
 	ctx.flight = flight or 0
 	ctx.conjureId = nil
+	ctx.eventSteps = { n = 0 }
 	ctx.vars[triggerId] = {
 		point = eventPoint,
 		normal = normal,
@@ -1762,11 +1776,15 @@ local function fireVessel(compiled: any, ctx: Context, id: string, energy: numbe
 		return
 	end
 	local cast = ctx.cast
-	cast.vessels += 1
-	if cast.vessels > SpellRunes.Budget.Vessels then
-		return
-	end
 	local vessel = compiled.runes[id].rune
+	-- (explosions are uncapped: they spawn nothing further, so they can't
+	-- run away -- their energy already bounds them)
+	if vessel ~= "Explosion" then
+		cast.vessels += 1
+		if cast.vessels > SpellRunes.Budget.Vessels then
+			return
+		end
+	end
 	local def = SpellRunes.Runes[vessel]
 	if not def.Damaging then
 		fireUtility(compiled, ctx, id, energy, element)

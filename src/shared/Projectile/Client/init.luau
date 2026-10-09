@@ -91,7 +91,9 @@ local SMOOTH_SET_REFRESH_INTERVAL = 0.1 -- real seconds; selection is presentati
 --                  frame ("high resolution"); the rest move on the scheduler
 -- A distance-hidden visual is parked out of sight with its effects suspended and
 -- keeps simulating; it re-enters like any visual coming back on screen.
--- Beams aren't hidden (they draw through BeamVisual).
+-- A beam is hidden once all of it is past the distance, and draws empty
+-- instead of being parked (BeamVisual.SetHidden). Sustained beam chains get
+-- the same limits (BeamChainVisual.SetRenderSettings).
 --   MaxUpdates  -- on-screen redraws per frame (the round-robin budget;
 --                  presentation only: positions come from elapsed time, so a
 --                  visual left waiting catches up exactly on its next turn)
@@ -142,7 +144,10 @@ local function refreshSmoothVisuals(now: number)
 		local maxDistanceSq = renderSettings.MaxDistance * renderSettings.MaxDistance
 		for _, visual in visuals do
 			if visual.rig and visual.rig.beam then
-				visual.hidden = false
+				local center, radius = BeamVisual.GetBounds(visual, visual.position, globalSimulationClock)
+				local hidden = (center - eye).Magnitude - radius > renderSettings.MaxDistance
+				visual.hidden = hidden
+				BeamVisual.SetHidden(visual, hidden)
 				continue
 			end
 			local offset = visual.position - eye
@@ -531,7 +536,7 @@ end
 local function updateOffscreen(visual: Visual, now: number)
 	local since: number = if visual.inView then now else visual.offscreenSince or now
 	visual.offscreenSince = since
-	if visual.hidden and not visual.parked then
+	if visual.hidden and not visual.parked and not (visual.rig and visual.rig.beam) then
 		-- beyond the render limits: out of sight at once, effects off (it's
 		-- placed back where it really is when it comes back)
 		VisualModel.SuspendEffects(visual)
@@ -824,6 +829,7 @@ function ProjectileClient.SetRenderSettings(settings: { [string]: number })
 			renderSettings[key] = if key == "MaxRendered" then math.floor(value) else value
 		end
 	end
+	BeamChainVisual.SetRenderSettings(renderSettings)
 	-- Lowering the cap takes effect now. Keep oldest admissions; retire the
 	-- newest excess without impact VFX, and never keep hidden simulation slots.
 	if visualCount > renderSettings.MaxRendered then
