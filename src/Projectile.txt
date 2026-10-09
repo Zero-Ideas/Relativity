@@ -11,7 +11,7 @@
 --     src/shared/VisualOffload.luau (157 lines)
 --     src/shared/ClientPresentation.luau (44 lines)
 --     src/shared/ChunkManager.luau (651 lines)
---     src/shared/Entity.luau (1023 lines)
+--     src/shared/Entity.luau (1101 lines)
 --   Shared projectile motion and protocol
 --     src/shared/Projectile/Motion.luau (227 lines)
 --     src/shared/Projectile/StepPlanner.luau (101 lines)
@@ -1480,6 +1480,14 @@ return ChunkManager
 	 CollisionGroup-based hiding was tried and reverted after it broke
 	 player-vs-floor collision).
 
+	 Last grounded position (server): every living humanoid entity remembers
+	 where it last stood on solid ground -- entity.LastGroundedCFrame (its
+	 root's CFrame then) / entity.LastGroundedPosition, checked every
+	 Entity.GroundCheckInterval seconds (the Humanoid has a floor and a short
+	 ray down hits something). If it ever falls below Entity.VoidHeight it's
+	 put back there, stopped, and entity.RescuedFromVoid fires. Set
+	 Entity.VoidRescue = false to turn that off.
+
 	 Position history (for lag-compensated hit detection, see Projectile.luau):
 	 every entity's real-world position is sampled on a real-time (not dilated)
 	 cadence and kept for Entity.HistoryWindow seconds, so entity:GetPositionAt(t)
@@ -1503,6 +1511,13 @@ Entity.__index = Entity
 Entity.HistoryWindow = 0.5 -- how far back samples are retained
 Entity.HistorySnapshotInterval = 0.01 -- minimum real time between recorded samples
 Entity.HistoryMinDelta = 0.5 -- studs; skip recording if barely moved since the last sample
+
+-- Void rescue (server): below VoidHeight an entity goes back to where it last
+-- stood (see "Last grounded position" above).
+Entity.VoidHeight = -27
+Entity.VoidRescue = true
+Entity.GroundCheckInterval = 0.1 -- seconds between grounded checks / void checks
+Entity.GroundProbe = 4 -- studs below the feet the ground ray reaches
 
 -- Debug: when true, every entity's hurtbox (HitboxRadius sphere) is streamed to
 -- clients and rendered as a translucent sphere. Flip this constant directly (or
@@ -1609,6 +1624,10 @@ function Entity.new(instance: Instance?, props: { [string]: any }?)
 		Died = Signal.new(),
 		ChunkChanged = Signal.new(),
 		Destroyed = Signal.new(),
+		RescuedFromVoid = Signal.new(),
+
+		LastGroundedCFrame = nil :: CFrame?, -- (server) the root's CFrame when last on solid ground
+		LastGroundedPosition = nil :: Vector3?,
 
 		_position = Vector3.zero, -- used when there is no instance
 		_root = nil :: BasePart?,
@@ -2219,6 +2238,65 @@ Heartbeat.Connect(function()
 		end
 	end
 end, { Name = "EntitySystem.History", Priority = -60 })
+
+-- Grounding loop (server): remembers where each humanoid entity last stood on
+-- solid ground, and puts it back there if it falls below VoidHeight.
+if RunService:IsServer() then
+	local groundParams = RaycastParams.new()
+	groundParams.FilterType = Enum.RaycastFilterType.Exclude
+	groundParams.IgnoreWater = false
+	local function rescue(entity: any, root: BasePart)
+		local target = entity.LastGroundedCFrame :: CFrame
+		local model = entity.Instance
+		-- (a little above where it stood, so it doesn't land inside the floor)
+		local lifted = target + Vector3.new(0, 0.5, 0)
+		if model and model:IsA("Model") then
+			local offset = root.CFrame:ToObjectSpace(model:GetPivot())
+			model:PivotTo(lifted * offset)
+		else
+			root.CFrame = lifted
+		end
+		root.AssemblyLinearVelocity = Vector3.zero
+		root.AssemblyAngularVelocity = Vector3.zero
+		print(`[Entity] {model and model:GetFullName() or "entity"} fell below Y={Entity.VoidHeight}; returned to its last grounded position {target.Position}`)
+		entity.RescuedFromVoid:Fire(target)
+	end
+	-- (real time, not dilated: a frozen or slowed world doesn't stop a fall)
+	local sinceCheck = 0
+	RunService.Heartbeat:Connect(function(dt: number)
+		sinceCheck += dt
+		if sinceCheck < Entity.GroundCheckInterval then
+			return
+		end
+		sinceCheck = 0
+		for i = 1, #entities do
+			local entity = entities[i]
+			local humanoid = entity.Humanoid
+			local root = entity._root
+			if entity.IsDestroyed or not humanoid or not root or not root.Parent or humanoid.Health <= 0 then
+				continue
+			end
+			local position = root.Position
+			if position.Y < Entity.VoidHeight then
+				if Entity.VoidRescue and entity.LastGroundedCFrame then
+					rescue(entity, root)
+				end
+				continue
+			end
+			if humanoid.FloorMaterial == Enum.Material.Air then
+				continue
+			end
+			-- (the floor must really be there: a ray from the root to just past the feet)
+			groundParams.FilterDescendantsInstances = { entity.Instance or root }
+			local reach = humanoid.HipHeight + root.Size.Y * 0.5 + Entity.GroundProbe
+			local hit = workspace:Raycast(position, Vector3.new(0, -reach, 0), groundParams)
+			if hit and hit.Position.Y >= Entity.VoidHeight then
+				entity.LastGroundedCFrame = root.CFrame
+				entity.LastGroundedPosition = position
+			end
+		end
+	end)
+end
 
 -- Slow loop: re-bucket moved entities into chunks, refresh humanoid dilation.
 Heartbeat.ConnectInterval(0.1, function()

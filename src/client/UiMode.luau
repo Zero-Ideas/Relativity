@@ -424,6 +424,9 @@ function UiMode.OpenStartMenu()
 		return
 	end
 	gui.Enabled = true
+	gui.Music:Play()
+	game.Lighting.UI_ColorCorrection.Enabled = true
+	game.Lighting.UI_MenuBlur.Enabled = true
 end
 
 function UiMode.start()
