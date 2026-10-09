@@ -14,7 +14,12 @@ local started = false
 local sprinting = false
 local pendingSprint: number? = nil
 local sequence = 0
-local lastForward, lastFlip = -math.huge, -math.huge
+local lastFlip = -math.huge
+-- Double tap: the same movement key twice within DOUBLE_TAP seconds (a
+-- different key in between starts over, so changing direction never flips).
+local DOUBLE_TAP = 0.2
+local lastTapKey: Enum.KeyCode? = nil
+local lastTapAt = -math.huge
 local pendingFlips: { [number]: { character: Model, cost: number, delta: Vector3, startedAt: number, scale: number, track: AnimationTrack? } } = {}
 
 local function nextId(): number
@@ -32,6 +37,16 @@ local function characterParts(): (Model?, Humanoid?, BasePart?)
 	local humanoid = character and character:FindFirstChildOfClass("Humanoid")
 	local root = character and character:FindFirstChild("HumanoidRootPart")
 	return character, humanoid, if root and root:IsA("BasePart") then root else nil
+end
+
+local function doubleTapped(key: Enum.KeyCode): boolean
+	local now = os.clock()
+	if key == lastTapKey and now - lastTapAt < DOUBLE_TAP then
+		lastTapKey, lastTapAt = nil, -math.huge
+		return true
+	end
+	lastTapKey, lastTapAt = key, now
+	return false
 end
 
 local function availableStamina(): number
@@ -221,20 +236,16 @@ function Locomotion.start(char)
 			toggleSprint()
 		end
 		if input.KeyCode==Enum.KeyCode.W then
-			local now = os.clock()
-			if now - lastForward < 0.2 then lastForward = -math.huge; flip() else lastForward = now end
+			if doubleTapped(input.KeyCode) then flip() end
 		end
 		if input.KeyCode==Enum.KeyCode.S then
-			local now = os.clock()
-			if now - lastForward < 0.2 then lastForward = -math.huge; backflip() else lastForward = now end
+			if doubleTapped(input.KeyCode) then backflip() end
 		end
 		if input.KeyCode==Enum.KeyCode.A then
-			local now = os.clock()
-			if now - lastForward < 0.2 then lastForward = -math.huge; cw_left() else lastForward = now end
+			if doubleTapped(input.KeyCode) then cw_left() end
 		end
 		if input.KeyCode==Enum.KeyCode.D then
-			local now = os.clock()
-			if now - lastForward < 0.2 then lastForward = -math.huge; cw_right() else lastForward = now end
+			if doubleTapped(input.KeyCode) then cw_right() end
 		end
 	end)
 	remote.OnClientEvent:Connect(function(action, id, accepted)
@@ -266,13 +277,13 @@ function Locomotion.start(char)
 	end)
 	local function reset()
 		pendingSprint = nil
-		lastForward, lastFlip = -math.huge, -math.huge
+		lastTapKey, lastTapAt, lastFlip = nil, -math.huge, -math.huge
 		table.clear(pendingFlips)
 		applySprint(false)
 	end
 	player.CharacterRemoving:Connect(reset)
 	player.CharacterAdded:Connect(reset)
-	UserInputService.WindowFocusReleased:Connect(function() lastForward = -math.huge end)
+	UserInputService.WindowFocusReleased:Connect(function() lastTapKey, lastTapAt = nil, -math.huge end)
 end
 
 return Locomotion
