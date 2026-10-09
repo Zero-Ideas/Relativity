@@ -1238,48 +1238,10 @@ local function launch(shot: Shot, direction: Vector3)
 	-- near it (see BeamChain): its triggers and damage are bound only then,
 	-- and if it never is, it just gives its quota slot back.
 	local bind: (any, number, any?) -> ()
-	local deferred = if shot.vessel == "Beam" and BeamHandler.DefersBinding then {
-		Bind = function(packet)
-			bind(packet, shot.damageEnergy, nil)
-		end,
-		Discard = function()
-			ProjectileQuota.Release(ctx.player, 1)
-		end,
-	} else nil
-	local projectile = (if shot.vessel == "Beam" then BeamHandler.Launch else Projectile.new)({
-		Origin = shot.spawn or (ctx.origin + direction * ctx.spawnOffset),
-		Direction = direction,
-		Speed = stats.speed,
-		Radius = stats.radius,
-		Lifetime = stats.lifetime,
-		Gravity = stats.gravity,
-		Bounces = stats.bounces,
-		Restitution = stats.restitution,
-		MaxPierces = stats.pierces,
-		PierceFalloff = stats.falloff,
-		Damage = shot.damageEnergy * shot.impact,
-		Source = caster,
-		-- (barriers that let this caster's magic through)
-		IgnoreInstances = ignore,
-		Filter = filter,
-		Homing = homing,
-		Visualize = true,
-		VisualRange = VISUAL_RANGE,
-		VisualScale = stats.scale,
-		Beam = if shot.vessel == "Beam" then {
-			Length = if stats.sustain then math.max(24, stats.speed * SUSTAIN_INTERVAL * 2) else 24,
-			ChannelId = shot.channelId,
-			-- (a sustained beam may keep a long link as one body until it meets
-			-- something -- unless a trigger watches every joiner's own position)
-			Lazy = positionalTriggers(compiled, shot.info) == false,
-			ExpireTriggers = expireTriggers(compiled, shot.info),
-		} else nil,
-		-- Built procedurally on the client -- see VisualModel's styled visuals.
-		Visual = { Style = shot.vessel, Color = elementDef.Color, Core = elementDef.Core },
-	}, deferred)
-
 	-- Reusable synchronous binding for both emitted packets and subdivisions.
 	-- Each fork receives a fraction of the UNFIRED trigger/damage energy.
+	-- (Defined before the launch: BeamHandler.Launch binds a packet it can't
+	-- keep dormant -- a single beam, a homing or triggered chain -- at once.)
 	bind = function(projectile, damageEnergy, triggerAmounts)
 		local lastStruck = nil
 		local boundWatches = {}
@@ -1339,6 +1301,46 @@ local function launch(shot: Shot, direction: Vector3)
 			for _, watch in boundWatches do watch.energy *= share end
 		end
 	end
+	local deferred = if shot.vessel == "Beam" and BeamHandler.DefersBinding then {
+		Bind = function(packet)
+			bind(packet, shot.damageEnergy, nil)
+		end,
+		Discard = function()
+			ProjectileQuota.Release(ctx.player, 1)
+		end,
+	} else nil
+	local projectile = (if shot.vessel == "Beam" then BeamHandler.Launch else Projectile.new)({
+		Origin = shot.spawn or (ctx.origin + direction * ctx.spawnOffset),
+		Direction = direction,
+		Speed = stats.speed,
+		Radius = stats.radius,
+		Lifetime = stats.lifetime,
+		Gravity = stats.gravity,
+		Bounces = stats.bounces,
+		Restitution = stats.restitution,
+		MaxPierces = stats.pierces,
+		PierceFalloff = stats.falloff,
+		Damage = shot.damageEnergy * shot.impact,
+		Source = caster,
+		-- (barriers that let this caster's magic through)
+		IgnoreInstances = ignore,
+		Filter = filter,
+		Homing = homing,
+		Visualize = true,
+		VisualRange = VISUAL_RANGE,
+		VisualScale = stats.scale,
+		Beam = if shot.vessel == "Beam" then {
+			Length = if stats.sustain then math.max(24, stats.speed * SUSTAIN_INTERVAL * 2) else 24,
+			ChannelId = shot.channelId,
+			-- (a sustained beam may keep a long link as one body until it meets
+			-- something -- unless a trigger watches every joiner's own position)
+			Lazy = positionalTriggers(compiled, shot.info) == false,
+			ExpireTriggers = expireTriggers(compiled, shot.info),
+		} else nil,
+		-- Built procedurally on the client -- see VisualModel's styled visuals.
+		Visual = { Style = shot.vessel, Color = elementDef.Color, Core = elementDef.Core },
+	}, deferred)
+
 	if not deferred then
 		bind(projectile, shot.damageEnergy, nil)
 	end
