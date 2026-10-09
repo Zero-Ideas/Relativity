@@ -53,8 +53,20 @@ local Channels = Protocol.Channels
 
 local ProjectileClient = {}
 
-function ProjectileClient.SetImpactHandler(fn: (Vector3, Vector3, Instance?, string?) -> ())
+function ProjectileClient.SetImpactHandler(fn: Impact.Handler)
 	Impact.SetHandler(fn)
+end
+
+-- Speed streaks: called once per rigged visual (not beams) with the root part
+-- its pose drives, the root's offset from the pose (which looks down -Z), a
+-- velocity getter (studs per local second, the visual's TimeScale included),
+-- its colour and a width. Returns a detach function (called the moment the
+-- visual is destroyed), or nil for no streak.
+type StreakHandler = (BasePart, CFrame, () -> Vector3, Color3?, number) -> (() -> ())?
+local streakHandler: StreakHandler? = nil
+
+function ProjectileClient.SetStreakHandler(fn: StreakHandler?)
+	streakHandler = fn
 end
 
 -- Pass-by: every frame each visual moving at least passMinSpeed (studs/s,
@@ -344,6 +356,10 @@ local function destroyVisual(id: number, discard: boolean?)
 	visuals[id] = nil
 	deferredVisuals[id] = nil
 	visualCount -= 1
+	if visual.streak then
+		visual.streak()
+		visual.streak = nil
+	end
 	visualTombstones += 1
 	if discard then
 		-- Settings eviction is not a hit: no draining beam tail or lingering
@@ -453,6 +469,17 @@ local function onSpawn(data: Protocol.SpawnPayload)
 	if data.ActivateParticlesOnCreate then
 		VisualModel.ActivateParticles(model)
 	end
+	local spec = data.Visual
+	visual.tint = spec and (spec.Color or spec.Core)
+	if streakHandler and rig and not rig.beam then
+		local width = 0.35 * (data.VisualScale or 1)
+		if spec and spec.Size then
+			width = math.min(spec.Size.X, spec.Size.Y) * (data.VisualScale or 1)
+		end
+		visual.streak = streakHandler(rig.root, rig.rootOffset, function()
+			return visual.velocity * visual.timeScale
+		end, visual.tint, width)
+	end
 	visuals[data.Id] = visual
 	visualCount += 1
 	table.insert(visualOrder, data.Id)
@@ -542,7 +569,8 @@ local function onMove(batch: { Protocol.MovePayload })
 				VisualModel.Place(visual, data.Position, data.Velocity)
 				visual.resumeEffectsOnNextUpdate = now
 				if data.Bounced and BeamVisual.ShouldPlayImpact(visual, data.Point or data.Position) then
-					Impact.Play(data.Point or data.Position, data.Normal, "bounce")
+					Impact.Play(data.Point or data.Position, data.Normal, "bounce",
+						{ Velocity = data.Velocity, Color = visual.tint })
 				end
 			end
 		elseif visual.synced or (visual.rig and visual.rig.beam) then
@@ -576,7 +604,7 @@ local function onHit(data: Protocol.HitPayload)
 			VisualModel.Place(visual, data.Position, visual.velocity)
 		end
 		if data.Kind and BeamVisual.ShouldPlayImpact(visual, data.Position) then
-			Impact.Play(data.Position, data.Normal, data.Kind)
+			Impact.Play(data.Position, data.Normal, data.Kind, { Velocity = visual.velocity, Color = visual.tint })
 		end
 	end
 	destroyVisual(data.Id)

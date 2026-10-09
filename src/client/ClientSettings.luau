@@ -40,6 +40,7 @@ local Presentation = require(ReplicatedStorage.Shared.ClientPresentation)
 local ClientAudio = require(script.Parent.ClientAudio)
 local HudScale = require(script.Parent.HudScale)
 local LightingSettings = require(script.Parent.LightingSettings)
+local Effects = require(script.Parent.Effects)
 local UiVisibility = require(script.Parent.UiVisibility)
 
 local remote = ReplicatedStorage:WaitForChild("ClientSettings") :: RemoteFunction
@@ -69,6 +70,9 @@ ClientSettings.Specs = {
 	{ Key = "EffectsIntensity", Label = "Particle effects intensity (%)", Kind = "number", Default = 100, Min = 0, Max = 100, Step = 5, Section = "Effects", Description = "Reduces cosmetic particles, not projectile bodies or hit detection." },
 	{ Key = "ReducedFlashes", Label = "Reduced flashes", Kind = "boolean", Default = false, Section = "Effects", Description = "Dims explosion lighting and spell circles; suppresses cast glints." },
 	{ Key = "CameraShake", Label = "Explosion camera shake (%)", Kind = "number", Default = 100, Min = 0, Max = 100, Step = 5, Section = "Effects" },
+	{ Key = "SurfaceImpacts", Label = "Surface impact effects", Kind = "boolean", Default = true, Section = "Effects", Description = "Sparks, dust, splinters, splashes and debris that match what a shot or blade hit." },
+	{ Key = "ProjectileStreaks", Label = "Fast projectile streaks", Kind = "boolean", Default = true, Section = "Effects", Description = "A motion streak behind very fast projectiles (the nearest 64)." },
+	{ Key = "BladeTrails", Label = "Blade swing trails", Kind = "boolean", Default = true, Section = "Effects" },
 	{ Key = "Glints", Label = "Cast glints", Kind = "boolean", Default = false, Section = "Effects" },
 	{ Key = "LensFlare", Label = "Lens flare", Kind = "boolean", Default = true, Section = "Lighting", Description = "The sun's lens flare. Everything under Lighting can be tuned below." },
 	{ Key = "KeySpells", Label = "Spells menu", Kind = "key", Default = "B", Section = "Controls" },
@@ -117,6 +121,11 @@ local function apply(key: string?)
 	end
 	Presentation.Set(values.EffectsIntensity / 100, values.ReducedFlashes == true, values.CameraShake / 100)
 	Glint.SetEnabled(values.Glints == true and not values.ReducedFlashes)
+	Effects.Configure({
+		SurfaceImpacts = values.SurfaceImpacts ~= false,
+		ProjectileStreaks = values.ProjectileStreaks ~= false,
+		BladeTrails = values.BladeTrails ~= false,
+	})
 	ClientAudio.SetVolumes(values.MasterVolume / 100, values.SpellVolume / 100, values.ImpactVolume / 100, values.UiVolume / 100, values.MusicVolume / 100)
 	HudScale.Set(values.HudScale)
 	LightingSettings.SetLensFlare(values.LensFlare ~= false)

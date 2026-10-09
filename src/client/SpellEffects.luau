@@ -18,7 +18,8 @@
 	"SpellExplosion" payload (one blast; still accepted):
 	 - Position: Vector3, Radius: number (blast radius), Color: Color3,
 	   Power: number? (centre damage), Normal: Vector3? (struck surface)
-	 Rendered by ExplosionVFX, which scales size/colour/layers with Power.
+	 Rendered by ExplosionVFX (through Effects.Explosion, which adds what the
+	 struck surface calls for), scaling size/colour/layers with Power.
 ]]
 
 local Debris = game:GetService("Debris")
@@ -28,7 +29,7 @@ local TweenService = game:GetService("TweenService")
 local Shared = ReplicatedStorage:WaitForChild("Shared")
 local VisualOffload = require(Shared.VisualOffload)
 local Impact = require(Shared.Projectile.Client.Impact)
-local ExplosionVFX = require(script.Parent.ExplosionVFX)
+local Effects = require(script.Parent.Effects)
 local _SpellCircleVFX = require(script.Parent.SpellCircleVFX) -- self-registers "SpellCircle"
 local _SpellBodyClient = require(script.Parent.SpellBodyClient) -- impulses, body effects, "SpellFX"
 
@@ -89,6 +90,13 @@ local function flare(position: Vector3, width: number, color: Color3)
 	Debris:AddItem(ball, FADE_TIME + 0.1)
 end
 
+-- The beam's heading into a point, at a nominal beam speed (impacts lean
+-- their spray along it).
+local function travel(from: Vector3, to: Vector3): Vector3?
+	local offset = to - from
+	return if offset.Magnitude > 1e-3 then offset.Unit * 600 else nil
+end
+
 VisualOffload.On("SpellBeam", function(data)
 	local points = data.Points
 	if typeof(points) ~= "table" or #points < 2 then
@@ -102,11 +110,12 @@ VisualOffload.On("SpellBeam", function(data)
 	end
 	flare(points[1], width, glow)
 	for index = 2, #points - 1 do
-		Impact.Play(points[index], nil, "bounce")
+		Impact.Play(points[index], nil, "bounce", { Velocity = travel(points[index - 1], points[index]), Color = glow })
 	end
 	if data.Kind then
 		flare(points[#points], width * 1.5, glow)
-		Impact.Play(points[#points], data.Normal, data.Kind)
+		Impact.Play(points[#points], data.Normal, data.Kind,
+			{ Velocity = travel(points[#points - 1], points[#points]), Color = glow })
 	end
 end)
 
@@ -118,7 +127,7 @@ local function playExplosion(data: any)
 	if typeof(position) ~= "Vector3" then
 		return
 	end
-	ExplosionVFX.Play(position, {
+	Effects.Explosion(position, {
 		Power = if typeof(data.Power) == "number" then data.Power else nil,
 		Radius = math.max(if typeof(data.Radius) == "number" then data.Radius else 6, 1),
 		Theme = if typeof(data.Element) == "string" then data.Element else nil,

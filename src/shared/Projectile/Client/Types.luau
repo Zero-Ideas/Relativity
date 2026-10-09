@@ -99,6 +99,8 @@ export type Visual = {
 	passPoint: Vector3?, -- and where on it
 	passDone: boolean?, -- already reported
 	suspendedParticles: { ParticleEmitter }?,
+	tint: Color3?, -- the spec's colour, for impact effects
+	streak: (() -> ())?, -- detaches the speed streak (SetStreakHandler)
 }
 
 -- ModuleScripts must return exactly one non-nil value.

@@ -16,12 +16,15 @@ local Impact = {}
 -- handler from SetHandler always runs regardless.
 Impact.DefaultEnabled = false
 
--- Custom impact hook: fn(position, normal, model?, kind). When set, it replaces
--- the built-in effect below. (model is nil for impacts; kind is
--- "entity" | "world" | "bounce" | "detonate".)
-local impactHandler: ((Vector3, Vector3, Instance?, string?) -> ())? = nil
+-- Custom impact hook: fn(position, normal, model?, kind, info?). When set, it
+-- replaces the built-in effect below. (model is nil for impacts; kind is
+-- "entity" | "world" | "bounce" | "detonate"; info, when known, carries the
+-- shot's Velocity and Color so the effect can spray the right way and tint.)
+export type Info = { Velocity: Vector3?, Color: Color3? }
+export type Handler = (Vector3, Vector3, Instance?, string?, Info?) -> ()
+local impactHandler: Handler? = nil
 
-function Impact.SetHandler(fn: ((Vector3, Vector3, Instance?, string?) -> ())?)
+function Impact.SetHandler(fn: Handler?)
 	impactHandler = fn
 end
 
@@ -78,10 +81,10 @@ local function defaultImpact(position: Vector3, normal: Vector3, kind: string?)
 	end)
 end
 
-function Impact.Play(position: Vector3, normal: Vector3?, kind: string?)
+function Impact.Play(position: Vector3, normal: Vector3?, kind: string?, info: Info?)
 	local n = normal or Vector3.yAxis
 	if impactHandler then
-		task.spawn(impactHandler, position, n, nil, kind)
+		task.spawn(impactHandler, position, n, nil, kind, info)
 	elseif Impact.DefaultEnabled then
 		defaultImpact(position, n, kind)
 	end
