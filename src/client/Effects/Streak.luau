@@ -19,9 +19,12 @@ local Util = require(script.Parent.Util)
 local Streak = {}
 
 Streak.Enabled = true
-Streak.MinSpeed = 220 -- studs/s (real) below which no streak shows
-Streak.Seconds = 0.035 -- tail length = this much of the path
-Streak.MaxLength = 60
+-- studs/s (real) below which no streak shows. Ordinary shots (TimeBlaster
+-- 220, Pheonix 250, spell bullets 300) never get one; the Railgun (1250)
+-- and anything faster does.
+Streak.MinSpeed = 800
+Streak.Seconds = 0.03 -- tail length = this much of the path (~2 frames at 60 fps)
+Streak.MaxLength = 200
 Streak.MaxActive = 64
 Streak.MaxAttached = 512 -- past this, new projectiles get none
 local BUDGET_INTERVAL = 0.15
