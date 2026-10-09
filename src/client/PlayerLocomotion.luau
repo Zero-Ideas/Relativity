@@ -82,7 +82,7 @@ local function flip()
 		pcall(function()
 			local track = animator:LoadAnimation(animation)
 			pending.track = track
-			track:Play()
+			--track:Play()
 			track:AdjustSpeed(scale)
 			track.Stopped:Once(function() track:Destroy() end)
 		end)
@@ -115,7 +115,7 @@ local function backflip()
 		pcall(function()
 			local track = animator:LoadAnimation(animation)
 			pending.track = track
-			track:Play()
+			--track:Play()
 			track.TimePosition=track.Length
 			while track.Length==0 do
 				task.wait()
@@ -158,7 +158,46 @@ local function cw_left()
 		pcall(function()
 			local track = animator:LoadAnimation(animation)
 			pending.track = track
-			track:Play()
+			--track:Play()
+			track:AdjustSpeed(scale)
+			track.Stopped:Once(function() track:Destroy() end)
+		end)
+	end
+	local t=tick()
+	repeat 
+		task.wait()
+		character.HumanoidRootPart.CFrame=CFrame.new(character.HumanoidRootPart.Position,Vector3.new(workspace.CurrentCamera.CFrame.Position.X,character.HumanoidRootPart.Position.Y,workspace.CurrentCamera.CFrame.Position.Z))*CFrame.Angles(0,math.pi,0)
+	until tick()-t>0.75
+end
+local function cw_right()
+	local character:Model, humanoid, root = characterParts()
+	local p_orientation=character:GetPivot()
+	local now = os.clock()
+	local scale = Movement.GetTimeScale()
+	local cost = setting("FlipCost", 60)
+	if not character or not humanoid or not root or humanoid.Health <= 0 or humanoid.PlatformStand
+		or humanoid.FloorMaterial == Enum.Material.Air or scale <= 0
+		or now - lastFlip < setting("FlipCooldown", 1.15) or availableStamina() < cost then return end
+	lastFlip = now
+	local camera = workspace.CurrentCamera
+	local look = if camera then camera.CFrame.RightVector else root.CFrame.LookVector
+	local direction = look * Vector3.new(1, 0, 1)
+	if direction.Magnitude < 0.001 then direction = Vector3.zAxis end
+	local delta = (Vector3.yAxis * 40 + direction.Unit * 160) * scale
+	local id = nextId()
+	local pending = { character = character, cost = cost, delta = delta, startedAt = now, scale = scale, track = nil :: AnimationTrack? }
+	pendingFlips[id] = pending
+	-- Request first, but do not wait for the round trip before moving.
+	remote:FireServer("Flip", id, nil, character)
+	root.AssemblyLinearVelocity += delta
+	local storage = game:GetService("Lighting"):FindFirstChild("AnimationStorage")
+	local animation = storage and storage:FindFirstChild("Cartwheel_Left")
+	local animator = humanoid:FindFirstChildOfClass("Animator")
+	if animation and animation:IsA("Animation") and animator then
+		pcall(function()
+			local track = animator:LoadAnimation(animation)
+			pending.track = track
+			--track:Play()
 			track:AdjustSpeed(scale)
 			track.Stopped:Once(function() track:Destroy() end)
 		end)
@@ -192,6 +231,10 @@ function Locomotion.start(char)
 		if input.KeyCode==Enum.KeyCode.A then
 			local now = os.clock()
 			if now - lastForward < 0.2 then lastForward = -math.huge; cw_left() else lastForward = now end
+		end
+		if input.KeyCode==Enum.KeyCode.D then
+			local now = os.clock()
+			if now - lastForward < 0.2 then lastForward = -math.huge; cw_right() else lastForward = now end
 		end
 	end)
 	remote.OnClientEvent:Connect(function(action, id, accepted)
