@@ -57,6 +57,7 @@ function Keybinds.SetSuspended(on: boolean)
 	suspended = on
 end
 local changed = Instance.new("BindableEvent")
+changed.Name = "KeybindsChanged" -- (shows up by name in debugging tools)
 Keybinds.Changed = changed.Event -- (setting) a key moved: update hints
 
 local function actionName(setting: string): string

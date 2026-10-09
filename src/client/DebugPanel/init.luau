@@ -61,6 +61,7 @@ local localPlayer = Players.LocalPlayer
 local panelWindow: any = nil -- the built ReGui window, once allowed
 local anyTabVisible = true -- false when every tab has been taken from this player
 local accessEvent = Instance.new("BindableEvent") -- (DebugPanel.AccessChanged)
+accessEvent.Name = "DebugPanelAccessChanged" -- (shows up by name in debugging tools)
 DebugPanel.AccessChanged = accessEvent.Event
 
 local function listed(): boolean

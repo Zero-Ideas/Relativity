@@ -38,8 +38,10 @@ local MAX_KEPT = 50
 
 local Notifications = {}
 local addedEvent = Instance.new("BindableEvent")
+addedEvent.Name = "NotificationsAdded" -- (shows up by name in debugging tools)
 Notifications.Added = addedEvent.Event
 local changedEvent = Instance.new("BindableEvent")
+changedEvent.Name = "NotificationsChanged" -- (shows up by name in debugging tools)
 Notifications.Changed = changedEvent.Event
 
 local entries: { Entry } = {} -- oldest first

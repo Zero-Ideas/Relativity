@@ -82,6 +82,7 @@ local START_MENU = "startmenu" -- (matched without regard to case)
 local startMenuOpen = false -- (the game UI stays off while it's up)
 local uiLoaded = false
 local startMenuClosed = Instance.new("BindableEvent")
+startMenuClosed.Name = "UiModeStartMenuClosed" -- (shows up by name in debugging tools)
 
 -- SetCoreGuiEnabled errors until the CoreScripts have registered it.
 local function hideBackpack()

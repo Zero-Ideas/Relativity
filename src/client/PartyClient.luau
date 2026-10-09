@@ -24,6 +24,7 @@ export type Member = Instance
 
 local PartyClient = {}
 local changedEvent = Instance.new("BindableEvent")
+changedEvent.Name = "PartyClientChanged" -- (shows up by name in debugging tools)
 PartyClient.Changed = changedEvent.Event
 
 local started = false

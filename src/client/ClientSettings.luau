@@ -95,6 +95,7 @@ local pending: { [string]: any } = {} -- changes not saved yet
 local saveQueued = false
 
 local changedEvent = Instance.new("BindableEvent")
+changedEvent.Name = "ClientSettingsChanged" -- (shows up by name in debugging tools)
 ClientSettings.Changed = changedEvent.Event
 
 local function apply(key: string?)
