@@ -121,6 +121,7 @@ local function playExplosion(data: any)
 	ExplosionVFX.Play(position, {
 		Power = if typeof(data.Power) == "number" then data.Power else nil,
 		Radius = math.max(if typeof(data.Radius) == "number" then data.Radius else 6, 1),
+		Theme = if typeof(data.Element) == "string" then data.Element else nil,
 		Color = if typeof(data.Color) == "Color3" then data.Color else nil,
 		Normal = if typeof(data.Normal) == "Vector3" then data.Normal else nil,
 	})

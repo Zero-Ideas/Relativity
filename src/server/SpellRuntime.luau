@@ -213,7 +213,7 @@ local function memoryOf(ctx: Context, scope: string): { [string]: any }
 end
 
 local evaluate: (compiled: any, ctx: Context, id: string, port: string) -> any
-local queueExplosionVisual: (center: Vector3, radius: number, color: Color3, power: number, normal: Vector3?) -> ()
+local queueExplosionVisual: (center: Vector3, radius: number, element: string, power: number, normal: Vector3?) -> ()
 
 -- Value arriving at `port` of rune `id`: from its wire, else the param the
 -- port falls back to (SpellRunes PortDef.Param), else nil.
@@ -1540,21 +1540,24 @@ local MIN_EXPLOSION_SCALE = 0.2 -- smallest radius fraction a split blast keeps
 -- Explosion visuals go out once a frame, as one "SpellExplosions" list per
 -- player holding only the blasts that player could see or hear (audio
 -- carries up to ~3000 studs for the biggest), instead of one message to
--- everyone per blast. Blasts of one colour going off this frame within
+-- everyone per blast. Each carries its element (the client's colour theme,
+-- ExplosionVFX) and that element's colour (for elements without a theme).
+-- Blasts of one element going off this frame within
 -- half a radius of each other are drawn as one (powers add) -- purely
 -- cosmetic: every blast still deals its own damage.
 local EXPLOSION_SEND_RANGE = 3000
 local explosionQueue: { any } = {}
 
-function queueExplosionVisual(center: Vector3, radius: number, color: Color3, power: number, normal: Vector3?)
+function queueExplosionVisual(center: Vector3, radius: number, element: string, power: number, normal: Vector3?)
 	for _, queued in explosionQueue do
-		if queued.Color == color and (queued.Position - center).Magnitude <= math.max(queued.Radius, radius) * .5 then
+		if queued.Element == element and (queued.Position - center).Magnitude <= math.max(queued.Radius, radius) * .5 then
 			queued.Power += power
 			queued.Radius = math.max(queued.Radius, radius)
 			return
 		end
 	end
-	table.insert(explosionQueue, { Position = center, Radius = radius, Color = color, Power = power, Normal = normal })
+	table.insert(explosionQueue, { Position = center, Radius = radius, Element = element,
+		Color = SpellRunes.Elements[element].Color, Power = power, Normal = normal })
 end
 
 Heartbeat.Connect(function()
@@ -1602,7 +1605,7 @@ local function explode(shot: Shot)
 		end
 	end
 	SpellWorld.DamageInRadius(center, radius, damageEnergy * shot.impact, ctx.player, ctx.caster)
-	queueExplosionVisual(center, radius, SpellRunes.Elements[shot.element].Color, damageEnergy * shot.impact,
+	queueExplosionVisual(center, radius, shot.element, damageEnergy * shot.impact,
 		-- the struck surface, so the visual sits on walls/ceilings/slopes
 		if ctx.isCast then nil else ctx.surfaceNormal)
 end

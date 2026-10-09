@@ -42,13 +42,28 @@
 	Budget: past LOD_DISTANCE only Energy plays; past MAX_DETAILED_ACTIVE
 	concurrent blasts counts halve and Smoke/Wind are dropped.
 
+	Colour themes: the template is authored as fire. A theme (THEMES below,
+	keyed by element name) recolours every fire-coloured particle -- the
+	energy, sparks, and the fiery bits of the other groups (shockwave rings,
+	glowing cracks, flaming dust); smoke, dust, rocks and white/black stay as
+	authored. Each authored colour is mapped by brightness ("heat") onto the
+	theme's Colors ramp, so embers stay dark and the core stays hot, and each
+	emitter gets its own nudge of heat and hue, some lean toward an accent
+	colour -- the blast is many related colours, never one flat tint.
+	Fire (and no theme) is the template as authored. An element with no
+	entry gets a ramp derived from its Color.
+
 	API:
-	 ExplosionVFX.Play(position, { Power, Radius?, Color?, Shake?, Normal? })
+	 ExplosionVFX.Play(position, { Power, Radius?, Theme?, Color?, Shake?, Normal? })
+	     Theme: a THEMES name (an element: "Arcane") or a theme table;
+	     unknown or omitted, Color (if any) derives one, else fire.
 	     Normal: the struck surface's normal (e.g. from a projectile hit). The
 	     effect is built on that surface with its +Y along the normal -- walls,
 	     ceilings and slopes included. Without it, it looks straight down for
 	     ground and is an upright air burst if there is none.
 	 ExplosionVFX.Describe(power, radius?) -> table   -- derived parameters (debug)
+	 ExplosionVFX.Themes                               -- the THEMES table (add/edit freely)
+	 ExplosionVFX.ThemeFromColor(color) -> Theme       -- the ramp an unthemed colour gets
 ]]
 
 local Players = game:GetService("Players")
@@ -103,6 +118,164 @@ local GROUP_TIERS: { [string]: { From: number, Counts: { number } } } = {
 	GroundCrack = { From = 0.72, Counts = { 1, 1 } },
 }
 local LOW_DETAIL_SKIP = { Smoke = true, Wind = true }
+
+--------------------------------------------------------------------------------
+-- Colour themes
+--------------------------------------------------------------------------------
+
+export type Theme = {
+	-- The heat ramp, darkest (embers) first, hottest (core) last, evenly
+	-- spaced. nil: the template's own fire colours.
+	Colors: { Color3 }?,
+	Accents: { Color3 }?, -- a share of the emitters lean toward one of these
+	AccentChance: number?, -- that share (default 0.35)
+	HueJitter: number?, -- +- hue shift per emitter, in hue turns (default 0.03)
+	HeatJitter: number?, -- +- heat shift per emitter (default 0.08)
+	Light: Color3?, -- the flash's light (default: the ramp's hot end)
+}
+
+local FIRE_LIGHT = Color3.fromRGB(255, 190, 110)
+local THEMES: { [string]: Theme } = {
+	Fire = { Light = FIRE_LIGHT },
+	Arcane = {
+		Colors = {
+			Color3.fromRGB(26, 6, 52), Color3.fromRGB(96, 24, 190),
+			Color3.fromRGB(176, 92, 255), Color3.fromRGB(240, 212, 255),
+		},
+		Accents = { Color3.fromRGB(255, 84, 214), Color3.fromRGB(92, 116, 255), Color3.fromRGB(140, 60, 255) },
+		HueJitter = 0.035,
+		Light = Color3.fromRGB(190, 120, 255),
+	},
+	Shock = {
+		Colors = {
+			Color3.fromRGB(4, 18, 56), Color3.fromRGB(18, 104, 228),
+			Color3.fromRGB(86, 198, 255), Color3.fromRGB(232, 250, 255),
+		},
+		Accents = { Color3.fromRGB(150, 128, 255), Color3.fromRGB(110, 255, 236), Color3.fromRGB(255, 255, 255) },
+		HueJitter = 0.03,
+		Light = Color3.fromRGB(150, 220, 255),
+	},
+}
+ExplosionVFX.Themes = THEMES
+
+-- Variations of each recoloured emitter kept per theme; a blast picks one
+-- per emitter at random (variety without recolouring every time).
+local THEME_VARIANTS = 6
+-- Heat of an authored colour: its luminance, stretched so the template's
+-- brightest fire (~0.75) lands near the hot end.
+local HEAT_GAIN = 1.1
+
+-- A ramp for a colour that has no theme: dark, rich, bright, near-white,
+-- with neighbouring hues as accents.
+local derivedThemes: { [string]: Theme } = {}
+function ExplosionVFX.ThemeFromColor(color: Color3): Theme
+	local key = color:ToHex()
+	local cached = derivedThemes[key]
+	if cached then
+		return cached
+	end
+	local h, s = color:ToHSV()
+	s = math.max(s, 0.5)
+	local theme: Theme = {
+		Colors = {
+			Color3.fromHSV(h, math.min(s + 0.15, 1), 0.12), Color3.fromHSV(h, s, 0.55),
+			Color3.fromHSV(h, s * 0.85, 0.97), Color3.fromHSV(h, s * 0.2, 1),
+		},
+		Accents = { Color3.fromHSV((h + 0.07) % 1, s, 1), Color3.fromHSV((h - 0.07) % 1, s, 1) },
+		Light = Color3.fromHSV(h, s * 0.6, 1),
+	}
+	derivedThemes[key] = theme
+	return theme
+end
+
+local function resolveTheme(theme: (string | Theme)?, color: Color3?): Theme
+	if type(theme) == "table" then
+		return theme
+	end
+	local named = if type(theme) == "string" then THEMES[theme] else nil
+	if named then
+		return named
+	end
+	return if color then ExplosionVFX.ThemeFromColor(color) else THEMES.Fire
+end
+
+-- Authored fire: saturated red..orange..amber. Greys, white, black, browns
+-- (rock, dirt) aren't, so they keep their colour under every theme.
+local function fiery(color: Color3): boolean
+	local h, s, v = color:ToHSV()
+	return v >= 0.03 and s >= 0.45 and (h <= 0.14 or h >= 0.94)
+end
+
+local function ramp(colors: { Color3 }, heat: number): Color3
+	local count = #colors
+	if count == 1 then
+		return colors[1]
+	end
+	local x = math.clamp(heat, 0, 1) * (count - 1)
+	local index = math.min(math.floor(x), count - 2)
+	return colors[index + 1]:Lerp(colors[index + 2], x - index)
+end
+
+-- One variation of `sequence` under `theme`, or nil when nothing in it is
+-- fire-coloured. The nudges are per emitter (the whole sequence shares
+-- them), so an emitter's own fade over its lifetime is kept.
+local function themedSequence(sequence: ColorSequence, theme: Theme, random: Random): ColorSequence?
+	local colors = theme.Colors :: { Color3 }
+	local heatShift = (random:NextNumber() * 2 - 1) * (theme.HeatJitter or 0.08)
+	local hueShift = (random:NextNumber() * 2 - 1) * (theme.HueJitter or 0.03)
+	local satShift = (random:NextNumber() * 2 - 1) * 0.08
+	local accents = theme.Accents
+	local accent: Color3? = nil
+	local accentAmount = 0
+	if accents and #accents > 0 and random:NextNumber() < (theme.AccentChance or 0.35) then
+		accent = accents[random:NextInteger(1, #accents)]
+		accentAmount = random:NextNumber(0.25, 0.65)
+	end
+	local changed = false
+	local points = {}
+	for _, point in sequence.Keypoints do
+		local value = point.Value
+		if fiery(value) then
+			changed = true
+			local heat = (0.299 * value.R + 0.587 * value.G + 0.114 * value.B) * HEAT_GAIN + heatShift
+			local mapped = ramp(colors, heat)
+			local h, s, v = mapped:ToHSV()
+			if accent then
+				-- toward the accent's hue, at this point's own brightness
+				local ah, as = accent:ToHSV()
+				local blended = Color3.fromHSV(h, s, v):Lerp(Color3.fromHSV(ah, as, v), accentAmount)
+				h, s, v = blended:ToHSV()
+			end
+			value = Color3.fromHSV((h + hueShift) % 1, math.clamp(s + satShift, 0, 1), v)
+		end
+		table.insert(points, ColorSequenceKeypoint.new(point.Time, value))
+	end
+	return if changed then ColorSequence.new(points) else nil
+end
+
+-- [theme][template emitter] = its variations ({} = nothing to recolour)
+local themedCache: { [Theme]: { [ParticleEmitter]: { ColorSequence } } } = setmetatable({}, { __mode = "k" }) :: any
+local themeRandom = Random.new()
+local function themedColor(original: ParticleEmitter, theme: Theme): ColorSequence?
+	local perTheme = themedCache[theme]
+	if not perTheme then
+		perTheme = setmetatable({}, { __mode = "k" }) :: any
+		themedCache[theme] = perTheme
+	end
+	local variants = perTheme[original]
+	if not variants then
+		variants = {}
+		for _ = 1, THEME_VARIANTS do
+			local sequence = themedSequence(original.Color, theme, themeRandom)
+			if not sequence then
+				break
+			end
+			table.insert(variants, sequence)
+		end
+		perTheme[original] = variants
+	end
+	return if #variants > 0 then variants[themeRandom:NextInteger(1, #variants)] else nil
+end
 -- Share of a group's (ranked) emitters used when the group first appears;
 -- ramps to 1 at full intensity. Always at least one emitter.
 local MIN_EMITTER_SHARE = 0.12
@@ -182,14 +355,6 @@ local function scaledSequence(sequence: NumberSequence, factor: number): NumberS
 		table.insert(points, NumberSequenceKeypoint.new(point.Time, point.Value * factor, point.Envelope * factor))
 	end
 	return NumberSequence.new(points)
-end
-
-local function tinted(sequence: ColorSequence, tint: Color3, amount: number): ColorSequence
-	local points = {}
-	for _, point in sequence.Keypoints do
-		table.insert(points, ColorSequenceKeypoint.new(point.Time, point.Value:Lerp(tint, amount)))
-	end
-	return ColorSequence.new(points)
 end
 
 local folder: Folder? = nil
@@ -381,7 +546,7 @@ end
 -- Play
 --------------------------------------------------------------------------------
 
-type PlayOptions = { Power: number?, Radius: number?, Color: Color3?, Shake: boolean?, Normal: Vector3? }
+type PlayOptions = { Power: number?, Radius: number?, Theme: (string | Theme)?, Color: Color3?, Shake: boolean?, Normal: Vector3? }
 
 function ExplosionVFX.Play(position: Vector3, options: PlayOptions?)
 	local source = template()
@@ -422,9 +587,12 @@ function ExplosionVFX.Play(position: Vector3, options: PlayOptions?)
 	root.Size = Vector3.one
 	root.CFrame = frame
 
+	local theme = resolveTheme(opts.Theme, opts.Color)
+	local recolor = theme.Colors ~= nil and #(theme.Colors :: { Color3 }) > 0
+
 	local light = Instance.new("PointLight")
 	light.Range = math.min(spec.Radius * 4, 60)
-	light.Color = Color3.fromRGB(255, 190, 110):Lerp(opts.Color or Color3.fromRGB(255, 190, 110), 0.4)
+	light.Color = theme.Light or (if recolor then ramp(theme.Colors :: { Color3 }, 0.8) else FIRE_LIGHT)
 	light.Shadows = spec.Intensity > 0.6
 	light.Parent = root
 
@@ -489,8 +657,11 @@ function ExplosionVFX.Play(position: Vector3, options: PlayOptions?)
 			if duration > 0 then
 				emitter.Rate *= factor
 			end
-			if opts.Color and emitter:GetAttribute("recolorable") then
-				emitter.Color = tinted(emitter.Color, opts.Color, 0.6)
+			if recolor then
+				local themed = themedColor(original, theme)
+				if themed then
+					emitter.Color = themed
+				end
 			end
 			emitter.Parent = attachmentFor(group, (original:GetAttribute("SourceHeight") :: number?) or 0)
 			local flash = group == "Energy" or group == "Shockwaves"

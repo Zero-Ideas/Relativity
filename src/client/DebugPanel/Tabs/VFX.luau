@@ -33,18 +33,22 @@ return function(window)
 
 	local level = 0.5
 	local radiusOverride = 0
-	local tintName = "Heat only"
+	local themeName = "Fire"
 	local placing = false
 
-	local tints: { [string]: Color3? } = { ["Heat only"] = nil }
-	local tintNames = { "Heat only" }
+	-- every element (a theme, or one derived from its colour) plus any extra themes
+	local themeColors: { [string]: Color3? } = {}
+	local themeNames = {}
 	for name, element in SpellRunes.Elements do
-		tints[name] = element.Color
-		table.insert(tintNames, name)
+		themeColors[name] = element.Color
+		table.insert(themeNames, name)
 	end
-	table.sort(tintNames, function(a, b)
-		return a == "Heat only" or (b ~= "Heat only" and a < b)
-	end)
+	for name in ExplosionVFX.Themes do
+		if not table.find(themeNames, name) then
+			table.insert(themeNames, name)
+		end
+	end
+	table.sort(themeNames)
 
 	local powerLine = statLine(tab, "Power")
 	local sizeLine = statLine(tab, "Derived")
@@ -54,7 +58,8 @@ return function(window)
 		return {
 			Power = power or powerAt(level),
 			Radius = if radiusOverride > 0 then radiusOverride else nil,
-			Color = tints[tintName],
+			Theme = themeName,
+			Color = themeColors[themeName],
 		}
 	end
 
@@ -98,17 +103,17 @@ return function(window)
 			refreshReadout()
 		end,
 	})
-	local tintPicker = tab:Combo({
-		Label = "Tint",
-		Placeholder = tintName,
+	local themePicker = tab:Combo({
+		Label = "Colour theme",
+		Placeholder = themeName,
 		GetItems = function()
-			return tintNames
+			return themeNames
 		end,
 		Callback = function(_, value)
-			tintName = value
+			themeName = value
 		end,
 	})
-	tintPicker:SetValueText(tintName)
+	themePicker:SetValueText(themeName)
 
 	local function inFront(distance: number): Vector3?
 		local character = localPlayer.Character
