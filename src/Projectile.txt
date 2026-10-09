@@ -25,7 +25,7 @@
 --     src/server/Projectile/Math.luau (71 lines)
 --     src/server/Projectile/CollisionLOD.luau (36 lines)
 --     src/server/Projectile/Raycast.luau (332 lines)
---     src/server/Projectile/Occupancy.luau (1069 lines)
+--     src/server/Projectile/Occupancy.luau (1045 lines)
 --     src/server/Projectile/Homing.luau (154 lines)
 --     src/server/Projectile/RewindHit.luau (144 lines)
 --     src/server/Projectile/Replication.luau (579 lines)
@@ -37,7 +37,7 @@
 --     src/server/Projectile/Parallel.luau (1076 lines)
 --     src/server/Projectile/init.luau (1589 lines)
 --     src/server/Projectile/BeamProjectileHandler.luau (377 lines)
---     src/server/Projectile/BeamChain.luau (1444 lines)
+--     src/server/Projectile/BeamChain.luau (1550 lines)
 --     src/server/Projectile/Beams.luau (9 lines)
 --     src/server/ProjectileQuota.luau (41 lines)
 --     src/server/ProjectileWorkerBootstrap.server.luau (201 lines)
@@ -5117,75 +5117,51 @@ function Occupancy.SegmentClear(origin: Vector3, displacement: Vector3, radius: 
 	return true
 end
 
--- Is the box [lo, hi] clear of everything a raycast could hit? Same
--- meaning as SegmentClear, for every centreline inside the box: marks carry
--- PAD studs of clearance, so sweeps of radius up to MaxRadius whose centre
--- stays in the box hit nothing. BeamChain puts beam samples to sleep in such
--- boxes. Returns "clear"; "moving" when a moving part's mark is in it (not
--- excluded by `ignore`); "static" when static marks are (FINE voxels plus
--- PAD are coarse: a caller may still prove it clear another way); "unknown"
--- when this can't tell (not baked, outside scanned terrain, over `maxCells`
--- coarse cells). Not counted in the skip stats.
-function Occupancy.BoxClear(lo: Vector3, hi: Vector3, ignore: { [Instance]: boolean }?, maxCells: number?): string
+-- Are these centrelines (origin, displacement pairs) clear of everything a
+-- raycast could hit? Same meaning as SegmentClear for each: a sweep of
+-- radius up to MaxRadius along any of them hits nothing. BeamChain puts beam
+-- samples to sleep along such lines. Returns "clear"; "moving" when a moving
+-- part's mark (not excluded by `ignore`) is on one; "static" when static
+-- marks are (FINE voxels grown by PAD are coarse: a caller may still prove
+-- it clear another way); "unknown" when this can't tell (not baked, outside
+-- scanned terrain). Not counted in the skip stats.
+function Occupancy.LinesClear(lines: { Vector3 }, ignore: { [Instance]: boolean }?): string
 	if not ready or not Occupancy.Enabled then
 		return "unknown"
 	end
-	local fx0, fy0, fz0 = floor(lo.X / FINE), floor(lo.Y / FINE), floor(lo.Z / FINE)
-	local fx1, fy1, fz1 = floor(hi.X / FINE), floor(hi.Y / FINE), floor(hi.Z / FINE)
-	local cx0, cy0, cz0 = fx0 // DIV, fy0 // DIV, fz0 // DIV
-	local cx1, cy1, cz1 = fx1 // DIV, fy1 // DIV, fz1 // DIV
-	if (cx1 - cx0 + 1) * (cy1 - cy0 + 1) * (cz1 - cz0 + 1) > (maxCells or 64) then
-		return "unknown"
-	end
 	refreshDynamic()
-	-- moving parts first: those rule a box out whatever the static verdict
-	for cz = cz0, cz1 do
-		for cy = cy0, cy1 do
-			for cx = cx0, cx1 do
-				local moving = dynamic[cellKey(cx, cy, cz)]
-				if moving then
-					for index = 1, #moving, 3 do
-						local mlo, mhi = moving[index], moving[index + 1]
-						if hi.X > mlo.X and lo.X < mhi.X and hi.Y > mlo.Y and lo.Y < mhi.Y and hi.Z > mlo.Z and lo.Z < mhi.Z
-							and not (ignore and ignore[moving[index + 2]]) then
-							return "moving"
-						end
-					end
+	local verdict = "clear"
+	for index = 1, #lines, 2 do
+		local origin, displacement = lines[index], lines[index + 1]
+		if hasTerrain and not insideTerrainScan(origin, origin + displacement) then
+			return "unknown"
+		end
+		if walk(origin, displacement, COARSE, coarseOccupied) then
+			blockedByMoving = false
+			currentIgnore = ignore
+			local blocked = walk(origin, displacement, FINE, fineOccupied)
+			currentIgnore = nil
+			if blocked then
+				if blockedByMoving then
+					return "moving"
 				end
+				verdict = "static"
 			end
 		end
 	end
-	if hasTerrain and not insideTerrainScan(lo, hi) then
-		return "unknown"
-	end
-	for cz = cz0, cz1 do
-		local az, bz = max(fz0 - cz * DIV, 0), min(fz1 - cz * DIV, DIV - 1)
-		for cy = cy0, cy1 do
-			local ay, by = max(fy0 - cy * DIV, 0), min(fy1 - cy * DIV, DIV - 1)
-			for cx = cx0, cx1 do
-				local mask = static[cellKey(cx, cy, cz)]
-				if mask then
-					if mask == FULL then
-						return "static"
-					end
-					local ax, bx = max(fx0 - cx * DIV, 0), min(fx1 - cx * DIV, DIV - 1)
-					local row = lshift(lshift(1, bx - ax + 1) - 1, ax)
-					for fz = az, bz do
-						for fy = ay, by do
-							if btest(readu16(mask, (fy + fz * DIV) * ROW_BYTES), row) then
-								return "static"
-							end
-						end
-					end
-				end
-			end
-		end
-	end
-	return "clear"
+	return verdict
 end
 
--- Does the map have terrain? (A box query that skips terrain must check it
--- itself then.)
+-- Adds the key of every coarse cell the segment passes through to `into`.
+function Occupancy.CellsAlong(origin: Vector3, displacement: Vector3, into: { [number]: boolean })
+	walk(origin, displacement, COARSE, function(cx: number, cy: number, cz: number): boolean
+		into[cellKey(cx, cy, cz)] = true
+		return false
+	end)
+end
+
+-- Does the map have terrain? (An engine query that skips terrain must
+-- check it itself then.)
 function Occupancy.HasTerrain(): boolean
 	return hasTerrain
 end
@@ -10617,30 +10593,52 @@ local REFRESH_PERIOD = 0.2
 local CLIP_RESEND = 0.25
 -- A chain lingers this long after its last packet before it ends.
 local CHAIN_GRACE = 0.25
--- Sleep: how far a sample may fly per sleep, the shortest window worth a box
--- test (in frames), the longest window, the most coarse cells a box may
--- span, and the clearance added around the engine's box query.
+-- Sleep windows: at least this far or this many frames of flight, at most
+-- this far / long; shorter than SLEEP_MIN_FRAMES isn't worth the test.
 local SLEEP_STUDS = 96
-local SLEEP_MIN_FRAMES = 3
+local SLEEP_TARGET_FRAMES = 8
+local SLEEP_MAX_STUDS = 768
 local SLEEP_MAX_SECONDS = 1
-local SLEEP_MAX_CELLS = 27
+local SLEEP_MIN_FRAMES = 2
+-- The swept box: clearance added all round, its widest cross-section, its
+-- longest reach (shape casts stop at 1024 studs), and the most lines that
+-- may index it for wake-ups.
 local SLEEP_MARGIN = 0.5
+local SLEEP_MAX_WIDTH = 256
+local SLEEP_MAX_REACH = 1000
+local SLEEP_MAX_LINES = 64
+-- Moving parts' marks are grown by at least this much (Occupancy: PAD +
+-- DYNAMIC_MARGIN), so a part that could touch a sleeper's sweep has a mark
+-- reaching one of its lines as long as they're close enough together.
+local MARK_GROWTH = 6
 
 --------------------------------------------------------------------------------
 -- Sleep
 --------------------------------------------------------------------------------
 
--- A sample sleeps while its whole future for a window -- its own flight and
--- its body to the sample ahead -- stays inside a box nothing a raycast could
--- hit is in. Asleep it skips Projectile.Step and its body cast and just
--- moves (exactly: constant acceleration). It wakes when the window ends, or
--- before that when anything could reach it: a moving part or entity's mark
--- entering the box (Occupancy refreshes those every frame), static geometry
--- appearing in it, the sample ahead being hit / bouncing / dying (its body
--- ends there), dilated time anywhere, or its real-time cap. Sleepers are
--- indexed by Occupancy's coarse cells for those checks.
+-- A sample sleeps while everything it will sweep for a window -- its own
+-- flight and its body to the sample ahead, a parallelogram (a line, for a
+-- steady beam) -- is clear of anything a raycast could hit. Asleep it skips
+-- Projectile.Step and its body cast and just moves (exactly: constant
+-- acceleration). It wakes when the window ends, or before that when anything
+-- could reach it: a moving part or entity's mark touching its sweep
+-- (Occupancy refreshes those every frame), static geometry appearing on it,
+-- the sample ahead being hit / bouncing / dying (its body ends there),
+-- dilated time anywhere, or its real-time cap. The sweep is bounded by an
+-- oriented box, tested by Occupancy when it's thin enough for one of its
+-- centrelines, else by one engine block cast through it with the sample's
+-- own filter (exact geometry, terrain included). Sleepers are indexed by the
+-- coarse cells a few lines through that box cross.
 local sleepCells: { [number]: { [any]: boolean } } = {}
 local sleeping = 0
+-- Why samples stayed awake (Stats tab): their chain can't sleep (homing,
+-- varying acceleration, positional triggers), their body is clipped, time
+-- is dilated somewhere, the window is too short, their body bends (bounce
+-- corners), its ends drift apart too fast (a fast sweep, a stopped front),
+-- or the test said no (a moving part / static geometry the engine
+-- confirmed / can't tell).
+local wakeful = { Chain = 0, Clipped = 0, Dilated = 0, Window = 0, Bent = 0, Spread = 0, Moving = 0, Static = 0,
+	Unknown = 0 }
 
 local function wake(s: any)
 	local keys = s._sleepKeys
@@ -10656,7 +10654,7 @@ local function wake(s: any)
 			end
 		end
 	end
-	s._sleepKeys, s._sleepAge, s._sleepLo, s._sleepHi, s._slept = nil, nil, nil, nil, nil
+	s._sleepKeys, s._sleepAge, s._sleepLines, s._slept = nil, nil, nil, nil
 	sleeping -= 1
 end
 
@@ -10825,8 +10823,7 @@ local function joinerFrom(chain: any, prototype: any, position: Vector3, velocit
 	s._lazyLink, s._incoming, s._contact, s._lastHit = nil, nil, nil, nil
 	s._beamReserveChildren, s._beamBindChild, s._beamScaleEnergy = nil, nil, nil
 	s._rep, s._repAhead, s._repClipN, s._repClipEnd, s._repTurns = nil, nil, nil, nil, nil
-	s._sleepKeys, s._sleepAge, s._sleepLo, s._sleepHi, s._slept, s._sleepRetry, s._behind =
-		nil, nil, nil, nil, nil, nil, nil
+	s._sleepKeys, s._sleepAge, s._sleepLines, s._slept, s._sleepRetry, s._behind = nil, nil, nil, nil, nil, nil
 	s._origin, s._tail, s._tailTurns, s._everLinked = position, { position }, #turns, true
 	return s
 end
@@ -11195,117 +11192,187 @@ local function drift(s: any, dt: number)
 	s.Age += dt
 end
 
--- Occupancy's marks are coarse (4-stud voxels grown by 4 studs, so a beam a
--- few studs over a floor never reads as clear there); then ask the engine:
--- which parts' bounds overlap the box (filtered like the sample's casts),
--- plus terrain voxels on maps that have terrain.
-local overlapFor: { [RaycastParams]: OverlapParams } = setmetatable({}, { __mode = "k" }) :: any
+local function refuse(p: any, why: string, retryAfter: number)
+	p._sleepRetry, p._sleepWhy = p.Age + retryAfter, why
+	wakeful[why] += 1
+end
 
-local function engineClear(s: any, lo: Vector3, hi: Vector3): boolean
-	local rayParams: RaycastParams = s._rayParams
-	local params = overlapFor[rayParams]
-	if not params then
-		params = OverlapParams.new()
-		params.FilterType = rayParams.FilterType
-		params.FilterDescendantsInstances = rayParams.FilterDescendantsInstances
-		params.CollisionGroup = rayParams.CollisionGroup
-		params.RespectCanCollide = rayParams.RespectCanCollide
-		overlapFor[rayParams] = params
+-- After its link pass: may `p` sleep? (See "Sleep" at the top.)
+local function trySleep(chain: any, p: any, globalDt: number)
+	if not chain.lazy or p.Radius > Occupancy.MaxRadius then
+		wakeful.Chain += 1
+		return
+	elseif p._beamSpanClipped then
+		wakeful.Clipped += 1
+		return
+	elseif not ChunkManager.IsTimeUniform() then
+		wakeful.Dilated += 1
+		return
 	end
-	local pad = Vector3.one * (s.Radius + SLEEP_MARGIN)
-	local low, high = lo - pad, hi + pad
-	if #workspace:GetPartBoundsInBox(CFrame.new((low + high) * .5), high - low, params) > 0 then
-		return false
+	local frame = globalDt * timeScaleOf(p)
+	if frame <= 0 then
+		return
+	elseif p._sleepRetry and p.Age < p._sleepRetry then
+		wakeful[p._sleepWhy or "Window"] += 1
+		return
 	end
-	if Occupancy.HasTerrain() then
-		local ok, materials = pcall(function()
-			return workspace.Terrain:ReadVoxels(Region3.new(low, high):ExpandToGrid(4), 4)
-		end)
-		if not ok then
-			return false
+	local span = p._beamSpan
+	if span and #span > 2 then
+		refuse(p, "Bent", frame * SLEEP_TARGET_FRAMES)
+		return
+	end
+	local speed = math.max(p.Velocity.Magnitude, 1)
+	local window = math.min(math.max(SLEEP_STUDS / speed, SLEEP_TARGET_FRAMES * frame), SLEEP_MAX_STUDS / speed,
+		SLEEP_MAX_SECONDS, p.Lifetime - p.Age - 1e-3)
+	if window < frame * SLEEP_MIN_FRAMES then
+		refuse(p, "Window", frame * SLEEP_MIN_FRAMES)
+		return
+	end
+
+	-- What it sweeps: its body runs from it to `finish` -- the sample ahead
+	-- (moving as that one does), else a fragment / tail end (moving with it)
+	-- -- so over the window the body sweeps the patch between these four
+	-- corners, which their oriented bounding box contains. Plus the radius,
+	-- and how far constant acceleration bows a path off its chord.
+	local a = Motion.GetAcceleration(p.Velocity, p.Acceleration, p.AccelerationDirection, p.Gravity)
+	local half = .5 * window * window
+	local dp = p.Velocity * window + a * half
+	local start = p.Position
+	local finish = if span and #span == 2 then span[2] else start
+	local front = p._ahead
+	local dFinish = dp
+	if front and (finish - front.Position).Magnitude < 1e-3 then
+		dFinish = if front.Dead then Vector3.zero else front.Velocity * window + a * half
+	end
+	local body = finish - start
+	local axis = if dp.Magnitude > 1e-4 then dp.Unit elseif body.Magnitude > 1e-4 then body.Unit else Vector3.xAxis
+	local side = body - axis * body:Dot(axis)
+	if side.Magnitude < 1e-4 then
+		local spread = dFinish - dp
+		side = spread - axis * spread:Dot(axis)
+	end
+	if side.Magnitude < 1e-4 then
+		side = if math.abs(axis.Y) < .9 then axis:Cross(Vector3.yAxis) else axis:Cross(Vector3.xAxis)
+	end
+	side = side.Unit
+	local up = axis:Cross(side)
+	local lo = Vector3.one * math.huge
+	local hi = -lo
+	for _, corner in { Vector3.zero, body, dp, body + dFinish } do
+		local projected = Vector3.new(corner:Dot(axis), corner:Dot(side), corner:Dot(up))
+		lo, hi = lo:Min(projected), hi:Max(projected)
+	end
+	local bow = a.Magnitude * window * window * .125
+	local pad = p.Radius + bow + SLEEP_MARGIN
+	local size = hi - lo
+	if size.Y > SLEEP_MAX_WIDTH or size.Z > SLEEP_MAX_WIDTH then
+		refuse(p, "Spread", window * .5)
+		return
+	elseif size.X + 2 * pad > SLEEP_MAX_REACH then
+		refuse(p, "Window", window * .5)
+		return
+	end
+	-- Lines through the box this far apart leave no point of its sweep
+	-- further than MARK_GROWTH - radius - 0.5 from one (see wakeScan).
+	local spacing = math.max((MARK_GROWTH - .5 - p.Radius - bow) * math.sqrt(2), 1)
+	local acrossCount = math.ceil(size.Y / spacing)
+	local upCount = math.ceil(size.Z / spacing)
+	if (acrossCount + 1) * (upCount + 1) > SLEEP_MAX_LINES then
+		refuse(p, "Spread", window * .5)
+		return
+	end
+	-- (box-space -> world, from `start`)
+	local function at(x: number, y: number, z: number): Vector3
+		return start + axis * x + side * y + up * z
+	end
+
+	-- Thin enough that one centreline is within Occupancy's clearance of
+	-- all of it? Then the grid can settle it; else (or if the grid is
+	-- unsure / sees static marks) one exact engine block cast.
+	local ignore = Raycast.ignoreSetFor(p._rayParams)
+	local verdict = "static"
+	local reach = axis * size.X
+	if math.max(size.Y, size.Z) * .5 + pad - SLEEP_MARGIN <= Occupancy.MaxRadius then
+		verdict = Occupancy.LinesClear({ at(lo.X, (lo.Y + hi.Y) * .5, (lo.Z + hi.Z) * .5), reach }, ignore)
+	end
+	if verdict == "static" or verdict == "unknown" then
+		-- Cast back-to-front through the box (a slab at the start, a body
+		-- this sample's own body cast just found clear, is the only part a
+		-- shape cast can't see into).
+		local cross = Vector3.new(size.Y + 2 * pad, size.Z + 2 * pad, .1)
+		local from = CFrame.fromMatrix(at(lo.X - pad, (lo.Y + hi.Y) * .5, (lo.Z + hi.Z) * .5), side, up, axis)
+		local hit = workspace:Blockcast(from, cross, axis * (size.X + 2 * pad), p._rayParams)
+		verdict = if hit then (if hit.Instance and hit.Instance.Anchored then "static" else "moving") else "clear"
+	end
+	if verdict ~= "clear" then
+		refuse(p, if verdict == "moving" then "Moving" elseif verdict == "static" then "Static" else "Unknown", window * .5)
+		return
+	end
+
+	-- Index it by the coarse cells those lines cross (its wake-up check
+	-- tests the same lines).
+	local lines = table.create(2 * (acrossCount + 1) * (upCount + 1))
+	for i = 0, acrossCount do
+		for j = 0, upCount do
+			local y = if acrossCount > 0 then lo.Y + size.Y * i / acrossCount else lo.Y
+			local z = if upCount > 0 then lo.Z + size.Z * j / upCount else lo.Z
+			table.insert(lines, at(lo.X, y, z))
+			table.insert(lines, reach)
 		end
-		local air, water = Enum.Material.Air, Enum.Material.Water
-		local ignoreWater = rayParams.IgnoreWater
-		local size = materials.Size
-		for x = 1, size.X do
-			for y = 1, size.Y do
-				for z = 1, size.Z do
-					local material = materials[x][y][z]
-					if material ~= air and not (ignoreWater and material == water) then
-						return false
-					end
-				end
+	end
+	local cells: { [number]: boolean } = {}
+	for index = 1, #lines, 2 do
+		Occupancy.CellsAlong(lines[index], lines[index + 1], cells)
+	end
+	local keys = {}
+	for key in cells do
+		local set = sleepCells[key]
+		if not set then
+			set = {}
+			sleepCells[key] = set
+		end
+		set[p] = true
+		table.insert(keys, key)
+	end
+	p._sleepKeys, p._sleepAge, p._sleepLines = keys, p.Age + window, lines
+	p._sleepIgnore, p._sleepAccel, p._sleepRetry, p._slept = ignore, a, nil, nil
+	sleeping += 1
+end
+
+-- Does the segment origin + [0, 1] * displacement touch the box [lo, hi]?
+local function segmentTouches(origin: Vector3, displacement: Vector3, lo: Vector3, hi: Vector3): boolean
+	local t0, t1 = 0, 1
+	for axis = 1, 3 do
+		local o, d, l, h
+		if axis == 1 then
+			o, d, l, h = origin.X, displacement.X, lo.X, hi.X
+		elseif axis == 2 then
+			o, d, l, h = origin.Y, displacement.Y, lo.Y, hi.Y
+		else
+			o, d, l, h = origin.Z, displacement.Z, lo.Z, hi.Z
+		end
+		if math.abs(d) < 1e-9 then
+			if o < l or o > h then
+				return false
+			end
+		else
+			local ta, tb = (l - o) / d, (h - o) / d
+			if ta > tb then
+				ta, tb = tb, ta
+			end
+			t0, t1 = math.max(t0, ta), math.min(t1, tb)
+			if t0 > t1 then
+				return false
 			end
 		end
 	end
 	return true
 end
 
--- After its link pass: may `p` sleep? (See "Sleep" at the top.)
-local function trySleep(chain: any, p: any, globalDt: number)
-	if not chain.lazy or p._beamSpanClipped or p.Radius > Occupancy.MaxRadius or not ChunkManager.IsTimeUniform() then
-		return
-	end
-	local frame = globalDt * timeScaleOf(p)
-	if frame <= 0 or (p._sleepRetry and p.Age < p._sleepRetry) then
-		return
-	end
-	local front = p._ahead
-	local frontMoving = front ~= nil and not front.Dead
-	local speed = math.max(p.Velocity.Magnitude, if frontMoving then front.Velocity.Magnitude else 0, 1)
-	local window = math.min(SLEEP_STUDS / speed, SLEEP_MAX_SECONDS, p.Lifetime - p.Age - 1e-3)
-	if window < frame * SLEEP_MIN_FRAMES then
-		p._sleepRetry = p.Age + frame * SLEEP_MIN_FRAMES
-		return
-	end
-	-- The box: its body now (itself, its corners, the front / fragment /
-	-- tail end), with every point moved by as much as either end moves over
-	-- the window, plus how far constant acceleration bows a path off its chord.
-	local a = Motion.GetAcceleration(p.Velocity, p.Acceleration, p.AccelerationDirection, p.Gravity)
-	local half = .5 * window * window
-	local dp = p.Velocity * window + a * half
-	local df = if frontMoving then front.Velocity * window + a * half else Vector3.zero
-	local lo, hi = p.Position, p.Position
-	local span = p._beamSpan
-	if span then
-		for _, point in span do
-			lo, hi = lo:Min(point), hi:Max(point)
-		end
-	end
-	local bow = Vector3.one * (a.Magnitude * window * window * .125)
-	lo = lo + dp:Min(df):Min(Vector3.zero) - bow
-	hi = hi + dp:Max(df):Max(Vector3.zero) + bow
-	local ignore = Raycast.ignoreSetFor(p._rayParams)
-	local verdict = Occupancy.BoxClear(lo, hi, ignore, SLEEP_MAX_CELLS)
-	if verdict == "static" and engineClear(p, lo, hi) then
-		verdict = "clear"
-	end
-	if verdict ~= "clear" then
-		p._sleepRetry = p.Age + window * .5
-		return
-	end
-	local coarse = Occupancy.Coarse
-	local keys = {}
-	for cz = math.floor(lo.Z / coarse), math.floor(hi.Z / coarse) do
-		for cy = math.floor(lo.Y / coarse), math.floor(hi.Y / coarse) do
-			for cx = math.floor(lo.X / coarse), math.floor(hi.X / coarse) do
-				local key = Occupancy.CoarseKey(cx, cy, cz)
-				local set = sleepCells[key]
-				if not set then
-					set = {}
-					sleepCells[key] = set
-				end
-				set[p] = true
-				table.insert(keys, key)
-			end
-		end
-	end
-	p._sleepKeys, p._sleepAge, p._sleepLo, p._sleepHi = keys, p.Age + window, lo, hi
-	p._sleepIgnore, p._sleepAccel, p._sleepRetry, p._slept = ignore, a, nil, nil
-	sleeping += 1
-end
-
--- Wakes every sleeper something may now reach (before the frame's heads).
+-- Wakes every sleeper something may now reach (before the frame's heads):
+-- any moving part whose mark touches one of its lines (they're spaced so a
+-- part that could reach the sweep always has; the extra stud is slack).
+local WAKE_GROW = Vector3.one
 local function wakeScan()
 	local changed, overflow = Occupancy.TakeStaticChanges()
 	if sleeping <= 0 then
@@ -11336,12 +11403,19 @@ local function wakeScan()
 				if woken[s] then
 					continue
 				end
-				local lo, hi, ignore = s._sleepLo, s._sleepHi, s._sleepIgnore
+				local lines, ignore = s._sleepLines, s._sleepIgnore
 				for index = 1, #boxes, 3 do
-					local mlo, mhi = boxes[index], boxes[index + 1]
-					if hi.X > mlo.X and lo.X < mhi.X and hi.Y > mlo.Y and lo.Y < mhi.Y and hi.Z > mlo.Z and lo.Z < mhi.Z
-						and not ignore[boxes[index + 2]] then
-						woken[s] = true
+					if ignore[boxes[index + 2]] then
+						continue
+					end
+					local lo, hi = boxes[index] - WAKE_GROW, boxes[index + 1] + WAKE_GROW
+					for line = 1, #lines, 2 do
+						if segmentTouches(lines[line], lines[line + 1], lo, hi) then
+							woken[s] = true
+							break
+						end
+					end
+					if woken[s] then
 						break
 					end
 				end
@@ -11853,6 +11927,14 @@ function Chain.GetJoinerStats()
 		Active = lastStats.Joiners,
 		Samples = lastStats.Samples,
 		Sleeping = lastStats.Sleeping,
+		-- awake samples by reason, summed since the last call
+		Wakeful = (function()
+			local copy = table.clone(wakeful)
+			for key in wakeful do
+				wakeful[key] = 0
+			end
+			return copy
+		end)(),
 		LazyLinks = lastStats.Lazy,
 		Chains = #chainOrder,
 		Created = lastStats.Created,

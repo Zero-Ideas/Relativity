@@ -830,75 +830,51 @@ function Occupancy.SegmentClear(origin: Vector3, displacement: Vector3, radius: 
 	return true
 end
 
--- Is the box [lo, hi] clear of everything a raycast could hit? Same
--- meaning as SegmentClear, for every centreline inside the box: marks carry
--- PAD studs of clearance, so sweeps of radius up to MaxRadius whose centre
--- stays in the box hit nothing. BeamChain puts beam samples to sleep in such
--- boxes. Returns "clear"; "moving" when a moving part's mark is in it (not
--- excluded by `ignore`); "static" when static marks are (FINE voxels plus
--- PAD are coarse: a caller may still prove it clear another way); "unknown"
--- when this can't tell (not baked, outside scanned terrain, over `maxCells`
--- coarse cells). Not counted in the skip stats.
-function Occupancy.BoxClear(lo: Vector3, hi: Vector3, ignore: { [Instance]: boolean }?, maxCells: number?): string
+-- Are these centrelines (origin, displacement pairs) clear of everything a
+-- raycast could hit? Same meaning as SegmentClear for each: a sweep of
+-- radius up to MaxRadius along any of them hits nothing. BeamChain puts beam
+-- samples to sleep along such lines. Returns "clear"; "moving" when a moving
+-- part's mark (not excluded by `ignore`) is on one; "static" when static
+-- marks are (FINE voxels grown by PAD are coarse: a caller may still prove
+-- it clear another way); "unknown" when this can't tell (not baked, outside
+-- scanned terrain). Not counted in the skip stats.
+function Occupancy.LinesClear(lines: { Vector3 }, ignore: { [Instance]: boolean }?): string
 	if not ready or not Occupancy.Enabled then
 		return "unknown"
 	end
-	local fx0, fy0, fz0 = floor(lo.X / FINE), floor(lo.Y / FINE), floor(lo.Z / FINE)
-	local fx1, fy1, fz1 = floor(hi.X / FINE), floor(hi.Y / FINE), floor(hi.Z / FINE)
-	local cx0, cy0, cz0 = fx0 // DIV, fy0 // DIV, fz0 // DIV
-	local cx1, cy1, cz1 = fx1 // DIV, fy1 // DIV, fz1 // DIV
-	if (cx1 - cx0 + 1) * (cy1 - cy0 + 1) * (cz1 - cz0 + 1) > (maxCells or 64) then
-		return "unknown"
-	end
 	refreshDynamic()
-	-- moving parts first: those rule a box out whatever the static verdict
-	for cz = cz0, cz1 do
-		for cy = cy0, cy1 do
-			for cx = cx0, cx1 do
-				local moving = dynamic[cellKey(cx, cy, cz)]
-				if moving then
-					for index = 1, #moving, 3 do
-						local mlo, mhi = moving[index], moving[index + 1]
-						if hi.X > mlo.X and lo.X < mhi.X and hi.Y > mlo.Y and lo.Y < mhi.Y and hi.Z > mlo.Z and lo.Z < mhi.Z
-							and not (ignore and ignore[moving[index + 2]]) then
-							return "moving"
-						end
-					end
+	local verdict = "clear"
+	for index = 1, #lines, 2 do
+		local origin, displacement = lines[index], lines[index + 1]
+		if hasTerrain and not insideTerrainScan(origin, origin + displacement) then
+			return "unknown"
+		end
+		if walk(origin, displacement, COARSE, coarseOccupied) then
+			blockedByMoving = false
+			currentIgnore = ignore
+			local blocked = walk(origin, displacement, FINE, fineOccupied)
+			currentIgnore = nil
+			if blocked then
+				if blockedByMoving then
+					return "moving"
 				end
+				verdict = "static"
 			end
 		end
 	end
-	if hasTerrain and not insideTerrainScan(lo, hi) then
-		return "unknown"
-	end
-	for cz = cz0, cz1 do
-		local az, bz = max(fz0 - cz * DIV, 0), min(fz1 - cz * DIV, DIV - 1)
-		for cy = cy0, cy1 do
-			local ay, by = max(fy0 - cy * DIV, 0), min(fy1 - cy * DIV, DIV - 1)
-			for cx = cx0, cx1 do
-				local mask = static[cellKey(cx, cy, cz)]
-				if mask then
-					if mask == FULL then
-						return "static"
-					end
-					local ax, bx = max(fx0 - cx * DIV, 0), min(fx1 - cx * DIV, DIV - 1)
-					local row = lshift(lshift(1, bx - ax + 1) - 1, ax)
-					for fz = az, bz do
-						for fy = ay, by do
-							if btest(readu16(mask, (fy + fz * DIV) * ROW_BYTES), row) then
-								return "static"
-							end
-						end
-					end
-				end
-			end
-		end
-	end
-	return "clear"
+	return verdict
 end
 
--- Does the map have terrain? (A box query that skips terrain must check it
--- itself then.)
+-- Adds the key of every coarse cell the segment passes through to `into`.
+function Occupancy.CellsAlong(origin: Vector3, displacement: Vector3, into: { [number]: boolean })
+	walk(origin, displacement, COARSE, function(cx: number, cy: number, cz: number): boolean
+		into[cellKey(cx, cy, cz)] = true
+		return false
+	end)
+end
+
+-- Does the map have terrain? (An engine query that skips terrain must
+-- check it itself then.)
 function Occupancy.HasTerrain(): boolean
 	return hasTerrain
 end

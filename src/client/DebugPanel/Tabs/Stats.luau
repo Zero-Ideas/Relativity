@@ -68,7 +68,7 @@ return function(window)
 	local sNetChannels = statLine(tab, "Network out by channel (msgs/s · KB/s · list items/s)")
 	local sSpawn = statLine(tab, "  spawning ms (count per frame)")
 	local sBeam = statLine(tab, "  beam ms (heads / links / stream), samples (asleep), joiners, links kept whole, new joiners per frame")
-	local sAwake = statLine(tab, "    awake beam samples by reason (chain can't / clipped / dilated / short window / moving part / geometry / unknown)")
+	local sAwake = statLine(tab, "    awake beam samples by reason (chain can't / clipped / dilated / short window / bent / spreading / moving part / geometry / unknown)")
 	local sLoop = statLine(tab, "  Main: step loop ms (loop / destroys)")
 	local sQueues = statLine(tab, "Visual queue (spawn / hit)")
 	local sBeams = statLine(tab, "Beam pose updates (total)")
@@ -163,8 +163,8 @@ return function(window)
 			local function n(key: string): number
 				return tonumber(w[key]) or 0
 			end
-			sAwake(string.format("%d / %d / %d / %d / %d / %d / %d", n("Chain"), n("Clipped"), n("Dilated"), n("Window"),
-				n("Moving"), n("Static"), n("Unknown")))
+			sAwake(string.format("%d / %d / %d / %d / %d / %d / %d / %d / %d", n("Chain"), n("Clipped"), n("Dilated"),
+				n("Window"), n("Bent"), n("Spread"), n("Moving"), n("Static"), n("Unknown")))
 		else
 			sAwake("-")
 			-- legacy handler: span casts / plan+connect / new joiners / rest
