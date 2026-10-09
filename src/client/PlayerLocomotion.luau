@@ -116,14 +116,18 @@ local function backflip()
 			local track = animator:LoadAnimation(animation)
 			pending.track = track
 			track:Play()
-			track:AdjustSpeed(scale)
+			track.TimePosition=track.Length
+			while track.Length==0 do
+				task.wait()
+			end
+			track:AdjustSpeed(-1)
 			track.Stopped:Once(function() track:Destroy() end)
 		end)
 	end
 	local t=tick()
 	repeat 
 		task.wait()
-		character.HumanoidRootPart.CFrame=CFrame.new(character.HumanoidRootPart.Position,Vector3.new(workspace.CurrentCamera.CFrame.Position.X,character.HumanoidRootPart.Position.Y,workspace.CurrentCamera.CFrame.Position.Z))
+		character.HumanoidRootPart.CFrame=CFrame.new(character.HumanoidRootPart.Position,Vector3.new(workspace.CurrentCamera.CFrame.Position.X,character.HumanoidRootPart.Position.Y,workspace.CurrentCamera.CFrame.Position.Z))*CFrame.Angles(0,math.pi,0)
 	until tick()-t>0.75
 end
 local function cw_left()
@@ -165,9 +169,12 @@ local function cw_left()
 		character.HumanoidRootPart.CFrame=CFrame.new(character.HumanoidRootPart.Position,Vector3.new(workspace.CurrentCamera.CFrame.Position.X,character.HumanoidRootPart.Position.Y,workspace.CurrentCamera.CFrame.Position.Z))*CFrame.Angles(0,math.pi,0)
 	until tick()-t>0.75
 end
-function Locomotion.start()
+function Locomotion.start(char)
+	warn(char)
 	if started then return end
 	started = true
+	local FlipAnimation:AnimationTrack=workspace:WaitForChild(char.Name):WaitForChild("Humanoid"):WaitForChild("Animator"):LoadAnimation(game.Lighting.AnimationStorage.FrontFlip)
+	local CartwheelAnimation:AnimationTrack=workspace:WaitForChild(char.Name):WaitForChild("Humanoid"):WaitForChild("Animator"):LoadAnimation(game.Lighting.AnimationStorage.Cartwheel)
 	applySprint(player:GetAttribute("Sprinting") == true)
 	UserInputService.InputBegan:Connect(function(input, processed)
 		if processed or UserInputService:GetFocusedTextBox() or SpellEditor.IsOpen() then return end
