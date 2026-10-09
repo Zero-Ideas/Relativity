@@ -54,6 +54,7 @@ local Signal = require(Shared:WaitForChild("Signal"))
 local StatusEffectSys = require(Shared:WaitForChild("StatusEffectSys"))
 local VisualOffload = require(Shared:WaitForChild("VisualOffload"))
 local Ragdoll = require(script.Parent:WaitForChild("Ragdoll"))
+local BarrierShapes = require(script.Parent:WaitForChild("BarrierShapes"))
 
 local SpellWorld = {}
 
@@ -92,6 +93,8 @@ export type Thing = {
 	_zone: any?,
 	_follow: any?, -- an entity it moves with
 	_frame: CFrame?, -- (barriers) where it stands
+	_shape: string?, -- (barriers) "Box" | "Dome" | "Sphere" | "Ring"
+	_size: Vector3?, -- (barriers) width, height, depth as built
 	_offset: CFrame?, -- (following) its frame relative to the entity
 	_relative: { [BasePart]: CFrame }?, -- (barriers) each part relative to _frame
 	_zoneRadius: number?,
@@ -515,6 +518,8 @@ function SpellWorld.CreateBarrier(options: BarrierOptions): Thing
 		_parts = parts,
 		_color = color,
 		_frame = frame,
+		_shape = if shape == "Dome" or shape == "Sphere" or shape == "Ring" then shape else "Box",
+		_size = Vector3.new(width, height, depth),
 		_relative = relative,
 	}
 	local carrier = carrierFrame(options.follow)
@@ -526,8 +531,141 @@ function SpellWorld.CreateBarrier(options: BarrierOptions): Thing
 		thingOfPart[part] = thing
 	end
 	track(thing, options.player)
+	SpellWorld.CheckBarrierShape(thing)
 	return thing
 end
+
+--------------------------------------------------------------------------------
+-- Shape moderation (see server/BarrierShapes)
+--------------------------------------------------------------------------------
+
+-- New barriers are judged together a moment after they appear, so a spell
+-- that builds many at once is judged as the finished shape, once.
+local SHAPE_CHECK_DELAY = 0.35
+local MAX_CLUSTER = 120
+local STRIKE_WINDOW = 600 -- seconds a flag counts against its casters
+local STRIKES_TO_LOCK = 3
+local LOCK_SECONDS = 60
+
+local pendingShapes: { Thing } = {}
+local shapeCheckQueued = false
+local strikes: { [Player]: { number } } = {}
+local lockedUntil: { [Player]: number } = {}
+
+local function primitiveOf(thing: Thing): BarrierShapes.Primitive
+	return { Frame = thing._frame :: CFrame, Shape = thing._shape or "Box", Size = thing._size :: Vector3 }
+end
+
+local function notice(player: Player, text: string)
+	VisualOffload.FireClient(player, "Notice", { Title = "Barriers", Text = text })
+end
+
+-- Every live barrier touching `seed`, transitively (any caster's).
+local function clusterOf(seed: Thing): { Thing }
+	local barriers = {}
+	for _, thing in things do
+		if thing.Kind == "Barrier" and not thing.Dead and thing._frame and thing._size then
+			table.insert(barriers, thing)
+		end
+	end
+	local bounds: { [Thing]: number } = {}
+	for _, thing in barriers do
+		bounds[thing] = BarrierShapes.Bound(primitiveOf(thing))
+	end
+	local cluster, seen = { seed }, { [seed] = true }
+	local index = 1
+	while index <= #cluster and #cluster < MAX_CLUSTER do
+		local current = cluster[index]
+		local position = (current._frame :: CFrame).Position
+		local reach = (bounds[current] or 0) + BarrierShapes.GAP
+		for _, other in barriers do
+			if not seen[other] and ((other._frame :: CFrame).Position - position).Magnitude <= reach + bounds[other] then
+				seen[other] = true
+				table.insert(cluster, other)
+			end
+		end
+		index += 1
+	end
+	return cluster
+end
+
+local function strike(player: Player)
+	local now = os.clock()
+	local list = strikes[player] or {}
+	strikes[player] = list
+	table.insert(list, now)
+	while list[1] and now - list[1] > STRIKE_WINDOW do
+		table.remove(list, 1)
+	end
+	if #list >= STRIKES_TO_LOCK then
+		table.clear(list)
+		lockedUntil[player] = now + LOCK_SECONDS
+		notice(player, `Barrier casting is disabled for {LOCK_SECONDS} seconds.`)
+	end
+end
+
+local function runShapeChecks()
+	shapeCheckQueued = false
+	local batch = pendingShapes
+	pendingShapes = {}
+	local judged: { [Thing]: boolean } = {}
+	for _, thing in batch do
+		if thing.Dead or judged[thing] then
+			continue
+		end
+		local cluster = clusterOf(thing)
+		for _, member in cluster do
+			judged[member] = true
+		end
+		local primitives = {}
+		for _, member in cluster do
+			table.insert(primitives, primitiveOf(member))
+		end
+		local flagged, report = BarrierShapes.Analyze(primitives)
+		if flagged then
+			local owners: { [Player]: boolean } = {}
+			for _, member in cluster do
+				if member.Owner then
+					owners[member.Owner] = true
+				end
+				member:Destroy(nil, "moderated")
+			end
+			local names = {}
+			for owner in owners do
+				table.insert(names, `{owner.Name} ({owner.UserId})`)
+				notice(owner, "A barrier build was removed for its shape.")
+				strike(owner)
+			end
+			warn(string.format("[BarrierShapes] removed %d barriers by %s at %s (length %.0f, shaft %.1f, base %.1f; %.2f ms)",
+				#cluster, table.concat(names, ", "), tostring((thing._frame :: CFrame).Position),
+				report.Length or 0, report.ShaftWidth or 0, report.BaseWidth or 0, report.Ms))
+		end
+	end
+end
+
+function SpellWorld.CheckBarrierShape(thing: Thing)
+	local owner = thing.Owner
+	if owner and (lockedUntil[owner] or 0) > os.clock() then
+		-- still on cooldown: it doesn't get to stand
+		task.defer(function()
+			thing:Destroy(nil, "moderated")
+		end)
+		return
+	end
+	if not BarrierShapes.Enabled then
+		return
+	end
+	table.insert(pendingShapes, thing)
+	if not shapeCheckQueued then
+		shapeCheckQueued = true
+		task.delay(SHAPE_CHECK_DELAY, runShapeChecks)
+	end
+end
+
+Players.PlayerRemoving:Connect(function(player)
+	strikes[player] = nil
+	lockedUntil[player] = nil
+end)
 
 local function flash(thing: Thing)
 	local color = thing._color or Color3.new(1, 1, 1)

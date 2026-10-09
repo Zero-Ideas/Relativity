@@ -1696,8 +1696,8 @@ local function watchThing(compiled: any, ctx: Context, id: string, thing: any, p
 	end
 	if #onEnd > 0 then
 		thing.OnDestroy:Connect(function(result)
-			if result.Kind == "removed" then
-				return -- (its caster left)
+			if result.Kind == "removed" or result.Kind == "moderated" then
+				return -- (its caster left, or shape moderation took it down)
 			end
 			for _, watch in onEnd do
 				fireTrigger(compiled, ctx, watch.trigger, watch.energy, element, result.Position, ctx.heading, nil, nil, triggerScale(watch, watch.energy), thing.Age)
