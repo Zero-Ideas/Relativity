@@ -26,6 +26,10 @@ local SCHEMA: { [string]: any } = {
 	MaxSmooth = { 0, 5000 },
 	MaxUpdates = { 100, 20000 },
 	Glints = "boolean",
+	LensFlare = "boolean",
+	-- the Lighting tab's overrides (client/LightingSettings):
+	-- { ["<object>.<Property>"] = number | boolean | string | { r, g, b } }
+	Lighting = "lighting",
 	UiMode = { "Mode 1", "Mode 2", "Mode 3" }, -- (a choice)
 	HideUnintegratedUi = "boolean",
 	HudScale = { 70, 130 },
@@ -72,7 +76,27 @@ local function clean(values: any): { [string]: any }
 	end
 	for key, rule in SCHEMA do
 		local value = values[key]
-		if rule == "boolean" then
+		if rule == "lighting" then
+			if typeof(value) == "table" then
+				local overrides, count = {}, 0
+				for name, entry in value do
+					if typeof(name) ~= "string" or #name > 80 or count >= 200 then
+						continue
+					end
+					local kind = typeof(entry)
+					if kind == "boolean" or (kind == "number" and entry == entry and math.abs(entry) < 1e6)
+						or (kind == "string" and #entry <= 32) then
+						overrides[name] = entry
+						count += 1
+					elseif kind == "table" and typeof(entry[1]) == "number" and typeof(entry[2]) == "number"
+						and typeof(entry[3]) == "number" then
+						overrides[name] = { math.clamp(entry[1], 0, 1), math.clamp(entry[2], 0, 1), math.clamp(entry[3], 0, 1) }
+						count += 1
+					end
+				end
+				result[key] = overrides
+			end
+		elseif rule == "boolean" then
 			if typeof(value) == "boolean" then
 				result[key] = value
 			end
