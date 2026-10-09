@@ -18,6 +18,8 @@ local INTEGRATED: { [string]: boolean } = {
 	SpellCircleEditor = true, SpellCharge = true,
 	SpellPreview = true, SpellTooltip = true,
 	ShooterConfigGui = true, DilationBubbleGui = true, TimeControlGui = true,
+	-- The start menu (UiMode holds the game UI back until it's disabled).
+	StartMenu = true, Startmenu = true,
 	-- A world-camera effect, not an unfinished menu.
 	Lensflare = true,
 	-- Roblox's touch movement controls live in PlayerGui, not CoreGui.
