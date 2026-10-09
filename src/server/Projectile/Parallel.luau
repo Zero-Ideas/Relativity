@@ -353,10 +353,8 @@ end
 
 local function entityChunkKeys(): { Vector3 }
 	local keys = {}
-	for _, chunk in ChunkManager.GetAllChunks() do
-		if chunk.EntityCount > 0 then
-			table.insert(keys, chunk.Key)
-		end
+	for key in ChunkManager.GetEntityChunkMask() do
+		table.insert(keys, key)
 	end
 	return keys
 end

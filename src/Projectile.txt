@@ -10,7 +10,7 @@
 --     src/shared/Heartbeat.luau (208 lines)
 --     src/shared/VisualOffload.luau (117 lines)
 --     src/shared/ClientPresentation.luau (44 lines)
---     src/shared/ChunkManager.luau (642 lines)
+--     src/shared/ChunkManager.luau (651 lines)
 --     src/shared/Entity.luau (1023 lines)
 --   Shared projectile motion and protocol
 --     src/shared/Projectile/Motion.luau (227 lines)
@@ -19,10 +19,11 @@
 --     src/shared/Projectile/Codec.luau (222 lines)
 --     src/shared/Projectile/BeamPath.luau (86 lines)
 --   Server simulation
---     src/server/Projectile/Types.luau (242 lines)
+--     src/server/Projectile/Types.luau (241 lines)
 --     src/server/Projectile/Config.luau (192 lines)
 --     src/server/Projectile/Math.luau (71 lines)
---     src/server/Projectile/Raycast.luau (315 lines)
+--     src/server/Projectile/CollisionLOD.luau (36 lines)
+--     src/server/Projectile/Raycast.luau (326 lines)
 --     src/server/Projectile/Occupancy.luau (962 lines)
 --     src/server/Projectile/Homing.luau (154 lines)
 --     src/server/Projectile/RewindHit.luau (144 lines)
@@ -32,11 +33,11 @@
 --     src/server/Projectile/Sweep.luau (385 lines)
 --     src/server/Projectile/Profile.luau (67 lines)
 --     src/server/Projectile/ApplyPass.luau (89 lines)
---     src/server/Projectile/Parallel.luau (1075 lines)
---     src/server/Projectile/init.luau (1546 lines)
---     src/server/Projectile/BeamProjectileHandler.luau (359 lines)
+--     src/server/Projectile/Parallel.luau (1073 lines)
+--     src/server/Projectile/init.luau (1548 lines)
+--     src/server/Projectile/BeamProjectileHandler.luau (371 lines)
 --     src/server/ProjectileQuota.luau (41 lines)
---     src/server/ProjectileWorkerBootstrap.server.luau (188 lines)
+--     src/server/ProjectileWorkerBootstrap.server.luau (193 lines)
 --   Client prediction and visuals
 --     src/shared/Projectile/Client/Types.luau (81 lines)
 --     src/shared/Projectile/Client/Prediction.luau (147 lines)
@@ -725,6 +726,7 @@ ChunkManager.FreezeUnloaded = true -- skip updates/queries in unloaded chunks
 ChunkManager.UseY = false -- 2D (XZ) chunking by default
 
 local chunks: { [Vector3]: any } = {} -- keyed by chunk-coordinate Vector3
+local entityChunkMask: { [Vector3]: boolean } = {}
 local chunkCount = 0
 local dilatedChunkCount = 0 -- chunks whose TimeScale ~= 1; see IsTimeUniform
 local timeVersion = 0 -- bumped on every chunk scale / zone change; see GetTimeVersion
@@ -792,6 +794,12 @@ end
 
 function ChunkManager.GetChunkByKey(key: Vector3)
 	return chunks[key]
+end
+
+-- Live, read-only-to-callers membership mask. Maintained on entity transitions
+-- so projectile casts need no per-cast scan or per-frame snapshot allocation.
+function ChunkManager.GetEntityChunkMask(): { [Vector3]: boolean }
+	return entityChunkMask
 end
 
 function ChunkManager.GetOrCreateChunk(worldPos: Vector3)
@@ -1016,6 +1024,7 @@ function ChunkManager._addEntity(entity, worldPos: Vector3)
 	if not chunk.Entities[entity] then
 		chunk.Entities[entity] = true
 		chunk.EntityCount += 1
+		entityChunkMask[chunk.Key] = true
 	end
 	return chunk
 end
@@ -1024,6 +1033,7 @@ function ChunkManager._removeEntity(entity, chunk)
 	if chunk and chunk.Entities[entity] then
 		chunk.Entities[entity] = nil
 		chunk.EntityCount -= 1
+		if chunk.EntityCount == 0 then entityChunkMask[chunk.Key] = nil end
 		maybeCollect(chunk)
 	end
 end
@@ -3345,10 +3355,9 @@ export type State = {
 	_simulationDebt: number,
 	_rayParams: RaycastParams,
 	-- beam body casts: _rayParams plus pierced entities, rebuilt only when the
-	-- pierced count changes (see ResolveBeamSpan); never mutated, so beam
+	-- pierced set grows (invalidated by resolveEntityHit); never mutated, so beam
 	-- samples cloned from this packet may share it
 	_spanParams: RaycastParams?,
-	_spanPierced: number?,
 	-- parallel movement (Parallel.luau): its raycast filter's id, queued /
 	-- slotted, and the frame mark of a result applied before this frame's step
 	-- loop (+mark: alive, -mark: dead)
@@ -3663,6 +3672,49 @@ return Math
 -- =============================================================================
 
 -- =============================================================================
+-- BEGIN FILE: src/server/Projectile/CollisionLOD.luau
+-- =============================================================================
+--!strict
+--!native
+--!optimize 2
+-- Called ONLY after occupancy failed to prove the cast empty. The entire
+-- radius-expanded segment must be in entity-free chunks to use a ray.
+-- Occupied boundaries retain full radius. Bound the lookup cost instead
+-- of scanning a huge box for a long diagonal or an unusually wide projectile.
+local CollisionLOD = {}
+local floor, min, max = math.floor, math.min, math.max
+local MAX_CELLS = 8
+
+function CollisionLOD.Radius(occupied: { [Vector3]: boolean }, size: number, useY: boolean,
+	origin: Vector3, displacement: Vector3, radius: number): number
+	if radius <= 0 or next(occupied) == nil then return 0 end
+	local cx, cy, cz = floor(origin.X / size), if useY then floor(origin.Y / size) else 0, floor(origin.Z / size)
+	if occupied[Vector3.new(cx, cy, cz)] then return radius end
+	local finish = origin + displacement
+	local lx, hx = floor((min(origin.X, finish.X)-radius)/size), floor((max(origin.X, finish.X)+radius)/size)
+	local lz, hz = floor((min(origin.Z, finish.Z)-radius)/size), floor((max(origin.Z, finish.Z)+radius)/size)
+	local ly, hy = 0, 0
+	if useY then
+		ly, hy = floor((min(origin.Y, finish.Y)-radius)/size), floor((max(origin.Y, finish.Y)+radius)/size)
+	end
+	if lx == hx and ly == hy and lz == hz then return 0 end
+	if (hx-lx+1)*(hy-ly+1)*(hz-lz+1) > MAX_CELLS then return radius end
+	for x = lx, hx do
+		for z = lz, hz do
+			for y = ly, hy do
+				if occupied[Vector3.new(x,y,z)] then return radius end
+			end
+		end
+	end
+	return 0
+end
+
+return CollisionLOD
+-- =============================================================================
+-- END FILE: src/server/Projectile/CollisionLOD.luau
+-- =============================================================================
+
+-- =============================================================================
 -- BEGIN FILE: src/server/Projectile/Raycast.luau
 -- =============================================================================
 --!native
@@ -3686,6 +3738,7 @@ local Replication = require(script.Parent.Replication)
 local Occupancy = require(script.Parent.Occupancy)
 local Types = require(script.Parent.Types)
 local Store = require(script.Parent.Store)
+local CollisionLOD = require(script.Parent.CollisionLOD)
 
 type State = Types.State
 type Verdict = Types.Verdict
@@ -3766,7 +3819,10 @@ function Raycast.buildRayParams(source: Types.EntityLike?, ignoreInstances: { In
 	return params
 end
 
--- Sweeps the projectile's body along `displacement`. Returns the contact as a
+-- Sweeps the projectile's body along `displacement`. Entity-free chunks use
+-- a centerline ray; occupied/boundary chunks retain the full swept radius.
+-- The already-computed adaptive-step flag avoids another lookup near entities.
+-- Returns the contact as a
 -- plain table (see Types.Contact) or nil. Distance is how far the ray -- or
 -- the sphere's center -- travelled, which is what the time accounting in
 -- init.luau needs; for a Spherecast, Position is the surface point instead.
@@ -3788,7 +3844,7 @@ local function ignoreSetFor(params: RaycastParams): { [Instance]: boolean }
 	return set
 end
 
-function Raycast.castMovement(projectile: State, origin: Vector3, displacement: Vector3, overrideParams: RaycastParams?): Types.Contact?
+function Raycast.castMovement(projectile: State, origin: Vector3, displacement: Vector3, overrideParams: RaycastParams?, nearEntities: boolean?): Types.Contact?
 	-- Provably empty space: the cast would find nothing, so don't make it
 	-- (see Occupancy -- it only says yes when nothing could be in the way).
 	-- The projectile's own filter is passed so its shooter doesn't block the
@@ -3798,13 +3854,18 @@ function Raycast.castMovement(projectile: State, origin: Vector3, displacement: 
 		return nil
 	end
 	local params = overrideParams or baseParams
+	local radius = projectile.Radius
+	if radius > 0 and not nearEntities then
+		radius = CollisionLOD.Radius(ChunkManager.GetEntityChunkMask(), ChunkManager.ChunkSize,
+			ChunkManager.UseY, origin, displacement, radius)
+	end
 	local result
-	if projectile.Radius > 0 then
+	if radius > 0 then
 		-- Sweeping a sphere along a line is exactly a capsule: a cylindrical
 		-- body of Radius around this segment plus spherical caps at both ends.
 		-- Adjacent adaptive substeps share the cap at their common joint, so
 		-- curved paths have no wedge-shaped collision gaps.
-		result = workspace:Spherecast(origin, projectile.Radius, displacement, params)
+		result = workspace:Spherecast(origin, radius, displacement, params)
 	else
 		result = workspace:Raycast(origin, displacement, params)
 	end
@@ -3852,11 +3913,12 @@ function Raycast.resolveEntityHit(
 	projectile: State,
 	entity: Types.EntityLike,
 	contact: Types.Contact,
-	hurtbox: Types.Hurtbox?
+	hurtbox: Types.Hurtbox?,
+	bodyHit: boolean?
 ): Verdict
 	if entity == projectile.Source or projectile._ignore[entity] then
 		-- can't collide with ourselves or an already-pierced target
-		nudgePast(projectile, contact.Position)
+		if not bodyHit then nudgePast(projectile, contact.Position) end
 		return "pass"
 	end
 	local filter = projectile.Filter
@@ -3869,7 +3931,8 @@ function Raycast.resolveEntityHit(
 		projectile.PiercesLeft -= 1
 		projectile.DamageMultiplier *= (1 - projectile.PierceFalloff)
 		projectile._ignore[entity] = true
-		nudgePast(projectile, contact.Position)
+		projectile._spanParams = nil -- the pierced set changed; invalidate lazily
+		if not bodyHit then nudgePast(projectile, contact.Position) end
 		return "pass"
 	end
 	return "destroy"
@@ -6737,7 +6800,7 @@ function Sweep.Run(
 	output: buffer,
 	uniformTime: boolean,
 	specs: { [number]: MotionSpec },
-	castHits: (Vector3, Vector3, number, number) -> any,
+	castHits: (Vector3, Vector3, number, number, boolean) -> any,
 	hasEntities: (Vector3) -> boolean,
 	onContact: ((item: number, from: Vector3, displacement: Vector3, hit: any) -> ())?,
 	homingIn: buffer?,
@@ -6867,7 +6930,7 @@ function Sweep.Run(
 		local endVelocity, movementVelocity = ProjectileMotion.Integrate(velocity, acceleration, direction, gravity,
 			minSpeed, maxSpeed, stepDt)
 		local displacement = movementVelocity * stepDt
-		local hit = castHits(position, displacement, radius, filter)
+		local hit = castHits(position, displacement, radius, filter, highRes)
 		if hit then
 			-- hand this substep back untouched; Step redoes it serially (with
 			-- this cast's result, so it needn't cast it again -- see onContact)
@@ -7425,10 +7488,8 @@ end
 
 local function entityChunkKeys(): { Vector3 }
 	local keys = {}
-	for _, chunk in ChunkManager.GetAllChunks() do
-		if chunk.EntityCount > 0 then
-			table.insert(keys, chunk.Key)
-		end
+	for key in ChunkManager.GetEntityChunkMask() do
+		table.insert(keys, key)
 	end
 	return keys
 end
@@ -8346,8 +8407,9 @@ return Parallel
 	   Filter = (entity)->bool  (which entities count as targets; also applied to homing acquisition)
 	   Gravity = 0              (number: studs/s² downward; Vector3: custom
 	              world-space gravity. Integrated as acceleration with dilated dt)
-	   Radius = 0               (>0 sweeps a capsule: cylindrical segment body
-	                              plus spherical substep-joint/end caps)
+	   Radius = 0               (>0 sweeps a capsule near entity-occupied chunks;
+	                              entity-free spans use a cheaper centerline ray.
+	                              Broad/ambiguous boundary spans retain the radius.)
 	   Bounces = 0              (world bounces before it dies; no upper bound is enforced)
 	   Restitution = 0.5        (velocity kept per bounce)
 	   Penetration = 0          (studs of wall material this projectile can punch
@@ -9108,7 +9170,7 @@ local function advance(projectile: Projectile, stepDt: number, highRes: boolean)
 		end
 	end
 	if not reused then
-		contact = Raycast.castMovement(projectile, from, displacement)
+		contact = Raycast.castMovement(projectile, from, displacement, nil, highRes)
 	end
 	if debugRays then
 		Replication.streamRay(projectile, from, if contact then contact.Position else to, not highRes)
@@ -9418,12 +9480,8 @@ end
 -- pierced set grows (ResolveBeamSpan runs for every beam packet every frame,
 -- and rebuilding them each call was thousands of allocations per frame).
 local function spanParams(self: Projectile): RaycastParams
-	local pierced = 0
-	for _ in self._ignore do
-		pierced += 1
-	end
 	local cached = self._spanParams
-	if cached and self._spanPierced == pierced then
+	if cached then
 		return cached
 	end
 	local ignore = self._rayParams.FilterDescendantsInstances
@@ -9433,14 +9491,23 @@ local function spanParams(self: Projectile): RaycastParams
 	params.IgnoreWater = self._rayParams.IgnoreWater
 	params.CollisionGroup = self._rayParams.CollisionGroup
 	params.FilterDescendantsInstances = ignore
-	self._spanParams, self._spanPierced = params, pierced
+	self._spanParams = params
 	return params
 end
 
+local function clipBeamPath(points: { Vector3 }, index: number, endpoint: Vector3?): { Vector3 }
+	local clipped = table.create(index + (if endpoint then 1 else 0))
+	table.move(points, 1, index, 1, clipped)
+	if endpoint then clipped[index+1] = endpoint end
+	return clipped
+end
+
 function Projectile.ResolveBeamSpan(self: Projectile, points: { Vector3 }, allowHits: boolean?, cornerIndices: { number }?): { Vector3 }
-	local clipped = { points[1] }
 	self._beamSpanClipped = nil
-	if self.Dead then return clipped end
+	if self.Dead then return { points[1] } end
+	-- Paths are immutable snapshots. An unobstructed span can retain its input
+	-- rather than allocate/copy a second identical array every frame.
+	if #points < 2 then return points end
 	local filtered = spanParams(self)
 	-- Entities skipped for the rest of THIS call only (frozen portions,
 	-- rejected targets) go on a private copy, never the cached params.
@@ -9473,7 +9540,7 @@ function Projectile.ResolveBeamSpan(self: Projectile, points: { Vector3 }, allow
 			if not entity then
 				-- Surface contact is not the sphere center. Keep the rendered
 				-- endpoint on the swept centerline, including its radius clearance.
-				table.insert(clipped, from + heading * (traveled + contact.Distance))
+				local clipped = clipBeamPath(points, index, from + heading * (traveled + contact.Distance))
 				self._beamSpanClipped = true
 				-- Each inserted beamlet owns its contact/trigger, not the whole
 				-- original gap. Bounce still belongs to its moving tip; do not
@@ -9492,14 +9559,11 @@ function Projectile.ResolveBeamSpan(self: Projectile, points: { Vector3 }, allow
 			if allowHits == false or combinedTimeScale(self) <= 0 or ChunkManager.GetTimeScaleAt(contact.Position) <= 0 then
 				exclude(entity.Instance)
 			else
-				local position, velocity = self.Position, self.Velocity
-				self.Velocity = heading * velocity.Magnitude
 				local headPosition = entity:GetHeadPosition()
 				local hurtbox: Types.Hurtbox = if headPosition and (contact.Position-headPosition).Magnitude <= entity.HeadRadius then "Head" else "Body"
-				local verdict = Raycast.resolveEntityHit(self, entity, contact, hurtbox)
-				self.Position, self.Velocity = position, velocity
+				local verdict = Raycast.resolveEntityHit(self, entity, contact, hurtbox, true)
 				if verdict == "destroy" then
-					table.insert(clipped, from + heading * (traveled + contact.Distance))
+					local clipped = clipBeamPath(points, index, from + heading * (traveled + contact.Distance))
 					self._beamSpan = BeamPath.Compact(clipped, cornerIndices)
 					self._beamSpanClipped = true
 					self._beamBodyHit = true
@@ -9510,11 +9574,10 @@ function Projectile.ResolveBeamSpan(self: Projectile, points: { Vector3 }, allow
 				exclude(entity.Instance)
 			end
 			contacts += 1
-			if contacts >= 16 then self._beamSpanClipped = true; return clipped end
+			if contacts >= 16 then self._beamSpanClipped = true; return clipBeamPath(points, index) end
 		end
-		table.insert(clipped, to)
 	end
-	return clipped
+	return points
 end
 function Projectile.ClearBeamPrevious(self: Projectile)
 	if not self.Beam or not self.Beam.PreviousId then return end
@@ -9847,14 +9910,17 @@ Projectile.SetBeamSpanStep(function(globalDt: number)
 		local id = streamOrder[(streamCursor + offset - 1) % orderCount + 1]
 		local stream = streams[id]
 		if not stream then continue end
-		local live, count = {}, 0
-		for _, node in stream.nodes do
+		local live, count, kept = stream.nodes, 0, 0
+		local oldCount = #live
+		for _, node in live do
 			node.incoming = false
 			if not node.projectile.Dead then
-				table.insert(live, node)
+				kept += 1
+				live[kept] = node
 				if node.projectile._beamJoiner then count += 1; updated += 1 end
 			end
 		end
+		for index = kept+1, oldCount do live[index] = nil end
 		if #live == 0 then streams[id] = nil; continue end
 		stream.nodes, stream.joinerCount = live, count
 		for _, node in live do
@@ -9886,6 +9952,15 @@ Projectile.SetBeamSpanStep(function(globalDt: number)
 				budgetSplits += 1
 				unlink(node)
 				resolve(node, initialPath(node), globalDt)
+				continue
+			end
+			-- No insertion: Plan already returned the complete physical path.
+			-- Avoid a temporary chain, Fill copy, and all child setup work.
+			if needed == 0 then
+				node.everLinked, previous.everLinked, previous.incoming = true, true, true
+				p._beamPrevious, p.Beam.PreviousId = front, front.Id
+				resolve(node, corners, globalDt)
+				if not front.Dead and not previous.previous then front._beamSpan = { front.Position } end
 				continue
 			end
 			-- Refine EVERY adjacent link every frame, including child-to-child
@@ -10183,6 +10258,7 @@ local Shared = ReplicatedStorage:WaitForChild("Shared")
 local ChunkManager = require(Shared:WaitForChild("ChunkManager"))
 local projectileModule = (actor.Parent :: Instance).Parent:WaitForChild("Projectile")
 local Sweep = require(projectileModule:WaitForChild("Sweep"))
+local CollisionLOD = require(projectileModule:WaitForChild("CollisionLOD"))
 -- Workers import centrally baked masks; they never probe shapes/read terrain.
 _G.__RelativityOccupancyWorker = true
 local Occupancy = require(projectileModule:WaitForChild("Occupancy"))
@@ -10259,7 +10335,7 @@ end
 -- the engine cast with the projectile's filter. True when anything is hit.
 -- The cast's RaycastResult when it hits something (true when it can't be
 -- cast here), else nil.
-local function castHits(from: Vector3, displacement: Vector3, radius: number, filter: number): any
+local function castHits(from: Vector3, displacement: Vector3, radius: number, filter: number, nearEntities: boolean): any
 	if Occupancy.SegmentClear(from, displacement, radius, filterIgnores[filter]) then
 		return nil
 	end
@@ -10268,7 +10344,11 @@ local function castHits(from: Vector3, displacement: Vector3, radius: number, fi
 		return true -- unknown filter: let the serial path cast it
 	end
 	if radius > 0 then
-		return workspace:Spherecast(from, radius, displacement, params)
+		-- Reuse the entity-chunk snapshot already sent for adaptive stepping.
+		if not nearEntities then
+			radius = CollisionLOD.Radius(entityChunks, ChunkManager.ChunkSize, ChunkManager.UseY, from, displacement, radius)
+		end
+		if radius > 0 then return workspace:Spherecast(from, radius, displacement, params) end
 	end
 	return workspace:Raycast(from, displacement, params)
 end

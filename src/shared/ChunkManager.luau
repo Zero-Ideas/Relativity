@@ -54,6 +54,7 @@ ChunkManager.FreezeUnloaded = true -- skip updates/queries in unloaded chunks
 ChunkManager.UseY = false -- 2D (XZ) chunking by default
 
 local chunks: { [Vector3]: any } = {} -- keyed by chunk-coordinate Vector3
+local entityChunkMask: { [Vector3]: boolean } = {}
 local chunkCount = 0
 local dilatedChunkCount = 0 -- chunks whose TimeScale ~= 1; see IsTimeUniform
 local timeVersion = 0 -- bumped on every chunk scale / zone change; see GetTimeVersion
@@ -121,6 +122,12 @@ end
 
 function ChunkManager.GetChunkByKey(key: Vector3)
 	return chunks[key]
+end
+
+-- Live, read-only-to-callers membership mask. Maintained on entity transitions
+-- so projectile casts need no per-cast scan or per-frame snapshot allocation.
+function ChunkManager.GetEntityChunkMask(): { [Vector3]: boolean }
+	return entityChunkMask
 end
 
 function ChunkManager.GetOrCreateChunk(worldPos: Vector3)
@@ -345,6 +352,7 @@ function ChunkManager._addEntity(entity, worldPos: Vector3)
 	if not chunk.Entities[entity] then
 		chunk.Entities[entity] = true
 		chunk.EntityCount += 1
+		entityChunkMask[chunk.Key] = true
 	end
 	return chunk
 end
@@ -353,6 +361,7 @@ function ChunkManager._removeEntity(entity, chunk)
 	if chunk and chunk.Entities[entity] then
 		chunk.Entities[entity] = nil
 		chunk.EntityCount -= 1
+		if chunk.EntityCount == 0 then entityChunkMask[chunk.Key] = nil end
 		maybeCollect(chunk)
 	end
 end

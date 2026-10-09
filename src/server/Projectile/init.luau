@@ -192,8 +192,9 @@
 	   Filter = (entity)->bool  (which entities count as targets; also applied to homing acquisition)
 	   Gravity = 0              (number: studs/s² downward; Vector3: custom
 	              world-space gravity. Integrated as acceleration with dilated dt)
-	   Radius = 0               (>0 sweeps a capsule: cylindrical segment body
-	                              plus spherical substep-joint/end caps)
+	   Radius = 0               (>0 sweeps a capsule near entity-occupied chunks;
+	                              entity-free spans use a cheaper centerline ray.
+	                              Broad/ambiguous boundary spans retain the radius.)
 	   Bounces = 0              (world bounces before it dies; no upper bound is enforced)
 	   Restitution = 0.5        (velocity kept per bounce)
 	   Penetration = 0          (studs of wall material this projectile can punch
@@ -954,7 +955,7 @@ local function advance(projectile: Projectile, stepDt: number, highRes: boolean)
 		end
 	end
 	if not reused then
-		contact = Raycast.castMovement(projectile, from, displacement)
+		contact = Raycast.castMovement(projectile, from, displacement, nil, highRes)
 	end
 	if debugRays then
 		Replication.streamRay(projectile, from, if contact then contact.Position else to, not highRes)
@@ -1264,12 +1265,8 @@ end
 -- pierced set grows (ResolveBeamSpan runs for every beam packet every frame,
 -- and rebuilding them each call was thousands of allocations per frame).
 local function spanParams(self: Projectile): RaycastParams
-	local pierced = 0
-	for _ in self._ignore do
-		pierced += 1
-	end
 	local cached = self._spanParams
-	if cached and self._spanPierced == pierced then
+	if cached then
 		return cached
 	end
 	local ignore = self._rayParams.FilterDescendantsInstances
@@ -1279,14 +1276,23 @@ local function spanParams(self: Projectile): RaycastParams
 	params.IgnoreWater = self._rayParams.IgnoreWater
 	params.CollisionGroup = self._rayParams.CollisionGroup
 	params.FilterDescendantsInstances = ignore
-	self._spanParams, self._spanPierced = params, pierced
+	self._spanParams = params
 	return params
 end
 
+local function clipBeamPath(points: { Vector3 }, index: number, endpoint: Vector3?): { Vector3 }
+	local clipped = table.create(index + (if endpoint then 1 else 0))
+	table.move(points, 1, index, 1, clipped)
+	if endpoint then clipped[index+1] = endpoint end
+	return clipped
+end
+
 function Projectile.ResolveBeamSpan(self: Projectile, points: { Vector3 }, allowHits: boolean?, cornerIndices: { number }?): { Vector3 }
-	local clipped = { points[1] }
 	self._beamSpanClipped = nil
-	if self.Dead then return clipped end
+	if self.Dead then return { points[1] } end
+	-- Paths are immutable snapshots. An unobstructed span can retain its input
+	-- rather than allocate/copy a second identical array every frame.
+	if #points < 2 then return points end
 	local filtered = spanParams(self)
 	-- Entities skipped for the rest of THIS call only (frozen portions,
 	-- rejected targets) go on a private copy, never the cached params.
@@ -1319,7 +1325,7 @@ function Projectile.ResolveBeamSpan(self: Projectile, points: { Vector3 }, allow
 			if not entity then
 				-- Surface contact is not the sphere center. Keep the rendered
 				-- endpoint on the swept centerline, including its radius clearance.
-				table.insert(clipped, from + heading * (traveled + contact.Distance))
+				local clipped = clipBeamPath(points, index, from + heading * (traveled + contact.Distance))
 				self._beamSpanClipped = true
 				-- Each inserted beamlet owns its contact/trigger, not the whole
 				-- original gap. Bounce still belongs to its moving tip; do not
@@ -1338,14 +1344,11 @@ function Projectile.ResolveBeamSpan(self: Projectile, points: { Vector3 }, allow
 			if allowHits == false or combinedTimeScale(self) <= 0 or ChunkManager.GetTimeScaleAt(contact.Position) <= 0 then
 				exclude(entity.Instance)
 			else
-				local position, velocity = self.Position, self.Velocity
-				self.Velocity = heading * velocity.Magnitude
 				local headPosition = entity:GetHeadPosition()
 				local hurtbox: Types.Hurtbox = if headPosition and (contact.Position-headPosition).Magnitude <= entity.HeadRadius then "Head" else "Body"
-				local verdict = Raycast.resolveEntityHit(self, entity, contact, hurtbox)
-				self.Position, self.Velocity = position, velocity
+				local verdict = Raycast.resolveEntityHit(self, entity, contact, hurtbox, true)
 				if verdict == "destroy" then
-					table.insert(clipped, from + heading * (traveled + contact.Distance))
+					local clipped = clipBeamPath(points, index, from + heading * (traveled + contact.Distance))
 					self._beamSpan = BeamPath.Compact(clipped, cornerIndices)
 					self._beamSpanClipped = true
 					self._beamBodyHit = true
@@ -1356,11 +1359,10 @@ function Projectile.ResolveBeamSpan(self: Projectile, points: { Vector3 }, allow
 				exclude(entity.Instance)
 			end
 			contacts += 1
-			if contacts >= 16 then self._beamSpanClipped = true; return clipped end
+			if contacts >= 16 then self._beamSpanClipped = true; return clipBeamPath(points, index) end
 		end
-		table.insert(clipped, to)
 	end
-	return clipped
+	return points
 end
 function Projectile.ClearBeamPrevious(self: Projectile)
 	if not self.Beam or not self.Beam.PreviousId then return end

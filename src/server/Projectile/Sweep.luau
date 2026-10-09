@@ -227,7 +227,7 @@ function Sweep.Run(
 	output: buffer,
 	uniformTime: boolean,
 	specs: { [number]: MotionSpec },
-	castHits: (Vector3, Vector3, number, number) -> any,
+	castHits: (Vector3, Vector3, number, number, boolean) -> any,
 	hasEntities: (Vector3) -> boolean,
 	onContact: ((item: number, from: Vector3, displacement: Vector3, hit: any) -> ())?,
 	homingIn: buffer?,
@@ -357,7 +357,7 @@ function Sweep.Run(
 		local endVelocity, movementVelocity = ProjectileMotion.Integrate(velocity, acceleration, direction, gravity,
 			minSpeed, maxSpeed, stepDt)
 		local displacement = movementVelocity * stepDt
-		local hit = castHits(position, displacement, radius, filter)
+		local hit = castHits(position, displacement, radius, filter, highRes)
 		if hit then
 			-- hand this substep back untouched; Step redoes it serially (with
 			-- this cast's result, so it needn't cast it again -- see onContact)

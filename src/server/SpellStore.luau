@@ -585,12 +585,12 @@ end
 -- Changes
 --------------------------------------------------------------------------------
 
-local function ready(player: Player): (Entry?, string?)
+local function ready(player: Player, allowDuringSave: boolean?): (Entry?, string?)
 	local entry = entries[player]
 	if not entry or not entry.loaded or not entry.available then
 		return nil, entry and entry.error or "Spell data has not loaded."
 	end
-	if entry.saving then
+	if entry.saving and not allowDuringSave then
 		return nil, "A spell save is already in progress."
 	end
 	return entry, nil
@@ -612,19 +612,28 @@ end
 -- A loadout / selection change: authoritative in the server cache at once;
 -- persisted shortly after (coalesced), with the autosave / leave / shutdown
 -- flush as backstops.
-local function selectionChanged(player: Player, entry: Entry)
+local function selectionChanged(player: Player, entry: Entry, includeState: boolean?)
 	entry.localRevision += 1
 	entry.dirty = true
 	if not selectionSaveQueued[player] then
 		selectionSaveQueued[player] = true
-		task.delay(1, function()
-			selectionSaveQueued[player] = nil
-			if entries[player] == entry and entry.dirty and entry.available and not entry.saving then
-				SpellStore.Save(player)
+		local function flush()
+			if entries[player] ~= entry or not entry.available or player.Parent ~= Players then
+				selectionSaveQueued[player] = nil
+				return
 			end
-		end)
+			if entry.saving then
+				-- Keep one pending flush: selection can change while an older
+				-- immutable snapshot is being written. Do not lose that change.
+				task.delay(1, flush)
+				return
+			end
+			selectionSaveQueued[player] = nil
+			if entry.dirty then SpellStore.Save(player) end
+		end
+		task.delay(1, flush)
 	end
-	return true, nil, publicState(entry)
+	return true, nil, if includeState == false then nil else publicState(entry)
 end
 
 local function compileOrError(graph: any): (any?, string?)
@@ -674,7 +683,7 @@ end
 
 -- Takes a spell off a hotbar slot (it stays in the library).
 function SpellStore.DeleteSlot(player: Player, slot: number)
-	local entry, err = ready(player)
+	local entry, err = ready(player, true)
 	if not entry then return false, err end
 	if not validSlot(slot) then return false, `Slot must be from 1 to {SLOT_COUNT}.` end
 	entry.data.loadout[tostring(slot)] = nil
@@ -703,7 +712,7 @@ end
 
 -- Puts a spell (a ref: "c:<id>" or "e:<id>") on a hotbar slot.
 function SpellStore.Equip(player: Player, slot: number, ref: string)
-	local entry, err = ready(player)
+	local entry, err = ready(player, true)
 	if not entry then return false, err end
 	if not validSlot(slot) then return false, `Slot must be from 1 to {SLOT_COUNT}.` end
 	if not validRef(ref) then return false, "Unknown spell." end
@@ -728,7 +737,7 @@ end
 -- Swaps two hotbar slots (either may be empty); the selection follows its
 -- spell.
 function SpellStore.SwapSlots(player: Player, a: number, b: number)
-	local entry, err = ready(player)
+	local entry, err = ready(player, true)
 	if not entry then return false, err end
 	if not validSlot(a) or not validSlot(b) or a == b then return false, "Pick two different slots." end
 	local loadout = entry.data.loadout
@@ -784,7 +793,7 @@ end
 -- Swaps a hotbar slot with its neighbour (direction -1 / 1); the selection
 -- follows its spell.
 function SpellStore.MoveSlot(player: Player, slot: number, direction: number)
-	local entry, err = ready(player)
+	local entry, err = ready(player, true)
 	if not entry then return false, err end
 	local other = slot + (if direction < 0 then -1 else 1)
 	if not validSlot(slot) or not validSlot(other) then return false, "Can't move that way." end
@@ -799,8 +808,12 @@ function SpellStore.MoveSlot(player: Player, slot: number, direction: number)
 end
 
 -- nil deselects (no spell equipped).
-function SpellStore.SetActive(player: Player, slot: number?)
-	local entry, err = ready(player)
+function SpellStore.SetActive(player: Player, slot: number?, includeState: boolean?)
+	-- Active selection only changes a scalar in the live cache. Save captures
+	-- its own snapshot and revision; it must not lock gameplay until I/O ends.
+	-- Graph/library mutations still use ready(player)'s normal save lock;
+	-- loadout-only changes use the same revision-safe deferred flush as this.
+	local entry, err = ready(player, true)
 	if not entry then return false, err end
 	if slot ~= nil then
 		if not validSlot(slot) then return false, "That spell card does not exist." end
@@ -808,8 +821,11 @@ function SpellStore.SetActive(player: Player, slot: number?)
 		if not record then return false, "That spell card does not exist." end
 		if record.invalid then return false, "This saved spell no longer compiles; its original graph has been preserved." end
 	end
+	if entry.data.activeSlot == slot then
+		return true, nil, if includeState == false then nil else publicState(entry)
+	end
 	entry.data.activeSlot = slot
-	return selectionChanged(player, entry)
+	return selectionChanged(player, entry, includeState)
 end
 
 local function findLoadout(data: any, name: string): number?
@@ -823,7 +839,7 @@ end
 
 -- Saves the current hotbar as a named loadout (replacing one of that name).
 function SpellStore.SaveLoadout(player: Player, name: string)
-	local entry, err = ready(player)
+	local entry, err = ready(player, true)
 	if not entry then return false, err end
 	local index = findLoadout(entry.data, name)
 	local saved = { name = name, slots = copy(entry.data.loadout) }
@@ -840,7 +856,7 @@ end
 
 -- Puts a saved loadout on the hotbar (skipping spells no longer available).
 function SpellStore.LoadLoadout(player: Player, name: string)
-	local entry, err = ready(player)
+	local entry, err = ready(player, true)
 	if not entry then return false, err end
 	local index = findLoadout(entry.data, name)
 	if not index then return false, "No loadout by that name." end
@@ -859,7 +875,7 @@ function SpellStore.LoadLoadout(player: Player, name: string)
 end
 
 function SpellStore.DeleteLoadout(player: Player, name: string)
-	local entry, err = ready(player)
+	local entry, err = ready(player, true)
 	if not entry then return false, err end
 	local index = findLoadout(entry.data, name)
 	if not index then return false, "No loadout by that name." end

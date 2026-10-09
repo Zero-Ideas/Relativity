@@ -1107,6 +1107,22 @@ local function spreadDirections(direction: Vector3, quantity: any): { Vector3 }
 	return directions
 end
 
+-- Sustained quantity channels need only their own direction. Building the
+-- whole spread once per channel made N copies do N^2 work every emission.
+local function spreadDirectionAt(direction: Vector3, quantity: any, index: number): Vector3
+	local count = if quantity then quantity.Count else 1
+	if count <= 1 or quantity.Pattern == "Stream" then return direction end
+	local up = if math.abs(direction.Y) > 0.99 then Vector3.xAxis else Vector3.yAxis
+	local basis = CFrame.lookAt(Vector3.zero, direction, up)
+	local spread = math.rad(quantity.Spread)
+	if quantity.Pattern == "Ring" then
+		local roll = (index - 1) / count * math.pi * 2
+		return (basis * CFrame.Angles(0, 0, roll) * CFrame.Angles(spread / 2, 0, 0)).LookVector
+	end
+	local t = (index - 1) / (count - 1) - 0.5
+	return (basis * CFrame.Angles(0, -t * spread, 0)).LookVector
+end
+
 type Shot = {
 	compiled: any,
 	ctx: Context,
@@ -1243,8 +1259,7 @@ local function emitSustain(parent: Shot, index: number, share: number, channelId
 	shot.perCopy *= share
 	shot.damageEnergy *= share
 	shot.energyScale *= share
-	local directions = spreadDirections(aimDirection(shot.compiled, shot.ctx, shot.id, shot.spawn), shot.stats.quantity)
-	launch(shot, directions[index])
+	launch(shot, spreadDirectionAt(aimDirection(shot.compiled, shot.ctx, shot.id, shot.spawn), shot.stats.quantity, index))
 end
 
 -- Fling: a blast whose power at a target (centre damage x falloff) reaches

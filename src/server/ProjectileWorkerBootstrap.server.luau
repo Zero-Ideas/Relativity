@@ -62,6 +62,7 @@ local Shared = ReplicatedStorage:WaitForChild("Shared")
 local ChunkManager = require(Shared:WaitForChild("ChunkManager"))
 local projectileModule = (actor.Parent :: Instance).Parent:WaitForChild("Projectile")
 local Sweep = require(projectileModule:WaitForChild("Sweep"))
+local CollisionLOD = require(projectileModule:WaitForChild("CollisionLOD"))
 -- Workers import centrally baked masks; they never probe shapes/read terrain.
 _G.__RelativityOccupancyWorker = true
 local Occupancy = require(projectileModule:WaitForChild("Occupancy"))
@@ -138,7 +139,7 @@ end
 -- the engine cast with the projectile's filter. True when anything is hit.
 -- The cast's RaycastResult when it hits something (true when it can't be
 -- cast here), else nil.
-local function castHits(from: Vector3, displacement: Vector3, radius: number, filter: number): any
+local function castHits(from: Vector3, displacement: Vector3, radius: number, filter: number, nearEntities: boolean): any
 	if Occupancy.SegmentClear(from, displacement, radius, filterIgnores[filter]) then
 		return nil
 	end
@@ -147,7 +148,11 @@ local function castHits(from: Vector3, displacement: Vector3, radius: number, fi
 		return true -- unknown filter: let the serial path cast it
 	end
 	if radius > 0 then
-		return workspace:Spherecast(from, radius, displacement, params)
+		-- Reuse the entity-chunk snapshot already sent for adaptive stepping.
+		if not nearEntities then
+			radius = CollisionLOD.Radius(entityChunks, ChunkManager.ChunkSize, ChunkManager.UseY, from, displacement, radius)
+		end
+		if radius > 0 then return workspace:Spherecast(from, radius, displacement, params) end
 	end
 	return workspace:Raycast(from, displacement, params)
 end

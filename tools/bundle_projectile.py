@@ -30,6 +30,7 @@ SECTIONS = [
         "src/server/Projectile/Types.luau",
         "src/server/Projectile/Config.luau",
         "src/server/Projectile/Math.luau",
+        "src/server/Projectile/CollisionLOD.luau",
         "src/server/Projectile/Raycast.luau",
         "src/server/Projectile/Occupancy.luau",
         "src/server/Projectile/Homing.luau",

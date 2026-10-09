@@ -85,8 +85,8 @@ local ok, problem = xpcall(function()
 	local compiled={
 		manaRoots={"mana"},
 		runes={mana={rune="Mana",params={Amount=30}},fire={rune="Fire",params={}},
-			beam={rune="Beam",params={}},sustain={rune="Sustain",params={Level=1}},
-			impact={rune="OnImpact",params={Share=50}},blast={rune="Explosion",params={}}},
+			beam={rune="Beam",params={}},sustain={rune="Sustain",params={Seconds=1}},
+			impact={rune="OnImpact",params={Share=50}},blast={rune="Explosion",params={Radius=4,Edge=0}}},
 		inputs={mana={},fire={},beam={},sustain={},impact={},blast={}},
 		outputs={mana={out={{to="fire"}}},fire={out={{to="beam"}}},beam={},
 			sustain={},impact={out={{to="blast"}}},blast={}},

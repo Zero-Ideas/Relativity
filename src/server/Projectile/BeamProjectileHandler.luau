@@ -140,14 +140,17 @@ Projectile.SetBeamSpanStep(function(globalDt: number)
 		local id = streamOrder[(streamCursor + offset - 1) % orderCount + 1]
 		local stream = streams[id]
 		if not stream then continue end
-		local live, count = {}, 0
-		for _, node in stream.nodes do
+		local live, count, kept = stream.nodes, 0, 0
+		local oldCount = #live
+		for _, node in live do
 			node.incoming = false
 			if not node.projectile.Dead then
-				table.insert(live, node)
+				kept += 1
+				live[kept] = node
 				if node.projectile._beamJoiner then count += 1; updated += 1 end
 			end
 		end
+		for index = kept+1, oldCount do live[index] = nil end
 		if #live == 0 then streams[id] = nil; continue end
 		stream.nodes, stream.joinerCount = live, count
 		for _, node in live do
@@ -179,6 +182,15 @@ Projectile.SetBeamSpanStep(function(globalDt: number)
 				budgetSplits += 1
 				unlink(node)
 				resolve(node, initialPath(node), globalDt)
+				continue
+			end
+			-- No insertion: Plan already returned the complete physical path.
+			-- Avoid a temporary chain, Fill copy, and all child setup work.
+			if needed == 0 then
+				node.everLinked, previous.everLinked, previous.incoming = true, true, true
+				p._beamPrevious, p.Beam.PreviousId = front, front.Id
+				resolve(node, corners, globalDt)
+				if not front.Dead and not previous.previous then front._beamSpan = { front.Position } end
 				continue
 			end
 			-- Refine EVERY adjacent link every frame, including child-to-child

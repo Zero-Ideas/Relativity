@@ -16,7 +16,7 @@ local caster=Entity.new(character,{ScaleHumanoid=true})
 local at=Vector3.new(0,7005,0)
 local compiled={manaRoots={"mana"},
 	runes={mana={rune="Mana",params={Amount=30}},fire={rune="Fire",params={}},
-		beam={rune="Beam",params={}},sustain={rune="Sustain",params={Level=5}}},
+		beam={rune="Beam",params={}},sustain={rune="Sustain",params={Seconds=5}}},
 	inputs={mana={},fire={},beam={},sustain={}},
 	outputs={mana={out={{to="fire"}}},fire={out={{to="beam"}}},beam={},sustain={}},
 	vessels={beam={mods={"sustain"},triggers={},count=1,modCost=0,triggerShare=0}}}

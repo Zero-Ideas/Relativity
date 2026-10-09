@@ -204,10 +204,9 @@ export type State = {
 	_simulationDebt: number,
 	_rayParams: RaycastParams,
 	-- beam body casts: _rayParams plus pierced entities, rebuilt only when the
-	-- pierced count changes (see ResolveBeamSpan); never mutated, so beam
+	-- pierced set grows (invalidated by resolveEntityHit); never mutated, so beam
 	-- samples cloned from this packet may share it
 	_spanParams: RaycastParams?,
-	_spanPierced: number?,
 	-- parallel movement (Parallel.luau): its raycast filter's id, queued /
 	-- slotted, and the frame mark of a result applied before this frame's step
 	-- loop (+mark: alive, -mark: dead)

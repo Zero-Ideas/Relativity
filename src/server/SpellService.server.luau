@@ -100,6 +100,7 @@ end)
 
 local lastCast: { [Player]: { [number]: number } } = {}
 local lastCommand: { [Player]: number } = {}
+local lastCommandWasSelection: { [Player]: boolean } = {}
 
 local function coolingDown(player: Player, slot: number?): boolean
 	local key = slot or SpellStore.GetActiveSlot(player)
@@ -363,18 +364,26 @@ local function handleCommand(player: Player, action: any, payload: any)
 		return response(false, nil, nil, "Invalid spell command.")
 	end
 	local now = os.clock()
-	if lastCommand[player] and now - lastCommand[player] < COMMAND_INTERVAL then
-		return response(false, SpellStore.GetState(player), nil, "Please wait before sending another spell command.")
+	local isSelection = action == "SetActive" or action == "ClearActive"
+	local interval = if isSelection and lastCommandWasSelection[player] then 0.05 else COMMAND_INTERVAL
+	if lastCommand[player] and now - lastCommand[player] < interval then
+		local result = response(false, nil, nil, "Please wait before sending another spell command.")
+		result.retryAfter = interval - (now - lastCommand[player])
+		return result
 	end
 	lastCommand[player] = now
+	lastCommandWasSelection[player] = isSelection
 	if action == "GetState" then
 		return response(true, SpellStore.GetState(player))
 	end
 	if action == "ClearActive" then
 		-- (deselect: no spell equipped)
 		BeamHandler.Stop(player)
-		local ok, err, state = SpellStore.SetActive(player, nil)
-		return response(ok, state or SpellStore.GetState(player), nil, err or "Spell deselected.")
+		local ok, err = SpellStore.SetActive(player, nil, false)
+		-- Selection changes no graphs: do not copy and resend the entire library.
+		local result = response(ok, nil, nil, err or "Spell deselected.")
+		result.selection = { slot = SpellStore.GetActiveSlot(player) }
+		return result
 	end
 	if typeof(payload) ~= "table" then
 		return response(false, SpellStore.GetState(player), nil, "Invalid spell command payload.")
@@ -405,8 +414,10 @@ local function handleCommand(player: Player, action: any, payload: any)
 		return response(ok, state or SpellStore.GetState(player), nil, err or "Taken off the hotbar (it's still in your library).")
 	elseif action == "SetActive" then
 		BeamHandler.Stop(player)
-		local ok, err, state = SpellStore.SetActive(player, slot)
-		return response(ok, state or SpellStore.GetState(player), nil, err or "Spell card equipped.")
+		local ok, err = SpellStore.SetActive(player, slot, false)
+		local result = response(ok, nil, nil, err or "Spell card equipped.")
+		result.selection = { slot = SpellStore.GetActiveSlot(player) }
+		return result
 	end
 	return response(false, SpellStore.GetState(player), nil, "Unknown spell command.")
 end
@@ -816,6 +827,7 @@ Players.PlayerRemoving:Connect(function(player)
 	chargeStart[player] = nil
 	chargePaid[player] = nil
 	lastCommand[player] = nil
+	lastCommandWasSelection[player] = nil
 	circleOpen[player] = nil
 	lastCircleBegin[player] = nil
 	frozenSpells[player] = nil

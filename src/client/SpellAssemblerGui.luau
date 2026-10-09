@@ -85,8 +85,10 @@ local function sendCast(target: Vector3)
 end
 local started = false
 local loadingCards = false
-local selectingCard = false
 local pendingActiveSlot: number? = nil
+local selectionPending = false -- separate flag: nil is a pending deselection
+local selectionVersion = 0
+local selectionWorker = false
 
 local SLOT_COUNT = 5
 local TOP_BAR = 48
@@ -253,7 +255,7 @@ local function updateTopBar()
 	if nameBox then
 		nameBox.PlaceholderText = SpellCompiler.SuggestName(doc.graph)
 	end
-	local displaySlot = pendingActiveSlot or serverState.activeSlot
+	local displaySlot = SpellAssemblerGui.GetSelectedSlot()
 	local active = displaySlot and slotRecord(displaySlot)
 	if activeLabel then
 		activeLabel.Text = `Active spell: {if active then active.name else "None"}`
@@ -292,27 +294,53 @@ end
 -- background GetState must not make an interactive command fail as busy
 -- or hit the server's 0.15-second command limit.
 local COMMAND_GAP = 0.2
-local commandBusy = false
 local commandReleased = Instance.new("BindableEvent")
 local lastCommandAt = -math.huge
+local lastCommandWasSelection = false
+local commandSequence = 0
+local nextCommandSequence = 1
+local appliedCommandSequence = 0
+
+local function acceptServerResult(result: any)
+	local sequence = result.clientSequence or 0
+	if sequence < appliedCommandSequence then return end
+	appliedCommandSequence = sequence
+	if result.state then serverState = result.state end
+	if result.selection then serverState.activeSlot = result.selection.slot end
+end
 
 local function invoke(action: string, payload: any?): any
-	while commandBusy do commandReleased.Event:Wait() end
-	commandBusy = true
-	local remaining = COMMAND_GAP - (os.clock() - lastCommandAt)
+	-- Reserve a ticket before yielding: waking all waiters must not reorder
+	-- two library swaps (or let a newer command overtake an earlier one).
+	commandSequence += 1
+	local sequence = commandSequence
+	while sequence ~= nextCommandSequence do commandReleased.Event:Wait() end
+	local isSelection = action == "SetActive" or action == "ClearActive"
+	local gap = if isSelection and lastCommandWasSelection then 0.08 else COMMAND_GAP
+	local remaining = gap - (os.clock() - lastCommandAt)
 	if remaining > 0 then task.wait(remaining) end
 	lastCommandAt = os.clock()
+	lastCommandWasSelection = isSelection
 	local ok, result = pcall(command.InvokeServer, command, action, payload)
-	commandBusy = false
-	commandReleased:Fire()
-	if not ok or typeof(result) ~= "table" then
-		return { ok = false, message = "The spell service did not respond." }
+	-- Network jitter can compress two arrivals despite client pacing. Retry
+	-- only an explicit throttle rejection (the server performed no mutation).
+	if ok and typeof(result) == "table" and typeof(result.retryAfter) == "number" then
+		task.wait(math.clamp(result.retryAfter, 0, 0.2) + 0.03)
+		lastCommandAt = os.clock()
+		ok, result = pcall(command.InvokeServer, command, action, payload)
 	end
+	if not ok or typeof(result) ~= "table" then
+		result = { ok = false, message = "The spell service did not respond." }
+	end
+	result.clientSequence = sequence
+	acceptServerResult(result)
+	nextCommandSequence += 1
+	commandReleased:Fire()
 	return result
 end
 
 local function applyServerResult(result: any)
-	if result.state then serverState = result.state end
+	acceptServerResult(result)
 	local message = result.message or ""
 	if not result.ok and result.errors and result.errors[1] then
 		message = result.errors[1].message or message
@@ -321,27 +349,42 @@ local function applyServerResult(result: any)
 	updateTopBar()
 end
 
--- Unequips the active spell (nothing casts until another is selected).
-local function deselectSlot()
-	if pendingActiveSlot then return end
+-- Highlight immediately and coalesce rapid clicks into the latest intent.
+-- Older acknowledgements may update the server cache, never the pending UI.
+local function requestSelection(slot: number?)
 	SpellAssemblerGui.CancelCast()
-	local result = invoke("ClearActive")
-	if result.ok then result.message = "Spell deselected." end
-	applyServerResult(result)
+	pendingActiveSlot = slot
+	selectionPending = true
+	selectionVersion += 1
+	updateTopBar()
+	if selectionWorker then return end
+	selectionWorker = true
+	task.spawn(function()
+		while selectionPending do
+			local version, target = selectionVersion, pendingActiveSlot
+			local result = invoke(if target then "SetActive" else "ClearActive", if target then { slot = target } else nil)
+			acceptServerResult(result)
+			if version == selectionVersion then
+				selectionPending = false
+				pendingActiveSlot = nil
+				if result.ok then
+					result.message = if target then `Equipped "{(slotRecord(target) or {}).name or "spell"}".` else "Spell deselected."
+				end
+				applyServerResult(result)
+			else
+				updateTopBar()
+			end
+		end
+		selectionWorker = false
+	end)
+end
+
+local function deselectSlot()
+	requestSelection(nil)
 end
 
 local function equipSlot(slot: number)
-	if pendingActiveSlot then return end
-	SpellAssemblerGui.CancelCast()
-	pendingActiveSlot = slot
-	updateTopBar()
-	setStatus("Equipping…", nil, true)
-	local result = invoke("SetActive", { slot = slot })
-	pendingActiveSlot = nil
-	if result.ok then
-		result.message = `Equipped "{(slotRecord(slot) or {}).name or "spell"}". Close the editor [V] and click to cast.`
-	end
-	applyServerResult(result)
+	requestSelection(slot)
 end
 
 -- Saves the circle to the selected slot. The first saved spell is equipped
@@ -364,7 +407,7 @@ local function saveCard(): boolean
 		-- a library spell (not a hotbar slot): saved back to it, or added
 		local result = invoke("SaveSpell", { id = editingSpellId, name = currentName(), graph = doc.graph })
 		savingCard = false
-		if result.state then serverState = result.state end
+		acceptServerResult(result)
 		local wasNew = editingSpellId == nil
 		if result.ok then
 			editingSpellId = result.id or editingSpellId
@@ -390,7 +433,7 @@ local function saveCard(): boolean
 			end
 			if free then
 				local equipped = invoke("Equip", { slot = free, ref = "c:" .. editingSpellId })
-				if equipped.state then serverState = equipped.state end
+				acceptServerResult(equipped)
 				if equipped.ok then
 					equipSlot(free)
 				else
@@ -404,7 +447,7 @@ local function saveCard(): boolean
 	savingCard = false
 	-- Apply the authoritative state BEFORE reading the saved record. Loading
 	-- its normalized graph/name avoids marking an older local copy as Saved.
-	if result.state then serverState = result.state end
+	acceptServerResult(result)
 	if result.ok then
 		local record = slotRecord(selectedSlot)
 		if record and record.graph then doc:load(record.graph) end
@@ -421,11 +464,11 @@ end
 
 -- Makes the next/previous saved slot the active spell (HUD arrows).
 local function cycleActive(direction: number)
-	local current = serverState.activeSlot or selectedSlot
+	local current = SpellAssemblerGui.GetSelectedSlot() or selectedSlot
 	for step = 1, SLOT_COUNT do
 		local slot = (current - 1 + direction * step) % SLOT_COUNT + 1
 		if slotRecord(slot) then
-			if slot ~= serverState.activeSlot then
+			if slot ~= SpellAssemblerGui.GetSelectedSlot() then
 				equipSlot(slot)
 			end
 			return
@@ -1290,7 +1333,8 @@ local chargeConnection: RBXScriptConnection? = nil
 local activeCache: { record: any, compiled: any, spec: any, sustain: boolean } = { record = nil, compiled = nil, spec = nil, sustain = false }
 
 local function refreshActive()
-	local record = serverState.activeSlot and slotRecord(serverState.activeSlot)
+	local slot = SpellAssemblerGui.GetSelectedSlot()
+	local record = slot and slotRecord(slot)
 	if not record or not record.graph then
 		activeCache.record, activeCache.compiled, activeCache.spec, activeCache.sustain = nil, nil, nil, false
 		return
@@ -1390,7 +1434,7 @@ local function startChargeBar()
 end
 
 function SpellAssemblerGui.Cast()
-	if pendingActiveSlot or SpellAssemblerGui.GetCooldownRemaining() > 0 or not canCast() or visible or holdingCast or charging then return end
+	if selectionPending or SpellAssemblerGui.GetCooldownRemaining() > 0 or not canCast() or visible or holdingCast or charging then return end
 	if not serverState.activeSlot then
 		if activeLabel then
 			activeLabel.Text = "No spell equipped: press E, then Save"
@@ -1534,7 +1578,7 @@ function SpellAssemblerGui.LoadCards()
 	buildGui()
 	setStatus("Loading spell cards…", nil, true)
 	local result = invoke("GetState")
-	if result.state then serverState = result.state end
+	acceptServerResult(result)
 	if result.ok and serverState.available and not hasLoadedCards then
 		hasLoadedCards = true
 		local initialSlot = serverState.activeSlot
@@ -1576,7 +1620,7 @@ end
 -- (StateChanged fires). Yields; returns the server's response.
 function SpellAssemblerGui.Command(action: string, payload: any?): any
 	local result = invoke(action, payload)
-	if result.state then serverState = result.state end
+	acceptServerResult(result)
 	updateTopBar()
 	return result
 end
@@ -1670,7 +1714,8 @@ function SpellAssemblerGui.SetLibraryOpener(open: () -> ())
 end
 
 function SpellAssemblerGui.GetSelectedSlot(): number?
-	return pendingActiveSlot or serverState.activeSlot
+	if selectionPending then return pendingActiveSlot end
+	return serverState.activeSlot
 end
 
 function SpellAssemblerGui.IsOpen(): boolean
@@ -1709,25 +1754,22 @@ function SpellAssemblerGui.SetToolRequired(required: boolean)
 end
 
 function SpellAssemblerGui.SelectSlot(slot: number)
-	if selectingCard or loadingCards then return end
+	if loadingCards then return end
 	if not slotRecord(slot) then
 		loadSlot(slot)
 		SpellAssemblerGui.Open()
 		return
 	end
-	selectingCard = true
 	local character = player.Character
 	local humanoid = character and character:FindFirstChildOfClass("Humanoid")
 	if humanoid then humanoid:UnequipTools() end
-	if serverState.activeSlot == slot then
+	if SpellAssemblerGui.GetSelectedSlot() == slot then
 		-- selecting the selected spell again deselects it
 		deselectSlot()
-		selectingCard = false
 		return
 	end
 	equipSlot(slot)
-	selectingCard = false
-	if serverState.activeSlot == slot then SpellAssemblerGui.Close() end
+	SpellAssemblerGui.Close()
 end
 
 function SpellAssemblerGui.start()

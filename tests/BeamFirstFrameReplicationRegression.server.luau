@@ -7,6 +7,7 @@ local H=require(server.Projectile.BeamProjectileHandler)
 local HB=require(shared.Heartbeat)
 local V=require(shared.VisualOffload)
 local Protocol=require(shared.Projectile.Protocol)
+local Codec=require(shared.Projectile.Codec)
 local limit=require(shared.Projectile.BeamPath).MaxStretch
 local origin=Vector3.new(0,6000,0)
 local channel=987654101
@@ -25,7 +26,8 @@ local function receive()
 				count+=1
 			end
 		elseif event.Key==Protocol.Channels.Move then
-			for _,data in event.Data do if known[data.Id] then paths[data.Id]=data.BeamPath;fresh[data.Id]=true end end
+			local batch=if typeof(event.Data)=="buffer" then Codec.DecodeMoves(event.Data) else event.Data
+			for _,data in batch do if known[data.Id] then paths[data.Id]=data.BeamPath;fresh[data.Id]=true end end
 		end
 	end
 	table.clear(V.Events)

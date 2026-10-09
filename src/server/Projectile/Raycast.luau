@@ -19,6 +19,7 @@ local Replication = require(script.Parent.Replication)
 local Occupancy = require(script.Parent.Occupancy)
 local Types = require(script.Parent.Types)
 local Store = require(script.Parent.Store)
+local CollisionLOD = require(script.Parent.CollisionLOD)
 
 type State = Types.State
 type Verdict = Types.Verdict
@@ -99,7 +100,10 @@ function Raycast.buildRayParams(source: Types.EntityLike?, ignoreInstances: { In
 	return params
 end
 
--- Sweeps the projectile's body along `displacement`. Returns the contact as a
+-- Sweeps the projectile's body along `displacement`. Entity-free chunks use
+-- a centerline ray; occupied/boundary chunks retain the full swept radius.
+-- The already-computed adaptive-step flag avoids another lookup near entities.
+-- Returns the contact as a
 -- plain table (see Types.Contact) or nil. Distance is how far the ray -- or
 -- the sphere's center -- travelled, which is what the time accounting in
 -- init.luau needs; for a Spherecast, Position is the surface point instead.
@@ -121,7 +125,7 @@ local function ignoreSetFor(params: RaycastParams): { [Instance]: boolean }
 	return set
 end
 
-function Raycast.castMovement(projectile: State, origin: Vector3, displacement: Vector3, overrideParams: RaycastParams?): Types.Contact?
+function Raycast.castMovement(projectile: State, origin: Vector3, displacement: Vector3, overrideParams: RaycastParams?, nearEntities: boolean?): Types.Contact?
 	-- Provably empty space: the cast would find nothing, so don't make it
 	-- (see Occupancy -- it only says yes when nothing could be in the way).
 	-- The projectile's own filter is passed so its shooter doesn't block the
@@ -131,13 +135,18 @@ function Raycast.castMovement(projectile: State, origin: Vector3, displacement: 
 		return nil
 	end
 	local params = overrideParams or baseParams
+	local radius = projectile.Radius
+	if radius > 0 and not nearEntities then
+		radius = CollisionLOD.Radius(ChunkManager.GetEntityChunkMask(), ChunkManager.ChunkSize,
+			ChunkManager.UseY, origin, displacement, radius)
+	end
 	local result
-	if projectile.Radius > 0 then
+	if radius > 0 then
 		-- Sweeping a sphere along a line is exactly a capsule: a cylindrical
 		-- body of Radius around this segment plus spherical caps at both ends.
 		-- Adjacent adaptive substeps share the cap at their common joint, so
 		-- curved paths have no wedge-shaped collision gaps.
-		result = workspace:Spherecast(origin, projectile.Radius, displacement, params)
+		result = workspace:Spherecast(origin, radius, displacement, params)
 	else
 		result = workspace:Raycast(origin, displacement, params)
 	end
@@ -185,11 +194,12 @@ function Raycast.resolveEntityHit(
 	projectile: State,
 	entity: Types.EntityLike,
 	contact: Types.Contact,
-	hurtbox: Types.Hurtbox?
+	hurtbox: Types.Hurtbox?,
+	bodyHit: boolean?
 ): Verdict
 	if entity == projectile.Source or projectile._ignore[entity] then
 		-- can't collide with ourselves or an already-pierced target
-		nudgePast(projectile, contact.Position)
+		if not bodyHit then nudgePast(projectile, contact.Position) end
 		return "pass"
 	end
 	local filter = projectile.Filter
@@ -202,7 +212,8 @@ function Raycast.resolveEntityHit(
 		projectile.PiercesLeft -= 1
 		projectile.DamageMultiplier *= (1 - projectile.PierceFalloff)
 		projectile._ignore[entity] = true
-		nudgePast(projectile, contact.Position)
+		projectile._spanParams = nil -- the pierced set changed; invalidate lazily
+		if not bodyHit then nudgePast(projectile, contact.Position) end
 		return "pass"
 	end
 	return "destroy"
