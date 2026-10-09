@@ -40,7 +40,7 @@ Entity.EnableHurtboxRendering() -- draws hurtboxes when Entity.ShowHurtboxes is 
 Entity.EnableHurtboxHistoryRendering() -- draws the history trail when Entity.ShowHurtboxHistory is true
 
 MovementController.start()
-task.spawn(function() require(script.PlayerLocomotion).start() end)
+task.spawn(function() require(script.PlayerLocomotion).start(game.Players.LocalPlayer) end)
 ChunkVisualizer.start()
 -- the time slider lives in the debug panel's Time tab; the old on-screen
 -- panel is gone everywhere
