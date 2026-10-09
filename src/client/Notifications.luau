@@ -19,6 +19,9 @@
 	  }) -> dismiss()
 
 	Added fires on every Push; Changed whenever the list changes.
+
+	The server can push one too: VisualOffload.FireClient(player, "Notice",
+	{ Title = ..., Text = ... }) (e.g. SpellWorld's barrier moderation).
 ]]
 
 local Signal = require(game:GetService("ReplicatedStorage"):WaitForChild("Shared"):WaitForChild("Signal"))
@@ -228,5 +231,16 @@ end
 function Notifications.Toggle()
 	Notifications.SetOpen(not open)
 end
+
+-- Server notices (text only: no buttons, nothing to call back)
+local VisualOffload = require(game:GetService("ReplicatedStorage"):WaitForChild("Shared"):WaitForChild("VisualOffload"))
+VisualOffload.On("Notice", function(data)
+	if typeof(data) == "table" and typeof(data.Text) == "string" then
+		Notifications.Push({
+			Title = if typeof(data.Title) == "string" then data.Title else nil,
+			Text = data.Text,
+		})
+	end
+end)
 
 return Notifications
