@@ -15,14 +15,17 @@
 ]]
 
 local Util = require(script.Parent.Util)
+local SpatialAudio = require(script.Parent.Parent.SpatialAudio)
 
 local Streak = {}
 
 Streak.Enabled = true
--- studs/s (real) below which no streak shows. Ordinary shots (TimeBlaster
--- 220, Pheonix 250, spell bullets 300) never get one; the Railgun (1250)
--- and anything faster does.
-Streak.MinSpeed = 800
+-- studs/s (real) below which no streak shows: the speed of sound (1225
+-- studs/s = 343 m/s at the canonical 0.28 m per stud; the same figure
+-- SpatialAudio delays booms by). Supersonic shots streak: the Railgun
+-- (1250, ~350 m/s) just clears it; TimeBlaster (220, ~62 m/s), Pheonix and
+-- spell bullets (300, ~84 m/s) are far below.
+Streak.MinSpeed = SpatialAudio.SpeedOfSound
 Streak.Seconds = 0.03 -- tail length = this much of the path (~2 frames at 60 fps)
 Streak.MaxLength = 200
 Streak.MaxActive = 64

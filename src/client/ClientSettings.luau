@@ -71,7 +71,7 @@ ClientSettings.Specs = {
 	{ Key = "ReducedFlashes", Label = "Reduced flashes", Kind = "boolean", Default = false, Section = "Effects", Description = "Dims explosion lighting and spell circles; suppresses cast glints." },
 	{ Key = "CameraShake", Label = "Explosion camera shake (%)", Kind = "number", Default = 100, Min = 0, Max = 100, Step = 5, Section = "Effects" },
 	{ Key = "SurfaceImpacts", Label = "Surface impact effects", Kind = "boolean", Default = true, Section = "Effects", Description = "Sparks, dust, splinters, splashes and debris that match what a shot or blade hit." },
-	{ Key = "ProjectileStreaks", Label = "Fast projectile streaks", Kind = "boolean", Default = true, Section = "Effects", Description = "A motion streak behind very fast projectiles (800+ studs/s, like the Railgun; the nearest 64)." },
+	{ Key = "ProjectileStreaks", Label = "Fast projectile streaks", Kind = "boolean", Default = true, Section = "Effects", Description = "A motion streak behind very fast projectiles (supersonic: 1225+ studs/s, like the Railgun; the nearest 64)." },
 	{ Key = "BladeTrails", Label = "Blade swing trails", Kind = "boolean", Default = true, Section = "Effects" },
 	{ Key = "Glints", Label = "Cast glints", Kind = "boolean", Default = false, Section = "Effects" },
 	{ Key = "LensFlare", Label = "Lens flare", Kind = "boolean", Default = true, Section = "Lighting", Description = "The sun's lens flare. Everything under Lighting can be tuned below." },

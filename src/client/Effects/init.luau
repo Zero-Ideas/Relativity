@@ -54,6 +54,7 @@ local Surface = require(script.Surface)
 local Swing = require(script.Swing)
 local Util = require(script.Util)
 local ExplosionVFX = require(script.Parent.ExplosionVFX)
+local SpatialAudio = require(script.Parent.SpatialAudio)
 
 local Effects = {}
 
@@ -136,7 +137,9 @@ function Effects.Impact(position: Vector3, normal: Vector3?, options: ImpactOpti
 	local strength = opts.Strength or KIND_STRENGTH[kind] or 1
 	local velocity = opts.Velocity
 	if not opts.Strength and velocity and kind ~= "scrape" then
-		strength *= math.clamp(velocity.Magnitude / 300, 0.6, 1.6)
+		-- by Mach number (1 stud = 0.28 m): a ~60 m/s blaster bolt ~0.7,
+		-- a supersonic railgun slug ~1.2, ~3x the speed of sound and up 1.8
+		strength *= math.clamp(0.6 + 0.6 * velocity.Magnitude / SpatialAudio.SpeedOfSound, 0.6, 1.8)
 	end
 	table.insert(queue, {
 		Position = position,
