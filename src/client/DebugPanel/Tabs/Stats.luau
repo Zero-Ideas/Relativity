@@ -67,8 +67,8 @@ return function(window)
 	local sHandlers = statLine(tab, "Heartbeat handlers ms/frame (costliest)")
 	local sNetChannels = statLine(tab, "Network out by channel (msgs/s · KB/s · list items/s)")
 	local sSpawn = statLine(tab, "  spawning ms (count per frame)")
-	local sBeam = statLine(tab, "  beam ms (heads / links / stream), samples (asleep, coasting), joiners, links kept whole, new joiners per frame")
-	local sAwake = statLine(tab, "    awake beam samples by reason (chain can't / clipped / dilated / short window / moving part / geometry / unknown)")
+	local sBeam = statLine(tab, "  beam ms (heads / links / stream), packets (dormant), joiners, links kept whole, new joiners, line casts per frame")
+	local sAwake = statLine(tab, "    packets made real per second (line hit / at a wall / front expired / bent / dilated / On Expire)")
 	local sLoop = statLine(tab, "  Main: step loop ms (loop / destroys)")
 	local sQueues = statLine(tab, "Visual queue (spawn / hit)")
 	local sBeams = statLine(tab, "Beam pose updates (total)")
@@ -156,16 +156,16 @@ return function(window)
 		sSpawn(string.format("%s  (%.0f)", ms("Spawn"), tonumber(p.Spawned) or 0))
 		if typeof(s.BeamSamples) == "number" then
 			-- BeamChain: every head step, every link, the event stream
-			sBeam(string.format("%s, %d samples (%d asleep, %d coasting), %d joiners, %d whole, %.1f new",
-				ms("BeamHeads", "BeamLinkPass", "BeamReplicate"), s.BeamSamples, tonumber(s.BeamSleeping) or 0,
-				tonumber(s.BeamCoasting) or 0, tonumber(s.BeamJoiners) or 0, tonumber(s.BeamLazyLinks) or 0,
-				tonumber(p.BeamCreated) or 0))
-			local w = if typeof(s.BeamWakeful) == "table" then s.BeamWakeful else {}
+			sBeam(string.format("%s, %d packets (%d dormant), %d joiners, %d whole, %.1f new, %.1f casts",
+				ms("BeamHeads", "BeamLinkPass", "BeamReplicate"), s.BeamSamples, tonumber(s.BeamDormant) or 0,
+				tonumber(s.BeamJoiners) or 0, tonumber(s.BeamLazyLinks) or 0, tonumber(p.BeamCreated) or 0,
+				tonumber(p.BeamStrandCasts) or 0))
+			local w = if typeof(s.BeamMadeReal) == "table" then s.BeamMadeReal else {}
 			local function n(key: string): number
 				return tonumber(w[key]) or 0
 			end
-			sAwake(string.format("%d / %d / %d / %d / %d / %d / %d", n("Chain"), n("Clipped"), n("Dilated"), n("Window"),
-				n("Moving"), n("Static"), n("Unknown")))
+			sAwake(string.format("%d / %d / %d / %d / %d / %d", n("Hit"), n("Wall"), n("Front"), n("Bent"), n("Dilated"),
+				n("Expire")))
 		else
 			sAwake("-")
 			-- legacy handler: span casts / plan+connect / new joiners / rest

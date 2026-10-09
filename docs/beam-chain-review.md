@@ -36,30 +36,34 @@ When a link can't get joiners (budget, quota, or `Plan` > 32 joiners), `unlink` 
 
 ## The sketch: sweep, detect, divide and repeat
 
-Yes, this works. It is a natural extension of the existing lazy links, and it is now implemented in `BeamChain`.
+Two separate passes at this were merged. Each one covers what the other missed.
 
-- **Divide and repeat (`settle` / `halve`).** A long lazy link stays one body while `ProbeBeamSpan` finds nothing. When the probe fails, the link is halved: one joiner at the middle of its path length, placed, moving, aged and given its energy exactly as the eager split would. Each half is then probed again. A clear half stays a single lazy body. A touching half is halved again, down to pieces under 32 studs, which resolve normally (hits, clipping, joiner deaths). A point contact on a link of length L now costs about log2(L/32) joiners instead of L/32: 4 instead of 15 for 512 studs, 5 instead of 31 for 1024. The untouched pieces are exactly the bodies the eager joiners would have had, so the hit/energy outcome is unchanged. The lazy link whose front died uses the same halving, again with graded ages so it still expires in turn.
-- **Launch samples only when needed (channel skipping).** On a lazy chain, a channel tick skips its sample when the aim has turned less than 1° and the launch point has moved less than 2 studs since the last launched sample, and that sample is still alive. The skipped ticks' energy rides on the next launched sample. Its link to the previous sample covers exactly where the skipped samples would have flown: same origin and direction means the same chord. That is the "beamlet that didn't need to exist". Links are capped at 4 × MaxStretch (≈120 studs at default speed). A steady beam drops from ~67 to ~17 samples/s per channel. A sweeping beam still gets a sample wherever the aim actually turned, so shape fidelity is unchanged. The last tick and channel stops flush any pending energy, so total energy is conserved. Chains with OnTimer/OnProximity triggers (not lazy) and the legacy handler are unaffected.
-- **Let go of parked fronts (`feeding`).** A link to a sample parked at a wall is kept only while the sample behind still heads into that spot: forward along the link, with lateral offset under MaxStretch. Once a sweep carries it past, it unlinks into an ordinary beam end along its own velocity. No joiners are ever made for such a stretched link, so no strings. A new sample on a lazy chain may link to a previous sample that parked less than 0.15 s ago, but only if it heads there. Without this, skipping would leave a gap in front of walls.
-- **No more dashes under budget (lazy chains).** A link that can't be halved (budget, quota) now stays whole and resolves as one body, clipped at the wall, instead of tearing off a permanent fragment.
-- **Coast (`coast`).** If Occupancy proves a sample's next frame of flight empty, the sample moves exactly, with constant acceleration and the chord widened by the arc's bow, without running `Projectile.Step`. This is the same reasoning as sleep, applied per frame with a cheap segment test. It only applies under uniform time, with no homing and no speed clamps. Anything else, or any doubt, takes the full step.
-- **Sleep fix.** `SLEEP_MIN_FRAMES` 3 → 2, so default-speed samples can sleep. Long diagonal bodies still often fail the 27-cell box test, so expect coast to matter more.
+From the dormant-packet pass (`master`, "upd"–"upd3"):
+
+- **Dormant packets.** A packet on a lazy chain starts as a record that moves by formula. Its SpellRuntime binding (triggers, damage) is deferred, and it gets no `Projectile.Step` and no per-link cast. Each frame, the dormant stretch of a beam is joined into one simplified line and cast. Only the packets either side of a contact are made real and go through the normal link pass. A packet that never meets anything never becomes one. This replaces the old sleep system (and the Occupancy box queries it needed) entirely.
+
+From this review:
+
+- **Divide and repeat (`settle` / `halve`).** When a real packet's long lazy link touches something, it is halved, and only the touching half keeps halving. Halving stops once pieces are short enough to need no joiners, and those resolve normally. Splitting the whole link made length / 32 joiners; this makes about log2(length / 32). The same halving applies when a lazy link's front dies, with graded ages so it still expires in turn.
+- **Launch samples only when needed (channel skipping).** On a lazy chain, a tick skips its sample while the aim turns less than 1° and the launch point moves less than 2 studs since the last launched sample, as long as that sample still flies. The skipped energy rides on the next launch, whose link covers exactly where the skipped samples would have flown. Links are capped at 4 × MaxStretch (≈120 studs at default speed). A steady beam goes from ~67 to ~17 packets/s per channel. That means fewer dormant records and Spawn messages. A sweep still gets a packet wherever the aim turned. The final tick and channel stops flush any pending energy.
+- **Let go of parked fronts (`feeding`).** A link to a packet parked at a wall is kept only while the packet behind still heads into that spot. Once a sweep carries it past, it unlinks into an ordinary beam end, with no joiners and no strings. A new packet on a lazy chain may link to one that parked less than 0.15 s ago, but only if it heads there. Without this, skipping would leave a gap in front of walls.
+- **No more dashes under budget (lazy chains).** A link that can't be halved now stays whole and resolves as one body, clipped at the wall, instead of tearing off a permanent fragment.
 - **Client.** Chains are drawn oldest first, so past the part budget it's always the newest chains that lose pieces, instead of a different set each frame.
 
-Unchanged: the wire format, `materializeAhead` (a lazy link's back dying on a hit still splits eagerly, since that only happens on hits), non-lazy chains' eager split, and the legacy handler.
+Dropped in the merge: this review's per-frame "coast" and the sleep-window fix. Dormant drift does both jobs.
 
 ## How to check it in Studio
 
-Stats tab, beam line: `samples (asleep, coasting), joiners, whole, new`.
+Stats tab, beam line: `packets (dormant), joiners, whole, new, casts`, plus the made-real reasons.
 
-1. 12 channels, steady aim into open air: samples should drop to roughly a quarter (~50/channel), with most coasting and joiners near 0.
+1. 12 channels, steady aim into open air: packets should drop to roughly a quarter (~50/channel), nearly all dormant, with joiners near 0 and a handful of casts.
 2. 12 channels sweeping across walls: `new` joiners per frame and the joiner count should be much lower. Wall strings should be gone. `BreakReasons.Parked` counts the let-gos.
 3. Beam held on a dummy and on a wall at 20 / 200 / 1000 studs: damage per second should match `LegacyBeams` / the previous build, with no gap or flicker at the impact point.
 4. Spells with OnExpire / OnImpact triggers: trigger counts and positions are still spread along the beam.
-5. Time-dilation zones: chains fall back to full steps (`Dilated`), and nothing should jump.
+5. Time-dilation zones: packets are made real (`Dilated`), and nothing should jump.
 
 ## Risks
 
 - Skipping changes **when** a held-on target takes damage (≈15 Hz chunks instead of 67 Hz), not how much. If that matters for feel, lower `SKIP_SPACING`.
-- Coast trusts `Occupancy.SegmentClear` exactly as `Projectile.Step` already does for its casts, but it skips the substep planner. If a map edit isn't reflected in Occupancy, coast will miss it in the same way the existing skip does.
+- A dormant strand is cast at frame ends, not swept between them. A thin object that a sweeping beam crosses entirely within one frame can be missed. The old per-sample casts had a similar gap, but this one is wider.
 - None of this has been run. The regression suites under `tests/` target the legacy handler.

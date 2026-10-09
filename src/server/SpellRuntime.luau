@@ -1151,6 +1151,17 @@ local function positionalTriggers(compiled: any, info: any): boolean
 	return false
 end
 
+-- Does this vessel carry an On Expire trigger? (A sustained beam's packets
+-- that never touch anything then still have to fire it as they run out.)
+local function expireTriggers(compiled: any, info: any): boolean
+	for _, triggerId in info.triggers do
+		if compiled.runes[triggerId].rune == "OnExpire" then
+			return true
+		end
+	end
+	return false
+end
+
 -- All flying vessels use the same swept-radius simulation and trigger pipeline.
 local function launch(shot: Shot, direction: Vector3)
 	local ctx = shot.ctx
@@ -1171,6 +1182,18 @@ local function launch(shot: Shot, direction: Vector3)
 	}
 	local ignore = SpellWorld.SpellIgnore(ctx.player, caster)
 	table.insert(ignore, 1, ctx.character)
+	-- A sustained beam's packet may stay a dormant record until something is
+	-- near it (see BeamChain): its triggers and damage are bound only then,
+	-- and if it never is, it just gives its quota slot back.
+	local bind: (any, number, any?) -> ()
+	local deferred = if shot.vessel == "Beam" and BeamHandler.DefersBinding then {
+		Bind = function(packet)
+			bind(packet, shot.damageEnergy, nil)
+		end,
+		Discard = function()
+			ProjectileQuota.Release(ctx.player, 1)
+		end,
+	} else nil
 	local projectile = (if shot.vessel == "Beam" then BeamHandler.Launch else Projectile.new)({
 		Origin = shot.spawn or (ctx.origin + direction * ctx.spawnOffset),
 		Direction = direction,
@@ -1199,14 +1222,14 @@ local function launch(shot: Shot, direction: Vector3)
 			-- (a sustained beam may keep a long link as one body until it meets
 			-- something -- unless a trigger watches every joiner's own position)
 			Lazy = positionalTriggers(compiled, shot.info) == false,
+			ExpireTriggers = expireTriggers(compiled, shot.info),
 		} else nil,
 		-- Built procedurally on the client -- see VisualModel's styled visuals.
 		Visual = { Style = shot.vessel, Color = elementDef.Color, Core = elementDef.Core },
-	})
+	}, deferred)
 
 	-- Reusable synchronous binding for both emitted packets and subdivisions.
 	-- Each fork receives a fraction of the UNFIRED trigger/damage energy.
-	local bind: (any, number, any?) -> ()
 	bind = function(projectile, damageEnergy, triggerAmounts)
 		local lastStruck = nil
 		local boundWatches = {}
@@ -1266,7 +1289,9 @@ local function launch(shot: Shot, direction: Vector3)
 			for _, watch in boundWatches do watch.energy *= share end
 		end
 	end
-	bind(projectile, shot.damageEnergy, nil)
+	if not deferred then
+		bind(projectile, shot.damageEnergy, nil)
+	end
 end
 
 -- A sustained channel's next shot, aimed from where the caster is now, and

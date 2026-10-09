@@ -22,12 +22,13 @@
 	   front dies, or wherever that equivalence doesn't hold (homing, an
 	   uneven time field along it, OnTimer / OnProximity triggers that need
 	   every joiner's own position).
-	 - Beamlets only do hit detection where something could be hit: a sample
-	   whose flight and body stay, for a while, inside a box with nothing in
-	   it SLEEPS -- no Projectile.Step, no body cast, just exact constant-
-	   acceleration motion -- until its window ends or anything could reach
-	   it (see "Sleep" below). Every cast it skips is one that provably
-	   finds nothing, so no outcome changes.
+	 - Beamlets are only made where hit detection needs them. A packet starts
+	   DORMANT: a record moving on a formula, its triggers and damage not even
+	   bound. Each frame the dormant stretches of a beam are joined into one
+	   line and cast; only where that line meets something are the packets
+	   either side of the contact made real beamlets (which then step, clip,
+	   hit and split exactly as below), and the rest of the line is cast on
+	   from there. A packet that never meets anything never becomes one.
 	 - Clients get one compact event stream per chain (see BeamWire): a new
 	   sample, a bounce, a link change, a clipped body, a death. Samples move
 	   deterministically in between, so nothing is sent per sample per frame.
@@ -48,7 +49,6 @@ local BeamWire = require(ProjectileShared:WaitForChild("BeamWire"))
 local Projectile = require(script.Parent)
 local Config = require(script.Parent.Config)
 local Raycast = require(script.Parent.Raycast)
-local Occupancy = require(script.Parent.Occupancy)
 local Profile = require(script.Parent.Profile)
 
 local Op, Section, DeathKind, Flag = BeamWire.Op, BeamWire.Section, BeamWire.Death, BeamWire.SpawnFlag
@@ -77,19 +77,11 @@ local REFRESH_PERIOD = 0.2
 local CLIP_RESEND = 0.25
 -- A chain lingers this long after its last packet before it ends.
 local CHAIN_GRACE = 0.25
--- Sleep: how far a sample may fly per sleep, the shortest window worth a box
--- test (in frames), the longest window, the most coarse cells a box may
--- span, and the clearance added around the engine's box query.
-local SLEEP_STUDS = 96
--- (was 3: at the default 2000 studs/s a 96-stud window is 2.9 frames at
--- 60 Hz, so no default beam sample could ever sleep)
-local SLEEP_MIN_FRAMES = 2
-local SLEEP_MAX_SECONDS = 1
-local SLEEP_MAX_CELLS = 27
-local SLEEP_MARGIN = 0.5
--- Coasting: a sample whose next frame of flight Occupancy proves empty moves
--- without Projectile.Step; this close to its lifetime it takes the full step.
-local COAST_MARGIN = 1e-3
+-- Dormant stretches are cast as simplified lines: a vertex is dropped when
+-- it's within this many studs of the line through its neighbours (the cast
+-- is widened by as much), and casts are cut at this length.
+local STRAIGHT_TOLERANCE = 0.1
+local MAX_CAST = 1000
 -- Halving: the most times one link is halved in a frame (a link is at most
 -- MaxJoinersPerLink + 1 pieces long, and 2^6 > 33).
 local MAX_HALVINGS = 8
@@ -104,50 +96,27 @@ local SKIP_SHIFT = 2
 local PARKED_LINK_AGE = 0.15
 
 --------------------------------------------------------------------------------
--- Sleep
+-- Dormant packets
 --------------------------------------------------------------------------------
 
--- A sample sleeps while its whole future for a window -- its own flight and
--- its body to the sample ahead -- stays inside a box nothing a raycast could
--- hit is in. Asleep it skips Projectile.Step and its body cast and just
--- moves (exactly: constant acceleration). It wakes when the window ends, or
--- before that when anything could reach it: a moving part or entity's mark
--- entering the box (Occupancy refreshes those every frame), static geometry
--- appearing in it, the sample ahead being hit / bouncing / dying (its body
--- ends there), dilated time anywhere, or its real-time cap. Sleepers are
--- indexed by Occupancy's coarse cells for those checks.
-local sleepCells: { [number]: { [any]: boolean } } = {}
-local sleeping = 0
--- Why samples stayed awake (Stats tab): their chain can't sleep (homing,
--- varying acceleration, positional triggers), their body is clipped, time
--- is dilated somewhere, the window is too short, or the box test said no
--- (a moving part / static geometry the engine confirmed / can't tell).
-local wakeful = { Chain = 0, Clipped = 0, Dilated = 0, Window = 0, Moving = 0, Static = 0, Unknown = 0 }
+-- Why dormant packets were made real beamlets (Stats tab), counted since
+-- the last GetJoinerStats: their line met something, they're about to reach
+-- a wall a packet ahead stopped at, the packet ahead expired and the gap to
+-- the next one needs joiners, their body bends in a way a line can't take,
+-- dilated time, or an On Expire trigger that needs every one.
+local madeReal = { Hit = 0, Wall = 0, Front = 0, Bent = 0, Dilated = 0, Expire = 0 }
 
-local function wake(s: any)
-	local keys = s._sleepKeys
-	if not keys then
+local function materialize(s: any, why: string)
+	if not s._dormant then
 		return
 	end
-	for _, key in keys do
-		local set = sleepCells[key]
-		if set then
-			set[s] = nil
-			if next(set) == nil then
-				sleepCells[key] = nil
-			end
-		end
+	s._dormant = nil
+	local bind = s._bind
+	s._bind, s._discard = nil, nil
+	if bind then
+		bind(s)
 	end
-	s._sleepKeys, s._sleepAge, s._sleepLo, s._sleepHi, s._slept = nil, nil, nil, nil, nil
-	sleeping -= 1
-end
-
--- Something happened to `s`: the sample whose body ends at it looks again.
-local function wakeBehind(s: any)
-	local behind = s._behind
-	if behind and behind._sleepKeys and behind._ahead == s then
-		wake(behind)
-	end
+	madeReal[why] += 1
 end
 
 --------------------------------------------------------------------------------
@@ -182,7 +151,6 @@ function Event.Fire(self: any, info: any)
 	local owner = self.owner
 	owner._contact = true
 	owner._lastHit = info
-	wakeBehind(owner)
 	for index = 1, #self do
 		local fn = self[index]
 		if fn then
@@ -202,6 +170,14 @@ local materializeAhead: (s: any) -> ()
 function Sample.Destroy(self: any, result: { Position: Vector3, Normal: Vector3 }?, kind: string?)
 	if self.Dead then
 		return
+	end
+	if self._dormant then
+		-- (never bound: nothing listens, only its quota slot to give back)
+		local discard = self._discard
+		self._dormant, self._bind, self._discard = nil, nil, nil
+		if discard then
+			discard()
+		end
 	end
 	if kind ~= nil and self._lazyLink then
 		-- The joiners ahead of it would have flown on past whatever stopped
@@ -308,8 +284,7 @@ local function joinerFrom(chain: any, prototype: any, position: Vector3, velocit
 	s._lazyLink, s._incoming, s._contact, s._lastHit = nil, nil, nil, nil
 	s._beamReserveChildren, s._beamBindChild, s._beamScaleEnergy = nil, nil, nil
 	s._rep, s._repAhead, s._repClipN, s._repClipEnd, s._repTurns = nil, nil, nil, nil, nil
-	s._sleepKeys, s._sleepAge, s._sleepLo, s._sleepHi, s._slept, s._sleepRetry, s._behind =
-		nil, nil, nil, nil, nil, nil, nil
+	s._dormant, s._bind, s._discard, s._prevPosition, s._behind = nil, nil, nil, nil, nil
 	s._origin, s._tail, s._tailTurns, s._everLinked = position, { position }, #turns, true
 	return s
 end
@@ -320,7 +295,7 @@ end
 
 local chains: { [number]: any } = {}
 local chainOrder: { number } = {}
-local frameStats = { Created = 0, BudgetSplits = 0, Lazy = 0, Samples = 0, Joiners = 0, Sleeping = 0, Coasting = 0 }
+local frameStats = { Created = 0, BudgetSplits = 0, Lazy = 0, Samples = 0, Joiners = 0, Dormant = 0 }
 local lastStats = table.clone(frameStats)
 -- (Parked: a link to a sample stopped at a wall, let go once the sample
 -- behind no longer heads into that spot)
@@ -353,12 +328,11 @@ local function newChain(id: number, config: any, settings: any): any
 		-- every sample along it would move along the same straight chord.
 		lazy = lazy and not settings.Homing and constant and settings.MinSpeed <= 0
 			and settings.MaxSpeed == math.huge,
-		-- Samples may skip Projectile.Step through empty space (see coast)
-		-- when nothing but a hit changes their flight.
-		coast = not settings.Homing and constant and settings.MinSpeed <= 0 and settings.MaxSpeed == math.huge,
 		-- Clients extrapolate in straight lines + constant acceleration; these
 		-- chains also get periodic per-sample poses.
 		refresh = settings.Homing ~= nil or not constant or settings.MinSpeed > 0 or settings.MaxSpeed ~= math.huge,
+		-- every packet fires an On Expire trigger as it runs out
+		expireTriggers = config.Beam and config.Beam.ExpireTriggers == true,
 		refreshCursor = 1,
 		refreshCarry = 0,
 		scale = 1,
@@ -389,14 +363,25 @@ local function feeding(p: any, corners: { Vector3 }): boolean
 	return along > 0 and (leg - heading * along).Magnitude <= BeamPath.MaxStretch
 end
 
-function Chain.Launch(config: any): any
+-- SpellRuntime hands over its trigger binding instead of binding at once
+-- (see Launch).
+Chain.DefersBinding = true
+
+-- `deferred` (SpellRuntime): { Bind = (packet) -> (), Discard = () -> () }.
+-- A packet of a chain that can run dormant keeps it until it's made real
+-- (Bind) or dies without ever being (Discard); anything else binds now.
+function Chain.Launch(config: any, deferred: any?): any
 	local beam = config.Beam
 	local id = beam and beam.ChannelId
 	if not id then
 		-- A single (unsustained) beam is one ordinary projectile, as before.
 		local beamConfig = table.clone(config)
 		beamConfig.Beam = table.clone(beam or {})
-		return Projectile.new(beamConfig)
+		local projectile = Projectile.new(beamConfig)
+		if deferred then
+			deferred.Bind(projectile)
+		end
+		return projectile
 	end
 	local started = os.clock()
 	local settings = Config.normalize(config, Projectile.GetDefaultMaxRealLifetime())
@@ -420,6 +405,12 @@ function Chain.Launch(config: any): any
 	chain.last = s
 	chain.lastLaunch = os.clock()
 	table.insert(chain.samples, s)
+	if deferred and chain.lazy then
+		s._dormant, s._bind, s._discard = true, deferred.Bind, deferred.Discard
+		s._accel = Motion.GetAcceleration(s.Velocity, s.Acceleration, s.AccelerationDirection, s.Gravity)
+	elseif deferred then
+		deferred.Bind(s)
+	end
 	Profile.Add("Spawn", os.clock() - started)
 	Profile.Count("Spawned", 1)
 	return s
@@ -812,7 +803,8 @@ local function timeScaleOf(s: any): number
 	return SafeMath.number(SafeMath.number(source and source.TimeScale, 1, 0) * SafeMath.number(s.TimeScale, 1, 0), 0, 0)
 end
 
--- Exactly what Projectile.Step does in empty space under uniform time.
+-- A dormant packet's frame: exactly what Projectile.Step does in empty
+-- space under uniform time.
 local function drift(s: any, dt: number)
 	dt += s._simulationDebt
 	if dt <= 0 then
@@ -820,217 +812,222 @@ local function drift(s: any, dt: number)
 		return
 	end
 	s._simulationDebt = 0
-	local a = s._sleepAccel
+	local a = s._accel
 	s.Position += s.Velocity * dt + a * (.5 * dt * dt)
 	s.Velocity += a * dt
 	s.Age += dt
 end
 
--- One frame of flight through provably empty space: exactly what
--- Projectile.Step does there (every cast it would make finds nothing), minus
--- its substep planning, chunk sampling and boundary searches -- the bulk of a
--- beam's per-sample cost when nothing is near it. Uniform time and a coasting
--- chain only (see newChain); anything else, or any doubt, takes the full step.
-local function coast(s: any, globalDt: number, realNow: number): boolean
-	local scale = timeScaleOf(s)
-	if scale <= 0 or realNow - s._spawnRealTime >= s.MaxRealLifetime then
-		return false
+-- A dormant packet's body, built as linkOne would build it (nil: it can't
+-- be one line and has to be made real, for `why`).
+local function dormantBody(chain: any, s: any): ({ Vector3 }?, string?)
+	local front = s._ahead
+	if front and front.Dead and not front._worldStop then
+		-- The packet ahead ran out. A long gap to it would carry on as
+		-- joiners (graded ages); a short one just leaves a fragment.
+		if chain.expireTriggers or (front.Position - s.Position).Magnitude > BeamPath.MaxStretch then
+			s._lazyLink = (front.Position - s.Position).Magnitude > BeamPath.MaxStretch or nil
+			return nil, "Front"
+		end
+		unlink(s)
+		front = nil
 	end
-	local dt = globalDt * scale + s._simulationDebt
-	if dt <= 0 or s.Age + dt >= s.Lifetime - COAST_MARGIN then
-		return false
+	if not front then
+		local path = initialPath(s)
+		s._beamSpan = path
+		return path, nil
 	end
-	local position, velocity = s.Position, s.Velocity
-	if not (SafeMath.isFiniteVector(position) and SafeMath.isFiniteVector(velocity)) then
-		return false
+	if front.Dead then
+		return nil, "Wall" -- (stopped at a wall: this one is next)
 	end
-	local a = Motion.GetAcceleration(velocity, s.Acceleration, s.AccelerationDirection, s.Gravity)
-	local displacement = velocity * dt + a * (.5 * dt * dt)
-	-- (the chord stands in for the arc: widened by how far the arc bows off it)
-	local reach = s.Radius + a.Magnitude * dt * dt * .125
-	if reach > Occupancy.MaxRadius
-		or not Occupancy.SegmentClear(position, displacement, reach, Raycast.ignoreSetFor(s._rayParams)) then
-		return false
+	local corners, needed = BeamPath.Plan(s.Position, front.Position, s._beamTurns, front._beamTurns)
+	if not corners then
+		return nil, "Bent"
 	end
-	s._simulationDebt = 0
-	s.Position = position + displacement
-	s.Velocity = velocity + a * dt
-	s.Age += dt
-	return true
+	s._lazyLink = needed > 0 or nil
+	s._everLinked, front._everLinked, front._incoming = true, true, true
+	s._beamSpan, s._beamSpanClipped = corners, nil
+	if not front._ahead and not front._dormant then
+		front._beamSpan = { front.Position }
+	end
+	return corners, nil
 end
 
--- Occupancy's marks are coarse (4-stud voxels grown by 4 studs, so a beam a
--- few studs over a floor never reads as clear there); then ask the engine:
--- which parts' bounds overlap the box (filtered like the sample's casts),
--- plus terrain voxels on maps that have terrain.
-local overlapFor: { [RaycastParams]: OverlapParams } = setmetatable({}, { __mode = "k" }) :: any
-
-local function engineClear(s: any, lo: Vector3, hi: Vector3): boolean
-	local rayParams: RaycastParams = s._rayParams
-	local params = overlapFor[rayParams]
-	if not params then
-		params = OverlapParams.new()
-		params.FilterType = rayParams.FilterType
-		params.FilterDescendantsInstances = rayParams.FilterDescendantsInstances
-		params.CollisionGroup = rayParams.CollisionGroup
-		params.RespectCanCollide = rayParams.RespectCanCollide
-		overlapFor[rayParams] = params
+-- Drops vertices within STRAIGHT_TOLERANCE of a straight run: returns the
+-- kept indices into `points`.
+local function simplify(points: { Vector3 }): { number }
+	local kept = { 1 }
+	local count = #points
+	if count < 2 then
+		return kept
 	end
-	local pad = Vector3.one * (s.Radius + SLEEP_MARGIN)
-	local low, high = lo - pad, hi + pad
-	if #workspace:GetPartBoundsInBox(CFrame.new((low + high) * .5), high - low, params) > 0 then
-		return false
-	end
-	if Occupancy.HasTerrain() then
-		local ok, materials = pcall(function()
-			return workspace.Terrain:ReadVoxels(Region3.new(low, high):ExpandToGrid(4), 4)
-		end)
-		if not ok then
-			return false
-		end
-		local air, water = Enum.Material.Air, Enum.Material.Water
-		local ignoreWater = rayParams.IgnoreWater
-		local size = materials.Size
-		for x = 1, size.X do
-			for y = 1, size.Y do
-				for z = 1, size.Z do
-					local material = materials[x][y][z]
-					if material ~= air and not (ignoreWater and material == water) then
-						return false
-					end
-				end
+	local anchor, heading = points[1], nil :: Vector3?
+	for index = 2, count do
+		local offset = points[index] - anchor
+		if not heading then
+			if offset.Magnitude > 1e-3 then
+				heading = offset.Unit
 			end
+			continue
 		end
+		local along = offset:Dot(heading)
+		if along > 0 and (offset - heading * along).Magnitude <= STRAIGHT_TOLERANCE then
+			continue
+		end
+		local last = index - 1
+		if kept[#kept] ~= last then
+			table.insert(kept, last)
+		end
+		anchor = points[last]
+		local leg = points[index] - anchor
+		heading = if leg.Magnitude > 1e-3 then leg.Unit else nil
 	end
-	return true
+	if kept[#kept] ~= count then
+		table.insert(kept, count)
+	end
+	return kept
 end
 
--- After its link pass: may `p` sleep? (See "Sleep" at the top.)
-local function trySleep(chain: any, p: any, globalDt: number)
-	if not chain.lazy or p.Radius > Occupancy.MaxRadius then
-		wakeful.Chain += 1
-		return
-	elseif p._beamSpanClipped then
-		wakeful.Clipped += 1
-		return
-	elseif not ChunkManager.IsTimeUniform() then
-		wakeful.Dilated += 1
-		return
-	end
-	local frame = globalDt * timeScaleOf(p)
-	if frame <= 0 then
-		return
-	elseif p._sleepRetry and p.Age < p._sleepRetry then
-		wakeful[p._sleepWhy or "Window"] += 1
-		return
-	end
-	local front = p._ahead
-	local frontMoving = front ~= nil and not front.Dead
-	local speed = math.max(p.Velocity.Magnitude, if frontMoving then front.Velocity.Magnitude else 0, 1)
-	local window = math.min(SLEEP_STUDS / speed, SLEEP_MAX_SECONDS, p.Lifetime - p.Age - 1e-3)
-	if window < frame * SLEEP_MIN_FRAMES then
-		p._sleepRetry, p._sleepWhy = p.Age + frame * SLEEP_MIN_FRAMES, "Window"
-		wakeful.Window += 1
-		return
-	end
-	-- The box: its body now (itself, its corners, the front / fragment /
-	-- tail end), with every point moved by as much as either end moves over
-	-- the window, plus how far constant acceleration bows a path off its chord.
-	local a = Motion.GetAcceleration(p.Velocity, p.Acceleration, p.AccelerationDirection, p.Gravity)
-	local half = .5 * window * window
-	local dp = p.Velocity * window + a * half
-	local df = if frontMoving then front.Velocity * window + a * half else Vector3.zero
-	local lo, hi = p.Position, p.Position
-	local span = p._beamSpan
-	if span then
-		for _, point in span do
-			lo, hi = lo:Min(point), hi:Max(point)
+-- First contact along the polyline: (segment index, the centreline point).
+local function castPolyline(proxy: any, points: { Vector3 }, kept: { number }): (number?, Vector3?)
+	for k = 1, #kept - 1 do
+		local from, to = points[kept[k]], points[kept[k + 1]]
+		local offset = to - from
+		local length = offset.Magnitude
+		if length < 1e-4 then
+			continue
 		end
-	end
-	local bow = Vector3.one * (a.Magnitude * window * window * .125)
-	lo = lo + dp:Min(df):Min(Vector3.zero) - bow
-	hi = hi + dp:Max(df):Max(Vector3.zero) + bow
-	local ignore = Raycast.ignoreSetFor(p._rayParams)
-	local verdict = Occupancy.BoxClear(lo, hi, ignore, SLEEP_MAX_CELLS)
-	if verdict == "static" and engineClear(p, lo, hi) then
-		verdict = "clear"
-	end
-	if verdict ~= "clear" then
-		local why = if verdict == "moving" then "Moving" elseif verdict == "static" then "Static" else "Unknown"
-		p._sleepRetry, p._sleepWhy = p.Age + window * .5, why
-		wakeful[why] += 1
-		return
-	end
-	local coarse = Occupancy.Coarse
-	local keys = {}
-	for cz = math.floor(lo.Z / coarse), math.floor(hi.Z / coarse) do
-		for cy = math.floor(lo.Y / coarse), math.floor(hi.Y / coarse) do
-			for cx = math.floor(lo.X / coarse), math.floor(hi.X / coarse) do
-				local key = Occupancy.CoarseKey(cx, cy, cz)
-				local set = sleepCells[key]
-				if not set then
-					set = {}
-					sleepCells[key] = set
-				end
-				set[p] = true
-				table.insert(keys, key)
+		local heading, traveled = offset / length, 0
+		while traveled < length - 1e-4 do
+			local distance = math.min(length - traveled, MAX_CAST)
+			Profile.Count("BeamStrandCasts", 1)
+			local contact = Raycast.castMovement(proxy, from + heading * traveled, heading * distance)
+			if contact then
+				return k, from + heading * (traveled + (contact.Distance or 0))
 			end
+			traveled += distance
 		end
 	end
-	p._sleepKeys, p._sleepAge, p._sleepLo, p._sleepHi = keys, p.Age + window, lo, hi
-	p._sleepIgnore, p._sleepAccel, p._sleepRetry, p._slept = ignore, a, nil, nil
-	sleeping += 1
+	return nil, nil
 end
 
--- Wakes every sleeper something may now reach (before the frame's heads).
-local function wakeScan()
-	local changed, overflow = Occupancy.TakeStaticChanges()
-	if sleeping <= 0 then
-		return
+-- One dormant stretch, back (newest) to front: cast it as one line; where it
+-- meets something, make the packets either side of the contact real and cast
+-- on from beyond them. Returns how many packets it made real (into `fresh`).
+local function castStrand(chain: any, records: { any }, fresh: { any })
+	local proxy = { Radius = records[1].Radius + STRAIGHT_TOLERANCE, _rayParams = records[1]._rayParams }
+	local function promote(s: any, why: string)
+		if s._dormant then
+			materialize(s, why)
+			table.insert(fresh, s)
+		end
 	end
-	local woken: { [any]: boolean } = {}
-	if overflow or not ChunkManager.IsTimeUniform() then
-		for _, set in sleepCells do
-			for s in set do
-				woken[s] = true
+	local first = 1
+	while first <= #records do
+		-- the line: every body from `first` on, end to end, and who owns each leg
+		local points, owners = {}, {}
+		local stop = #records
+		for index = first, #records do
+			local s = records[index]
+			local body, why = dormantBody(chain, s)
+			if not body then
+				promote(s, why :: string)
+				stop = index - 1
+				break
 			end
-		end
-	else
-		for _, key in changed do
-			local set = sleepCells[key]
-			if set then
-				for s in set do
-					woken[s] = true
-				end
-			end
-		end
-		for key, boxes in Occupancy.DynamicMarks() do
-			local set = sleepCells[key]
-			if not set then
-				continue
-			end
-			for s in set do
-				if woken[s] then
-					continue
-				end
-				local lo, hi, ignore = s._sleepLo, s._sleepHi, s._sleepIgnore
-				for index = 1, #boxes, 3 do
-					local mlo, mhi = boxes[index], boxes[index + 1]
-					if hi.X > mlo.X and lo.X < mhi.X and hi.Y > mlo.Y and lo.Y < mhi.Y and hi.Z > mlo.Z and lo.Z < mhi.Z
-						and not ignore[boxes[index + 2]] then
-						woken[s] = true
+			if not s._ahead then
+				-- the beam's front: also the ground it just covered
+				local previous = s._prevPosition
+				if previous and (s.Position - previous).Magnitude > 1e-4 then
+					local _, hitAt = castPolyline(proxy, { previous, s.Position }, { 1, 2 })
+					if hitAt then
+						promote(s, "Hit")
+						stop = index - 1
 						break
 					end
 				end
 			end
+			if #points == 0 or (points[#points] - body[1]).Magnitude > 1e-3 then
+				if #points > 0 then
+					-- (not contiguous: cast what we have, start again here)
+					stop = index - 1
+					break
+				end
+				table.insert(points, body[1])
+			end
+			for leg = 2, #body do
+				table.insert(points, body[leg])
+				table.insert(owners, index)
+			end
+		end
+		if #points >= 2 then
+			local kept = simplify(points)
+			local k, hitAt = castPolyline(proxy, points, kept)
+			if k and hitAt then
+				-- whose body: the nearest original leg inside the simplified one
+				local owner, best = owners[kept[k]], math.huge
+				for leg = kept[k], kept[k + 1] - 1 do
+					local a, b = points[leg], points[leg + 1]
+					local offset = b - a
+					local t = math.clamp((hitAt - a):Dot(offset) / math.max(offset:Dot(offset), 1e-8), 0, 1)
+					local d = (a + offset * t - hitAt).Magnitude
+					if d < best then
+						owner, best = owners[leg], d
+					end
+				end
+				promote(records[owner], "Hit")
+				local ahead = records[owner + 1]
+				if ahead then
+					promote(ahead, "Hit")
+				end
+				first = owner + 2
+				continue
+			end
+		end
+		first = math.max(stop, first) + 1
+		-- (skip the one just made real, if any)
+		while first <= #records and not records[first]._dormant do
+			first += 1
 		end
 	end
-	local count = 0
-	for s in woken do
-		wake(s)
-		count += 1
+end
+
+-- Every dormant stretch of a chain (see castStrand); the packets made real
+-- get their link this frame like everyone else.
+local function castDormant(chain: any, globalDt: number)
+	local samples = chain.samples
+	local behindDormant: { [any]: boolean } = {}
+	local any = false
+	for _, s in samples do
+		if s._dormant and not s.Dead then
+			any = true
+			local ahead = s._ahead
+			if ahead and ahead._dormant and not ahead.Dead then
+				behindDormant[ahead] = true
+			end
+		end
 	end
-	Profile.Count("BeamWakes", count)
+	if not any then
+		return
+	end
+	local fresh = {}
+	for _, s in samples do
+		if not s._dormant or s.Dead or behindDormant[s] then
+			continue
+		end
+		local records = { s }
+		local ahead = s._ahead
+		while ahead and ahead._dormant and not ahead.Dead do
+			table.insert(records, ahead)
+			ahead = ahead._ahead
+		end
+		castStrand(chain, records, fresh)
+	end
+	for _, s in fresh do
+		if not s.Dead then
+			linkOne(chain, s, globalDt)
+		end
+	end
 end
 
 local function stepLinks(chain: any, globalDt: number)
@@ -1048,22 +1045,14 @@ local function stepLinks(chain: any, globalDt: number)
 	end
 	for index = 1, count do
 		local p = samples[index]
-		if p.Dead then
-			continue
+		if not p.Dead and not p._dormant then
+			linkOne(chain, p, globalDt)
 		end
-		if p._slept then
-			-- (asleep all frame: nothing about its link can have changed)
-			if p._lazyLink then
-				frameStats.Lazy += 1
-			end
-			continue
-		end
-		linkOne(chain, p, globalDt)
-		if p._lazyLink then
+	end
+	castDormant(chain, globalDt)
+	for _, p in samples do
+		if p._lazyLink and not p.Dead then
 			frameStats.Lazy += 1
-		end
-		if not p.Dead and not p._sleepKeys then
-			trySleep(chain, p, globalDt)
 		end
 	end
 end
@@ -1194,8 +1183,8 @@ local function encodeDelta(chain: any, now: number, globalDt: number): BeamWire.
 		end
 	end
 	for _, s in samples do
-		if not s._rep or s._slept then
-			continue -- (unsent, or asleep all frame: nothing new)
+		if not s._rep then
+			continue
 		end
 		local ahead = s._ahead
 		local aheadId = if ahead then ahead.Id else 0
@@ -1427,35 +1416,42 @@ Projectile.SetBeamSpanStep(function(globalDt: number)
 		return
 	end
 	local headStarted = os.clock()
-	wakeScan()
 	local uniform = ChunkManager.IsTimeUniform()
 	local realNow = os.clock()
-	local sampleCount, joinerCount, coasted = 0, 0, 0
+	local sampleCount, joinerCount, dormantCount = 0, 0, 0
 	for offset = 1, orderCount do
 		local chain = chains[chainOrder[offset]]
 		if not chain then
 			continue
 		end
 		local samples = chain.samples
-		local coasting = uniform and chain.coast
 		for index = 1, #samples do
 			local s = samples[index]
 			if s.Dead then
 				continue
 			end
-			if s._sleepKeys then
+			if s._dormant then
 				local dt = globalDt * timeScaleOf(s)
-				if uniform and s.Age + dt + s._simulationDebt <= s._sleepAge
-					and realNow - s._spawnRealTime < s.MaxRealLifetime then
+				if not uniform and (Planner.ChunkTimeScaleAt(s.Position) ~= 1
+					or Planner.ChunkTimeScaleAt(s.Position + s.Velocity * dt) ~= 1) then
+					materialize(s, "Dilated") -- (Step handles dilation)
+				elseif realNow - s._spawnRealTime >= s.MaxRealLifetime then
+					s:Destroy(nil, nil)
+					continue
+				elseif s.Age + dt + s._simulationDebt >= s.Lifetime then
+					-- runs out this frame, where it would have
+					drift(s, math.max(s.Lifetime - s.Age - s._simulationDebt, 0))
+					if chain.expireTriggers then
+						materialize(s, "Expire")
+					end
+					s:Destroy(nil, nil)
+					continue
+				else
+					s._prevPosition = s.Position
 					drift(s, dt)
-					s._slept = true
+					dormantCount += 1
 					continue
 				end
-				wake(s)
-			end
-			if coasting and coast(s, globalDt, realNow) then
-				coasted += 1
-				continue
 			end
 			if not Projectile.Step(s :: any, globalDt) and not s.Dead then
 				s:Destroy(nil, nil)
@@ -1479,9 +1475,6 @@ Projectile.SetBeamSpanStep(function(globalDt: number)
 		for index = 1, oldCount do
 			local s = samples[index]
 			s._incoming = false
-			if s.Dead and s._sleepKeys then
-				wake(s)
-			end
 			if not s.Dead then
 				kept += 1
 				samples[kept] = s
@@ -1524,9 +1517,8 @@ Projectile.SetBeamSpanStep(function(globalDt: number)
 		chainOrder = live
 	end
 	Profile.Add("BeamReplicate", os.clock() - replicateStarted)
-	frameStats.Samples, frameStats.Joiners, frameStats.Sleeping = sampleCount, joinerCount, sleeping
-	frameStats.Coasting = coasted
-	Profile.Count("BeamAsleep", sleeping)
+	frameStats.Samples, frameStats.Joiners, frameStats.Dormant = sampleCount, joinerCount, dormantCount
+	Profile.Count("BeamDormant", dormantCount)
 	lastStats = table.clone(frameStats)
 	frameStats.Created, frameStats.BudgetSplits, frameStats.Lazy = 0, 0, 0
 end)
@@ -1535,14 +1527,12 @@ function Chain.GetJoinerStats()
 	return {
 		Active = lastStats.Joiners,
 		Samples = lastStats.Samples,
-		Sleeping = lastStats.Sleeping,
-		-- moved this frame without Projectile.Step (nothing within reach)
-		Coasting = lastStats.Coasting,
-		-- awake samples by reason, summed since the last call
-		Wakeful = (function()
-			local copy = table.clone(wakeful)
-			for key in wakeful do
-				wakeful[key] = 0
+		Dormant = lastStats.Dormant,
+		-- packets made real beamlets, by reason, since the last call
+		MadeReal = (function()
+			local copy = table.clone(madeReal)
+			for key in madeReal do
+				madeReal[key] = 0
 			end
 			return copy
 		end)(),
