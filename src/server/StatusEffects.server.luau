@@ -35,9 +35,11 @@ end)
 -- StatusEffectSys's own doc comment on stacking), OnExpire covers all of
 -- those uniformly, so this never needs its own timer. Reapplying while
 -- already active just ADDS to the remaining duration (stock
--- StatusEffectSys stacking behavior) -- handy for chaining stun-locks from
--- repeated hits.
+-- StatusEffectSys stacking behavior), but never past STUN_MAX seconds left:
+-- repeated hits can keep someone down, not lock them out for good.
+local STUN_MAX = 5
 StatusEffectSys.Register("Stun", {
+	MaxDuration = STUN_MAX,
 	OnApply = function(entity)
 		local character = entity.Instance
 		if character and character:IsA("Model") then

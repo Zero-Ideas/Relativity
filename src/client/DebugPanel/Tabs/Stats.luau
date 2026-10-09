@@ -69,7 +69,7 @@ return function(window)
 	local sSpawn = statLine(tab, "  spawning ms (count per frame)")
 	local sBeam = statLine(tab, "  beam ms (heads / links / stream), packets (dormant), joiners, links kept whole, new joiners, line casts per frame")
 	local sAwake = statLine(tab, "    packets made real per second (line hit / at a wall / front expired / bent / dilated / On Expire)")
-	local sFlow = statLine(tab, "  flowing beams: ms, beams, points, tickets, casts / contacts since last update")
+	local sFlow = statLine(tab, "  flowing beams: ms, beams, points, tickets, casts / contacts / steady legs since last update")
 	local sLoop = statLine(tab, "  Main: step loop ms (loop / destroys)")
 	local sQueues = statLine(tab, "Visual queue (spawn / hit)")
 	local sBeams = statLine(tab, "Beam pose updates (total)")
@@ -176,9 +176,9 @@ return function(window)
 				math.max(beamTotal - beamKnown, 0), tonumber(p.BeamLinks) or 0, tonumber(p.BeamCreated) or 0))
 		end
 		local flow = if typeof(s.BeamFlow) == "table" then s.BeamFlow else nil
-		sFlow(if flow then string.format("%s, %d beams, %d points, %d tickets, %d / %d", ms("BeamFlow"),
+		sFlow(if flow then string.format("%s, %d beams, %d points, %d tickets, %d / %d / %d", ms("BeamFlow"),
 			tonumber(flow.Beams) or 0, tonumber(flow.Points) or 0, tonumber(flow.Tickets) or 0, tonumber(flow.Casts) or 0,
-			tonumber(flow.Contacts) or 0) else "-")
+			tonumber(flow.Contacts) or 0, tonumber(flow.Steady) or 0) else "-")
 		sLoop(ms("StepLoop", "StepDestroy"))
 		local reasons = if typeof(s.RaycastReasons) == "table" then s.RaycastReasons else {}
 		local checks = math.max(tonumber(s.RaycastChecks) or 0, 1)

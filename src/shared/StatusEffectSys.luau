@@ -13,9 +13,10 @@
 
 	Stacking: one active instance per (entity, effect name). Reapplying an
 	already-active effect does NOT reset it -- the new duration is ADDED to
-	whatever time remains, and the new potency is added to the current stack
-	count (capped at the definition's MaxStacks, default unlimited). An effect
-	ends the moment either Duration or Potency reaches 0 (whichever first).
+	whatever time remains (capped at the definition's MaxDuration, default
+	unlimited), and the new potency is added to the current stack count
+	(capped at the definition's MaxStacks, default unlimited). An effect ends
+	the moment either Duration or Potency reaches 0 (whichever first).
 
 	API:
 	 StatusEffectSys.Register(name, definition: EffectDefinition)
@@ -45,6 +46,9 @@
 	                                            -- the entity being destroyed)
 	   TickInterval: number?                    -- omitted/0 = OnTick never fires
 	   MaxStacks: number?                       -- default unlimited
+	   MaxDuration: number?                     -- most seconds it can have left,
+	                                            -- however it's applied/stacked;
+	                                            -- default unlimited
 
 	 ActiveEffect (returned by ApplyEffect/GetEffect, read freely -- e.g. for a
 	 debuff timer UI): { Name, Definition, Duration, Potency }
@@ -59,6 +63,7 @@ export type EffectDefinition = {
 	OnExpire: ((entity: any, effect: any) -> ())?,
 	TickInterval: number?,
 	MaxStacks: number?,
+	MaxDuration: number?,
 }
 
 local definitions: { [string]: EffectDefinition } = {}
@@ -171,20 +176,22 @@ function StatusEffectSys:ApplyEffect(entity, name: string, duration: number, pot
 	local effects = activeEffects[entity]
 	local effect = effects[name]
 	local maxStacks = definition.MaxStacks or math.huge
+	local maxDuration = definition.MaxDuration or math.huge
 
 	if effect then
-		effect.Duration += duration
+		local beforeDuration = effect.Duration
+		effect.Duration = math.max(math.min(beforeDuration + duration, maxDuration), beforeDuration)
 		local before = effect.Potency
 		effect.Potency = math.min(effect.Potency + potency, maxStacks)
 		local onStack = definition.OnStack
 		if onStack then
-			onStack(entity, effect, duration, effect.Potency - before)
+			onStack(entity, effect, effect.Duration - beforeDuration, effect.Potency - before)
 		end
 	else
 		effect = {
 			Name = name,
 			Definition = definition,
-			Duration = duration,
+			Duration = math.min(duration, maxDuration),
 			Potency = math.min(potency, maxStacks),
 			_tickAccumulator = 0,
 		}

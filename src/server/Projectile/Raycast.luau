@@ -126,6 +126,9 @@ local function ignoreSetFor(params: RaycastParams): { [Instance]: boolean }
 	return set
 end
 
+-- (the set a cast's filter excludes, as Occupancy takes it -- BeamFlow)
+Raycast.ignoreSetFor = ignoreSetFor
+
 function Raycast.castMovement(projectile: State, origin: Vector3, displacement: Vector3, overrideParams: RaycastParams?, nearEntities: boolean?): Types.Contact?
 	-- Provably empty space: the cast would find nothing, so don't make it
 	-- (see Occupancy -- it only says yes when nothing could be in the way).

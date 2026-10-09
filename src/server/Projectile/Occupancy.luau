@@ -818,6 +818,174 @@ function Occupancy.SegmentClear(origin: Vector3, displacement: Vector3, radius: 
 	return true
 end
 
+-- Where along a sweep of `radius` from `origin` by `displacement` something
+-- might be hit: the stretches (as fractions of the segment: from, to, from,
+-- to...) whose centreline runs through marked voxels -- every mark carries
+-- PAD of clearance, so nothing can be touched anywhere else. An empty list:
+-- provably clear. nil: can't tell (not baked, too wide, outside scanned
+-- terrain) -- cast all of it. Fine voxels are only walked inside coarse
+-- cells that have something in them, so a long segment costs one coarse
+-- lookup per 64 studs plus the stretches near geometry. Not counted in the
+-- skip stats. (BeamFlow casts only these stretches of a beam leg.)
+function Occupancy.SuspectSpans(origin: Vector3, displacement: Vector3, radius: number,
+	ignore: { [Instance]: boolean }?, giveUpAt: number?): { number }?
+	if not ready or not Occupancy.Enabled or radius > Occupancy.MaxRadius then
+		return nil
+	end
+	if hasTerrain and not insideTerrainScan(origin, origin + displacement) then
+		return nil
+	end
+	refreshDynamic()
+	local limit = giveUpAt or 0.5
+	local spans: { number } = {}
+	local n, suspect = 0, 0
+	-- (one Amanatides-Woo walk over coarse cells; inside occupied ones a
+	-- second over fine voxels -- both inline: no call per voxel)
+	local ox, oy, oz = origin.X, origin.Y, origin.Z
+	local DX, DY, DZ = displacement.X, displacement.Y, displacement.Z
+	local x, y, z = ox / COARSE, oy / COARSE, oz / COARSE
+	local dx, dy, dz = DX / COARSE, DY / COARSE, DZ / COARSE
+	local ix, iy, iz = floor(x), floor(y), floor(z)
+	local ex, ey, ez = floor(x + dx), floor(y + dy), floor(z + dz)
+	local sx = if dx > 0 then 1 elseif dx < 0 then -1 else 0
+	local sy = if dy > 0 then 1 elseif dy < 0 then -1 else 0
+	local sz = if dz > 0 then 1 elseif dz < 0 then -1 else 0
+	local inf = math.huge
+	local tx = if dx > 0 then (ix + 1 - x) / dx elseif dx < 0 then (x - ix) / -dx else inf
+	local ty = if dy > 0 then (iy + 1 - y) / dy elseif dy < 0 then (y - iy) / -dy else inf
+	local tz = if dz > 0 then (iz + 1 - z) / dz elseif dz < 0 then (z - iz) / -dz else inf
+	local ux = if dx ~= 0 then 1 / abs(dx) else inf
+	local uy = if dy ~= 0 then 1 / abs(dy) else inf
+	local uz = if dz ~= 0 then 1 / abs(dz) else inf
+	local steps = abs(ex - ix) + abs(ey - iy) + abs(ez - iz) + 1
+	local enter = 0
+	for step = 1, steps + 1 do
+		local leave = if step > steps then 1 else min(tx, ty, tz, 1)
+		if step > steps then
+			-- (floating-point slack: the end cell, if the walk didn't land on it)
+			if ix == ex and iy == ey and iz == ez then
+				break
+			end
+			ix, iy, iz = ex, ey, ez
+			enter = 0
+		end
+		local key = cellKey(ix, iy, iz)
+		if dynamic[key] ~= nil or static[key] ~= nil then
+			-- fine voxels of this stretch [enter, leave]
+			local width = leave - enter
+			local fxo, fyo, fzo = (ox + DX * enter) / FINE, (oy + DY * enter) / FINE, (oz + DZ * enter) / FINE
+			local fdx, fdy, fdz = DX * width / FINE, DY * width / FINE, DZ * width / FINE
+			local jx, jy, jz = floor(fxo), floor(fyo), floor(fzo)
+			local kx, ky, kz = floor(fxo + fdx), floor(fyo + fdy), floor(fzo + fdz)
+			local gx = if fdx > 0 then 1 elseif fdx < 0 then -1 else 0
+			local gy = if fdy > 0 then 1 elseif fdy < 0 then -1 else 0
+			local gz = if fdz > 0 then 1 elseif fdz < 0 then -1 else 0
+			local vx = if fdx > 0 then (jx + 1 - fxo) / fdx elseif fdx < 0 then (fxo - jx) / -fdx else inf
+			local vy = if fdy > 0 then (jy + 1 - fyo) / fdy elseif fdy < 0 then (fyo - jy) / -fdy else inf
+			local vz = if fdz > 0 then (jz + 1 - fzo) / fdz elseif fdz < 0 then (fzo - jz) / -fdz else inf
+			local wx = if fdx ~= 0 then 1 / abs(fdx) else inf
+			local wy = if fdy ~= 0 then 1 / abs(fdy) else inf
+			local wz = if fdz ~= 0 then 1 / abs(fdz) else inf
+			local fineSteps = abs(kx - jx) + abs(ky - jy) + abs(kz - jz) + 1
+			local fenter = 0
+			for _ = 1, fineSteps do
+				local fleave = min(vx, vy, vz, 1)
+				-- is voxel (jx, jy, jz) marked? (inline fineOccupied)
+				local cx, cy, cz = jx // DIV, jy // DIV, jz // DIV
+				local k = if cx == ix and cy == iy and cz == iz then key else cellKey(cx, cy, cz)
+				local hit = false
+				local mask = static[k]
+				if mask then
+					local lx, ly, lz = jx - cx * DIV, jy - cy * DIV, jz - cz * DIV
+					hit = btest(readu16(mask, (ly + lz * DIV) * ROW_BYTES), lshift(1, lx))
+				end
+				if not hit then
+					local moving = dynamic[k]
+					if moving then
+						local x0, y0, z0 = jx * FINE, jy * FINE, jz * FINE
+						local x1, y1, z1 = x0 + FINE, y0 + FINE, z0 + FINE
+						for index = 1, #moving, 3 do
+							local lo, hi = moving[index], moving[index + 1]
+							if x1 > lo.X and x0 < hi.X and y1 > lo.Y and y0 < hi.Y and z1 > lo.Z and z0 < hi.Z
+								and not (ignore and ignore[moving[index + 2]]) then
+								hit = true
+								break
+							end
+						end
+					end
+				end
+				if hit then
+					local t0, t1 = enter + width * fenter, enter + width * fleave
+					if n > 0 and spans[n] >= t0 - 1e-6 then
+						suspect += max(t1 - spans[n], 0)
+						spans[n] = max(spans[n], t1)
+					else
+						spans[n + 1], spans[n + 2] = t0, t1
+						n += 2
+						suspect += t1 - t0
+					end
+					if suspect > limit then
+						return nil -- (mostly near geometry: one whole cast is cheaper)
+					end
+				end
+				fenter = fleave
+				if vx <= vy and vx <= vz then
+					jx += gx
+					vx += wx
+				elseif vy <= vz then
+					jy += gy
+					vy += wy
+				else
+					jz += gz
+					vz += wz
+				end
+			end
+		end
+		if step > steps then
+			break
+		end
+		enter = leave
+		if tx <= ty and tx <= tz then
+			ix += sx
+			tx += ux
+		elseif ty <= tz then
+			iy += sy
+			ty += uy
+		else
+			iz += sz
+			tz += uz
+		end
+	end
+	return spans
+end
+
+-- True when no moving part's mark (outside `ignore`) is in any coarse cell
+-- the segment passes through: nothing that moves could be on it. (Static
+-- geometry isn't looked at; a caller uses this when it already knows the
+-- segment is clear of that -- BeamFlow, for a beam leg it cast last frame.)
+-- Conservative: a whole coarse cell with a moving part in it counts.
+function Occupancy.MovingClear(origin: Vector3, displacement: Vector3, ignore: { [Instance]: boolean }?): boolean
+	if not ready or not Occupancy.Enabled then
+		return false
+	end
+	refreshDynamic()
+	if next(dynamic) == nil then
+		return true
+	end
+	return not walk(origin, displacement, COARSE, function(cx: number, cy: number, cz: number): boolean
+		local moving = dynamic[cellKey(cx, cy, cz)]
+		if not moving then
+			return false
+		end
+		for index = 3, #moving, 3 do
+			if not (ignore and ignore[moving[index]]) then
+				return true
+			end
+		end
+		return false
+	end)
+end
+
 -- Counters since the last call (DebugService's Stats tab), then reset.
 function Occupancy.TakeStats()
 	local snapshot = table.clone(stats)

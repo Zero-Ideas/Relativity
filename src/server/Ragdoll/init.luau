@@ -190,8 +190,13 @@ local function replaceJoints(character: Model, humanoid: Humanoid)
 			part.CanCollide = part.Name ~= "HumanoidRootPart"
 		end
 	end
+	local animated = {}
 	for _, joint in character:GetDescendants() do
-		if joint:IsA("Motor6D") then motors[joint] = joint.Enabled end
+		if joint:IsA("Motor6D") then
+			motors[joint] = joint.Enabled
+		elseif joint:IsA("AnimationConstraint") then
+			animated[joint] = joint.Enabled
+		end
 	end
 	originalRigSettings[character] = {
 		RequiresNeck = humanoid.RequiresNeck,
@@ -202,6 +207,7 @@ local function replaceJoints(character: Model, humanoid: Humanoid)
 		GettingUp = humanoid:GetStateEnabled(Enum.HumanoidStateType.GettingUp),
 		AnimateEnabled = animateScript and animateScript:IsA("LocalScript") and animateScript.Enabled,
 		Motors = motors,
+		Animated = animated,
 	}
 	-- Necessary for Ragdolling to function properly
 	humanoid.BreakJointsOnDeath = false
@@ -280,6 +286,16 @@ local function replaceJoints(character: Model, humanoid: Humanoid)
 		end
 	end
 
+	-- Upgraded avatar joints (no Motor6Ds): each limb is held by a kinematic
+	-- AnimationConstraint over a BallSocketConstraint that's already there
+	-- with limits. Switching the AnimationConstraint off leaves the limb on
+	-- its ball socket. Root stays: the body keeps riding the root part.
+	for joint in animated do
+		if joint.Name ~= "Root" and joint.Parent and joint.Parent:FindFirstChildWhichIsA("BallSocketConstraint") then
+			joint.Enabled = false
+		end
+	end
+
 	humanoid.AutoRotate = false -- Disabling AutoRotate prevents the Character rotating in first person or Shift-Lock
 	character:SetAttribute("LastRag", tick()) -- Used for anti-cheats to prevent flying Ragdolls from getting flagged
 end
@@ -304,6 +320,8 @@ local function resetJoints(character: Model, humanoid: Humanoid)
 		-- Re-enable original Motor6D joints
 		if instance:IsA("Motor6D") then
 			instance.Enabled = if original and original.Motors[instance] ~= nil then original.Motors[instance] else true
+		elseif instance:IsA("AnimationConstraint") then
+			instance.Enabled = if original and original.Animated[instance] ~= nil then original.Animated[instance] else true
 		end
 	end
 

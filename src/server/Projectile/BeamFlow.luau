@@ -58,6 +58,8 @@ local Planner = require(ProjectileShared:WaitForChild("StepPlanner"))
 local BeamWire = require(ProjectileShared:WaitForChild("BeamWire"))
 
 local Raycast = require(script.Parent.Raycast)
+local Occupancy = require(script.Parent.Occupancy)
+local CollisionLOD = require(script.Parent.CollisionLOD)
 local Profile = require(script.Parent.Profile)
 
 local Kind, FlowOp, FlowFlag, Section, DeathKind =
@@ -79,6 +81,13 @@ local EXIT_STEP = 0.05
 -- Cuts at most this many points into a beam per frame (a pathological
 -- crowd of thin things).
 local MAX_CONTACTS = 64
+-- Steady legs: a leg whose ends only slid along its own line since last
+-- frame (within this many studs) was found clear there then, so only the
+-- stretch it newly covers is cast -- as long as no moving part's mark is
+-- anywhere along it. Every leg is still cast whole one frame in FULL_EVERY
+-- (staggered), for anchored parts moved by scripts.
+local STEADY = 0.05
+local FULL_EVERY = 8
 
 local function pinned(kind: number): boolean
 	return kind == CUT or kind == CORNER or kind == IN or kind == OUT
@@ -93,7 +102,8 @@ end
 --------------------------------------------------------------------------------
 
 local flows: { any } = {}
-local stats = { Beams = 0, Points = 0, Tickets = 0, Casts = 0, Contacts = 0 }
+local stats = { Beams = 0, Points = 0, Tickets = 0, Casts = 0, Contacts = 0, Corners = 0, Cuts = 0, Passes = 0,
+	Released = 0, Steady = 0 }
 
 local function newPoint(flow: any, kind: number, pos: Vector3, vel: Vector3, tau: number, age: number): any
 	local id = flow.nextId
@@ -166,6 +176,7 @@ function Flow.New(chain: any, settings: any): any
 		finished = false,
 	}
 	flow.proxy = { Radius = flow.radius, _rayParams = flow.rayParams }
+	flow.ignore = Raycast.ignoreSetFor(flow.rayParams)
 	table.insert(flows, flow)
 	return flow
 end
@@ -401,17 +412,78 @@ end
 
 -- First thing the beam's body meets from `from` along `direction` within
 -- `length`: (distance, contact) or nil.
+-- One engine cast of `length` studs from `start` along `direction`.
+local function engineCast(flow: any, start: Vector3, direction: Vector3, length: number): RaycastResult?
+	local displacement = direction * length
+	local radius = flow.radius
+	if radius > 0 then
+		radius = CollisionLOD.Radius(ChunkManager.GetEntityChunkMask(), ChunkManager.ChunkSize, ChunkManager.UseY, start,
+			displacement, radius)
+	end
+	Profile.Count(if radius > 0 then "BeamFlowSpheres" else "BeamFlowRays", 1)
+	Profile.Count("BeamFlowEngineStuds", length)
+	return if radius > 0 then workspace:Spherecast(start, radius, displacement, flow.rayParams)
+		else workspace:Raycast(start, displacement, flow.rayParams)
+end
+
+-- Engine casts start this far before a suspect stretch: the point there is
+-- in an unmarked voxel, so a sphere at it touches nothing (and a cast can't
+-- miss what its sphere already overlaps at the start).
+local SPAN_LEAD = 0.05
+
+-- One leg's body. Occupancy says which stretches of it could touch
+-- anything (SuspectSpans); only those are cast by the engine -- a bounce
+-- leg pays for the few studs at each wall, not its whole length.
+local function castOnce(flow: any, origin: Vector3, displacement: Vector3): any?
+	local t0 = os.clock()
+	local spans = Occupancy.SuspectSpans(origin, displacement, flow.radius, flow.ignore)
+	local t1 = os.clock()
+	Profile.Add("BeamFlowOccupancy", t1 - t0)
+	if spans and #spans == 0 then
+		return nil
+	end
+	local length = displacement.Magnitude
+	if length < 1e-6 then
+		return nil
+	end
+	local direction = displacement / length
+	local result, offset = nil, 0
+	if not spans then
+		result = engineCast(flow, origin, direction, length)
+	else
+		for index = 1, #spans, 2 do
+			local from = math.max(spans[index] * length - SPAN_LEAD, 0)
+			local to = math.min(spans[index + 1] * length + SPAN_LEAD, length)
+			if to - from > 1e-4 then
+				result = engineCast(flow, origin + direction * from, direction, to - from)
+				if result then
+					offset = from
+					break
+				end
+			end
+		end
+	end
+	Profile.Add("BeamFlowEngine", os.clock() - t1)
+	if not result then
+		return nil
+	end
+	return { Position = result.Position, Normal = result.Normal, Instance = result.Instance, Distance = offset + result.Distance }
+end
+
 local function cast(flow: any, from: Vector3, direction: Vector3, length: number): (number?, any?)
+	local started = os.clock()
 	local traveled = 0
 	while traveled < length - 1e-4 do
 		local distance = math.min(length - traveled, MAX_CAST)
 		stats.Casts += 1
-		local contact = Raycast.castMovement(flow.proxy, from + direction * traveled, direction * distance)
+		local contact = castOnce(flow, from + direction * traveled, direction * distance)
 		if contact then
+			Profile.Add("BeamFlowCasts", os.clock() - started)
 			return traveled + (contact.Distance or 0), contact
 		end
 		traveled += distance
 	end
+	Profile.Add("BeamFlowCasts", os.clock() - started)
 	return nil, nil
 end
 
@@ -543,6 +615,7 @@ end
 
 -- Lets go of pinned point `index` (its surface is gone from the beam).
 local function release(flow: any, index: number)
+	stats.Released += 1
 	local points = flow.points
 	local point = points[index]
 	local newer = points[index + 1]
@@ -661,6 +734,7 @@ local function contactAt(flow: any, index: number, distance: number, direction: 
 	local ghost = if exitPoint then ghostOf(exitPoint, exitVel, exitTau) else ghostOf(b.pos, b.vel, b.tau)
 
 	if reaction == "bounce" then
+		stats.Corners += 1
 		local corner = newPoint(flow, CORNER, position, vel, tau, age)
 		corner.normal, corner.part, corner.prevTau, corner.plane = normal, part, tau, position
 		insertAt(flow, index, corner)
@@ -686,6 +760,7 @@ local function contactAt(flow: any, index: number, distance: number, direction: 
 	end
 
 	if reaction == "cut" then
+		stats.Cuts += 1
 		local cut = newPoint(flow, CUT, position, vel, tau, age)
 		cut.normal, cut.part, cut.entity, cut.prevTau, cut.ghost = normal, part, entity, tau, ghost
 		table.insert(flow.impacts, { position, normal, impactKind })
@@ -713,6 +788,7 @@ local function contactAt(flow: any, index: number, distance: number, direction: 
 	end
 
 	-- passes through (pierce / penetrate / ghost: something it ignores)
+	stats.Passes += 1
 	local entry = newPoint(flow, IN, position, vel, tau, age)
 	entry.normal, entry.part, entry.entity, entry.prevTau, entry.passKind = normal, part, entity, tau, reaction
 	entry.ghost = ghost
@@ -767,6 +843,42 @@ end
 
 local frameNumber = 0
 
+-- Free points that add nothing -- on the straight line between their
+-- neighbours, moving with them, their material in step -- go. (Mirrored
+-- bounce legs and steady stretches leave plenty.)
+local COLLINEAR = 0.05 -- studs off the line
+local function collapse(flow: any)
+	local points = flow.points
+	local index = #points - 1
+	while index >= 2 do
+		local p = points[index]
+		local newer, older = points[index + 1], points[index - 1]
+		if p.kind == FREE and not p.marker and not p.gap and not newer.gap and newer.kind == FREE and older.kind == FREE then
+			local span = older.pos - newer.pos
+			local lengthSq = span:Dot(span)
+			if lengthSq > 1e-6 then
+				local t = (p.pos - newer.pos):Dot(span) / lengthSq
+				if t > 0 and t < 1 then
+					local onLine = (newer.pos + span * t - p.pos).Magnitude <= COLLINEAR
+					local velocity = newer.vel:Lerp(older.vel, t)
+					local inStep = (velocity - p.vel).Magnitude <= 0.005 * math.max(p.vel.Magnitude, 1)
+					local tau = newer.tau + (older.tau - newer.tau) * t
+					if onLine and inStep and math.abs(tau - p.tau) <= 0.01 then
+						removeAt(flow, index)
+					end
+				end
+			end
+		end
+		index -= 1
+	end
+end
+
+-- How far `p` is off the line through `origin` along `direction`.
+local function offLine(p: Vector3, origin: Vector3, direction: Vector3): number
+	local v = p - origin
+	return (v - direction * v:Dot(direction)).Magnitude
+end
+
 local function collide(flow: any)
 	frameNumber += 1
 	local points = flow.points
@@ -817,15 +929,36 @@ local function collide(flow: any)
 				continue
 			end
 			local heading = aim / reach
+			local lastA = a.lastPos
+			if lastA and a.lastOlder == b and (frameNumber + a.id) % FULL_EVERY ~= 0
+				and offLine(lastA, a.pos, heading) < STEADY and offLine(b.pos, a.pos, heading) < STEADY
+				and (a.pos - lastA):Dot(heading) >= -1e-3
+				and Occupancy.MovingClear(a.pos, b.pos - a.pos, flow.ignore) then
+				-- Same line into the same spot (and nothing moving near it):
+				-- the surface is still there. Only the material moved on.
+				stats.Steady += 1
+				local distance = (b.pos - a.pos).Magnitude
+				local tau = if farTau then a.tau + (farTau - a.tau) * math.clamp(distance / reach, 0, 1)
+					else a.tau - distance / math.max(a.vel.Magnitude, 1e-3)
+				b.tau = math.max(tau, b.tau)
+				b.age = math.max(flow.clock - b.tau, 0)
+				flowedThrough(flow, b)
+				index -= 1
+				continue
+			end
 			local distance, contact = cast(flow, a.pos, heading, reach + (if farPos then 0 else PIN_REACH))
 			if contact and distance then
-				local target = targetOf(contact.Instance)
-				local same = target == targetOf(b.part)
+				local point = a.pos + heading * distance
+				local normal = SafeMath.unit(contact.Normal, -heading)
+				-- the same surface: the same thing, or the same plane (a wall of
+				-- several parts, a hit a hair off), or right where it was
+				local same = targetOf(contact.Instance) == targetOf(b.part)
+					or (b.normal and normal:Dot(b.normal) > 0.95 and math.abs((point - b.pos):Dot(b.normal)) < 0.5)
+					or (point - b.pos).Magnitude < 1
 				local before = (b.pos - a.pos).Magnitude
 				if same or distance >= before - 1e-3 then
-					local point = a.pos + heading * distance
 					b.pos = point
-					b.normal = SafeMath.unit(contact.Normal, b.normal or -heading)
+					b.normal = normal
 					b.part = if same then b.part else contact.Instance
 					local tau = if farTau then a.tau + (farTau - a.tau) * math.clamp(distance / reach, 0, 1)
 						else a.tau - distance / math.max(a.vel.Magnitude, 1e-3)
@@ -848,13 +981,40 @@ local function collide(flow: any)
 			continue -- (same leg again, now to a free point)
 		end
 		-- a leg of plain material
-		local distance, contact = cast(flow, a.pos, direction, length)
+		local distance, contact = nil, nil
+		local lastA, lastB = a.lastPos, b.lastPos
+		if lastA and lastB and a.lastOlder == b and (frameNumber + a.id) % FULL_EVERY ~= 0
+			and offLine(lastA, a.pos, direction) < STEADY and offLine(lastB, a.pos, direction) < STEADY
+			and Occupancy.MovingClear(a.pos, offset, flow.ignore) then
+			-- Slid along its own line: last frame covered [lo, hi] of it
+			stats.Steady += 1
+			local t1, t2 = (lastA - a.pos):Dot(direction), (lastB - a.pos):Dot(direction)
+			local lo, hi = math.min(t1, t2), math.max(t1, t2)
+			if lo > 1e-3 then
+				distance, contact = cast(flow, a.pos, direction, math.min(lo, length))
+			end
+			if not contact and hi < length - 1e-3 then
+				local from = math.max(hi, 0)
+				local d, c = cast(flow, a.pos + direction * from, direction, length - from)
+				if c and d then
+					distance, contact = from + d, c
+				end
+			end
+		else
+			distance, contact = cast(flow, a.pos, direction, length)
+		end
 		if contact and distance and contacts < MAX_CONTACTS then
 			contacts += 1
 			index = contactAt(flow, index, distance, direction, contact, state)
 			continue
 		end
 		index -= 1
+	end
+	-- (what each leg was, for next frame's steady test)
+	for k = 1, #points do
+		local point = points[k]
+		point.lastPos = point.pos
+		point.lastOlder = if k > 1 and not point.gap then points[k - 1] else nil
 	end
 end
 
@@ -966,17 +1126,26 @@ function Flow.Step(flow: any, globalDt: number)
 	local dt = globalDt * scale
 	if dt > 0 then
 		flow.clock += dt
+		local t0 = os.clock()
 		advance(flow, dt)
 		flowPast(flow)
 		unpin(flow) -- (right after: a back end that just bounced lets its corner go now)
+		local t1 = os.clock()
 		collide(flow)
+		local t2 = os.clock()
+		collapse(flow)
+		Profile.Add("BeamFlowMove", t1 - t0)
+		Profile.Add("BeamFlowCollide", t2 - t1)
+		Profile.Add("BeamFlowCollapse", os.clock() - t2)
 	end
 	local points = flow.points
 	local front = points[1]
 	-- (this frame's absorptions first: material that stopped at a wall
 	-- this frame mustn't read as having run out)
+	local t3 = os.clock()
 	settleTickets(flow)
 	expireTickets(flow, if front then front.tau else (if flow.closed then nil else -math.huge), front and front.pos)
+	Profile.Add("BeamFlowTickets", os.clock() - t3)
 	if flow.closed and #points <= 1 then
 		if points[1] then
 			removeAt(flow, 1)
@@ -1223,14 +1392,49 @@ function Flow.Describe(): { string }
 	return lines
 end
 
+-- Shape of every live beam (debugging): how many separate pieces, how many
+-- points each has, and how long they are.
+function Flow.Anatomy(): { [string]: number }
+	local pieces, single, short, total, length, released = 0, 0, 0, 0, 0, 0
+	for _, flow in flows do
+		local points = flow.points
+		local count, pieceLength = 0, 0
+		for index = 1, #points do
+			local point = points[index]
+			count += 1
+			total += 1
+			local newer = points[index + 1]
+			if newer and not newer.gap then
+				pieceLength += (newer.pos - point.pos).Magnitude
+			else
+				pieces += 1
+				length += pieceLength
+				if count <= 2 then
+					single += 1
+				end
+				if pieceLength < 8 then
+					short += 1
+				end
+				count, pieceLength = 0, 0
+			end
+			if point.kind == FREE and (point.marker or point.ghost) then
+				released += 1
+			end
+		end
+	end
+	return { Pieces = pieces, TwoPointPieces = single, ShortPieces = short, Points = total,
+		AverageLength = if pieces > 0 then length / pieces else 0 }
+end
+
 function Flow.TakeStats(): { [string]: number }
 	local points, tickets = 0, 0
 	for _, flow in flows do
 		points += #flow.points
 		tickets += #flow.tickets
 	end
-	local snapshot = { Beams = #flows, Points = points, Tickets = tickets, Casts = stats.Casts, Contacts = stats.Contacts }
-	stats.Casts, stats.Contacts = 0, 0
+	local snapshot = { Beams = #flows, Points = points, Tickets = tickets, Casts = stats.Casts, Contacts = stats.Contacts,
+		Corners = stats.Corners, Cuts = stats.Cuts, Passes = stats.Passes, Released = stats.Released, Steady = stats.Steady }
+	stats.Casts, stats.Contacts, stats.Corners, stats.Cuts, stats.Passes, stats.Released, stats.Steady = 0, 0, 0, 0, 0, 0, 0
 	return snapshot
 end
 

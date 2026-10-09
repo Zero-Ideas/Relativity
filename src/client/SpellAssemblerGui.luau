@@ -1328,6 +1328,15 @@ local chargeGui: ScreenGui? = nil
 local chargeFill: Frame? = nil
 local chargeText: TextLabel? = nil
 local chargeConnection: RBXScriptConnection? = nil
+
+-- The LocalPlayer's "Casting" attribute mirrors charging / channelling, for
+-- place scripts (MainGui.Animation faces the mouse only while it's set).
+local function syncCasting()
+	local casting = charging or holdingCast
+	if player:GetAttribute("Casting") ~= casting then
+		player:SetAttribute("Casting", casting)
+	end
+end
 -- The active card compiled once, with its circle spec: the same
 -- SpellCircleLayout.Build the server broadcasts, so the caster's own circle
 -- draws instantly and matches what everyone else sees.
@@ -1404,6 +1413,7 @@ end
 
 local function stopChargeBar()
 	charging = false
+	syncCasting()
 	if chargeConnection then
 		chargeConnection:Disconnect()
 		chargeConnection = nil
@@ -1457,6 +1467,7 @@ function SpellAssemblerGui.Cast()
 			return
 		end
 		charging = true
+		syncCasting()
 		chargeStarted = os.clock()
 		channelRemote:FireServer("ChargeBegin")
 		startChargeBar()
@@ -1468,6 +1479,7 @@ function SpellAssemblerGui.Cast()
 	end
 	local mouse = player:GetMouse()
 	holdingCast = true
+	syncCasting()
 	sendCast(mouse.Hit.Position)
 	local character = player.Character
 	if character and activeCache.spec then
@@ -1535,6 +1547,7 @@ function SpellAssemblerGui.StopCast()
 	end
 	if not holdingCast then return end
 	holdingCast = false
+	syncCasting()
 	channelRemote:FireServer("Stop")
 	if player.Character then
 		SpellCircleVFX.End(player.Character)

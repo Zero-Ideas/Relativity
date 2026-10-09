@@ -1580,7 +1580,9 @@ Projectile.SetBeamSpanStep(function(globalDt: number)
 
 	local replicateStarted = os.clock()
 	replicate(globalDt)
+	local flowStream = os.clock()
 	Flow.Replicate()
+	Profile.Add("BeamFlowStream", os.clock() - flowStream)
 	for _, chain in endedFlows do
 		table.insert(ended, chain)
 	end
