@@ -126,23 +126,11 @@ local stats = { Checks = 0, Skipped = 0, Coarse = 0, StaticCells = 0, DistinctMa
 local blockedByMoving = false -- set by fineOccupied when a moving part's cell is what blocked
 local refineCpu, refineProbes, refineYields = 0, 0, 0
 
--- Coarse cells static marks were added to since the last TakeStaticChanges
--- (BeamChain wakes beam samples sleeping in them). Capped; past the cap
--- the taker hears "everything changed".
-local MAX_CHANGED = 4096
-local changedStatic: { number } = {}
-local changedOverflow = false
-
 local function setStatic(key: number, mask: buffer)
 	if static[key] == mask then return end
 	static[key] = mask
 	if not isWorker then
 		dirtyCells[key] = true
-		if #changedStatic < MAX_CHANGED then
-			table.insert(changedStatic, key)
-		else
-			changedOverflow = true
-		end
 		if schedulePublish then schedulePublish() end
 	end
 end
@@ -828,77 +816,6 @@ function Occupancy.SegmentClear(origin: Vector3, displacement: Vector3, radius: 
 	end
 	stats.Skipped += 1
 	return true
-end
-
--- Are these centrelines (origin, displacement pairs) clear of everything a
--- raycast could hit? Same meaning as SegmentClear for each: a sweep of
--- radius up to MaxRadius along any of them hits nothing. BeamChain puts beam
--- samples to sleep along such lines. Returns "clear"; "moving" when a moving
--- part's mark (not excluded by `ignore`) is on one; "static" when static
--- marks are (FINE voxels grown by PAD are coarse: a caller may still prove
--- it clear another way); "unknown" when this can't tell (not baked, outside
--- scanned terrain). Not counted in the skip stats.
-function Occupancy.LinesClear(lines: { Vector3 }, ignore: { [Instance]: boolean }?): string
-	if not ready or not Occupancy.Enabled then
-		return "unknown"
-	end
-	refreshDynamic()
-	local verdict = "clear"
-	for index = 1, #lines, 2 do
-		local origin, displacement = lines[index], lines[index + 1]
-		if hasTerrain and not insideTerrainScan(origin, origin + displacement) then
-			return "unknown"
-		end
-		if walk(origin, displacement, COARSE, coarseOccupied) then
-			blockedByMoving = false
-			currentIgnore = ignore
-			local blocked = walk(origin, displacement, FINE, fineOccupied)
-			currentIgnore = nil
-			if blocked then
-				if blockedByMoving then
-					return "moving"
-				end
-				verdict = "static"
-			end
-		end
-	end
-	return verdict
-end
-
--- Adds the key of every coarse cell the segment passes through to `into`.
-function Occupancy.CellsAlong(origin: Vector3, displacement: Vector3, into: { [number]: boolean })
-	walk(origin, displacement, COARSE, function(cx: number, cy: number, cz: number): boolean
-		into[cellKey(cx, cy, cz)] = true
-		return false
-	end)
-end
-
--- Does the map have terrain? (An engine query that skips terrain must
--- check it itself then.)
-function Occupancy.HasTerrain(): boolean
-	return hasTerrain
-end
-
--- Coarse cell edge and keys, for callers keeping an index aligned with this
--- grid (BeamChain's sleeping samples).
-Occupancy.Coarse = COARSE
-function Occupancy.CoarseKey(cx: number, cy: number, cz: number): number
-	return cellKey(cx, cy, cz)
-end
-
--- This frame's moving-part marks: coarse key -> { lo, hi, owner, lo, hi,
--- owner, ... }. Read only.
-function Occupancy.DynamicMarks(): { [number]: { any } }
-	refreshDynamic()
-	return dynamic
-end
-
--- Coarse keys that gained static marks since the last call, and whether
--- more changed than were kept (then treat everything as changed).
-function Occupancy.TakeStaticChanges(): ({ number }, boolean)
-	local keys, overflow = changedStatic, changedOverflow
-	changedStatic, changedOverflow = {}, false
-	return keys, overflow
 end
 
 -- Counters since the last call (DebugService's Stats tab), then reset.
