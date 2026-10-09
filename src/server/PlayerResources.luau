@@ -4,6 +4,7 @@
 local Players = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local RunService = game:GetService("RunService")
+local FrameProfiler = require(game:GetService("ReplicatedStorage"):WaitForChild("Shared"):WaitForChild("FrameProfiler"))
 local Shared = ReplicatedStorage:WaitForChild("Shared")
 local Entity = require(Shared.Entity)
 local SpellSettings = require(Shared.SpellSettings)
@@ -118,7 +119,7 @@ Players.PlayerRemoving:Connect(function(player)
 end)
 
 local elapsed = 0
-RunService.Heartbeat:Connect(function(dt: number)
+FrameProfiler.Connect(RunService.Heartbeat, "PlayerResources.Heartbeat", function(dt: number)
 	elapsed += dt
 	if elapsed < 0.1 then return end
 	local interval = elapsed

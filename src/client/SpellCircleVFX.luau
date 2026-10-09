@@ -36,6 +36,7 @@
 local Players = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local RunService = game:GetService("RunService")
+local FrameProfiler = require(game:GetService("ReplicatedStorage"):WaitForChild("Shared"):WaitForChild("FrameProfiler"))
 
 local Shared = ReplicatedStorage:WaitForChild("Shared")
 local VisualOffload = require(Shared.VisualOffload)
@@ -1005,7 +1006,7 @@ end
 
 local function ensureRunning()
 	if not connection then
-		connection = RunService.RenderStepped:Connect(step)
+		connection = FrameProfiler.Connect(RunService.RenderStepped, "SpellCircleVFX.RenderStepped", step)
 	end
 end
 

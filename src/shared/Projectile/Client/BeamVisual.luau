@@ -10,6 +10,7 @@ local Geometry = require(script.Parent.BeamGeometry)
 local Ribbon = require(script.Parent.BeamRibbon)
 local View = require(script.Parent.View)
 local RunService = game:GetService("RunService")
+local FrameProfiler = require(game:GetService("ReplicatedStorage"):WaitForChild("Shared"):WaitForChild("FrameProfiler"))
 local Planner = require(script.Parent.Parent.Parent.Projectile.StepPlanner)
 local Prediction = require(script.Parent.Prediction)
 local Heartbeat = require(script.Parent.Parent.Parent.Heartbeat)
@@ -307,7 +308,7 @@ local function draw(rig: Types.Rig)
 		for index = 1, #state.points-1 do table.insert(spans, { state.points[index], state.points[index+1] }) end
 	end
 	pending[state] = { segments = Geometry.Split(spans), joints = {} }
-	if not applyConnection then applyConnection = RunService.PreSimulation:Connect(BeamVisual.ApplyGroups) end
+	if not applyConnection then applyConnection = FrameProfiler.Connect(RunService.PreSimulation, "BeamVisual.PreSimulation", BeamVisual.ApplyGroups) end
 end
 function BeamVisual.Build(data: Protocol.SpawnPayload): (Instance, Types.Rig)
 	local beam = assert(data.Beam)
@@ -327,7 +328,7 @@ function BeamVisual.Build(data: Protocol.SpawnPayload): (Instance, Types.Rig)
 				radius = math.max(beam.Radius, .025), segments = {}, joints = {}, members = {}, byId = {}, visible = false, dirty = true }
 			groups[beam.ChannelId] = group
 			model.Parent = workspace
-			if not applyConnection then applyConnection = RunService.PreSimulation:Connect(BeamVisual.ApplyGroups) end
+			if not applyConnection then applyConnection = FrameProfiler.Connect(RunService.PreSimulation, "BeamVisual.PreSimulation#2", BeamVisual.ApplyGroups) end
 		end
 		-- Each logical packet owns only metadata, not cylinders/Motor6Ds. Its
 		-- placeholder can retire without deleting another packet's shared rig.

@@ -11,7 +11,7 @@
 --     src/shared/VisualOffload.luau (157 lines)
 --     src/shared/ClientPresentation.luau (62 lines)
 --     src/shared/ChunkManager.luau (651 lines)
---     src/shared/Entity.luau (1101 lines)
+--     src/shared/Entity.luau (1102 lines)
 --   Shared projectile motion and protocol
 --     src/shared/Projectile/Motion.luau (227 lines)
 --     src/shared/Projectile/StepPlanner.luau (101 lines)
@@ -35,7 +35,7 @@
 --     src/server/Projectile/Profile.luau (67 lines)
 --     src/server/Projectile/ApplyPass.luau (89 lines)
 --     src/server/Projectile/Parallel.luau (1076 lines)
---     src/server/Projectile/init.luau (1589 lines)
+--     src/server/Projectile/init.luau (1590 lines)
 --     src/server/Projectile/BeamProjectileHandler.luau (377 lines)
 --     src/server/Projectile/BeamChain.luau (1822 lines)
 --     src/server/Projectile/BeamFlow.luau (1447 lines)
@@ -50,8 +50,8 @@
 --     src/shared/Projectile/Client/Impact.luau (90 lines)
 --     src/shared/Projectile/Client/VisualModel.luau (771 lines)
 --     src/shared/Projectile/Client/BeamGeometry.luau (119 lines)
---     src/shared/Projectile/Client/BeamVisual.luau (565 lines)
---     src/shared/Projectile/Client/BeamChainVisual.luau (848 lines)
+--     src/shared/Projectile/Client/BeamVisual.luau (566 lines)
+--     src/shared/Projectile/Client/BeamChainVisual.luau (849 lines)
 --     src/shared/Projectile/Client/BeamRibbon.luau (115 lines)
 --     src/shared/Projectile/Client/BeamFlowVisual.luau (418 lines)
 --     src/shared/Projectile/Client/init.luau (958 lines)
@@ -1518,6 +1518,7 @@ return ChunkManager
 ]]
 
 local RunService = game:GetService("RunService")
+local FrameProfiler = require(game:GetService("ReplicatedStorage"):WaitForChild("Shared"):WaitForChild("FrameProfiler"))
 local Players = game:GetService("Players")
 
 local Heartbeat = require(script.Parent.Heartbeat)
@@ -2284,7 +2285,7 @@ if RunService:IsServer() then
 	end
 	-- (real time, not dilated: a frozen or slowed world doesn't stop a fall)
 	local sinceCheck = 0
-	RunService.Heartbeat:Connect(function(dt: number)
+	FrameProfiler.Connect(RunService.Heartbeat, "Entity.Heartbeat", function(dt: number)
 		sinceCheck += dt
 		if sinceCheck < Entity.GroundCheckInterval then
 			return
@@ -9051,6 +9052,7 @@ return Parallel
 
 
 local RunService = game:GetService("RunService")
+local FrameProfiler = require(game:GetService("ReplicatedStorage"):WaitForChild("Shared"):WaitForChild("FrameProfiler"))
 local Shared = game:GetService("ReplicatedStorage"):WaitForChild("Shared")
 
 local Heartbeat = require(Shared:WaitForChild("Heartbeat"))
@@ -10314,7 +10316,7 @@ end, { Name = "ProjectileSystem.Step", Priority = 5 })
 -- Parallel movement dispatch: before physics, so the workers' parallel phase
 -- finishes before the Heartbeat loop above collects it (dt is this frame's,
 -- dilated the same way Heartbeat.Connect callbacks receive it).
-RunService.PreSimulation:Connect(function(dt: number)
+FrameProfiler.Connect(RunService.PreSimulation, "Projectile.PreSimulation", function(dt: number)
 	local started = os.clock()
 	if stepEndedAt > 0 and stepEndedAt > dispatchEndedAt then
 		-- our last step -> this dispatch: replication, other scripts' callbacks,
@@ -15669,6 +15671,7 @@ local Geometry = require(script.Parent.BeamGeometry)
 local Ribbon = require(script.Parent.BeamRibbon)
 local View = require(script.Parent.View)
 local RunService = game:GetService("RunService")
+local FrameProfiler = require(game:GetService("ReplicatedStorage"):WaitForChild("Shared"):WaitForChild("FrameProfiler"))
 local Planner = require(script.Parent.Parent.Parent.Projectile.StepPlanner)
 local Prediction = require(script.Parent.Prediction)
 local Heartbeat = require(script.Parent.Parent.Parent.Heartbeat)
@@ -15966,7 +15969,7 @@ local function draw(rig: Types.Rig)
 		for index = 1, #state.points-1 do table.insert(spans, { state.points[index], state.points[index+1] }) end
 	end
 	pending[state] = { segments = Geometry.Split(spans), joints = {} }
-	if not applyConnection then applyConnection = RunService.PreSimulation:Connect(BeamVisual.ApplyGroups) end
+	if not applyConnection then applyConnection = FrameProfiler.Connect(RunService.PreSimulation, "BeamVisual.PreSimulation", BeamVisual.ApplyGroups) end
 end
 function BeamVisual.Build(data: Protocol.SpawnPayload): (Instance, Types.Rig)
 	local beam = assert(data.Beam)
@@ -15986,7 +15989,7 @@ function BeamVisual.Build(data: Protocol.SpawnPayload): (Instance, Types.Rig)
 				radius = math.max(beam.Radius, .025), segments = {}, joints = {}, members = {}, byId = {}, visible = false, dirty = true }
 			groups[beam.ChannelId] = group
 			model.Parent = workspace
-			if not applyConnection then applyConnection = RunService.PreSimulation:Connect(BeamVisual.ApplyGroups) end
+			if not applyConnection then applyConnection = FrameProfiler.Connect(RunService.PreSimulation, "BeamVisual.PreSimulation#2", BeamVisual.ApplyGroups) end
 		end
 		-- Each logical packet owns only metadata, not cylinders/Motor6Ds. Its
 		-- placeholder can retire without deleting another packet's shared rig.
@@ -16256,6 +16259,7 @@ return BeamVisual
 ]]
 
 local RunService = game:GetService("RunService")
+local FrameProfiler = require(game:GetService("ReplicatedStorage"):WaitForChild("Shared"):WaitForChild("FrameProfiler"))
 local Shared = script.Parent.Parent.Parent
 local ChunkManager = require(Shared:WaitForChild("ChunkManager"))
 local Heartbeat = require(Shared:WaitForChild("Heartbeat"))
@@ -17073,7 +17077,7 @@ function BeamChainVisual.Enable()
 	end
 	enabled = true
 	VisualOffload.On(BeamWire.Channel, onMessage)
-	applyConnection = RunService.PreSimulation:Connect(apply)
+	applyConnection = FrameProfiler.Connect(RunService.PreSimulation, "BeamChainVisual.PreSimulation", apply)
 end
 
 return BeamChainVisual

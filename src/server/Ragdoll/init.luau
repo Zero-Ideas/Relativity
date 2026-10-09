@@ -4,6 +4,7 @@
 local Players = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local RunService = game:GetService("RunService")
+local FrameProfiler = require(game:GetService("ReplicatedStorage"):WaitForChild("Shared"):WaitForChild("FrameProfiler"))
 
 local Shared = ReplicatedStorage:WaitForChild("Shared")
 local ChunkManager = require(Shared.ChunkManager)
@@ -123,7 +124,7 @@ end
 -- proportional to local time and cancel the portion of engine gravity that
 -- should not occur. Gravity uses scale^2 because both velocity and elapsed time
 -- are dilated: x(realTime) = x(worldTime * scale).
-RunService.Heartbeat:Connect(function()
+FrameProfiler.Connect(RunService.Heartbeat, "Ragdoll.Heartbeat", function()
 	for character, state in trackedRagdolls do
 		if not character.Parent then
 			removeTracking(character)

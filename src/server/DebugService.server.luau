@@ -30,6 +30,7 @@
 local Players = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local RunService = game:GetService("RunService")
+local FrameProfiler = require(game:GetService("ReplicatedStorage"):WaitForChild("Shared"):WaitForChild("FrameProfiler"))
 local DebugStream = require(script.Parent.DebugStream)
 local ServerStorage = game:GetService("ServerStorage")
 local StarterPack = game:GetService("StarterPack")
@@ -124,6 +125,8 @@ do
 end
 local ChunkManager = require(Shared.ChunkManager)
 local Heartbeat = require(Shared.Heartbeat)
+local FrameProfiler = require(Shared.FrameProfiler)
+local EngineStats = require(Shared.EngineStats)
 local Entity = require(Shared.Entity)
 local StatusEffectSys = require(Shared.StatusEffectSys)
 local Projectile = require(script.Parent.Projectile)
@@ -629,15 +632,28 @@ end
 local PROJECTILE_STEP_PRIORITY = 5
 local lastNetTake = os.clock()
 
+-- Every timed script system: the shared Heartbeat's handlers plus every
+-- other frame hook (FrameProfiler), costliest first.
 local function handlerStats(): ({ any }, number)
-	local top, early = {}, 0
-	for index, entry in Heartbeat.TakeProfile() do
+	local all, early = {}, 0
+	for _, entry in Heartbeat.TakeProfile() do
 		if entry.Priority < PROJECTILE_STEP_PRIORITY then
 			early += entry.Ms
 		end
-		if index <= 8 and entry.Ms >= 0.005 then
-			table.insert(top, { Name = entry.Name, Ms = entry.Ms })
+		table.insert(all, { Name = entry.Name, Ms = entry.Ms })
+	end
+	for _, entry in FrameProfiler.Take() do
+		table.insert(all, { Name = entry.Name, Ms = entry.Ms })
+	end
+	table.sort(all, function(a, b)
+		return a.Ms > b.Ms
+	end)
+	local top = {}
+	for index, entry in all do
+		if index > 12 or entry.Ms < 0.005 then
+			break
 		end
+		table.insert(top, entry)
 	end
 	return top, early
 end
@@ -738,6 +754,8 @@ local function buildStats()
 		CastsRay = (profile.CastRay or 0) + (parallel.WorkerReasons and parallel.WorkerReasons[9] or 0) / math.max(parallel.AppliedFrames or 1, 1),
 		Handlers = handlers,
 		EarlyHandlersMs = earlyHandlersMs,
+		EnginePhysics = EngineStats.Physics(),
+		EngineMemory = EngineStats.Memory(6),
 		NetChannels = netStats(),
 		Entities = chunks.TrackedEntityCount,
 		Chunks = chunks.ChunkCount,
@@ -788,7 +806,7 @@ local function refreshTicker()
 		or DebugStream.IsConnected()
 	if needed and not frameConnection then
 		frames, frameTime, worstFrame, sinceSend = 0, 0, 0, 0
-		frameConnection = RunService.Heartbeat:Connect(onFrame)
+		frameConnection = FrameProfiler.Connect(RunService.Heartbeat, "DebugService.Heartbeat", onFrame)
 	elseif not needed and frameConnection then
 		frameConnection:Disconnect()
 		frameConnection = nil

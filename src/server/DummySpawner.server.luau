@@ -5,6 +5,7 @@
 local Players = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local RunService = game:GetService("RunService")
+local FrameProfiler = require(game:GetService("ReplicatedStorage"):WaitForChild("Shared"):WaitForChild("FrameProfiler"))
 local Shared = ReplicatedStorage:WaitForChild("Shared")
 local Entity = require(Shared.Entity)
 local SafeMath = require(Shared.SafeMath)
@@ -255,7 +256,7 @@ VisualOffload.On("DummySpawner", function(data, player)
 end)
 
 local elapsed = 0
-RunService.Heartbeat:Connect(function(dt)
+FrameProfiler.Connect(RunService.Heartbeat, "DummySpawner.Heartbeat", function(dt)
 	for model, state in counters do
 		local move = state.Move
 		if move then

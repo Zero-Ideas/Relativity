@@ -26,6 +26,7 @@
 ]]
 
 local Players = game:GetService("Players")
+local FrameProfiler = require(game:GetService("ReplicatedStorage"):WaitForChild("Shared"):WaitForChild("FrameProfiler"))
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local Signal = require(ReplicatedStorage:WaitForChild("Shared"):WaitForChild("Signal"))
 local UserInputService = game:GetService("UserInputService")
@@ -1430,7 +1431,7 @@ local function startChargeBar()
 	if chargeConnection then
 		chargeConnection:Disconnect()
 	end
-	chargeConnection = game:GetService("RunService").RenderStepped:Connect(function()
+	chargeConnection = FrameProfiler.Connect(game:GetService("RunService").RenderStepped, "SpellAssemblerGui.RenderStepped", function()
 		local level = SpellRunes.ChargeFromHold(os.clock() - chargeStarted)
 		local fill = chargeFill :: Frame
 		local text = chargeText :: TextLabel
@@ -1560,7 +1561,7 @@ local function startAimStream()
 	if aimConnection then return end
 	local mouse = player:GetMouse()
 	local elapsed, last, sinceSend = 0, nil, 0
-	aimConnection = game:GetService("RunService").Heartbeat:Connect(function(dt)
+	aimConnection = FrameProfiler.Connect(game:GetService("RunService").Heartbeat, "SpellAssemblerGui.Heartbeat", function(dt)
 		-- while charging / channelling, and for a while after each cast: a
 		-- Stream's later copies and a released beam re-aim at the live cursor
 		local recent = os.clock() - lastCastAt < AIM_AFTER_CAST

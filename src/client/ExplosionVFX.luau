@@ -69,6 +69,7 @@
 local Players = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local RunService = game:GetService("RunService")
+local FrameProfiler = require(game:GetService("ReplicatedStorage"):WaitForChild("Shared"):WaitForChild("FrameProfiler"))
 
 local Shared = ReplicatedStorage:WaitForChild("Shared")
 local ChunkManager = require(Shared.ChunkManager)
@@ -694,10 +695,10 @@ function ExplosionVFX.Play(position: Vector3, options: PlayOptions?)
 	updateBlast(blast, 0) -- fire zero-delay emitters before the first render
 
 	if not connection then
-		connection = RunService.RenderStepped:Connect(step)
+		connection = FrameProfiler.Connect(RunService.RenderStepped, "ExplosionVFX.RenderStepped", step)
 	end
 	if blast.Shake > 0 and not shakeBound then
-		RunService:BindToRenderStep("ExplosionVFXShake", Enum.RenderPriority.Camera.Value + 1, applyShake)
+		RunService:BindToRenderStep("ExplosionVFXShake", Enum.RenderPriority.Camera.Value + 1, FrameProfiler.Wrap("ExplosionVFX.Shake", applyShake))
 		shakeBound = true
 	end
 end

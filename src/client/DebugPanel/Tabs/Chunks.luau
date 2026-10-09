@@ -8,6 +8,7 @@
 local ContextActionService = game:GetService("ContextActionService")
 local Players = game:GetService("Players")
 local RunService = game:GetService("RunService")
+local FrameProfiler = require(game:GetService("ReplicatedStorage"):WaitForChild("Shared"):WaitForChild("FrameProfiler"))
 local UserInputService = game:GetService("UserInputService")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local Shared = ReplicatedStorage:WaitForChild("Shared")
@@ -578,7 +579,7 @@ return function(window, ReGui)
 		VisualOffload.Fire("DebugChunkWatch", active)
 		if active and not connection then
 		VisualOffload.Fire("DebugRequestChunks")
-		connection = RunService.RenderStepped:Connect(function(dt)
+		connection = FrameProfiler.Connect(RunService.RenderStepped, "DebugPanel.Chunks.RenderStepped", function(dt)
 			sinceRedraw += dt
 			if sinceRedraw >= MAP_REFRESH then
 				sinceRedraw = 0

@@ -60,6 +60,7 @@
 
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local RunService = game:GetService("RunService")
+local FrameProfiler = require(game:GetService("ReplicatedStorage"):WaitForChild("Shared"):WaitForChild("FrameProfiler"))
 local Players = game:GetService("Players")
 local Shared = ReplicatedStorage:WaitForChild("Shared")
 
@@ -187,7 +188,7 @@ end
 -- minus their cosmetic bob), so shots leave the drone even while it's
 -- catching up with a moving character instead of a fixed point beside it.
 local drones: { [Model]: DroneRig.FollowState } = {}
-RunService.Heartbeat:Connect(function(dt: number)
+FrameProfiler.Connect(RunService.Heartbeat, "Shooter.Heartbeat", function(dt: number)
 	local seen: { [Model]: boolean } = {}
 	for _, player in Players:GetPlayers() do
 		local character = player.Character

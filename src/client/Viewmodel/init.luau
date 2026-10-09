@@ -90,6 +90,7 @@
 ]]
 
 local RunService = game:GetService("RunService")
+local FrameProfiler = require(game:GetService("ReplicatedStorage"):WaitForChild("Shared"):WaitForChild("FrameProfiler"))
 local UserInputService = game:GetService("UserInputService")
 local Workspace = game:GetService("Workspace")
 local TweenService = game:GetService("TweenService")
@@ -380,7 +381,7 @@ function Viewmodel.Equip(tool: Tool, character: Model)
 	-- Motor6D.Transform right before Stepped fires, so this is the one spot
 	-- where our Transform override deterministically lands last (see
 	-- ArmRig.luau). NOTE Stepped's dt is the SECOND argument.
-	entry.Connection = RunService.Stepped:Connect(function(_runningTime: number, dt: number)
+	entry.Connection = FrameProfiler.Connect(RunService.Stepped, "Viewmodel.Stepped", function(_runningTime: number, dt: number)
 		if not (handle.Parent and rightArm.Torso.Parent) then
 			-- The tool/character was destroyed out from under us -- clean up
 			-- via Unequip's own restore path rather than erroring every frame.

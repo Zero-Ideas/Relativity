@@ -3,6 +3,7 @@
 local Players = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local RunService = game:GetService("RunService")
+local FrameProfiler = require(game:GetService("ReplicatedStorage"):WaitForChild("Shared"):WaitForChild("FrameProfiler"))
 local Shared = ReplicatedStorage.Shared
 local Schema = require(Shared.ProjectileBenchmark)
 local VisualOffload = require(Shared.VisualOffload)
@@ -105,7 +106,7 @@ return function(window)
 	end, Active = function(active)
 		if active and not sampling then
 			frames, elapsed, worst = 0, 0, 0
-			sampling = RunService.RenderStepped:Connect(function(dt)
+			sampling = FrameProfiler.Connect(RunService.RenderStepped, "DebugPanel.Benchmarks.RenderStepped", function(dt)
 				frames += 1; elapsed += dt; worst = math.max(worst, dt)
 			end)
 		elseif not active and sampling then sampling:Disconnect(); sampling = nil end

@@ -6,12 +6,66 @@
 
 local Players = game:GetService("Players")
 local RunService = game:GetService("RunService")
+local FrameProfiler = require(game:GetService("ReplicatedStorage"):WaitForChild("Shared"):WaitForChild("FrameProfiler"))
 local Stats = game:GetService("Stats")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local Shared = ReplicatedStorage:WaitForChild("Shared")
 local VisualOffload = require(Shared.VisualOffload)
 local Util = require(script.Parent.Parent.Util)
 local ProjectileClient = require(Shared.Projectile.Client)
+local Heartbeat = require(Shared.Heartbeat)
+local FrameProfiler = require(Shared.FrameProfiler)
+local EngineStats = require(Shared.EngineStats)
+
+-- The three "beyond projectiles" lines, shared by the server and client
+-- sections: costliest script systems, engine physics, memory by category.
+local function systemsText(entries: any): string
+	local parts = {}
+	for _, entry in (if typeof(entries) == "table" then entries else {}) do
+		table.insert(parts, string.format("%s %.2f", tostring(entry.Name), tonumber(entry.Ms) or 0))
+	end
+	return if #parts > 0 then table.concat(parts, "  ·  ") else "-"
+end
+
+local function physicsText(p: any): string
+	if typeof(p) ~= "table" then
+		return "-"
+	end
+	local function n(value: any, format: string): string
+		return if typeof(value) == "number" then string.format(format, value) else "-"
+	end
+	return `{n(p.RealFps, "%.0f")} / {n(p.AwakeParts, "%d")} / {n(p.Throttling, "%d")}% / {n(p.Primitives, "%d")} / {n(p.MovingPrimitives, "%d")} / {n(p.Contacts, "%d")}`
+end
+
+local function memoryText(entries: any): string
+	local parts = {}
+	for _, entry in (if typeof(entries) == "table" then entries else {}) do
+		table.insert(parts, string.format("%s %.0f", tostring(entry.Tag), tonumber(entry.Mb) or 0))
+	end
+	return if #parts > 0 then table.concat(parts, "  ·  ") else "-"
+end
+
+-- This client's own costliest script systems (Heartbeat handlers + other frame hooks).
+local function clientSystems(): { any }
+	local all = {}
+	for _, entry in Heartbeat.TakeProfile() do
+		table.insert(all, { Name = entry.Name, Ms = entry.Ms })
+	end
+	for _, entry in FrameProfiler.Take() do
+		table.insert(all, { Name = entry.Name, Ms = entry.Ms })
+	end
+	table.sort(all, function(a, b)
+		return a.Ms > b.Ms
+	end)
+	local top = {}
+	for index, entry in all do
+		if index > 12 or entry.Ms < 0.005 then
+			break
+		end
+		table.insert(top, entry)
+	end
+	return top
+end
 local statLine = Util.statLine
 local fmt, readStat = Util.fmt, Util.readStat
 
@@ -36,6 +90,9 @@ return function(window)
 	local cMemory = statLine(tab, "Memory")
 	local cInstances = statLine(tab, "Instances")
 	local cVisuals = statLine(tab, "Projectile visuals")
+	local cHooks = statLine(tab, "Script systems ms/frame (costliest)")
+	local cPhysics = statLine(tab, "Physics (real FPS / awake parts / throttled % / primitives / moving / contacts)")
+	local cMemoryTags = statLine(tab, "Memory by category (MB)")
 
 	tab:Separator({ Text = "Server" })
 	local sFps = statLine(tab, "Heartbeat FPS")
@@ -64,7 +121,9 @@ return function(window)
 	local sHeap = statLine(tab, "  Lua heap MB / GC freed MB per frame")
 	local sSplit = statLine(tab, "Frame split ms (ours / sim: workers+physics+others / between frames)")
 	local sSim = statLine(tab, "  sim split ms (slowest worker / physics / early handlers / engine+other)")
-	local sHandlers = statLine(tab, "Heartbeat handlers ms/frame (costliest)")
+	local sHandlers = statLine(tab, "Script systems ms/frame (costliest)")
+	local sPhysics = statLine(tab, "Physics (real FPS / awake parts / throttled % / primitives / moving / contacts)")
+	local sMemoryTags = statLine(tab, "Memory by category (MB)")
 	local sNetChannels = statLine(tab, "Network out by channel (msgs/s · KB/s · list items/s)")
 	local sSpawn = statLine(tab, "  spawning ms (count per frame)")
 	local sBeam = statLine(tab, "  beam ms (heads / links / stream), packets (dormant), joiners, links kept whole, new joiners, line casts per frame")
@@ -143,11 +202,9 @@ return function(window)
 		local physicsMs = tonumber(s.PhysicsMs) or 0
 		local earlyMs = tonumber(s.EarlyHandlersMs) or 0
 		sSim(string.format("%.2f / %.2f / %.2f / %.2f", workerMs, physicsMs, earlyMs, math.max(simMs - workerMs - physicsMs - earlyMs, 0)))
-		local handlerParts = {}
-		for _, entry in (if typeof(s.Handlers) == "table" then s.Handlers else {}) do
-			table.insert(handlerParts, string.format("%s %.2f", tostring(entry.Name), tonumber(entry.Ms) or 0))
-		end
-		sHandlers(if #handlerParts > 0 then table.concat(handlerParts, "  ·  ") else "-")
+		sHandlers(systemsText(s.Handlers))
+		sPhysics(physicsText(s.EnginePhysics))
+		sMemoryTags(memoryText(s.EngineMemory))
 		local netParts = {}
 		for _, entry in (if typeof(s.NetChannels) == "table" then s.NetChannels else {}) do
 			table.insert(netParts, string.format("%s %.0f · %.1f · %.0f", tostring(entry.Channel), tonumber(entry.PerSecond) or 0,
@@ -209,7 +266,7 @@ return function(window)
 	local function setActive(active: boolean)
 		if active and not connection then
 			frames, frameTime, worstFrame = 0, 0, 0
-			connection = RunService.RenderStepped:Connect(function(dt)
+			connection = FrameProfiler.Connect(RunService.RenderStepped, "DebugPanel.Stats.RenderStepped", function(dt)
 				frames += 1
 				frameTime += dt
 				if dt > worstFrame then
@@ -241,6 +298,9 @@ return function(window)
 			clientStats.Visuals, clientStats.BeamChains or 0, clientStats.BeamSamples or 0, clientStats.FlowBeams or 0,
 			clientStats.FlowPoints or 0, clientStats.DetailFull or 0,
 			clientStats.DetailReduced or 0, clientStats.DetailBare or 0, clientStats.DetailLit or 0))
+		cHooks(systemsText(clientSystems()))
+		cPhysics(physicsText(EngineStats.Physics()))
+		cMemoryTags(memoryText(EngineStats.Memory(6)))
 	end
 
 	return { Active = setActive, Tick = sample }

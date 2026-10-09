@@ -5,6 +5,7 @@
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local HttpService = game:GetService("HttpService")
 local RunService = game:GetService("RunService")
+local FrameProfiler = require(game:GetService("ReplicatedStorage"):WaitForChild("Shared"):WaitForChild("FrameProfiler"))
 local Shared = ReplicatedStorage:WaitForChild("Shared")
 local Compiler = require(Shared.SpellCompiler)
 local Layout = require(Shared.SpellCircleLayout)
@@ -134,7 +135,7 @@ function Preview.Cooldown(self: any, deadline: number, fired: boolean, manaSpent
 	if deadline <= now then return end
 	active[self] = true
 	if connection then return end
-	connection = RunService.RenderStepped:Connect(function()
+	connection = FrameProfiler.Connect(RunService.RenderStepped, "SpellCardPreview.RenderStepped", function()
 		local time = workspace:GetServerTimeNow()
 		for preview in active do if not preview:Step(time) then active[preview] = nil end end
 		if next(active) == nil and connection then connection:Disconnect(); connection = nil end

@@ -2,6 +2,7 @@
 -- Adapter for the authored MainGui. No legacy cache/remotes or polling loop.
 local Players = game:GetService("Players")
 local RunService = game:GetService("RunService")
+local FrameProfiler = require(game:GetService("ReplicatedStorage"):WaitForChild("Shared"):WaitForChild("FrameProfiler"))
 local UserInputService = game:GetService("UserInputService")
 local ContextActionService = game:GetService("ContextActionService")
 local SpellEditor = require(script.Parent.SpellAssemblerGui)
@@ -27,7 +28,7 @@ end
 
 local function animate()
 	if animatorConnection then return end
-	animatorConnection = RunService.RenderStepped:Connect(function(dt)
+	animatorConnection = FrameProfiler.Connect(RunService.RenderStepped, "MainHud.RenderStepped", function(dt)
 		local unfinished = false
 		local alpha = 1 - math.exp(-14 * dt)
 		for _, bar in bars do
