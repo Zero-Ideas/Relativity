@@ -30,6 +30,12 @@
 	for other UI. Either HUD hides while the spell editor is open (its glass
 	is see-through), and the editor's look follows the "Spell editor
 	opacity" / "background blur" settings.
+
+	Start menu: while the place's "Startmenu" ScreenGui is enabled (the
+	player's copy in PlayerGui, or StarterGui's before that copy arrives),
+	all of this UI is off -- no HUD, no topbar, no menu keys, and any open
+	window closes. It comes on when Startmenu is disabled, and goes off
+	again whenever it's re-enabled (e.g. a respawn that resets it).
 ]]
 
 local Players = game:GetService("Players")
@@ -70,6 +76,8 @@ local mode: Mode = "Mode3"
 local inboxIcon: any = nil
 local hintIcons: { [string]: any } = {} -- key setting -> the topbar icon showing it
 local editorOpen = false -- (the HUD hides behind the editor's glass)
+local START_MENU = "Startmenu"
+local startMenuOpen = false -- (the game UI stays off while it's up)
 
 -- SetCoreGuiEnabled errors until the CoreScripts have registered it.
 local function hideBackpack()
@@ -86,10 +94,11 @@ end
 local function apply()
 	local ours = mode ~= "Dev"
 	GameHud.SetLayout(if mode == "Mode3" then "Mode 3" else "Mode 1")
-	MainHud.SetEnabled(not ours and not editorOpen)
-	GameHud.SetEnabled(ours and not editorOpen)
+	local hidden = editorOpen or startMenuOpen
+	MainHud.SetEnabled(not ours and not hidden)
+	GameHud.SetEnabled(ours and not hidden)
 	-- (GameHud has its own controls; the compact casting panel is the dev UI's)
-	SpellAssemblerGui.SetCompactHudEnabled(not ours)
+	SpellAssemblerGui.SetCompactHudEnabled(not ours and not startMenuOpen)
 	player:SetAttribute("UiMode", mode)
 end
 
@@ -219,7 +228,7 @@ end
 local function bindKeys()
 	local function menu(open: () -> ()): () -> boolean?
 		return function()
-			if editorOpen then
+			if editorOpen or startMenuOpen then
 				return false
 			end
 			open()
@@ -237,11 +246,12 @@ local function bindKeys()
 	Keybinds.Bind("KeySettings", menu(SettingsWindow.Toggle))
 	Keybinds.Bind("KeyDebug", menu(DebugPanel.Toggle))
 	Keybinds.Bind("KeyEditor", function()
+		if startMenuOpen then return false end
 		SpellAssemblerGui.ToggleEditor()
 		return true
 	end)
 	Keybinds.Bind("KeyHotbar", function()
-		if editorOpen then return false end
+		if editorOpen or startMenuOpen then return false end
 		return GameHud.ToggleHotbar()
 	end)
 
@@ -258,6 +268,76 @@ local function bindKeys()
 	refreshHints()
 end
 
+-- The start menu came up or went away (see the module comment).
+local function startMenuChanged()
+	Icon.setTopbarEnabled(not startMenuOpen)
+	if startMenuOpen then
+		SpellAssemblerGui.Close()
+		SpellLibrary.Close()
+		PartyWindow.Close()
+		SettingsWindow.Close()
+		CreditsWindow.Close()
+		ServerBrowser.Close()
+		Notifications.SetOpen(false)
+	end
+	apply()
+end
+
+local function watchStartMenu()
+	local playerGui: Instance? = player:FindFirstChildOfClass("PlayerGui")
+	-- (StarterGui's only counts until the player's own copy has shown up:
+	-- after that, a missing copy means it's gone, not that it's still up)
+	local seenCopy = false
+	local watched: { [Instance]: boolean } = {}
+	local function refresh()
+		local copy = playerGui and playerGui:FindFirstChild(START_MENU)
+		local open = false
+		if copy and copy:IsA("ScreenGui") then
+			seenCopy = true
+			open = copy.Enabled
+		elseif not seenCopy then
+			local template = StarterGui:FindFirstChild(START_MENU)
+			open = template ~= nil and template:IsA("ScreenGui") and template.Enabled
+		end
+		if open ~= startMenuOpen then
+			startMenuOpen = open
+			startMenuChanged()
+		end
+	end
+	local function watch(gui: Instance?)
+		if gui and gui.Name == START_MENU and gui:IsA("ScreenGui") and not watched[gui] then
+			watched[gui] = true
+			gui:GetPropertyChangedSignal("Enabled"):Connect(refresh)
+			gui.Destroying:Connect(function()
+				watched[gui] = nil
+			end)
+		end
+	end
+	local function attach(gui: Instance)
+		playerGui = gui
+		watch(gui:FindFirstChild(START_MENU))
+		gui.ChildAdded:Connect(function(child)
+			watch(child)
+			refresh()
+		end)
+		gui.ChildRemoved:Connect(refresh)
+	end
+	watch(StarterGui:FindFirstChild(START_MENU))
+	StarterGui.ChildAdded:Connect(function(child)
+		watch(child)
+		refresh()
+	end)
+	if playerGui then
+		attach(playerGui)
+	else
+		task.spawn(function()
+			attach(player:WaitForChild("PlayerGui"))
+			refresh()
+		end)
+	end
+	refresh()
+end
+
 function UiMode.start()
 	hideBackpack()
 	ClientSettings.start() -- (defaults now, saved settings once loaded)
@@ -265,6 +345,7 @@ function UiMode.start()
 	GameHud.start()
 	buildTopbar()
 	bindKeys()
+	watchStartMenu() -- (before the first apply: no flash of UI behind it)
 	-- the spell editor's Library button
 	SpellAssemblerGui.SetLibraryOpener(SpellLibrary.Open)
 	SpellAssemblerGui.OpenChanged:Connect(function(isOpen: boolean)
