@@ -1,12 +1,22 @@
 --!strict
 -- Code-built quadcopter: charcoal chassis, four guarded rotors, landing
--- skids, navigation lamps, and a single underside WeaponMount attachment.
+-- skids, navigation lamps, and a small two-jointed arm on the underside
+-- WeaponMount that holds the weapon. Pose() swings the arm so the weapon
+-- points along the aim whatever the chassis is doing (upside down included).
 -- Cosmetic, anchored parts only; no scripts/physics from the equipped Tool.
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local DroneRig = require(ReplicatedStorage.Shared.DroneRig)
 
 local DroneVisual = {}
 export type Rotor = {part: BasePart, offset: CFrame, direction: number}
+export type Rig = {
+	shoulder: BasePart, upper: BasePart, elbow: BasePart, fore: BasePart, wrist: BasePart,
+	weapon: Model?,
+}
+-- Arm lengths (studs): shoulder -> elbow hangs below the chassis and leans
+-- along the aim, elbow -> hand points straight along it.
+local UPPER_LENGTH, FORE_LENGTH = 0.5, 0.45
+local ARM_THICKNESS = 0.11
 local ROTOR_SPEED = 90 -- cosmetic radians/sec; diagonally opposite motors match
 local DARK = Color3.fromRGB(34, 38, 44)
 local METAL = Color3.fromRGB(82, 88, 95)
@@ -24,7 +34,8 @@ end
 
 -- Only copy geometry. Never clone scripts, sounds, joints, emitters or Tools
 -- into the world/portal, where they could execute or produce duplicate VFX.
-local function mountWeapon(model: Model, mount: Attachment, tool: Tool)
+-- (built around the hand at the origin: Pose moves its pivot to the hand)
+local function mountWeapon(model: Model, tool: Tool)
 	local handle = tool:FindFirstChild("Handle")
 	if not handle or not handle:IsA("BasePart") then
 		handle = tool:FindFirstChildWhichIsA("BasePart", true)
@@ -34,7 +45,7 @@ local function mountWeapon(model: Model, mount: Attachment, tool: Tool)
 	weapon.Name = "MountedWeapon"
 	weapon:SetAttribute("ToolName", tool.Name)
 	local offset = tool:GetAttribute("DroneMountOffset")
-	local frame = mount.WorldCFrame * (if typeof(offset) == "CFrame" then offset else tool.Grip:Inverse())
+	local frame = if typeof(offset) == "CFrame" then offset else tool.Grip:Inverse()
 	for _, original in tool:GetDescendants() do
 		if not original:IsA("BasePart") or not original.Archivable then continue end
 		local copy = original:Clone()
@@ -48,6 +59,7 @@ local function mountWeapon(model: Model, mount: Attachment, tool: Tool)
 		copy.CFrame = frame * handle.CFrame:ToObjectSpace(original.CFrame)
 		copy.Parent = weapon
 	end
+	weapon.WorldPivot = CFrame.identity
 	weapon.Parent = model
 end
 
@@ -100,8 +112,67 @@ function DroneVisual.Create(tool: Tool?): Model
 	mount.Name = "WeaponMount"
 	mount.CFrame = DroneRig.WeaponMountOffset
 	mount.Parent = body
-	if tool then mountWeapon(model, mount, tool) end
+	-- the arm (posed every frame by Pose; laid out hanging for now)
+	local shoulderAt = DroneRig.WeaponMountOffset.Position
+	local function joint(name: string, at: Vector3, size: number): Part
+		local made = part(name, Vector3.one * size, CFrame.new(at), METAL)
+		made.Shape = Enum.PartType.Ball
+		return made
+	end
+	joint("ArmShoulder", shoulderAt, 0.22)
+	part("ArmUpper", Vector3.new(ARM_THICKNESS, ARM_THICKNESS, UPPER_LENGTH), CFrame.new(shoulderAt), DARK)
+	joint("ArmElbow", shoulderAt, 0.16)
+	part("ArmFore", Vector3.new(ARM_THICKNESS, ARM_THICKNESS, FORE_LENGTH), CFrame.new(shoulderAt), DARK)
+	local wrist = joint("ArmWrist", shoulderAt, 0.14)
+	wrist.Color = accent
+	wrist.Material = Enum.Material.Neon
+	if tool then mountWeapon(model, tool) end
+	-- (resting pose, pointing ahead; Pose takes over once it flies)
+	DroneVisual.Pose(DroneVisual.Rig(model), CFrame.identity, Vector3.new(0, 0, -1))
 	return model
+end
+
+-- The arm and weapon parts of a drone made by Create (or a clone of one).
+function DroneVisual.Rig(model: Model): Rig
+	local function get(name: string): BasePart
+		return model:FindFirstChild(name) :: BasePart
+	end
+	local weapon = model:FindFirstChild("MountedWeapon")
+	return {
+		shoulder = get("ArmShoulder"), upper = get("ArmUpper"), elbow = get("ArmElbow"),
+		fore = get("ArmFore"), wrist = get("ArmWrist"),
+		weapon = if weapon and weapon:IsA("Model") then weapon else nil,
+	}
+end
+
+local function segment(part: BasePart, from: Vector3, to: Vector3)
+	local offset = to - from
+	if offset.Magnitude < 1e-4 then
+		part.CFrame = CFrame.new(from)
+		return
+	end
+	local up = if math.abs(offset.Unit.Y) > 0.98 then Vector3.xAxis else Vector3.yAxis
+	part.CFrame = CFrame.lookAt((from + to) * 0.5, to, up)
+end
+
+-- Places the arm under `body` (the chassis frame, already pivoted) so the
+-- weapon in its hand points along `aim` (a unit vector, world space).
+-- "Under" follows the chassis: flipped upside down, the arm reaches up.
+function DroneVisual.Pose(rig: Rig, body: CFrame, aim: Vector3)
+	local shoulder = (body * DroneRig.WeaponMountOffset).Position
+	local down = -body.UpVector
+	local elbow = shoulder + (down * 0.8 + aim * 0.45).Unit * UPPER_LENGTH
+	local hand = elbow + aim * FORE_LENGTH
+	rig.shoulder.CFrame = CFrame.new(shoulder)
+	segment(rig.upper, shoulder, elbow)
+	rig.elbow.CFrame = CFrame.new(elbow)
+	segment(rig.fore, elbow, hand)
+	rig.wrist.CFrame = CFrame.new(hand)
+	if rig.weapon then
+		-- (kept upright in the world, not rolled with the chassis)
+		local up = if math.abs(aim.Y) > 0.98 then body.LookVector else Vector3.yAxis
+		rig.weapon:PivotTo(CFrame.lookAt(hand, hand + aim, up))
+	end
 end
 
 function DroneVisual.Parts(model: Model): {BasePart}
