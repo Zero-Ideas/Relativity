@@ -139,6 +139,9 @@ end
 -- the engine cast with the projectile's filter. True when anything is hit.
 -- The cast's RaycastResult when it hits something (true when it can't be
 -- cast here), else nil.
+-- engine casts this batch made (the Stats tab's sphere / ray counts)
+local sphereCasts, rayCasts = 0, 0
+
 local function castHits(from: Vector3, displacement: Vector3, radius: number, filter: number, nearEntities: boolean): any
 	if Occupancy.SegmentClear(from, displacement, radius, filterIgnores[filter]) then
 		return nil
@@ -152,8 +155,12 @@ local function castHits(from: Vector3, displacement: Vector3, radius: number, fi
 		if not nearEntities then
 			radius = CollisionLOD.Radius(entityChunks, ChunkManager.ChunkSize, ChunkManager.UseY, from, displacement, radius)
 		end
-		if radius > 0 then return workspace:Spherecast(from, radius, displacement, params) end
+		if radius > 0 then
+			sphereCasts += 1
+			return workspace:Spherecast(from, radius, displacement, params)
+		end
 	end
+	rayCasts += 1
 	return workspace:Raycast(from, displacement, params)
 end
 
@@ -188,6 +195,7 @@ actor:BindToMessageParallel("Sweep", function(frame: number, input: buffer, coun
 	task.synchronize()
 	results:Fire(workerId, frame, count, ms, result, occupancy.Checks, occupancy.Skipped, {
 		occupancy.NotReady, occupancy.TooWide, occupancy.OutsideTerrain, occupancy.Blocked, occupancy.BlockedMoving,
-		occupancy.DynamicParts, occupancy.LargestDynamic,
+		occupancy.DynamicParts, occupancy.LargestDynamic, sphereCasts, rayCasts,
 	}, contacts, homingOut)
+	sphereCasts, rayCasts = 0, 0
 end)

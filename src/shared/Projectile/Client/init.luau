@@ -44,6 +44,7 @@ local Types = require(script.Types)
 local View = require(script.View)
 local VisualModel = require(script.VisualModel)
 local BeamVisual = require(script.BeamVisual)
+local BeamChainVisual = require(script.BeamChainVisual)
 
 type Visual = Types.Visual
 
@@ -684,6 +685,7 @@ local function renderStep(globalDt: number)
 	BeamVisual.StepRetired(globalDt)
 	local now = os.clock()
 	View.refresh()
+	BeamChainVisual.Step(globalDt)
 	refreshSmoothVisuals(now)
 
 	local slotCount = #visualOrder
@@ -796,13 +798,17 @@ function ProjectileClient.EnableClientRendering()
 		DebugRays.Draw(data.From, data.To, data.LowRes)
 	end)
 
+	BeamChainVisual.Enable()
 	View.refresh()
 	Heartbeat.Connect(renderStep, { Name = "ProjectileSystem.ClientSimulate", Priority = 5 })
 end
 
 function ProjectileClient.GetStats()
+	local beamChains, beamSamples = BeamChainVisual.GetStats()
 	return {
 		Visuals = visualCount,
+		BeamChains = beamChains,
+		BeamSamples = beamSamples,
 		VisualUpdatesPerFrame = renderSettings.MaxUpdates,
 		SmoothLimit = renderSettings.MaxSmooth,
 	}

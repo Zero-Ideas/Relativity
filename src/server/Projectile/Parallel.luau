@@ -284,6 +284,9 @@ local function refreshWorkers(): boolean
 				-- (6: that worker's moving-part count; the largest is kept)
 				workerReasons[6] = math.max(workerReasons[6] or 0, reasons[6] or 0)
 				workerReasons[7] = reasons[7] or workerReasons[7] -- (7: a worker's largest moving part, by name)
+				-- (8 / 9: engine Spherecasts / Raycasts the worker made)
+				workerReasons[8] = (workerReasons[8] or 0) + (reasons[8] or 0)
+				workerReasons[9] = (workerReasons[9] or 0) + (reasons[9] or 0)
 			end
 		end)
 	end

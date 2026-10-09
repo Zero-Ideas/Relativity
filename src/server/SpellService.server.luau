@@ -16,7 +16,7 @@ local SpellCircleLayout = require(Shared:WaitForChild("SpellCircleLayout"))
 local VisualOffload = require(Shared:WaitForChild("VisualOffload"))
 local SpellStore = require(script.Parent:WaitForChild("SpellStore"))
 local SpellRuntime = require(script.Parent:WaitForChild("SpellRuntime"))
-local BeamHandler = require(script.Parent:WaitForChild("Projectile"):WaitForChild("BeamProjectileHandler"))
+local BeamHandler = require(script.Parent:WaitForChild("Projectile"):WaitForChild("Beams"))
 
 local PlayerResources = require(script.Parent.PlayerResources)
 -- (the cast cooldown is a live admin setting: SpellSettings.GetCooldown())

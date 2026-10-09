@@ -7,8 +7,8 @@
 --   Shared foundations
 --     src/shared/SafeMath.luau (110 lines)
 --     src/shared/Signal.luau (100 lines)
---     src/shared/Heartbeat.luau (208 lines)
---     src/shared/VisualOffload.luau (117 lines)
+--     src/shared/Heartbeat.luau (237 lines)
+--     src/shared/VisualOffload.luau (157 lines)
 --     src/shared/ClientPresentation.luau (44 lines)
 --     src/shared/ChunkManager.luau (651 lines)
 --     src/shared/Entity.luau (1023 lines)
@@ -18,13 +18,14 @@
 --     src/shared/Projectile/Protocol.luau (112 lines)
 --     src/shared/Projectile/Codec.luau (222 lines)
 --     src/shared/Projectile/BeamPath.luau (86 lines)
+--     src/shared/Projectile/BeamWire.luau (149 lines)
 --   Server simulation
 --     src/server/Projectile/Types.luau (241 lines)
 --     src/server/Projectile/Config.luau (192 lines)
 --     src/server/Projectile/Math.luau (71 lines)
 --     src/server/Projectile/CollisionLOD.luau (36 lines)
---     src/server/Projectile/Raycast.luau (326 lines)
---     src/server/Projectile/Occupancy.luau (962 lines)
+--     src/server/Projectile/Raycast.luau (332 lines)
+--     src/server/Projectile/Occupancy.luau (1069 lines)
 --     src/server/Projectile/Homing.luau (154 lines)
 --     src/server/Projectile/RewindHit.luau (144 lines)
 --     src/server/Projectile/Replication.luau (579 lines)
@@ -33,11 +34,13 @@
 --     src/server/Projectile/Sweep.luau (385 lines)
 --     src/server/Projectile/Profile.luau (67 lines)
 --     src/server/Projectile/ApplyPass.luau (89 lines)
---     src/server/Projectile/Parallel.luau (1073 lines)
---     src/server/Projectile/init.luau (1548 lines)
---     src/server/Projectile/BeamProjectileHandler.luau (371 lines)
+--     src/server/Projectile/Parallel.luau (1076 lines)
+--     src/server/Projectile/init.luau (1589 lines)
+--     src/server/Projectile/BeamProjectileHandler.luau (377 lines)
+--     src/server/Projectile/BeamChain.luau (1444 lines)
+--     src/server/Projectile/Beams.luau (9 lines)
 --     src/server/ProjectileQuota.luau (41 lines)
---     src/server/ProjectileWorkerBootstrap.server.luau (193 lines)
+--     src/server/ProjectileWorkerBootstrap.server.luau (201 lines)
 --   Client prediction and visuals
 --     src/shared/Projectile/Client/Types.luau (81 lines)
 --     src/shared/Projectile/Client/Prediction.luau (147 lines)
@@ -47,7 +50,8 @@
 --     src/shared/Projectile/Client/VisualModel.luau (577 lines)
 --     src/shared/Projectile/Client/BeamGeometry.luau (116 lines)
 --     src/shared/Projectile/Client/BeamVisual.luau (520 lines)
---     src/shared/Projectile/Client/init.luau (841 lines)
+--     src/shared/Projectile/Client/BeamChainVisual.luau (734 lines)
+--     src/shared/Projectile/Client/init.luau (847 lines)
 
 -- =============================================================================
 -- SECTION: Shared foundations
@@ -308,6 +312,9 @@ return Signal
 	 Heartbeat.SetGlobalTimeScale(scale) / GetGlobalTimeScale() -> number
 	 Heartbeat.GetStats() -> { ConnectionCount, GlobalTimeScale, AvgFrameTime }
 	 Heartbeat.GetConnections() -> { Connection }
+	 Heartbeat.TakeProfile() -> { { Name, Ms, Priority } }   (each named handler's average
+	     ms per frame since the last call, costliest first -- the debug panel's
+	     per-system breakdown)
 
 	 options: { Name?, Priority? = 0, TimeScale? = 1 }
 	 Connection fields: Name, Priority, TimeScale, LocalTime, Connected
@@ -321,6 +328,12 @@ local Heartbeat = {}
 local connections = {} -- priority-sorted (ascending) array of Connection
 local globalTimeScale = 1
 local needsSort = false
+
+-- per-handler cost for TakeProfile: seconds by connection Name since the last
+-- call (two os.clock reads per handler per frame -- cheap at this count)
+local profileTotals: { [string]: number } = {}
+local profilePriority: { [string]: number } = {}
+local profileFrames = 0
 
 -- rolling average of per-frame cost (seconds) over a fixed window
 local WINDOW = 60
@@ -433,6 +446,20 @@ function Heartbeat.GetConnections()
 	return table.clone(connections)
 end
 
+function Heartbeat.TakeProfile(): { { Name: string, Ms: number, Priority: number } }
+	local frames = math.max(profileFrames, 1)
+	local result = {}
+	for name, seconds in profileTotals do
+		table.insert(result, { Name = name, Ms = seconds / frames * 1000, Priority = profilePriority[name] or 0 })
+	end
+	table.sort(result, function(a, b)
+		return a.Ms > b.Ms
+	end)
+	table.clear(profileTotals)
+	profileFrames = 0
+	return result
+end
+
 --------------------------------------------------------------------------------
 -- The one true loop
 --------------------------------------------------------------------------------
@@ -451,9 +478,12 @@ local function step(realDt: number)
 	-- Snapshot so a callback may connect/disconnect during the frame without
 	-- skipping or double-running siblings. New connections run next frame.
 	local snapshot = table.clone(connections)
+	profileFrames += 1
+	local clock = os.clock
 	for i = 1, #snapshot do
 		local connection = snapshot[i]
 		if connection.Connected then
+			local handlerStarted = clock()
 			local dilatedDt = globalDt * connection.TimeScale
 			connection.LocalTime += dilatedDt
 
@@ -473,6 +503,9 @@ local function step(realDt: number)
 					warn(`[Heartbeat] "{connection.Name}" errored: {err}`)
 				end
 			end
+			local name = connection.Name
+			profileTotals[name] = (profileTotals[name] or 0) + clock() - handlerStarted
+			profilePriority[name] = connection.Priority
 		end
 	end
 
@@ -514,8 +547,13 @@ return Heartbeat
 	 VisualOffload.On(channel, handler) -> { Disconnect }
 	     server handler: handler(payload, player)
 	     client handler: handler(payload)
+	 VisualOffload.TakeSendStats() -> { { Channel, Messages, KB, Items } }
+	     what was sent since the last call, by channel, busiest first:
+	     messages (one per recipient), buffer kilobytes, and table entries
+	     (list payloads -- a table's wire size isn't cheap to measure)
 ]]
 
+local Players = game:GetService("Players")
 local RunService = game:GetService("RunService")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 
@@ -578,18 +616,53 @@ local function ensureListening()
 	end
 end
 
+-- Send counters for the debug panel (see TakeSendStats).
+type SendStat = { Messages: number, Bytes: number, Items: number }
+local sendStats: { [string]: SendStat } = {}
+
+local function noteSend(channel: string, payload: any, recipients: number)
+	local stat = sendStats[channel]
+	if not stat then
+		stat = { Messages = 0, Bytes = 0, Items = 0 }
+		sendStats[channel] = stat
+	end
+	stat.Messages += recipients
+	local kind = typeof(payload)
+	if kind == "buffer" then
+		stat.Bytes += buffer.len(payload) * recipients
+	elseif kind == "string" then
+		stat.Bytes += #payload * recipients
+	elseif kind == "table" then
+		stat.Items += math.max(#payload, 1) * recipients
+	end
+end
+
+function VisualOffload.TakeSendStats(): { { Channel: string, Messages: number, KB: number, Items: number } }
+	local result = {}
+	for channel, stat in sendStats do
+		table.insert(result, { Channel = channel, Messages = stat.Messages, KB = stat.Bytes / 1024, Items = stat.Items })
+	end
+	table.sort(result, function(a, b)
+		return a.Messages + a.Items > b.Messages + b.Items
+	end)
+	table.clear(sendStats)
+	return result
+end
+
 function VisualOffload.Fire(channel: string, payload: any?)
-	
 	local r = getRemote()
 	if RunService:IsServer() then
+		noteSend(channel, payload, #Players:GetPlayers())
 		r:FireAllClients(channel, payload)
 	else
+		noteSend(channel, payload, 1)
 		r:FireServer(channel, payload)
 	end
 end
 
 function VisualOffload.FireClient(player: Player, channel: string, payload: any?)
 	assert(RunService:IsServer(), "VisualOffload.FireClient is server-only")
+	noteSend(channel, payload, 1)
 	getRemote():FireClient(player, channel, payload)
 end
 
@@ -3143,6 +3216,162 @@ return BeamPath
 -- =============================================================================
 
 -- =============================================================================
+-- BEGIN FILE: src/shared/Projectile/BeamWire.luau
+-- =============================================================================
+--!native
+--!strict
+--!optimize 2
+--[[
+	Projectile/BeamWire.luau
+	Binary stream for sustained beam chains: server Projectile/BeamChain ->
+	client Projectile/Client/BeamChainVisual. A chain's samples move
+	deterministically between events, so only events cross the wire (a new
+	sample, a bounce, a link change, a clipped body, a death), never a pose per
+	sample per frame.
+
+	One message per recipient per frame, on Channel: a run of sections.
+	  Section := u32 chainId, u8 kind, f64 serverTime (end of the server frame)
+	             [Snapshot: Header] Op* u8 Op.End
+	  Header  := f32 radius, f32 length, u8x3 color, u8x3 core, f32x3 gravity, f32 timeScale
+	  Op.Spawn  := u32 id, v3 pos, v3 vel, f32 life, u32 ahead, u8 flags,
+	               [Fragment: v3 offset] [Origin: v3 origin], u8 n, v3 x n turns
+	  Op.Pose   := u32 id, v3 pos, v3 vel, f32 life
+	  Op.Bounce := u32 id, v3 pos, v3 vel, v3 contact, v3 normal, u8 n, v3 x n new turns
+	  Op.Link   := u32 id, u32 ahead, [ahead == 0: v3 fragment offset]
+	  Op.Clip   := u32 id, u8 n, v3 x n (n == 0: the body is whole again)
+	  Op.Death  := u32 id, u8 kind, [kind ~= Expire: v3 contact, v3 normal, u8 bodyHit]
+	               (a World death without bodyHit parks one radius off the wall)
+	  Op.Scale  := f32 timeScale (the chain's personal/local dilation)
+	Section.End: the chain is gone on the server (every death already sent).
+	Section.Exit: this client left the chain's range; drop it without drains.
+]]
+
+local BeamWire = {}
+
+BeamWire.Channel = "ProjBeamChain"
+BeamWire.Section = table.freeze({ Delta = 0, Snapshot = 1, End = 2, Exit = 3 })
+BeamWire.Op = table.freeze({ End = 0, Spawn = 1, Pose = 2, Bounce = 3, Link = 4, Clip = 5, Death = 6, Scale = 7 })
+BeamWire.Death = table.freeze({ Expire = 0, World = 1, Entity = 2, Other = 3 })
+-- Stopped: a sample already parked at a wall (dead), still anchoring followers.
+BeamWire.SpawnFlag = table.freeze({ Fragment = 1, Origin = 2, Joiner = 4, EverLinked = 8, Stopped = 16 })
+
+export type Writer = { buf: buffer, n: number }
+
+function BeamWire.Writer(size: number?): Writer
+	return { buf = buffer.create(size or 256), n = 0 }
+end
+
+local function reserve(w: Writer, bytes: number)
+	local need = w.n + bytes
+	local size = buffer.len(w.buf)
+	if need <= size then
+		return
+	end
+	while size < need do
+		size *= 2
+	end
+	local grown = buffer.create(size)
+	buffer.copy(grown, 0, w.buf, 0, w.n)
+	w.buf = grown
+end
+BeamWire.Reserve = reserve
+
+function BeamWire.U8(w: Writer, v: number)
+	reserve(w, 1)
+	buffer.writeu8(w.buf, w.n, v)
+	w.n += 1
+end
+
+function BeamWire.U32(w: Writer, v: number)
+	reserve(w, 4)
+	buffer.writeu32(w.buf, w.n, v)
+	w.n += 4
+end
+
+function BeamWire.F32(w: Writer, v: number)
+	reserve(w, 4)
+	buffer.writef32(w.buf, w.n, v)
+	w.n += 4
+end
+
+function BeamWire.F64(w: Writer, v: number)
+	reserve(w, 8)
+	buffer.writef64(w.buf, w.n, v)
+	w.n += 8
+end
+
+function BeamWire.V3(w: Writer, v: Vector3)
+	reserve(w, 12)
+	local b, n = w.buf, w.n
+	buffer.writef32(b, n, v.X)
+	buffer.writef32(b, n + 4, v.Y)
+	buffer.writef32(b, n + 8, v.Z)
+	w.n = n + 12
+end
+
+-- Appends `from`'s bytes to `w`.
+function BeamWire.Append(w: Writer, from: Writer)
+	if from.n == 0 then
+		return
+	end
+	reserve(w, from.n)
+	buffer.copy(w.buf, w.n, from.buf, 0, from.n)
+	w.n += from.n
+end
+
+-- The written bytes as one exactly-sized buffer.
+function BeamWire.Finish(w: Writer): buffer
+	local out = buffer.create(w.n)
+	buffer.copy(out, 0, w.buf, 0, w.n)
+	return out
+end
+
+export type Reader = { buf: buffer, n: number }
+
+function BeamWire.Reader(buf: buffer): Reader
+	return { buf = buf, n = 0 }
+end
+
+function BeamWire.More(r: Reader): boolean
+	return r.n < buffer.len(r.buf)
+end
+
+function BeamWire.ReadU8(r: Reader): number
+	local v = buffer.readu8(r.buf, r.n)
+	r.n += 1
+	return v
+end
+
+function BeamWire.ReadU32(r: Reader): number
+	local v = buffer.readu32(r.buf, r.n)
+	r.n += 4
+	return v
+end
+
+function BeamWire.ReadF32(r: Reader): number
+	local v = buffer.readf32(r.buf, r.n)
+	r.n += 4
+	return v
+end
+
+function BeamWire.ReadF64(r: Reader): number
+	local v = buffer.readf64(r.buf, r.n)
+	r.n += 8
+	return v
+end
+
+function BeamWire.ReadV3(r: Reader): Vector3
+	local b, n = r.buf, r.n
+	r.n = n + 12
+	return Vector3.new(buffer.readf32(b, n), buffer.readf32(b, n + 4), buffer.readf32(b, n + 8))
+end
+
+return BeamWire
+-- =============================================================================
+-- END FILE: src/shared/Projectile/BeamWire.luau
+-- =============================================================================
+
+-- =============================================================================
 -- SECTION: Server simulation
 -- =============================================================================
 
@@ -3739,6 +3968,7 @@ local Occupancy = require(script.Parent.Occupancy)
 local Types = require(script.Parent.Types)
 local Store = require(script.Parent.Store)
 local CollisionLOD = require(script.Parent.CollisionLOD)
+local Profile = require(script.Parent.Profile)
 
 type State = Types.State
 type Verdict = Types.Verdict
@@ -3844,6 +4074,9 @@ local function ignoreSetFor(params: RaycastParams): { [Instance]: boolean }
 	return set
 end
 
+-- (BeamChain: the set a sleeping beam sample's box test ignores)
+Raycast.ignoreSetFor = ignoreSetFor
+
 function Raycast.castMovement(projectile: State, origin: Vector3, displacement: Vector3, overrideParams: RaycastParams?, nearEntities: boolean?): Types.Contact?
 	-- Provably empty space: the cast would find nothing, so don't make it
 	-- (see Occupancy -- it only says yes when nothing could be in the way).
@@ -3865,8 +4098,10 @@ function Raycast.castMovement(projectile: State, origin: Vector3, displacement: 
 		-- body of Radius around this segment plus spherical caps at both ends.
 		-- Adjacent adaptive substeps share the cap at their common joint, so
 		-- curved paths have no wedge-shaped collision gaps.
+		Profile.Count("CastSphere", 1)
 		result = workspace:Spherecast(origin, radius, displacement, params)
 	else
+		Profile.Count("CastRay", 1)
 		result = workspace:Raycast(origin, displacement, params)
 	end
 	if not result then
@@ -4178,11 +4413,23 @@ local stats = { Checks = 0, Skipped = 0, Coarse = 0, StaticCells = 0, DistinctMa
 local blockedByMoving = false -- set by fineOccupied when a moving part's cell is what blocked
 local refineCpu, refineProbes, refineYields = 0, 0, 0
 
+-- Coarse cells static marks were added to since the last TakeStaticChanges
+-- (BeamChain wakes beam samples sleeping in them). Capped; past the cap
+-- the taker hears "everything changed".
+local MAX_CHANGED = 4096
+local changedStatic: { number } = {}
+local changedOverflow = false
+
 local function setStatic(key: number, mask: buffer)
 	if static[key] == mask then return end
 	static[key] = mask
 	if not isWorker then
 		dirtyCells[key] = true
+		if #changedStatic < MAX_CHANGED then
+			table.insert(changedStatic, key)
+		else
+			changedOverflow = true
+		end
 		if schedulePublish then schedulePublish() end
 	end
 end
@@ -4868,6 +5115,101 @@ function Occupancy.SegmentClear(origin: Vector3, displacement: Vector3, radius: 
 	end
 	stats.Skipped += 1
 	return true
+end
+
+-- Is the box [lo, hi] clear of everything a raycast could hit? Same
+-- meaning as SegmentClear, for every centreline inside the box: marks carry
+-- PAD studs of clearance, so sweeps of radius up to MaxRadius whose centre
+-- stays in the box hit nothing. BeamChain puts beam samples to sleep in such
+-- boxes. Returns "clear"; "moving" when a moving part's mark is in it (not
+-- excluded by `ignore`); "static" when static marks are (FINE voxels plus
+-- PAD are coarse: a caller may still prove it clear another way); "unknown"
+-- when this can't tell (not baked, outside scanned terrain, over `maxCells`
+-- coarse cells). Not counted in the skip stats.
+function Occupancy.BoxClear(lo: Vector3, hi: Vector3, ignore: { [Instance]: boolean }?, maxCells: number?): string
+	if not ready or not Occupancy.Enabled then
+		return "unknown"
+	end
+	local fx0, fy0, fz0 = floor(lo.X / FINE), floor(lo.Y / FINE), floor(lo.Z / FINE)
+	local fx1, fy1, fz1 = floor(hi.X / FINE), floor(hi.Y / FINE), floor(hi.Z / FINE)
+	local cx0, cy0, cz0 = fx0 // DIV, fy0 // DIV, fz0 // DIV
+	local cx1, cy1, cz1 = fx1 // DIV, fy1 // DIV, fz1 // DIV
+	if (cx1 - cx0 + 1) * (cy1 - cy0 + 1) * (cz1 - cz0 + 1) > (maxCells or 64) then
+		return "unknown"
+	end
+	refreshDynamic()
+	-- moving parts first: those rule a box out whatever the static verdict
+	for cz = cz0, cz1 do
+		for cy = cy0, cy1 do
+			for cx = cx0, cx1 do
+				local moving = dynamic[cellKey(cx, cy, cz)]
+				if moving then
+					for index = 1, #moving, 3 do
+						local mlo, mhi = moving[index], moving[index + 1]
+						if hi.X > mlo.X and lo.X < mhi.X and hi.Y > mlo.Y and lo.Y < mhi.Y and hi.Z > mlo.Z and lo.Z < mhi.Z
+							and not (ignore and ignore[moving[index + 2]]) then
+							return "moving"
+						end
+					end
+				end
+			end
+		end
+	end
+	if hasTerrain and not insideTerrainScan(lo, hi) then
+		return "unknown"
+	end
+	for cz = cz0, cz1 do
+		local az, bz = max(fz0 - cz * DIV, 0), min(fz1 - cz * DIV, DIV - 1)
+		for cy = cy0, cy1 do
+			local ay, by = max(fy0 - cy * DIV, 0), min(fy1 - cy * DIV, DIV - 1)
+			for cx = cx0, cx1 do
+				local mask = static[cellKey(cx, cy, cz)]
+				if mask then
+					if mask == FULL then
+						return "static"
+					end
+					local ax, bx = max(fx0 - cx * DIV, 0), min(fx1 - cx * DIV, DIV - 1)
+					local row = lshift(lshift(1, bx - ax + 1) - 1, ax)
+					for fz = az, bz do
+						for fy = ay, by do
+							if btest(readu16(mask, (fy + fz * DIV) * ROW_BYTES), row) then
+								return "static"
+							end
+						end
+					end
+				end
+			end
+		end
+	end
+	return "clear"
+end
+
+-- Does the map have terrain? (A box query that skips terrain must check it
+-- itself then.)
+function Occupancy.HasTerrain(): boolean
+	return hasTerrain
+end
+
+-- Coarse cell edge and keys, for callers keeping an index aligned with this
+-- grid (BeamChain's sleeping samples).
+Occupancy.Coarse = COARSE
+function Occupancy.CoarseKey(cx: number, cy: number, cz: number): number
+	return cellKey(cx, cy, cz)
+end
+
+-- This frame's moving-part marks: coarse key -> { lo, hi, owner, lo, hi,
+-- owner, ... }. Read only.
+function Occupancy.DynamicMarks(): { [number]: { any } }
+	refreshDynamic()
+	return dynamic
+end
+
+-- Coarse keys that gained static marks since the last call, and whether
+-- more changed than were kept (then treat everything as changed).
+function Occupancy.TakeStaticChanges(): ({ number }, boolean)
+	local keys, overflow = changedStatic, changedOverflow
+	changedStatic, changedOverflow = {}, false
+	return keys, overflow
 end
 
 -- Counters since the last call (DebugService's Stats tab), then reset.
@@ -7419,6 +7761,9 @@ local function refreshWorkers(): boolean
 				-- (6: that worker's moving-part count; the largest is kept)
 				workerReasons[6] = math.max(workerReasons[6] or 0, reasons[6] or 0)
 				workerReasons[7] = reasons[7] or workerReasons[7] -- (7: a worker's largest moving part, by name)
+				-- (8 / 9: engine Spherecasts / Raycasts the worker made)
+				workerReasons[8] = (workerReasons[8] or 0) + (reasons[8] or 0)
+				workerReasons[9] = (workerReasons[9] or 0) + (reasons[9] or 0)
 			end
 		end)
 	end
@@ -8578,6 +8923,7 @@ type Methods = {
 	Destroy: (self: Projectile, result: { Position: Vector3, Normal: Vector3 }?, kind: string?) -> (),
 	SetTimeScale: (self: Projectile, scale: number) -> (),
 	ResolveBeamSpan: (self: Projectile, points: { Vector3 }, allowHits: boolean?, cornerIndices: { number }?) -> { Vector3 },
+	ProbeBeamSpan: (self: Projectile, points: { Vector3 }, trimEnd: number?) -> boolean,
 	ClearBeamPrevious: (self: Projectile) -> (),
 }
 export type Projectile = Types.State & Methods
@@ -9484,6 +9830,11 @@ local function spanParams(self: Projectile): RaycastParams
 	if cached then
 		return cached
 	end
+	-- Nothing pierced yet: exactly its movement filter, which is already
+	-- shared (Raycast.buildRayParams). ResolveBeamSpan copies before excluding.
+	if next(self._ignore) == nil then
+		return self._rayParams
+	end
 	local ignore = self._rayParams.FilterDescendantsInstances
 	for entity in self._ignore do if entity.Instance then table.insert(ignore, entity.Instance) end end
 	local params = RaycastParams.new()
@@ -9579,6 +9930,41 @@ function Projectile.ResolveBeamSpan(self: Projectile, points: { Vector3 }, allow
 	end
 	return points
 end
+-- True when nothing touches the body along `points` at all. No hits, no
+-- clipping, no side effects: BeamChain keeps a long link in one piece while
+-- this holds, and only subdivides it where the body actually meets something.
+-- `trimEnd` stops that far short of the last point (a world-stopped front sits
+-- exactly one radius off its wall).
+function Projectile.ProbeBeamSpan(self: Projectile, points: { Vector3 }, trimEnd: number?): boolean
+	local last = #points - 1
+	if last < 1 then
+		return true
+	end
+	local params = spanParams(self)
+	for index = 1, last do
+		local from = points[index]
+		local offset = points[index + 1] - from
+		local full = offset.Magnitude
+		local length = if index == last and trimEnd then full - trimEnd else full
+		if length < 1e-4 then
+			continue
+		end
+		local heading, traveled = offset / full, 0
+		while traveled < length - 1e-4 do
+			local distance = math.min(length - traveled, 1000)
+			if Raycast.castMovement(self, from + heading * traveled, heading * distance, params) then
+				return false
+			end
+			traveled += distance
+		end
+	end
+	return true
+end
+
+function Projectile.GetDefaultMaxRealLifetime(): number
+	return defaultMaxRealLifetime
+end
+
 function Projectile.ClearBeamPrevious(self: Projectile)
 	if not self.Beam or not self.Beam.PreviousId then return end
 	self.Beam.PreviousId, self._beamPrevious = nil, nil
@@ -9789,11 +10175,17 @@ Handler.MaxNewJoinersPerFrame = 128
 -- counting after a packet dies -- a front that stopped young can't keep
 -- anchoring fresh joiners forever.
 Handler.MaxJoinerSourceAge = 3
+-- Packets go out often enough that consecutive ones sit just under one link
+-- (MaxStretch) apart, so a steady beam needs no joiners. (It used to floor at
+-- 1/60 s: at 2000 studs/s that spaced packets 33 studs apart, just over the
+-- 32-stud link, so nearly every link also needed a joiner -- twice the
+-- bodies.) A fast beam can need several packets a frame; see
+-- MAX_PACKETS_PER_CHANNEL_FRAME.
 function Handler.GetInterval(speed: number): number
-	return math.max(1 / 60, math.min(Handler.Interval, (BeamPath.MaxStretch - 2) / math.max(speed, 1)))
+	return math.max(1 / 240, math.min(Handler.Interval, (BeamPath.MaxStretch - 2) / math.max(speed, 1)))
 end
 local INPUT_TIMEOUT = .75
-local MAX_PACKETS_PER_CHANNEL_FRAME = 2
+local MAX_PACKETS_PER_CHANNEL_FRAME = 4
 local MAX_CHANNELS_PER_PLAYER = 32
 local channels: { any } = {}
 local lastInput: { [Player]: number } = {}
@@ -10144,6 +10536,1473 @@ return Handler
 -- =============================================================================
 
 -- =============================================================================
+-- BEGIN FILE: src/server/Projectile/BeamChain.luau
+-- =============================================================================
+--!strict
+--[[
+	Projectile/BeamChain.luau
+	Sustained beams: one chain per Sustain channel, made of lightweight
+	samples instead of full projectiles. (The original BeamProjectileHandler,
+	where every packet and joiner is a Store-backed projectile with its own
+	replicated visual, stays as a backup -- see Beams.luau.)
+
+	Same mechanics, cheaper carriers:
+	 - A sample is a plain table with the fields a projectile has, so it moves
+	   and collides through the very same Projectile.Step (homing, gravity,
+	   dilation, pierce, penetration, bounce) and its links through the same
+	   ResolveBeamSpan (body damage, world clipping). SpellRuntime binds its
+	   OnHit / OnDestroy / energy hooks exactly as before.
+	 - Links are planned like before (newer sample = back, older = front,
+	   bounce corners from BeamPath.Plan). A link longer than BeamPath's
+	   MaxStretch used to be split into joiner projectiles at once. In free
+	   space those joiners only ever slide along the straight chord between
+	   the link's ends (lerped position + lerped velocity stays on it), so here
+	   a long link stays ONE body while nothing touches it, and is split into
+	   the same joiners the moment it meets anything (ProbeBeamSpan), when its
+	   front dies, or wherever that equivalence doesn't hold (homing, an
+	   uneven time field along it, OnTimer / OnProximity triggers that need
+	   every joiner's own position).
+	 - Beamlets only do hit detection where something could be hit: a sample
+	   whose flight and body stay, for a while, inside a box with nothing in
+	   it SLEEPS -- no Projectile.Step, no body cast, just exact constant-
+	   acceleration motion -- until its window ends or anything could reach
+	   it (see "Sleep" below). Every cast it skips is one that provably
+	   finds nothing, so no outcome changes.
+	 - Clients get one compact event stream per chain (see BeamWire): a new
+	   sample, a bounce, a link change, a clipped body, a death. Samples move
+	   deterministically in between, so nothing is sent per sample per frame.
+]]
+
+local Players = game:GetService("Players")
+local Shared = game:GetService("ReplicatedStorage"):WaitForChild("Shared")
+local Heartbeat = require(Shared:WaitForChild("Heartbeat"))
+local ChunkManager = require(Shared:WaitForChild("ChunkManager"))
+local VisualOffload = require(Shared:WaitForChild("VisualOffload"))
+local SafeMath = require(Shared:WaitForChild("SafeMath"))
+local ProjectileShared = Shared:WaitForChild("Projectile")
+local Motion = require(ProjectileShared:WaitForChild("Motion"))
+local Planner = require(ProjectileShared:WaitForChild("StepPlanner"))
+local BeamPath = require(ProjectileShared:WaitForChild("BeamPath"))
+local BeamWire = require(ProjectileShared:WaitForChild("BeamWire"))
+
+local Projectile = require(script.Parent)
+local Config = require(script.Parent.Config)
+local Raycast = require(script.Parent.Raycast)
+local Occupancy = require(script.Parent.Occupancy)
+local Profile = require(script.Parent.Profile)
+
+local Op, Section, DeathKind, Flag = BeamWire.Op, BeamWire.Section, BeamWire.Death, BeamWire.SpawnFlag
+local U8, U32, F32, F64, V3 = BeamWire.U8, BeamWire.U32, BeamWire.F32, BeamWire.F64, BeamWire.V3
+
+local Chain = {}
+Chain.Interval = 1 / 30
+Chain.MaxJoinersPerBeam = 512
+Chain.MaxNewJoinersPerFrame = 128
+-- No new joiners once BOTH real (launched, non-joiner) packets a link spans
+-- are older than this many real seconds (see BeamProjectileHandler).
+Chain.MaxJoinerSourceAge = 3
+-- Consecutive packets sit just under one link apart (see
+-- BeamProjectileHandler.GetInterval).
+function Chain.GetInterval(speed: number): number
+	return math.max(1 / 240, math.min(Chain.Interval, (BeamPath.MaxStretch - 2) / math.max(speed, 1)))
+end
+
+local INPUT_TIMEOUT = .75
+local MAX_PACKETS_PER_CHANNEL_FRAME = 4
+local MAX_CHANNELS_PER_PLAYER = 32
+-- Homing / non-uniform-time / velocity-relative chains: every sample's pose
+-- is re-sent about this often (clients only extrapolate between events).
+local REFRESH_PERIOD = 0.2
+-- A clipped body's endpoint is re-sent once it moves this far.
+local CLIP_RESEND = 0.25
+-- A chain lingers this long after its last packet before it ends.
+local CHAIN_GRACE = 0.25
+-- Sleep: how far a sample may fly per sleep, the shortest window worth a box
+-- test (in frames), the longest window, the most coarse cells a box may
+-- span, and the clearance added around the engine's box query.
+local SLEEP_STUDS = 96
+local SLEEP_MIN_FRAMES = 3
+local SLEEP_MAX_SECONDS = 1
+local SLEEP_MAX_CELLS = 27
+local SLEEP_MARGIN = 0.5
+
+--------------------------------------------------------------------------------
+-- Sleep
+--------------------------------------------------------------------------------
+
+-- A sample sleeps while its whole future for a window -- its own flight and
+-- its body to the sample ahead -- stays inside a box nothing a raycast could
+-- hit is in. Asleep it skips Projectile.Step and its body cast and just
+-- moves (exactly: constant acceleration). It wakes when the window ends, or
+-- before that when anything could reach it: a moving part or entity's mark
+-- entering the box (Occupancy refreshes those every frame), static geometry
+-- appearing in it, the sample ahead being hit / bouncing / dying (its body
+-- ends there), dilated time anywhere, or its real-time cap. Sleepers are
+-- indexed by Occupancy's coarse cells for those checks.
+local sleepCells: { [number]: { [any]: boolean } } = {}
+local sleeping = 0
+
+local function wake(s: any)
+	local keys = s._sleepKeys
+	if not keys then
+		return
+	end
+	for _, key in keys do
+		local set = sleepCells[key]
+		if set then
+			set[s] = nil
+			if next(set) == nil then
+				sleepCells[key] = nil
+			end
+		end
+	end
+	s._sleepKeys, s._sleepAge, s._sleepLo, s._sleepHi, s._slept = nil, nil, nil, nil, nil
+	sleeping -= 1
+end
+
+-- Something happened to `s`: the sample whose body ends at it looks again.
+local function wakeBehind(s: any)
+	local behind = s._behind
+	if behind and behind._sleepKeys and behind._ahead == s then
+		wake(behind)
+	end
+end
+
+--------------------------------------------------------------------------------
+-- Samples
+--------------------------------------------------------------------------------
+
+-- OnHit / OnDestroy for one sample. SpellRuntime connects one listener each,
+-- so a plain list beats a Signal. Firing marks the sample: a pierce or a
+-- penetration moves it, and clients must hear about that.
+local Event = {}
+Event.__index = Event
+
+local function newEvent(owner: any): any
+	return setmetatable({ owner = owner }, Event)
+end
+
+function Event.Connect(self: any, fn: (any) -> ())
+	table.insert(self, fn)
+	return {
+		Connected = true,
+		Disconnect = function(connection)
+			connection.Connected = false
+			local index = table.find(self, fn)
+			if index then
+				table.remove(self, index)
+			end
+		end,
+	}
+end
+
+function Event.Fire(self: any, info: any)
+	local owner = self.owner
+	owner._contact = true
+	owner._lastHit = info
+	wakeBehind(owner)
+	for index = 1, #self do
+		local fn = self[index]
+		if fn then
+			fn(info)
+		end
+	end
+end
+
+local Sample = {}
+local SampleMeta = { __index = Sample }
+
+local materializeAhead: (s: any) -> ()
+
+-- Same contract as Projectile.Destroy: exactly once, fires OnDestroy with
+-- { Position, Normal, Kind }. A world stop parks the sample one radius off the
+-- wall so followers can keep linking to it.
+function Sample.Destroy(self: any, result: { Position: Vector3, Normal: Vector3 }?, kind: string?)
+	if self.Dead then
+		return
+	end
+	if kind ~= nil and self._lazyLink then
+		-- The joiners ahead of it would have flown on past whatever stopped
+		-- it. Split first, so their energy shares leave before its triggers fire.
+		materializeAhead(self)
+	end
+	self.Dead = true
+	self._worldStop = kind == "world" and not self._beamBodyHit
+	local info = {
+		Position = if result then SafeMath.vector(result.Position, self.Position) else self.Position,
+		Normal = if result then SafeMath.unit(result.Normal, Vector3.yAxis) else Vector3.yAxis,
+		Kind = kind,
+	}
+	if self._worldStop then
+		self.Position = info.Position + info.Normal * self.Radius
+	end
+	local chain = self._chain
+	if chain then
+		table.insert(chain.deaths, { self, info })
+	end
+	self.OnDestroy:Fire(info)
+	table.clear(self._ignore)
+	self.HomingTarget = nil
+end
+
+function Sample.SetTimeScale(self: any, scale: number)
+	self.TimeScale = SafeMath.number(scale, 1, 0)
+end
+
+local function fromSettings(chain: any, settings: any): any
+	local position = settings.Origin
+	local s = {
+		Id = chain.nextId,
+		Position = position,
+		Velocity = settings.Direction * settings.Speed,
+		Speed = settings.Speed,
+		Acceleration = settings.Acceleration,
+		AccelerationDirection = settings.AccelerationDirection,
+		MinSpeed = settings.MinSpeed,
+		MaxSpeed = settings.MaxSpeed,
+		Gravity = settings.Gravity,
+		Radius = settings.Radius,
+		Lifetime = settings.Lifetime,
+		Age = 0,
+		MaxRealLifetime = settings.MaxRealLifetime,
+		TimeScale = settings.TimeScale,
+		Damage = settings.Damage,
+		DamageMultiplier = 1,
+		Source = settings.Source,
+		IgnoreInstances = settings.IgnoreInstances,
+		Filter = settings.Filter,
+		BouncesLeft = settings.Bounces,
+		Restitution = settings.Restitution,
+		Penetration = settings.Penetration,
+		PiercesLeft = settings.MaxPierces,
+		PierceFalloff = settings.PierceFalloff,
+		Homing = settings.Homing,
+		HomingDelay = if settings.Homing then settings.Homing.Delay else 0,
+		HomingTarget = if settings.Homing then settings.Homing.Target else nil,
+		ReacquireTimer = 0,
+		-- The chain replicates itself (BeamWire); the projectile streams stay
+		-- silent for samples.
+		Visualize = false,
+		VisualRange = settings.VisualRange,
+		Beam = settings.Beam,
+		RewindSeconds = 0,
+		Dead = false,
+		_spawnRealTime = os.clock(),
+		_acquireTimer = 0,
+		_ignore = {},
+		_simulationDebt = 0,
+		_rayParams = Raycast.buildRayParams(settings.Source, settings.IgnoreInstances),
+		_spawnStreamed = false,
+		_streamedSynced = false,
+		_lastStreamedTimeScale = 1,
+		_beamTurns = {},
+		_chain = chain,
+		_origin = position,
+		_tail = { position },
+		_tailTurns = 0,
+		_everLinked = false,
+	}
+	chain.nextId += 1
+	s.OnHit, s.OnDestroy = newEvent(s), newEvent(s)
+	return setmetatable(s, SampleMeta)
+end
+
+-- A joiner: the prototype's flight state at a point on its link, with its
+-- own identity, events, pierced set and turns (cf. Projectile.CreateBeamSample).
+local function joinerFrom(chain: any, prototype: any, position: Vector3, velocity: Vector3, turns: { Vector3 }): any
+	local s = table.clone(prototype)
+	s.Id = chain.nextId
+	chain.nextId += 1
+	s.Position, s.Velocity, s.Speed = position, velocity, velocity.Magnitude
+	s.Dead = false
+	s._beamJoiner = true
+	s._beamTurns = turns
+	s._ignore = table.clone(prototype._ignore)
+	s._simulationDebt = 0
+	s.OnHit, s.OnDestroy = newEvent(s), newEvent(s)
+	s._worldStop, s._beamBodyHit, s._spanParams = nil, nil, nil
+	s._beamSpan, s._beamSpanClipped, s._ahead, s._fragment = nil, nil, nil, nil
+	s._lazyLink, s._incoming, s._contact, s._lastHit = nil, nil, nil, nil
+	s._beamReserveChildren, s._beamBindChild, s._beamScaleEnergy = nil, nil, nil
+	s._rep, s._repAhead, s._repClipN, s._repClipEnd, s._repTurns = nil, nil, nil, nil, nil
+	s._sleepKeys, s._sleepAge, s._sleepLo, s._sleepHi, s._slept, s._sleepRetry, s._behind =
+		nil, nil, nil, nil, nil, nil, nil
+	s._origin, s._tail, s._tailTurns, s._everLinked = position, { position }, #turns, true
+	return s
+end
+
+--------------------------------------------------------------------------------
+-- Chains
+--------------------------------------------------------------------------------
+
+local chains: { [number]: any } = {}
+local chainOrder: { number } = {}
+local frameStats = { Created = 0, BudgetSplits = 0, Lazy = 0, Samples = 0, Joiners = 0, Sleeping = 0 }
+local lastStats = table.clone(frameStats)
+local breakReasons = { Geometry = 0, ChannelBudget = 0, FrameBudget = 0, Quota = 0, SourceAge = 0 }
+
+local function colorBytes(color: Color3?, fallback: Color3): (number, number, number)
+	local c = color or fallback
+	return math.clamp(math.floor(c.R * 255 + .5), 0, 255), math.clamp(math.floor(c.G * 255 + .5), 0, 255),
+		math.clamp(math.floor(c.B * 255 + .5), 0, 255)
+end
+
+local function newChain(id: number, config: any, settings: any): any
+	local visual = settings.Visual
+	local acceleration = settings.Acceleration
+	local constant = typeof(acceleration) ~= "number" or acceleration == 0
+	local lazy = config.Beam and config.Beam.Lazy == true
+	local chain = {
+		id = id,
+		samples = {},
+		last = nil,
+		nextId = 1,
+		joinerCount = 0,
+		deaths = {},
+		observers = {},
+		lastLaunch = os.clock(),
+		source = settings.Source,
+		visualize = settings.Visualize,
+		visualRange = settings.VisualRange,
+		-- A long link may stay one body (see the module comment) only when
+		-- every sample along it would move along the same straight chord.
+		lazy = lazy and not settings.Homing and constant and settings.MinSpeed <= 0
+			and settings.MaxSpeed == math.huge,
+		-- Clients extrapolate in straight lines + constant acceleration; these
+		-- chains also get periodic per-sample poses.
+		refresh = settings.Homing ~= nil or not constant or settings.MinSpeed > 0 or settings.MaxSpeed ~= math.huge,
+		refreshCursor = 1,
+		refreshCarry = 0,
+		scale = 1,
+		header = {
+			radius = settings.Radius,
+			length = settings.Beam.Length,
+			color = table.pack(colorBytes(visual and visual.Color, Color3.fromRGB(255, 96, 28))),
+			core = table.pack(colorBytes(visual and visual.Core, Color3.new(1, 1, 1))),
+			-- (constant acceleration only; see `refresh`)
+			gravity = Motion.GetAcceleration(Vector3.zAxis, if constant then acceleration else 0, nil, settings.Gravity),
+		},
+	}
+	chains[id] = chain
+	table.insert(chainOrder, id)
+	return chain
+end
+
+function Chain.Launch(config: any): any
+	local beam = config.Beam
+	local id = beam and beam.ChannelId
+	if not id then
+		-- A single (unsustained) beam is one ordinary projectile, as before.
+		local beamConfig = table.clone(config)
+		beamConfig.Beam = table.clone(beam or {})
+		return Projectile.new(beamConfig)
+	end
+	local started = os.clock()
+	local settings = Config.normalize(config, Projectile.GetDefaultMaxRealLifetime())
+	local chain = chains[id] or newChain(id, config, settings)
+	local s = fromSettings(chain, settings)
+	local previous = chain.last
+	if previous and not previous.Dead then
+		s._ahead = previous
+		previous._behind = s
+	end
+	chain.last = s
+	chain.lastLaunch = os.clock()
+	table.insert(chain.samples, s)
+	Profile.Add("Spawn", os.clock() - started)
+	Profile.Count("Spawned", 1)
+	return s
+end
+
+--------------------------------------------------------------------------------
+-- Links (a port of BeamProjectileHandler's span step onto samples)
+--------------------------------------------------------------------------------
+
+local function realBehind(s: any): any
+	return if s._beamJoiner then s._realBehind or s else s
+end
+local function realAhead(s: any): any
+	return if s._beamJoiner then s._realAhead or s else s
+end
+local function realAge(s: any): number
+	return os.clock() - (s._spawnRealTime or os.clock())
+end
+
+-- Break ONLY this link; the sample keeps a finite body pointing where its
+-- link went (cf. BeamProjectileHandler's unlink).
+local function unlink(s: any)
+	local path = s._beamSpan
+	local offset = path and path[2] and path[2] - path[1]
+	if not offset or offset.Magnitude < 1e-4 then
+		offset = if s.Velocity.Magnitude > 1e-4 then s.Velocity.Unit * math.min(s.Beam.Length, BeamPath.MaxStretch) else nil
+	end
+	if offset and offset.Magnitude > BeamPath.MaxStretch then
+		offset = offset.Unit * BeamPath.MaxStretch
+	end
+	s._fragment = offset
+	s._ahead, s._everLinked, s._lazyLink = nil, true, nil
+	s._beamSpanClipped = nil
+end
+
+local function initialPath(s: any): { Vector3 }
+	if s._incoming then
+		return { s.Position }
+	end
+	if s._fragment then
+		return { s.Position, s.Position + s._fragment }
+	end
+	if s._everLinked then
+		if s.Velocity.Magnitude > 1e-4 then
+			return { s.Position, s.Position + s.Velocity.Unit * math.min(s.Beam.Length, BeamPath.MaxStretch) }
+		end
+		return { s.Position }
+	end
+	local tail, turns = s._tail, s._beamTurns
+	for index = s._tailTurns + 1, #turns do
+		table.insert(tail, turns[index])
+	end
+	s._tailTurns = #turns
+	if (tail[#tail] - s.Position).Magnitude > 1e-4 then
+		table.insert(tail, s.Position)
+	end
+	local length, cap = 0, math.min(s.Beam.Length, BeamPath.MaxStretch)
+	for index = #tail, 2, -1 do
+		local span = (tail[index] - tail[index - 1]).Magnitude
+		if length + span > cap then
+			tail[index - 1] = tail[index]:Lerp(tail[index - 1], (cap - length) / span)
+			for _ = 1, index - 2 do
+				table.remove(tail, 1)
+			end
+			break
+		end
+		length += span
+	end
+	while #tail > 9 do
+		table.remove(tail, 1)
+	end
+	local reverse = table.create(#tail)
+	for index = #tail, 1, -1 do
+		table.insert(reverse, tail[index])
+	end
+	return reverse
+end
+
+local function resolve(s: any, points: { Vector3 }, globalDt: number)
+	s._beamSpan = Projectile.ResolveBeamSpan(s, points, globalDt > 0)
+end
+
+-- Would every point of this path move at the same time scale? (Only then do
+-- its virtual joiners stay on the chord.)
+local function uniformAlong(corners: { Vector3 }): boolean
+	for leg = 1, #corners - 1 do
+		local from, to = corners[leg], corners[leg + 1]
+		local offset = to - from
+		local length = offset.Magnitude
+		if length < 1e-4 then
+			continue
+		end
+		local scale = Planner.ChunkTimeScaleAt(from)
+		if Planner.ChunkTimeScaleAt(to) ~= scale then
+			return false
+		end
+		local heading = offset / length
+		if Motion.GetTimeScaleBoundaryDt(from, heading, ChunkManager.ChunkSize, ChunkManager.UseY, scale, length,
+			Planner.ChunkTimeScaleAt) < length
+			or ChunkManager.GetRadialTimeScaleBoundaryDt(from, heading, length) < length then
+			return false
+		end
+	end
+	return true
+end
+
+local created = 0 -- joiners created this frame (all chains)
+
+-- Why a link can't be subdivided right now (nil: it can, and any quota is
+-- already reserved).
+local function blocked(chain: any, p: any, front: any, corners: { Vector3 }?, needed: number): string?
+	if not corners then
+		return "Geometry"
+	elseif needed > 0 and realAge(realBehind(p)) > Chain.MaxJoinerSourceAge
+		and realAge(realAhead(front)) > Chain.MaxJoinerSourceAge then
+		return "SourceAge"
+	elseif chain.joinerCount + needed > Chain.MaxJoinersPerBeam then
+		return "ChannelBudget"
+	elseif created + needed > Chain.MaxNewJoinersPerFrame then
+		return "FrameBudget"
+	elseif needed > 0 and p._beamReserveChildren and not p._beamReserveChildren(needed) then
+		return "Quota"
+	end
+	return nil
+end
+
+-- Inserts `needed` joiners along the planned link p -> front and resolves
+-- every resulting link (cf. BeamProjectileHandler). `expiring`: the front just
+-- died, and the stretch a lazy link stood for carries on as the joiners an
+-- eager split would have made (ages graded along the path, so they expire in
+-- turn instead of all at once).
+local function split(chain: any, p: any, front: any, corners: { Vector3 }, needed: number, globalDt: number,
+	expiring: boolean?, deferred: boolean?)
+	local behindReal, aheadReal = realBehind(p), realAhead(front)
+	local list = { p }
+	local behind, ahead = p._beamTurns, front._beamTurns
+	local total = 0
+	for leg = 1, #corners - 1 do
+		total += (corners[leg + 1] - corners[leg]).Magnitude
+	end
+	local along = 0
+	local share = 1 / (needed + 1)
+	for leg = 1, #corners - 1 do
+		local from, to = corners[leg], corners[leg + 1]
+		local legLength = (to - from).Magnitude
+		local pieces = math.max(1, math.ceil(legLength / BeamPath.MaxStretch))
+		local phase = math.min(#behind + leg - 1, #ahead)
+		for piece = 1, pieces - 1 do
+			local t = piece / pieces
+			local prototype = if phase == #ahead then front else p
+			local velocity = if #behind == #ahead then p.Velocity:Lerp(front.Velocity, t)
+				elseif phase == #behind then p.Velocity
+				elseif phase == #ahead then front.Velocity
+				else (to - from).Unit * p.Velocity.Magnitude * p.Restitution ^ (phase - #behind)
+			local turns = table.move(ahead, 1, phase, 1, {})
+			local child = joinerFrom(chain, prototype, from:Lerp(to, t), velocity, turns)
+			child._realBehind, child._realAhead = behindReal, aheadReal
+			-- Toward a world-stopped front, never inherit its frozen age (it
+			-- would keep seeding young joiners); otherwise graded along the path.
+			local fraction = if total > 0 then (along + legLength * t) / total else t
+			child.Age = if front.Dead and not expiring then p.Age else p.Age + (front.Age - p.Age) * fraction
+			child.Damage = p.Damage * share
+			if p._beamBindChild then
+				p._beamBindChild(child, share)
+			end
+			table.insert(list, child)
+			table.insert(chain.samples, child)
+		end
+		along += legLength
+	end
+	if p._beamScaleEnergy then
+		p._beamScaleEnergy(share)
+	else
+		p.Damage *= share
+	end
+	table.insert(list, front)
+	for link = 1, #list - 1 do
+		local back, forward = list[link], list[link + 1]
+		back._ahead, back._everLinked, back._lazyLink = forward, true, nil
+		forward._everLinked, forward._incoming, forward._behind = true, true, back
+		if deferred then
+			continue -- (mid-step: the next link pass resolves these)
+		end
+		local path = BeamPath.Connect(back.Position, forward.Position, back._beamTurns, forward._beamTurns)
+		if path then
+			resolve(back, path, globalDt)
+		else
+			unlink(back)
+			resolve(back, initialPath(back), globalDt)
+		end
+	end
+	if not front.Dead and not front._ahead then
+		front._beamSpan = { front.Position }
+	end
+	chain.joinerCount += needed
+	created += needed
+	frameStats.Created += needed
+	Profile.Count("BeamCreated", needed)
+end
+
+function materializeAhead(s: any)
+	local front = s._ahead
+	if not front or (front.Dead and not front._worldStop) then
+		return
+	end
+	local chain = s._chain
+	local corners, needed = BeamPath.Plan(s.Position, front.Position, s._beamTurns, front._beamTurns)
+	if corners and needed > 0 then
+		local reason = blocked(chain, s, front, corners, needed)
+		if reason then
+			breakReasons[reason] += 1
+		else
+			split(chain, s, front, corners, needed, 0, false, true)
+		end
+	end
+	s._lazyLink = nil
+end
+
+local function linkOne(chain: any, p: any, globalDt: number)
+	do
+		local front = p._ahead
+		if front and front.Dead and not front._worldStop then
+			if p._lazyLink then
+				local corners, needed = BeamPath.Plan(p.Position, front.Position, p._beamTurns, front._beamTurns)
+				if corners and needed > 0 and not blocked(chain, p, front, corners, needed) then
+					split(chain, p, front, corners, needed, globalDt, true)
+					return
+				end
+			end
+			unlink(p)
+			front = nil
+		end
+		if not front then
+			resolve(p, initialPath(p), globalDt)
+			return
+		end
+		local corners, needed = BeamPath.Plan(p.Position, front.Position, p._beamTurns, front._beamTurns)
+		if corners and needed > 0 and chain.lazy and (ChunkManager.IsTimeUniform() or uniformAlong(corners))
+			and Projectile.ProbeBeamSpan(p, corners, if front.Dead then 0.1 else nil) then
+			-- Nothing touches it: one body, no joiners.
+			p._lazyLink, p._everLinked, front._everLinked, front._incoming = true, true, true, true
+			p._beamSpan, p._beamSpanClipped = corners, nil
+			if not front.Dead and not front._ahead then
+				front._beamSpan = { front.Position }
+			end
+			return
+		end
+		local reason = blocked(chain, p, front, corners, needed)
+		if reason then
+			breakReasons[reason] += 1
+			frameStats.BudgetSplits += 1
+			unlink(p)
+			resolve(p, initialPath(p), globalDt)
+			return
+		end
+		if needed == 0 then
+			p._lazyLink, p._everLinked, front._everLinked, front._incoming = nil, true, true, true
+			resolve(p, corners :: { Vector3 }, globalDt)
+			if not front.Dead and not front._ahead then
+				front._beamSpan = { front.Position }
+			end
+			return
+		end
+		split(chain, p, front, corners :: { Vector3 }, needed, globalDt)
+	end
+end
+
+local function timeScaleOf(s: any): number
+	local source = s.Source
+	return SafeMath.number(SafeMath.number(source and source.TimeScale, 1, 0) * SafeMath.number(s.TimeScale, 1, 0), 0, 0)
+end
+
+-- Exactly what Projectile.Step does in empty space under uniform time.
+local function drift(s: any, dt: number)
+	dt += s._simulationDebt
+	if dt <= 0 then
+		s._simulationDebt = dt
+		return
+	end
+	s._simulationDebt = 0
+	local a = s._sleepAccel
+	s.Position += s.Velocity * dt + a * (.5 * dt * dt)
+	s.Velocity += a * dt
+	s.Age += dt
+end
+
+-- Occupancy's marks are coarse (4-stud voxels grown by 4 studs, so a beam a
+-- few studs over a floor never reads as clear there); then ask the engine:
+-- which parts' bounds overlap the box (filtered like the sample's casts),
+-- plus terrain voxels on maps that have terrain.
+local overlapFor: { [RaycastParams]: OverlapParams } = setmetatable({}, { __mode = "k" }) :: any
+
+local function engineClear(s: any, lo: Vector3, hi: Vector3): boolean
+	local rayParams: RaycastParams = s._rayParams
+	local params = overlapFor[rayParams]
+	if not params then
+		params = OverlapParams.new()
+		params.FilterType = rayParams.FilterType
+		params.FilterDescendantsInstances = rayParams.FilterDescendantsInstances
+		params.CollisionGroup = rayParams.CollisionGroup
+		params.RespectCanCollide = rayParams.RespectCanCollide
+		overlapFor[rayParams] = params
+	end
+	local pad = Vector3.one * (s.Radius + SLEEP_MARGIN)
+	local low, high = lo - pad, hi + pad
+	if #workspace:GetPartBoundsInBox(CFrame.new((low + high) * .5), high - low, params) > 0 then
+		return false
+	end
+	if Occupancy.HasTerrain() then
+		local ok, materials = pcall(function()
+			return workspace.Terrain:ReadVoxels(Region3.new(low, high):ExpandToGrid(4), 4)
+		end)
+		if not ok then
+			return false
+		end
+		local air, water = Enum.Material.Air, Enum.Material.Water
+		local ignoreWater = rayParams.IgnoreWater
+		local size = materials.Size
+		for x = 1, size.X do
+			for y = 1, size.Y do
+				for z = 1, size.Z do
+					local material = materials[x][y][z]
+					if material ~= air and not (ignoreWater and material == water) then
+						return false
+					end
+				end
+			end
+		end
+	end
+	return true
+end
+
+-- After its link pass: may `p` sleep? (See "Sleep" at the top.)
+local function trySleep(chain: any, p: any, globalDt: number)
+	if not chain.lazy or p._beamSpanClipped or p.Radius > Occupancy.MaxRadius or not ChunkManager.IsTimeUniform() then
+		return
+	end
+	local frame = globalDt * timeScaleOf(p)
+	if frame <= 0 or (p._sleepRetry and p.Age < p._sleepRetry) then
+		return
+	end
+	local front = p._ahead
+	local frontMoving = front ~= nil and not front.Dead
+	local speed = math.max(p.Velocity.Magnitude, if frontMoving then front.Velocity.Magnitude else 0, 1)
+	local window = math.min(SLEEP_STUDS / speed, SLEEP_MAX_SECONDS, p.Lifetime - p.Age - 1e-3)
+	if window < frame * SLEEP_MIN_FRAMES then
+		p._sleepRetry = p.Age + frame * SLEEP_MIN_FRAMES
+		return
+	end
+	-- The box: its body now (itself, its corners, the front / fragment /
+	-- tail end), with every point moved by as much as either end moves over
+	-- the window, plus how far constant acceleration bows a path off its chord.
+	local a = Motion.GetAcceleration(p.Velocity, p.Acceleration, p.AccelerationDirection, p.Gravity)
+	local half = .5 * window * window
+	local dp = p.Velocity * window + a * half
+	local df = if frontMoving then front.Velocity * window + a * half else Vector3.zero
+	local lo, hi = p.Position, p.Position
+	local span = p._beamSpan
+	if span then
+		for _, point in span do
+			lo, hi = lo:Min(point), hi:Max(point)
+		end
+	end
+	local bow = Vector3.one * (a.Magnitude * window * window * .125)
+	lo = lo + dp:Min(df):Min(Vector3.zero) - bow
+	hi = hi + dp:Max(df):Max(Vector3.zero) + bow
+	local ignore = Raycast.ignoreSetFor(p._rayParams)
+	local verdict = Occupancy.BoxClear(lo, hi, ignore, SLEEP_MAX_CELLS)
+	if verdict == "static" and engineClear(p, lo, hi) then
+		verdict = "clear"
+	end
+	if verdict ~= "clear" then
+		p._sleepRetry = p.Age + window * .5
+		return
+	end
+	local coarse = Occupancy.Coarse
+	local keys = {}
+	for cz = math.floor(lo.Z / coarse), math.floor(hi.Z / coarse) do
+		for cy = math.floor(lo.Y / coarse), math.floor(hi.Y / coarse) do
+			for cx = math.floor(lo.X / coarse), math.floor(hi.X / coarse) do
+				local key = Occupancy.CoarseKey(cx, cy, cz)
+				local set = sleepCells[key]
+				if not set then
+					set = {}
+					sleepCells[key] = set
+				end
+				set[p] = true
+				table.insert(keys, key)
+			end
+		end
+	end
+	p._sleepKeys, p._sleepAge, p._sleepLo, p._sleepHi = keys, p.Age + window, lo, hi
+	p._sleepIgnore, p._sleepAccel, p._sleepRetry, p._slept = ignore, a, nil, nil
+	sleeping += 1
+end
+
+-- Wakes every sleeper something may now reach (before the frame's heads).
+local function wakeScan()
+	local changed, overflow = Occupancy.TakeStaticChanges()
+	if sleeping <= 0 then
+		return
+	end
+	local woken: { [any]: boolean } = {}
+	if overflow or not ChunkManager.IsTimeUniform() then
+		for _, set in sleepCells do
+			for s in set do
+				woken[s] = true
+			end
+		end
+	else
+		for _, key in changed do
+			local set = sleepCells[key]
+			if set then
+				for s in set do
+					woken[s] = true
+				end
+			end
+		end
+		for key, boxes in Occupancy.DynamicMarks() do
+			local set = sleepCells[key]
+			if not set then
+				continue
+			end
+			for s in set do
+				if woken[s] then
+					continue
+				end
+				local lo, hi, ignore = s._sleepLo, s._sleepHi, s._sleepIgnore
+				for index = 1, #boxes, 3 do
+					local mlo, mhi = boxes[index], boxes[index + 1]
+					if hi.X > mlo.X and lo.X < mhi.X and hi.Y > mlo.Y and lo.Y < mhi.Y and hi.Z > mlo.Z and lo.Z < mhi.Z
+						and not ignore[boxes[index + 2]] then
+						woken[s] = true
+						break
+					end
+				end
+			end
+		end
+	end
+	local count = 0
+	for s in woken do
+		wake(s)
+		count += 1
+	end
+	Profile.Count("BeamWakes", count)
+end
+
+local function stepLinks(chain: any, globalDt: number)
+	local samples = chain.samples
+	local count = #samples
+	for index = 1, count do
+		local s = samples[index]
+		local ahead = s._ahead
+		if ahead and not s.Dead then
+			ahead._behind = s
+			if not ahead.Dead then
+				ahead._incoming = true
+			end
+		end
+	end
+	for index = 1, count do
+		local p = samples[index]
+		if p.Dead then
+			continue
+		end
+		if p._slept then
+			-- (asleep all frame: nothing about its link can have changed)
+			if p._lazyLink then
+				frameStats.Lazy += 1
+			end
+			continue
+		end
+		linkOne(chain, p, globalDt)
+		if p._lazyLink then
+			frameStats.Lazy += 1
+		end
+		if not p.Dead and not p._sleepKeys then
+			trySleep(chain, p, globalDt)
+		end
+	end
+end
+
+--------------------------------------------------------------------------------
+-- Replication (see BeamWire for the format)
+--------------------------------------------------------------------------------
+
+local function writeSpawn(w: BeamWire.Writer, s: any, stopped: boolean?)
+	U8(w, Op.Spawn)
+	U32(w, s.Id)
+	V3(w, s.Position)
+	V3(w, if stopped then Vector3.zero else s.Velocity)
+	F32(w, math.max(s.Lifetime - s.Age, 0))
+	local ahead = s._ahead
+	U32(w, if ahead and not stopped then ahead.Id else 0)
+	local fragment = s._fragment
+	local origin = not ahead and not s._everLinked
+	local flags = (if fragment then Flag.Fragment else 0) + (if origin then Flag.Origin else 0)
+		+ (if s._beamJoiner then Flag.Joiner else 0) + (if s._everLinked then Flag.EverLinked else 0)
+		+ (if stopped then Flag.Stopped else 0)
+	U8(w, flags)
+	if fragment then
+		V3(w, fragment)
+	end
+	if origin then
+		V3(w, s._origin)
+	end
+	local turns = s._beamTurns
+	local n = math.min(#turns, 255)
+	U8(w, n)
+	for index = 1, n do
+		V3(w, turns[index])
+	end
+	s._rep, s._repAhead, s._repTurns = true, if ahead and not stopped then ahead.Id else 0, #turns
+end
+
+local function writePose(w: BeamWire.Writer, s: any)
+	U8(w, Op.Pose)
+	U32(w, s.Id)
+	V3(w, s.Position)
+	V3(w, s.Velocity)
+	F32(w, math.max(s.Lifetime - s.Age, 0))
+end
+
+local function clipState(s: any): ({ Vector3 }?, Vector3?)
+	local span = s._beamSpan
+	if s._beamSpanClipped and span and #span > 0 then
+		return span, span[#span]
+	end
+	return nil, nil
+end
+
+local function writeClip(w: BeamWire.Writer, s: any, span: { Vector3 }?)
+	U8(w, Op.Clip)
+	U32(w, s.Id)
+	local n = if span then math.min(#span, 255) else 0
+	U8(w, n)
+	for index = 1, n do
+		V3(w, (span :: { Vector3 })[index])
+	end
+	s._repClipN = n
+	s._repClipEnd = if span and n > 0 then span[n] else nil
+end
+
+-- Spawns `ahead` for a client that never saw it: a sample that stopped at a
+-- wall in its first frame still anchors its followers.
+local function ensureStopped(w: BeamWire.Writer, ahead: any?)
+	if ahead and ahead.Dead and ahead._worldStop and not ahead._rep then
+		writeSpawn(w, ahead, true)
+	end
+end
+
+local function writeHeader(w: BeamWire.Writer, chain: any)
+	local header = chain.header
+	F32(w, header.radius)
+	F32(w, header.length)
+	for index = 1, 3 do
+		U8(w, header.color[index])
+	end
+	for index = 1, 3 do
+		U8(w, header.core[index])
+	end
+	V3(w, header.gravity)
+	F32(w, chain.scale)
+end
+
+-- This frame's events for everyone already watching the chain.
+local function encodeDelta(chain: any, now: number, globalDt: number): BeamWire.Writer?
+	local w = BeamWire.Writer(512)
+	U32(w, chain.id)
+	U8(w, Section.Delta)
+	F64(w, now)
+	local start = w.n
+	local samples = chain.samples
+	if chain.scaleChanged then
+		U8(w, Op.Scale)
+		F32(w, chain.scale)
+	end
+	-- New samples first, so links in this section can name them.
+	for _, s in samples do
+		if not s.Dead and not s._rep then
+			ensureStopped(w, s._ahead)
+			writeSpawn(w, s)
+			s._contact = nil
+			local span = clipState(s)
+			if span then
+				writeClip(w, s, span)
+			end
+		end
+	end
+	-- Periodic poses for chains clients can't extrapolate exactly.
+	local refreshing: { [any]: boolean }? = nil
+	if chain.refresh or not ChunkManager.IsTimeUniform() then
+		local live = #samples
+		chain.refreshCarry += live * globalDt / REFRESH_PERIOD
+		local budget = math.min(math.floor(chain.refreshCarry), live)
+		chain.refreshCarry -= budget
+		if budget > 0 then
+			refreshing = {}
+			for _ = 1, budget do
+				if chain.refreshCursor > live then
+					chain.refreshCursor = 1
+				end
+				(refreshing :: any)[samples[chain.refreshCursor]] = true
+				chain.refreshCursor += 1
+			end
+		end
+	end
+	for _, s in samples do
+		if not s._rep or s._slept then
+			continue -- (unsent, or asleep all frame: nothing new)
+		end
+		local ahead = s._ahead
+		local aheadId = if ahead then ahead.Id else 0
+		if aheadId ~= s._repAhead then
+			-- (a dying sample too: its drained body ends at its new link)
+			ensureStopped(w, ahead)
+			U8(w, Op.Link)
+			U32(w, s.Id)
+			U32(w, aheadId)
+			if aheadId == 0 then
+				V3(w, s._fragment or Vector3.zero)
+			end
+			s._repAhead = aheadId
+		end
+		if s.Dead then
+			continue
+		end
+		local turns = s._beamTurns
+		if #turns > (s._repTurns or 0) then
+			local hit = s._lastHit
+			local frame = hit and hit.CFrame
+			local contact = if frame then frame.Position else s.Position
+			local normal = if frame then frame.LookVector else Vector3.yAxis
+			U8(w, Op.Bounce)
+			U32(w, s.Id)
+			V3(w, s.Position)
+			V3(w, s.Velocity)
+			V3(w, contact)
+			V3(w, normal)
+			local first = s._repTurns + 1
+			local n = math.min(#turns - first + 1, 255)
+			U8(w, n)
+			for index = first, first + n - 1 do
+				V3(w, turns[index])
+			end
+			s._repTurns = #turns
+			s._contact = nil
+		elseif s._contact or (refreshing and refreshing[s]) then
+			writePose(w, s)
+			s._contact = nil
+		end
+		local span, finish = clipState(s)
+		if span then
+			if s._repClipN ~= #span or not s._repClipEnd or ((finish :: Vector3) - s._repClipEnd).Magnitude > CLIP_RESEND then
+				writeClip(w, s, span)
+			end
+		elseif s._repClipN and s._repClipN > 0 then
+			writeClip(w, s, nil)
+		end
+	end
+	for _, death in chain.deaths do
+		local s, info = death[1], death[2]
+		if not s._rep then
+			continue
+		end
+		U8(w, Op.Death)
+		U32(w, s.Id)
+		local kind = info.Kind
+		if kind == nil then
+			U8(w, DeathKind.Expire)
+		else
+			U8(w, if kind == "world" then DeathKind.World elseif kind == "entity" then DeathKind.Entity else DeathKind.Other)
+			V3(w, info.Position)
+			V3(w, info.Normal)
+			U8(w, if s._beamBodyHit then 1 else 0)
+		end
+	end
+	if w.n == start then
+		return nil
+	end
+	U8(w, Op.End)
+	return w
+end
+
+-- The whole chain for a client that just started watching it.
+local function encodeSnapshot(chain: any, now: number): BeamWire.Writer
+	local w = BeamWire.Writer(1024)
+	U32(w, chain.id)
+	U8(w, Section.Snapshot)
+	F64(w, now)
+	writeHeader(w, chain)
+	local stopped: { [any]: boolean } = {}
+	for _, s in chain.samples do
+		if s.Dead then
+			continue
+		end
+		local ahead = s._ahead
+		if ahead and ahead.Dead and ahead._worldStop and not stopped[ahead] then
+			stopped[ahead] = true
+			writeSpawn(w, ahead, true)
+		end
+		writeSpawn(w, s)
+		local span = clipState(s)
+		if span then
+			writeClip(w, s, span)
+		end
+	end
+	U8(w, Op.End)
+	return w
+end
+
+local function closedSection(id: number, kind: number, now: number): BeamWire.Writer
+	local w = BeamWire.Writer(16)
+	U32(w, id)
+	U8(w, kind)
+	F64(w, now)
+	U8(w, Op.End)
+	return w
+end
+
+local function playerRoots(): { [Player]: Vector3 }
+	local roots = {}
+	for _, player in Players:GetPlayers() do
+		local character = player.Character
+		local root = character and character.PrimaryPart
+		if root then
+			roots[player] = root.Position
+		end
+	end
+	return roots
+end
+
+local function bounds(chain: any): (Vector3?, Vector3?)
+	local low, high = nil, nil
+	for _, s in chain.samples do
+		if s.Dead then
+			continue
+		end
+		local position = s.Position
+		low = if low then low:Min(position) else position
+		high = if high then high:Max(position) else position
+	end
+	return low, high
+end
+
+local function distanceToBox(point: Vector3, low: Vector3, high: Vector3): number
+	return (point - point:Max(low):Min(high)).Magnitude
+end
+
+-- Builds and sends this frame's per-recipient messages.
+local function replicate(globalDt: number)
+	local now = workspace:GetServerTimeNow()
+	local roots = playerRoots()
+	local outgoing: { [Player]: BeamWire.Writer } = {}
+	local function send(player: Player, section: BeamWire.Writer)
+		local out = outgoing[player]
+		if not out then
+			out = BeamWire.Writer(section.n + 64)
+			outgoing[player] = out
+		end
+		BeamWire.Append(out, section)
+	end
+	for _, id in chainOrder do
+		local chain = chains[id]
+		if not chain then
+			continue
+		end
+		if not chain.visualize then
+			table.clear(chain.deaths)
+			continue
+		end
+		local observers = chain.observers
+		if chain.finished then
+			-- Its last deaths, then the End.
+			if next(observers) then
+				local delta = encodeDelta(chain, now, globalDt)
+				local section = closedSection(chain.id, Section.End, now)
+				for player in observers do
+					if player.Parent then
+						if delta then
+							send(player, delta)
+						end
+						send(player, section)
+					end
+				end
+			end
+			table.clear(chain.deaths)
+			continue
+		end
+		local low, high = bounds(chain)
+		local range = chain.visualRange
+		local scale = SafeMath.number(chain.source and chain.source.TimeScale, 1, 0)
+		chain.scaleChanged = scale ~= chain.scale
+		chain.scale = scale
+		local snapshot: BeamWire.Writer? = nil
+		-- (nobody watching: a later snapshot carries everything)
+		local delta = if next(observers) then encodeDelta(chain, now, globalDt) else nil
+		local exit: BeamWire.Writer? = nil
+		for player, position in roots do
+			local watching = observers[player]
+			local distance = if low and high then distanceToBox(position, low, high) else math.huge
+			if watching and distance > range * 1.1 + 8 then
+				observers[player] = nil
+				exit = exit or closedSection(id, Section.Exit, now)
+				send(player, exit :: BeamWire.Writer)
+			elseif watching then
+				if delta then
+					send(player, delta)
+				end
+			elseif distance <= range then
+				observers[player] = true
+				snapshot = snapshot or encodeSnapshot(chain, now)
+				send(player, snapshot :: BeamWire.Writer)
+			end
+		end
+		for player in observers do
+			if not roots[player] then
+				observers[player] = nil
+			end
+		end
+		table.clear(chain.deaths)
+	end
+	for player, out in outgoing do
+		if player.Parent then
+			VisualOffload.FireClient(player, BeamWire.Channel, BeamWire.Finish(out))
+		end
+	end
+end
+
+--------------------------------------------------------------------------------
+-- Frame step: every head, then every link, then the stream
+--------------------------------------------------------------------------------
+
+Projectile.SetBeamSpanStep(function(globalDt: number)
+	created = 0
+	local orderCount = #chainOrder
+	if orderCount == 0 then
+		lastStats = table.clone(frameStats)
+		return
+	end
+	local headStarted = os.clock()
+	wakeScan()
+	local uniform = ChunkManager.IsTimeUniform()
+	local realNow = os.clock()
+	local sampleCount, joinerCount = 0, 0
+	for offset = 1, orderCount do
+		local chain = chains[chainOrder[offset]]
+		if not chain then
+			continue
+		end
+		local samples = chain.samples
+		for index = 1, #samples do
+			local s = samples[index]
+			if s.Dead then
+				continue
+			end
+			if s._sleepKeys then
+				local dt = globalDt * timeScaleOf(s)
+				if uniform and s.Age + dt + s._simulationDebt <= s._sleepAge
+					and realNow - s._spawnRealTime < s.MaxRealLifetime then
+					drift(s, dt)
+					s._slept = true
+					continue
+				end
+				wake(s)
+			end
+			if not Projectile.Step(s :: any, globalDt) and not s.Dead then
+				s:Destroy(nil, nil)
+			end
+		end
+	end
+	Profile.Add("BeamHeads", os.clock() - headStarted)
+
+	local linkStarted = os.clock()
+	local now = os.clock()
+	local ended = {}
+	for offset = 1, orderCount do
+		local id = chainOrder[offset]
+		local chain = chains[id]
+		if not chain then
+			continue
+		end
+		-- Drop the dead (their deaths are already queued for the stream).
+		local samples, kept, joiners = chain.samples, 0, 0
+		local oldCount = #samples
+		for index = 1, oldCount do
+			local s = samples[index]
+			s._incoming = false
+			if s.Dead and s._sleepKeys then
+				wake(s)
+			end
+			if not s.Dead then
+				kept += 1
+				samples[kept] = s
+				if s._beamJoiner then
+					joiners += 1
+				end
+			end
+		end
+		for index = kept + 1, oldCount do
+			samples[index] = nil
+		end
+		chain.joinerCount = joiners
+		if kept == 0 then
+			if now - chain.lastLaunch > CHAIN_GRACE then
+				-- (dropped after the stream has sent its last deaths)
+				chain.finished = true
+				table.insert(ended, chain)
+			end
+			continue
+		end
+		stepLinks(chain, globalDt)
+		sampleCount += #chain.samples
+		joinerCount += chain.joinerCount
+	end
+	Profile.Add("BeamLinkPass", os.clock() - linkStarted)
+	Profile.Count("BeamSamples", sampleCount)
+
+	local replicateStarted = os.clock()
+	replicate(globalDt)
+	if #ended > 0 then
+		for _, chain in ended do
+			chains[chain.id] = nil
+		end
+		local live = {}
+		for _, id in chainOrder do
+			if chains[id] then
+				table.insert(live, id)
+			end
+		end
+		chainOrder = live
+	end
+	Profile.Add("BeamReplicate", os.clock() - replicateStarted)
+	frameStats.Samples, frameStats.Joiners, frameStats.Sleeping = sampleCount, joinerCount, sleeping
+	Profile.Count("BeamAsleep", sleeping)
+	lastStats = table.clone(frameStats)
+	frameStats.Created, frameStats.BudgetSplits, frameStats.Lazy = 0, 0, 0
+end)
+
+function Chain.GetJoinerStats()
+	return {
+		Active = lastStats.Joiners,
+		Samples = lastStats.Samples,
+		Sleeping = lastStats.Sleeping,
+		LazyLinks = lastStats.Lazy,
+		Chains = #chainOrder,
+		Created = lastStats.Created,
+		Updated = lastStats.Joiners,
+		BudgetSplits = lastStats.BudgetSplits,
+		MaxPerBeam = Chain.MaxJoinersPerBeam,
+		MaxNewPerFrame = Chain.MaxNewJoinersPerFrame,
+		BreakReasons = table.clone(breakReasons),
+	}
+end
+
+--------------------------------------------------------------------------------
+-- Channels (identical to BeamProjectileHandler)
+--------------------------------------------------------------------------------
+
+local channels: { any } = {}
+local lastInput: { [Player]: number } = {}
+local nextChannelId = 0
+
+function Chain.IsActive(player: Player): boolean
+	for _, channel in channels do
+		if channel.Player == player then
+			return true
+		end
+	end
+	return false
+end
+
+function Chain.Stop(player: Player)
+	for index = #channels, 1, -1 do
+		if channels[index].Player == player then
+			table.remove(channels, index)
+		end
+	end
+	lastInput[player] = nil
+end
+
+-- KeepAlive cannot begin a cast or modify its duration/stats. Only the
+-- server's validated SpellCast path can call Start.
+function Chain.KeepAlive(player: Player)
+	if lastInput[player] then
+		lastInput[player] = os.clock()
+	end
+end
+
+function Chain.BeginCast(player: Player)
+	lastInput[player] = os.clock()
+end
+
+function Chain.Start(options: any): boolean
+	if not lastInput[options.Player] or os.clock() - lastInput[options.Player] > INPUT_TIMEOUT then
+		return false
+	end
+	local count = 0
+	for _, channel in channels do
+		if channel.Player == options.Player then
+			count += 1
+		end
+	end
+	if count >= MAX_CHANNELS_PER_PLAYER then
+		return false
+	end
+	local channel = table.clone(options)
+	nextChannelId += 1
+	channel.Id = nextChannelId
+	channel.Interval = Chain.GetInterval(options.Speed or 2000)
+	channel.Remaining = options.Duration
+	channel.NextEmit = options.Delay or 0
+	channel.Started = os.clock()
+	if channel.NextEmit == 0 then
+		local slice = math.min(channel.Interval, channel.Remaining)
+		channel.Emit(slice / options.Duration, channel.Id)
+		channel.Remaining -= slice
+		channel.NextEmit = channel.Interval
+	end
+	table.insert(channels, channel)
+	return true
+end
+
+Heartbeat.Connect(function(globalDt: number)
+	local now = os.clock()
+	for index = #channels, 1, -1 do
+		local channel = channels[index]
+		local player, character = channel.Player, channel.Character
+		local humanoid = character:FindFirstChildOfClass("Humanoid")
+		-- a channel only ends early if another weapon is taken out (same rule
+		-- as SpellService.canCastSpells)
+		local otherTool = false
+		for _, child in character:GetChildren() do
+			if child:IsA("Tool") and child.Name ~= "SpellAssembler" then
+				otherTool = true
+				break
+			end
+		end
+		if channel.Remaining <= 1e-8 or not player.Parent or player.Character ~= character
+			or not humanoid or humanoid.Health <= 0 or otherTool
+			or now - (lastInput[player] or 0) > INPUT_TIMEOUT or now - channel.Started >= 60 then
+			table.remove(channels, index)
+			continue
+		end
+		local caster = channel.Caster
+		if caster and (caster.IsDestroyed or caster.Health <= 0) then
+			table.remove(channels, index)
+			continue
+		end
+		local scale = ChunkManager.GetTimeScaleAt(channel.Origin()) * (caster and caster.TimeScale or 1)
+		if scale <= 0 then
+			continue
+		end
+		channel.NextEmit -= globalDt * scale
+		local emitted = 0
+		while channel.NextEmit <= 0 and channel.Remaining > 1e-8 and emitted < MAX_PACKETS_PER_CHANNEL_FRAME do
+			local slice = math.min(channel.Interval, channel.Remaining)
+			channel.Emit(slice / channel.Duration, channel.Id)
+			channel.Remaining -= slice
+			channel.NextEmit += channel.Interval
+			emitted += 1
+		end
+	end
+end, { Name = "BeamChain.Channel", Priority = 4 })
+
+Players.PlayerRemoving:Connect(function(player)
+	Chain.Stop(player)
+	for _, chain in chains do
+		chain.observers[player] = nil
+	end
+end)
+
+return Chain
+-- =============================================================================
+-- END FILE: src/server/Projectile/BeamChain.luau
+-- =============================================================================
+
+-- =============================================================================
+-- BEGIN FILE: src/server/Projectile/Beams.luau
+-- =============================================================================
+--!strict
+-- Which sustained-beam implementation runs. BeamChain (lightweight samples,
+-- one replicated stream per channel) is the default. The original
+-- BeamProjectileHandler (every packet and joiner a full projectile) is kept
+-- as a backup: set the attribute LegacyBeams = true on ServerScriptService
+-- before the server starts to run it instead (e.g. to A/B a benchmark).
+-- Only the chosen one is required -- each installs the beam span step.
+local legacy = game:GetService("ServerScriptService"):GetAttribute("LegacyBeams") == true
+return require(script.Parent:WaitForChild(if legacy then "BeamProjectileHandler" else "BeamChain")) :: any
+-- =============================================================================
+-- END FILE: src/server/Projectile/Beams.luau
+-- =============================================================================
+
+-- =============================================================================
 -- BEGIN FILE: src/server/ProjectileQuota.luau
 -- =============================================================================
 --!strict
@@ -10335,6 +12194,9 @@ end
 -- the engine cast with the projectile's filter. True when anything is hit.
 -- The cast's RaycastResult when it hits something (true when it can't be
 -- cast here), else nil.
+-- engine casts this batch made (the Stats tab's sphere / ray counts)
+local sphereCasts, rayCasts = 0, 0
+
 local function castHits(from: Vector3, displacement: Vector3, radius: number, filter: number, nearEntities: boolean): any
 	if Occupancy.SegmentClear(from, displacement, radius, filterIgnores[filter]) then
 		return nil
@@ -10348,8 +12210,12 @@ local function castHits(from: Vector3, displacement: Vector3, radius: number, fi
 		if not nearEntities then
 			radius = CollisionLOD.Radius(entityChunks, ChunkManager.ChunkSize, ChunkManager.UseY, from, displacement, radius)
 		end
-		if radius > 0 then return workspace:Spherecast(from, radius, displacement, params) end
+		if radius > 0 then
+			sphereCasts += 1
+			return workspace:Spherecast(from, radius, displacement, params)
+		end
 	end
+	rayCasts += 1
 	return workspace:Raycast(from, displacement, params)
 end
 
@@ -10384,8 +12250,9 @@ actor:BindToMessageParallel("Sweep", function(frame: number, input: buffer, coun
 	task.synchronize()
 	results:Fire(workerId, frame, count, ms, result, occupancy.Checks, occupancy.Skipped, {
 		occupancy.NotReady, occupancy.TooWide, occupancy.OutsideTerrain, occupancy.Blocked, occupancy.BlockedMoving,
-		occupancy.DynamicParts, occupancy.LargestDynamic,
+		occupancy.DynamicParts, occupancy.LargestDynamic, sphereCasts, rayCasts,
 	}, contacts, homingOut)
+	sphereCasts, rayCasts = 0, 0
 end)
 -- =============================================================================
 -- END FILE: src/server/ProjectileWorkerBootstrap.server.luau
@@ -12080,6 +13947,747 @@ return BeamVisual
 -- =============================================================================
 
 -- =============================================================================
+-- BEGIN FILE: src/shared/Projectile/Client/BeamChainVisual.luau
+-- =============================================================================
+--!strict
+--[[
+	Projectile/Client/BeamChainVisual.luau
+	Draws sustained beam chains from the server's BeamWire stream (sending
+	side: ServerScriptService Projectile/BeamChain). Purely cosmetic.
+
+	Each chain is a set of samples moving deterministically (velocity +
+	constant acceleration, the chain's time scale, chunk dilation) between the
+	server's events. Every frame each sample's body is rebuilt the way the
+	server builds it: to the sample ahead through the bounce corners
+	(BeamPath.Plan), else its clipped / fragment / tail body. One pooled set of
+	cylinders per chain, posed through Motor6D.Transform like BeamVisual.
+
+	Timing: a chain keeps one clock offset (the smallest transit seen), so
+	samples from late messages catch up by exactly their extra delay and stay
+	evenly spaced instead of inheriting network jitter.
+
+	Drawing: bodies are joined end to end into strands (a sample's body ends
+	where the one ahead of it starts) and vertices that are straight to within
+	a fraction of the radius are dropped, so a steady beam is a handful of
+	long cylinders however many samples it has. Cylinders are cut at fixed
+	lengths from the back, so only the front piece of a strand changes size.
+]]
+
+local RunService = game:GetService("RunService")
+local Shared = script.Parent.Parent.Parent
+local ChunkManager = require(Shared:WaitForChild("ChunkManager"))
+local Heartbeat = require(Shared:WaitForChild("Heartbeat"))
+local VisualOffload = require(Shared:WaitForChild("VisualOffload"))
+local ProjectileShared = Shared:WaitForChild("Projectile")
+local Planner = require(ProjectileShared:WaitForChild("StepPlanner"))
+local BeamPath = require(ProjectileShared:WaitForChild("BeamPath"))
+local BeamWire = require(ProjectileShared:WaitForChild("BeamWire"))
+local View = require(script.Parent.View)
+local Impact = require(script.Parent.Impact)
+
+local Op, Section, DeathKind, Flag = BeamWire.Op, BeamWire.Section, BeamWire.Death, BeamWire.SpawnFlag
+local ReadU8, ReadU32, ReadF32, ReadF64, ReadV3 = BeamWire.ReadU8, BeamWire.ReadU32, BeamWire.ReadF32, BeamWire.ReadF64, BeamWire.ReadV3
+
+local BeamChainVisual = {}
+
+local MAX_SEGMENT = 128 -- studs per pooled cylinder
+local STRAIGHT = 0.15 -- of the radius: how far a merged straight run may stray from a dropped vertex
+local EXPIRE_GRACE = 0.5 -- seconds a sample out of life waits for the server's death before dying here
+local MAX_PARTS_PER_FRAME = 2400 -- cylinders + joint balls posed per frame, all chains
+local JOINT_COS = math.cos(math.rad(12)) -- bends sharper than this get a ball
+local DEAD_GRACE = 0.25 -- real seconds a dead sample is kept for in-flight messages
+local GHOST_LIFETIME = 1.5 -- a dead sample still named as a link target
+local DRAIN_LIMIT = 5
+local IMPACT_THROTTLE, IMPACT_SPACING = 0.1, 4
+local ROTATION = CFrame.Angles(0, math.pi / 2, 0) -- cylinder X axis -> path Z
+local DEATH_KINDS = { [DeathKind.World] = "world", [DeathKind.Entity] = "entity", [DeathKind.Other] = "detonate" }
+
+type Sample = {
+	id: number,
+	pos: Vector3,
+	vel: Vector3,
+	life: number,
+	ahead: number,
+	turns: { Vector3 },
+	origin: Vector3?,
+	fragment: Vector3?,
+	everLinked: boolean,
+	clip: { Vector3 }?,
+	dead: boolean,
+	stopped: boolean,
+	diedAt: number,
+	expiredAt: number?,
+}
+
+local chains: { [number]: any } = {}
+local pending: { [any]: any } = {}
+local applyConnection: RBXScriptConnection? = nil
+local enabled = false
+local uniform = true
+
+--------------------------------------------------------------------------------
+-- Rig (cf. BeamVisual)
+--------------------------------------------------------------------------------
+
+local function part(parent: Instance, name: string, color: Color3, pose: CFrame?): Part
+	local p = Instance.new("Part")
+	p.Name, p.Color, p.Transparency = name, color, 1
+	p.Shape = Enum.PartType.Cylinder
+	p.Size = Vector3.one * 0.05
+	p.Material = Enum.Material.Neon
+	p.CanCollide, p.CanQuery, p.CanTouch, p.CastShadow = false, false, false, false
+	-- (posed before becoming visible: no one-frame default-axis flash)
+	if pose then
+		p.CFrame = pose
+	end
+	p.Parent = parent
+	return p
+end
+
+local function motor(driver: BasePart, p: BasePart, pose: CFrame?): Motor6D
+	local joint = Instance.new("Motor6D")
+	joint.C0 = if pose then driver.CFrame:ToObjectSpace(pose) else CFrame.identity
+	joint.Part0, joint.Part1, joint.Parent = driver, p, driver
+	return joint
+end
+
+local function shape(chain: any, pool: { any }, index: number, pose: CFrame, size: Vector3, ball: boolean)
+	local pair = pool[index]
+	if not pair then
+		local core = part(chain.model, if ball then "BeamJointCore" else "BeamCore", chain.core, pose)
+		local glow = part(chain.model, if ball then "BeamJointGlow" else "BeamGlow", chain.color, pose)
+		if ball then
+			core.Shape, glow.Shape = Enum.PartType.Ball, Enum.PartType.Ball
+		end
+		pair = { core = core, glow = glow, coreMotor = motor(chain.driver, core, pose), glowMotor = motor(chain.driver, glow, pose) }
+		pool[index] = pair
+	end
+	local transform = chain.driver.CFrame:ToObjectSpace(pose)
+	if pair.size ~= size then
+		pair.size = size
+		pair.core.Size = if ball then size * .55 else Vector3.new(size.X, size.Y * .55, size.Z * .55)
+		pair.glow.Size = size
+	end
+	pair.coreMotor.Transform = pair.coreMotor.C0:Inverse() * transform
+	pair.glowMotor.Transform = pair.glowMotor.C0:Inverse() * transform
+	if not pair.shown then
+		pair.shown = true
+		pair.core.Transparency, pair.glow.Transparency = 0, .5
+	end
+end
+
+local function hideAfter(pool: { any }, used: number)
+	for index = used + 1, #pool do
+		local pair = pool[index]
+		if pair.shown then
+			pair.shown = false
+			pair.core.Transparency, pair.glow.Transparency = 1, 1
+		end
+	end
+end
+
+-- Size and pose land together before the engine commits transforms.
+local function apply()
+	for chain, geometry in pending do
+		pending[chain] = nil
+		if not chain.model.Parent then
+			continue
+		end
+		local diameter = chain.radius * 2
+		local segments = geometry.segments
+		for index = 1, #segments, 2 do
+			local a, b = segments[index], segments[index + 1]
+			local offset = b - a
+			local length = offset.Magnitude
+			local up = if math.abs(offset.Y / length) > .99 then Vector3.xAxis else Vector3.yAxis
+			shape(chain, chain.segments, (index + 1) // 2, CFrame.lookAt((a + b) * .5, b, up) * ROTATION,
+				Vector3.new(length, diameter, diameter), false)
+		end
+		hideAfter(chain.segments, #segments // 2)
+		for index, point in geometry.joints do
+			shape(chain, chain.joints, index, CFrame.new(point), Vector3.one * diameter, true)
+		end
+		hideAfter(chain.joints, #geometry.joints)
+	end
+end
+
+--------------------------------------------------------------------------------
+-- Chains
+--------------------------------------------------------------------------------
+
+local function newChain(id: number): any
+	local model = Instance.new("Model")
+	model.Name = "BeamChain_" .. id
+	local chain = {
+		id = id,
+		model = model,
+		driver = nil :: any,
+		radius = .35,
+		length = 24,
+		color = Color3.fromRGB(255, 96, 28),
+		core = Color3.new(1, 1, 1),
+		gravity = Vector3.zero,
+		timeScale = 1,
+		offset = nil :: number?,
+		samples = {} :: { [number]: Sample },
+		segments = {},
+		joints = {},
+		drains = {},
+		ended = false,
+		lastImpact = 0,
+		impactPoint = Vector3.zero,
+	}
+	chains[id] = chain
+	return chain
+end
+
+local function destroyChain(chain: any)
+	chains[chain.id] = nil
+	pending[chain] = nil
+	chain.model:Destroy()
+end
+
+local function advance(chain: any, s: Sample, dt: number)
+	if dt <= 0 or s.stopped or s.life <= 0 then
+		return
+	end
+	if not uniform then
+		dt *= Planner.ChunkTimeScaleAt(s.pos)
+	end
+	dt = math.min(dt, s.life)
+	local g = chain.gravity
+	s.pos += s.vel * dt + g * (.5 * dt * dt)
+	s.vel += g * dt
+	s.life -= dt
+end
+
+-- Real seconds -> this chain's simulated seconds.
+local function simulated(chain: any, seconds: number): number
+	return seconds * Heartbeat.GetGlobalTimeScale() * chain.timeScale
+end
+
+-- The extra delay of a section stamped `serverTime` over the chain's
+-- fastest-seen transit (re-baselining everything if this one was faster).
+local function lagOf(chain: any, serverTime: number): number
+	local transit = math.max(workspace:GetServerTimeNow() - serverTime, 0)
+	local offset = chain.offset
+	if not offset then
+		chain.offset = transit
+		return 0
+	end
+	if transit < offset then
+		local catchUp = simulated(chain, offset - transit)
+		for _, s in chain.samples do
+			advance(chain, s, catchUp)
+		end
+		chain.offset = transit
+		return 0
+	end
+	return transit - offset
+end
+
+local function trim(points: { Vector3 }, distance: number): number
+	while distance > 0 and #points > 1 do
+		local length = (points[2] - points[1]).Magnitude
+		if distance >= length then
+			table.remove(points, 1)
+			distance -= length
+		else
+			points[1] = points[1]:Lerp(points[2], distance / length)
+			distance = 0
+		end
+	end
+	local total = 0
+	for index = 1, #points - 1 do
+		total += (points[index + 1] - points[index]).Magnitude
+	end
+	return total
+end
+
+local function tailOf(chain: any, s: Sample): { Vector3 }?
+	local origin = s.origin
+	if not origin then
+		return nil
+	end
+	-- Back along what it actually travelled: its bounce corners, newest
+	-- first, then where it was launched -- capped like the server's tail.
+	local cap = math.min(chain.length, BeamPath.MaxStretch)
+	local points = { s.pos }
+	local total, last = 0, s.pos
+	local turns = s.turns
+	for index = #turns + 1, 1, -1 do
+		local point = if index > 1 then turns[index - 1] else origin
+		local span = (point - last).Magnitude
+		if span < 1e-4 then
+			continue
+		end
+		if total + span >= cap then
+			table.insert(points, last:Lerp(point, (cap - total) / span))
+			return points
+		end
+		total += span
+		table.insert(points, point)
+		last = point
+	end
+	return points
+end
+
+-- This sample's body, built exactly as the server builds it.
+local function pathOf(chain: any, s: Sample, incoming: { [number]: boolean }): { Vector3 }?
+	if s.dead then
+		return nil
+	end
+	local clip = s.clip
+	if clip then
+		local points = table.clone(clip)
+		points[1] = s.pos
+		return points
+	end
+	if s.ahead ~= 0 then
+		local ahead = chain.samples[s.ahead]
+		if ahead then
+			return (BeamPath.Plan(s.pos, ahead.pos, s.turns, ahead.turns))
+		end
+		return nil
+	end
+	if incoming[s.id] then
+		return nil
+	end
+	local fragment = s.fragment
+	if fragment then
+		return { s.pos, s.pos + fragment }
+	end
+	if not s.everLinked then
+		return tailOf(chain, s)
+	end
+	return nil
+end
+
+local function incomingOf(chain: any): { [number]: boolean }
+	local incoming = {}
+	for _, s in chain.samples do
+		if not s.dead and s.ahead ~= 0 then
+			incoming[s.ahead] = true
+		end
+	end
+	return incoming
+end
+
+local function playImpact(chain: any, point: Vector3, normal: Vector3, kind: string)
+	if not View.contains(point) then
+		return
+	end
+	-- Cosmetic throttle only: every packet's server damage is unaffected.
+	local now = os.clock()
+	if now - chain.lastImpact < IMPACT_THROTTLE and (point - chain.impactPoint).Magnitude < IMPACT_SPACING then
+		return
+	end
+	chain.lastImpact, chain.impactPoint = now, point
+	Impact.Play(point, normal, kind)
+end
+
+-- Its body at death, cut at the contact (nothing past what stopped it).
+local function deathPath(path: { Vector3 }, contact: Vector3?): { Vector3 }
+	if not contact or #path < 2 then
+		return path
+	end
+	local best, distance = 1, math.huge
+	for index = 1, #path - 1 do
+		local a, b = path[index], path[index + 1]
+		local offset = b - a
+		local t = math.clamp((contact - a):Dot(offset) / math.max(offset:Dot(offset), 1e-8), 0, 1)
+		local d = (a + offset * t - contact).Magnitude
+		if d < distance then
+			best, distance = index, d
+		end
+	end
+	while #path > best + 1 do
+		table.remove(path)
+	end
+	path[#path] = contact
+	return path
+end
+
+--------------------------------------------------------------------------------
+-- Messages
+--------------------------------------------------------------------------------
+
+local function readSpawn(r: BeamWire.Reader): Sample
+	local id = ReadU32(r)
+	local pos, vel = ReadV3(r), ReadV3(r)
+	local life = ReadF32(r)
+	local ahead = ReadU32(r)
+	local flags = ReadU8(r)
+	local fragment = if bit32.btest(flags, Flag.Fragment) then ReadV3(r) else nil
+	local origin = if bit32.btest(flags, Flag.Origin) then ReadV3(r) else nil
+	local turns = {}
+	for index = 1, ReadU8(r) do
+		turns[index] = ReadV3(r)
+	end
+	local stopped = bit32.btest(flags, Flag.Stopped)
+	return {
+		id = id,
+		pos = pos,
+		vel = vel,
+		life = life,
+		ahead = ahead,
+		turns = turns,
+		origin = origin,
+		fragment = if fragment and fragment.Magnitude > 1e-4 then fragment else nil,
+		everLinked = bit32.btest(flags, Flag.EverLinked),
+		clip = nil,
+		dead = stopped,
+		stopped = stopped,
+		diedAt = os.clock(),
+	}
+end
+
+local function onDeath(chain: any, s: Sample, kind: number, contact: Vector3?, normal: Vector3?, bodyHit: boolean)
+	local body = pathOf(chain, s, incomingOf(chain))
+	s.dead, s.diedAt = true, os.clock()
+	if body and #body > 1 then
+		local speed = s.vel.Magnitude
+		local points = deathPath(body, if kind ~= DeathKind.Expire then contact else nil)
+		if speed > 1e-3 and #points > 1 then
+			table.insert(chain.drains, { points = points, speed = speed, started = os.clock() })
+		end
+	end
+	if kind == DeathKind.World and not bodyHit and contact and normal then
+		-- Parked one radius off the wall; followers keep ending here.
+		s.stopped = true
+		s.pos = contact + normal * chain.radius
+		s.vel = Vector3.zero
+	end
+	if kind ~= DeathKind.Expire and contact and normal then
+		playImpact(chain, contact, normal, DEATH_KINDS[kind] or "world")
+	end
+end
+
+local function readSection(r: BeamWire.Reader)
+	local id = ReadU32(r)
+	local kind = ReadU8(r)
+	local serverTime = ReadF64(r)
+	local chain = chains[id]
+	if kind == Section.Snapshot then
+		if chain then
+			table.clear(chain.samples)
+			table.clear(chain.drains)
+			chain.offset, chain.ended = nil, false
+		else
+			chain = newChain(id)
+		end
+		chain.radius = math.max(ReadF32(r), .025)
+		chain.length = ReadF32(r)
+		chain.color = Color3.fromRGB(ReadU8(r), ReadU8(r), ReadU8(r))
+		chain.core = Color3.fromRGB(ReadU8(r), ReadU8(r), ReadU8(r))
+		chain.gravity = ReadV3(r)
+		chain.timeScale = ReadF32(r)
+		if not chain.driver then
+			local driver = part(chain.model, "ProjectileMotorRoot", chain.color)
+			driver.Anchored = true
+			chain.driver = driver
+			chain.model.Parent = workspace
+		end
+	elseif kind == Section.Exit then
+		if chain then
+			destroyChain(chain)
+		end
+		chain = nil
+	elseif kind == Section.End then
+		if chain then
+			chain.ended = true
+			-- (the server has nothing left: whatever is still flying here ends)
+			for _, s in chain.samples do
+				if not s.dead then
+					onDeath(chain, s, DeathKind.Expire, nil, nil, false)
+				end
+			end
+		end
+	end
+	local lag = if chain then lagOf(chain, serverTime) else 0
+	while true do
+		local op = ReadU8(r)
+		if op == Op.End then
+			return
+		elseif op == Op.Spawn then
+			local s = readSpawn(r)
+			if chain then
+				chain.samples[s.id] = s
+				advance(chain, s, simulated(chain, lag))
+			end
+		elseif op == Op.Pose then
+			local sid, pos, vel, life = ReadU32(r), ReadV3(r), ReadV3(r), ReadF32(r)
+			local s = chain and chain.samples[sid]
+			if s and not s.dead then
+				s.pos, s.vel, s.life = pos, vel, life
+				advance(chain, s, simulated(chain, lag))
+			end
+		elseif op == Op.Bounce then
+			local sid, pos, vel, contact, normal = ReadU32(r), ReadV3(r), ReadV3(r), ReadV3(r), ReadV3(r)
+			local turns = {}
+			for index = 1, ReadU8(r) do
+				turns[index] = ReadV3(r)
+			end
+			local s = chain and chain.samples[sid]
+			if s and not s.dead then
+				s.pos, s.vel = pos, vel
+				table.move(turns, 1, #turns, #s.turns + 1, s.turns)
+				advance(chain, s, simulated(chain, lag))
+				playImpact(chain, contact, normal, "bounce")
+			end
+		elseif op == Op.Link then
+			local sid, ahead = ReadU32(r), ReadU32(r)
+			local fragment = if ahead == 0 then ReadV3(r) else nil
+			local s = chain and chain.samples[sid]
+			if s then
+				s.ahead, s.everLinked = ahead, true
+				s.fragment = if fragment and fragment.Magnitude > 1e-4 then fragment else nil
+			end
+		elseif op == Op.Clip then
+			local sid = ReadU32(r)
+			local n = ReadU8(r)
+			local points = if n > 0 then table.create(n) else nil
+			for index = 1, n do
+				(points :: { Vector3 })[index] = ReadV3(r)
+			end
+			local s = chain and chain.samples[sid]
+			if s then
+				s.clip = points
+			end
+		elseif op == Op.Death then
+			local sid, deathKind = ReadU32(r), ReadU8(r)
+			local contact, normal, bodyHit = nil, nil, false
+			if deathKind ~= DeathKind.Expire then
+				contact, normal, bodyHit = ReadV3(r), ReadV3(r), ReadU8(r) == 1
+			end
+			local s = chain and chain.samples[sid]
+			if s and not s.dead then
+				onDeath(chain, s, deathKind, contact, normal, bodyHit)
+			end
+		elseif op == Op.Scale then
+			local scale = ReadF32(r)
+			if chain then
+				chain.timeScale = scale
+			end
+		else
+			warn("[BeamChainVisual] unknown op", op)
+			r.n = buffer.len(r.buf)
+			return
+		end
+	end
+end
+
+local function onMessage(payload: any)
+	if typeof(payload) ~= "buffer" then
+		return
+	end
+	local r = BeamWire.Reader(payload)
+	while BeamWire.More(r) do
+		readSection(r)
+	end
+end
+
+--------------------------------------------------------------------------------
+-- Frame
+--------------------------------------------------------------------------------
+
+function BeamChainVisual.Step(globalDt: number)
+	if not enabled then
+		return
+	end
+	uniform = ChunkManager.IsTimeUniform()
+	local now = os.clock()
+	local partsLeft = MAX_PARTS_PER_FRAME
+	for _, chain in chains do
+		if not chain.driver then
+			continue
+		end
+		local dt = globalDt * chain.timeScale
+		for _, s in chain.samples do
+			advance(chain, s, dt) -- (a dead one still moving is a link target until relinked)
+			if not s.dead and s.life <= 0 then
+				-- Out of life: the server's expiry is on its way. Should it
+				-- never come, don't leave the body hanging in the air.
+				local expired = s.expiredAt or now
+				s.expiredAt = expired
+				if now - expired > EXPIRE_GRACE then
+					onDeath(chain, s, DeathKind.Expire, nil, nil, false)
+				end
+			end
+		end
+		local incoming = incomingOf(chain)
+		for sid, s in chain.samples do
+			if s.dead and now - s.diedAt > DEAD_GRACE
+				and (not incoming[sid] or (not s.stopped and now - s.diedAt > GHOST_LIFETIME)) then
+				chain.samples[sid] = nil
+			end
+		end
+		-- Tails of dead bodies keep flying into whatever stopped them.
+		local drains = chain.drains
+		for index = #drains, 1, -1 do
+			local drain = drains[index]
+			local left = trim(drain.points, drain.speed * dt)
+			if left <= 1e-3 or now - drain.started > DRAIN_LIMIT then
+				table.remove(drains, index)
+			end
+		end
+		if chain.ended and next(chain.samples) == nil and #drains == 0 then
+			destroyChain(chain)
+			continue
+		end
+
+		-- Geometry: every visible piece, split into pooled cylinders, with a
+		-- ball wherever a body ends or bends sharply.
+		local segments: { Vector3 } = {}
+		local jointPoints: { Vector3 } = {}
+		local ends: { [Vector3]: number } = {}
+		local inDirection: { [Vector3]: Vector3 } = {}
+		local outDirection: { [Vector3]: Vector3 } = {}
+		local radius = chain.radius
+		local function addPolyline(points: { Vector3 })
+			local first, lastDirection = true, nil
+			for index = 1, #points - 1 do
+				local a, b = points[index], points[index + 1]
+				local offset = b - a
+				local length = offset.Magnitude
+				if length < 1e-4 then
+					continue
+				end
+				local direction = offset / length
+				if first then
+					first = false
+					ends[a] = (ends[a] or 0) + 1
+					outDirection[a] = direction
+				elseif lastDirection and lastDirection:Dot(direction) < JOINT_COS and View.contains(a, radius * 2) then
+					table.insert(jointPoints, a)
+				end
+				lastDirection = direction
+				if partsLeft <= 0 or not View.contains((a + b) * .5, length * .5 + radius) then
+					continue
+				end
+				-- fixed-length pieces from the back; only the last one varies
+				local pieces = math.max(1, math.ceil(length / MAX_SEGMENT - 1e-6))
+				for piece = 1, pieces do
+					table.insert(segments, a + direction * ((piece - 1) * MAX_SEGMENT))
+					table.insert(segments, if piece == pieces then b else a + direction * (piece * MAX_SEGMENT))
+				end
+				partsLeft -= pieces
+			end
+			if lastDirection then
+				local tip = points[#points]
+				ends[tip] = (ends[tip] or 0) + 1
+				inDirection[tip] = lastDirection
+			end
+		end
+		-- Strands: every body, joined to the body of the sample ahead where it
+		-- ends exactly where that one starts, then straightened.
+		local samples = chain.samples
+		local paths: { [number]: { Vector3 } } = {}
+		for sid, s in samples do
+			local path = pathOf(chain, s, incoming)
+			if path and #path > 1 then
+				paths[sid] = path
+			end
+		end
+		local nextOf: { [number]: number } = {}
+		local joined: { [number]: boolean } = {}
+		for sid, path in paths do
+			local ahead = samples[sid].ahead
+			local following = ahead ~= 0 and paths[ahead]
+			if following and not joined[ahead] and (following[1] - path[#path]).Magnitude < 1e-3 then
+				nextOf[sid], joined[ahead] = ahead, true
+			end
+		end
+		local starts: { number } = {}
+		for sid in paths do
+			if not joined[sid] then
+				table.insert(starts, sid)
+			end
+		end
+		table.sort(starts) -- (a stable order keeps pooled pieces on the same strand)
+		local tolerance = math.max(radius * STRAIGHT, 1e-3)
+		for _, first in starts do
+			local kept = { paths[first][1] }
+			local anchor, heading, last = kept[1], nil :: Vector3?, kept[1]
+			local sid: number? = first
+			local guard = 0
+			while sid and guard < 100000 do
+				guard += 1
+				local path = paths[sid]
+				for index = 2, #path do
+					local point = path[index]
+					local offset = point - anchor
+					if not heading then
+						if offset.Magnitude > 1e-3 then
+							heading = offset.Unit
+						end
+						last = point
+						continue
+					end
+					local along = offset:Dot(heading)
+					if along > 0 and (offset - heading * along).Magnitude <= tolerance then
+						last = point -- still on the anchor's line
+						continue
+					end
+					table.insert(kept, last)
+					anchor = last
+					local leg = point - last
+					heading = if leg.Magnitude > 1e-3 then leg.Unit else nil
+					last = point
+				end
+				sid = nextOf[sid]
+			end
+			table.insert(kept, last)
+			addPolyline(kept)
+		end
+		for _, drain in drains do
+			addPolyline(drain.points)
+		end
+		for point, count in ends do
+			local into, out = inDirection[point], outDirection[point]
+			if count ~= 2 or not into or not out or into:Dot(out) < JOINT_COS then
+				if View.contains(point, radius * 2) then
+					table.insert(jointPoints, point)
+				end
+			end
+		end
+		local jointCount = math.min(#jointPoints, math.max(partsLeft, 0))
+		for index = #jointPoints, jointCount + 1, -1 do
+			jointPoints[index] = nil
+		end
+		partsLeft -= jointCount
+		pending[chain] = { segments = segments, joints = jointPoints }
+	end
+end
+
+function BeamChainVisual.GetStats(): (number, number)
+	local chainCount, sampleCount = 0, 0
+	for _, chain in chains do
+		chainCount += 1
+		for _, s in chain.samples do
+			if not s.dead then
+				sampleCount += 1
+			end
+		end
+	end
+	return chainCount, sampleCount
+end
+
+function BeamChainVisual.Enable()
+	if enabled or RunService:IsServer() then
+		return
+	end
+	enabled = true
+	VisualOffload.On(BeamWire.Channel, onMessage)
+	applyConnection = RunService.PreSimulation:Connect(apply)
+end
+
+return BeamChainVisual
+-- =============================================================================
+-- END FILE: src/shared/Projectile/Client/BeamChainVisual.luau
+-- =============================================================================
+
+-- =============================================================================
 -- BEGIN FILE: src/shared/Projectile/Client/init.luau
 -- =============================================================================
 --!native
@@ -12128,6 +14736,7 @@ local Types = require(script.Types)
 local View = require(script.View)
 local VisualModel = require(script.VisualModel)
 local BeamVisual = require(script.BeamVisual)
+local BeamChainVisual = require(script.BeamChainVisual)
 
 type Visual = Types.Visual
 
@@ -12768,6 +15377,7 @@ local function renderStep(globalDt: number)
 	BeamVisual.StepRetired(globalDt)
 	local now = os.clock()
 	View.refresh()
+	BeamChainVisual.Step(globalDt)
 	refreshSmoothVisuals(now)
 
 	local slotCount = #visualOrder
@@ -12880,13 +15490,17 @@ function ProjectileClient.EnableClientRendering()
 		DebugRays.Draw(data.From, data.To, data.LowRes)
 	end)
 
+	BeamChainVisual.Enable()
 	View.refresh()
 	Heartbeat.Connect(renderStep, { Name = "ProjectileSystem.ClientSimulate", Priority = 5 })
 end
 
 function ProjectileClient.GetStats()
+	local beamChains, beamSamples = BeamChainVisual.GetStats()
 	return {
 		Visuals = visualCount,
+		BeamChains = beamChains,
+		BeamSamples = beamSamples,
 		VisualUpdatesPerFrame = renderSettings.MaxUpdates,
 		SmoothLimit = renderSettings.MaxSmooth,
 	}

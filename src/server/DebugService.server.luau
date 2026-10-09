@@ -623,8 +623,50 @@ local function inboundRate(): (number?, boolean)
 	return if any then total else measured, any
 end
 
+-- Network sends by channel (VisualOffload.TakeSendStats) as per-second rates,
+-- and Heartbeat handlers by cost (Heartbeat.TakeProfile): the ones that run
+-- before the projectile step (lower Priority) sit inside its "sim" gap.
+local PROJECTILE_STEP_PRIORITY = 5
+local lastNetTake = os.clock()
+
+local function handlerStats(): ({ any }, number)
+	local top, early = {}, 0
+	for index, entry in Heartbeat.TakeProfile() do
+		if entry.Priority < PROJECTILE_STEP_PRIORITY then
+			early += entry.Ms
+		end
+		if index <= 8 and entry.Ms >= 0.005 then
+			table.insert(top, { Name = entry.Name, Ms = entry.Ms })
+		end
+	end
+	return top, early
+end
+
+local function netStats(): { any }
+	local now = os.clock()
+	local elapsed = math.max(now - lastNetTake, 1e-3)
+	lastNetTake = now
+	local top = {}
+	for index, entry in VisualOffload.TakeSendStats() do
+		if index > 6 then
+			break
+		end
+		table.insert(top, {
+			Channel = entry.Channel,
+			PerSecond = entry.Messages / elapsed,
+			KBps = entry.KB / elapsed,
+			ItemsPerSecond = entry.Items / elapsed,
+		})
+	end
+	return top
+end
+
+local Beams = require(script.Parent:WaitForChild("Projectile"):WaitForChild("Beams"))
+
 local function buildStats()
 	local projectiles = Projectile.GetStats()
+	local beams = Beams.GetJoinerStats()
+	local handlers, earlyHandlersMs = handlerStats()
 	local timing = Projectile.TakeStepTiming()
 	local occupancy = Projectile.TakeOccupancyStats()
 	local parallel = Projectile.TakeParallelStats()
@@ -644,6 +686,14 @@ local function buildStats()
 		Players = #Players:GetPlayers(),
 		GlobalTimeScale = Heartbeat.GetGlobalTimeScale(),
 		Projectiles = projectiles.Active,
+		-- sustained beams: chains of lightweight samples (BeamChain), or nil
+		-- under the legacy handler, whose packets are ordinary projectiles
+		BeamChains = beams.Chains,
+		BeamSamples = beams.Samples,
+		BeamJoiners = beams.Active,
+		BeamLazyLinks = beams.LazyLinks,
+		BeamSleeping = beams.Sleeping,
+		BeamWakeful = beams.Wakeful,
 		StepMs = timing.StepMs,
 		StepWorstMs = timing.StepWorstMs,
 		BeamMs = timing.BeamMs,
@@ -681,6 +731,13 @@ local function buildStats()
 		PendingSpawns = projectiles.PendingVisualSpawns,
 		PendingHits = projectiles.PendingVisualHits,
 		BeamPoseUpdates = projectiles.BeamPoseUpdates,
+		-- engine casts per frame, main thread + workers (workers report totals
+		-- per batch; one batch per worker per frame)
+		CastsSphere = (profile.CastSphere or 0) + (parallel.WorkerReasons and parallel.WorkerReasons[8] or 0) / math.max(parallel.AppliedFrames or 1, 1),
+		CastsRay = (profile.CastRay or 0) + (parallel.WorkerReasons and parallel.WorkerReasons[9] or 0) / math.max(parallel.AppliedFrames or 1, 1),
+		Handlers = handlers,
+		EarlyHandlersMs = earlyHandlersMs,
+		NetChannels = netStats(),
 		Entities = chunks.TrackedEntityCount,
 		Chunks = chunks.ChunkCount,
 		LoadedChunks = chunks.LoadedChunkCount,

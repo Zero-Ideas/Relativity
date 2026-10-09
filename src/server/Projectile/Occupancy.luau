@@ -126,11 +126,23 @@ local stats = { Checks = 0, Skipped = 0, Coarse = 0, StaticCells = 0, DistinctMa
 local blockedByMoving = false -- set by fineOccupied when a moving part's cell is what blocked
 local refineCpu, refineProbes, refineYields = 0, 0, 0
 
+-- Coarse cells static marks were added to since the last TakeStaticChanges
+-- (BeamChain wakes beam samples sleeping in them). Capped; past the cap
+-- the taker hears "everything changed".
+local MAX_CHANGED = 4096
+local changedStatic: { number } = {}
+local changedOverflow = false
+
 local function setStatic(key: number, mask: buffer)
 	if static[key] == mask then return end
 	static[key] = mask
 	if not isWorker then
 		dirtyCells[key] = true
+		if #changedStatic < MAX_CHANGED then
+			table.insert(changedStatic, key)
+		else
+			changedOverflow = true
+		end
 		if schedulePublish then schedulePublish() end
 	end
 end
@@ -816,6 +828,101 @@ function Occupancy.SegmentClear(origin: Vector3, displacement: Vector3, radius: 
 	end
 	stats.Skipped += 1
 	return true
+end
+
+-- Is the box [lo, hi] clear of everything a raycast could hit? Same
+-- meaning as SegmentClear, for every centreline inside the box: marks carry
+-- PAD studs of clearance, so sweeps of radius up to MaxRadius whose centre
+-- stays in the box hit nothing. BeamChain puts beam samples to sleep in such
+-- boxes. Returns "clear"; "moving" when a moving part's mark is in it (not
+-- excluded by `ignore`); "static" when static marks are (FINE voxels plus
+-- PAD are coarse: a caller may still prove it clear another way); "unknown"
+-- when this can't tell (not baked, outside scanned terrain, over `maxCells`
+-- coarse cells). Not counted in the skip stats.
+function Occupancy.BoxClear(lo: Vector3, hi: Vector3, ignore: { [Instance]: boolean }?, maxCells: number?): string
+	if not ready or not Occupancy.Enabled then
+		return "unknown"
+	end
+	local fx0, fy0, fz0 = floor(lo.X / FINE), floor(lo.Y / FINE), floor(lo.Z / FINE)
+	local fx1, fy1, fz1 = floor(hi.X / FINE), floor(hi.Y / FINE), floor(hi.Z / FINE)
+	local cx0, cy0, cz0 = fx0 // DIV, fy0 // DIV, fz0 // DIV
+	local cx1, cy1, cz1 = fx1 // DIV, fy1 // DIV, fz1 // DIV
+	if (cx1 - cx0 + 1) * (cy1 - cy0 + 1) * (cz1 - cz0 + 1) > (maxCells or 64) then
+		return "unknown"
+	end
+	refreshDynamic()
+	-- moving parts first: those rule a box out whatever the static verdict
+	for cz = cz0, cz1 do
+		for cy = cy0, cy1 do
+			for cx = cx0, cx1 do
+				local moving = dynamic[cellKey(cx, cy, cz)]
+				if moving then
+					for index = 1, #moving, 3 do
+						local mlo, mhi = moving[index], moving[index + 1]
+						if hi.X > mlo.X and lo.X < mhi.X and hi.Y > mlo.Y and lo.Y < mhi.Y and hi.Z > mlo.Z and lo.Z < mhi.Z
+							and not (ignore and ignore[moving[index + 2]]) then
+							return "moving"
+						end
+					end
+				end
+			end
+		end
+	end
+	if hasTerrain and not insideTerrainScan(lo, hi) then
+		return "unknown"
+	end
+	for cz = cz0, cz1 do
+		local az, bz = max(fz0 - cz * DIV, 0), min(fz1 - cz * DIV, DIV - 1)
+		for cy = cy0, cy1 do
+			local ay, by = max(fy0 - cy * DIV, 0), min(fy1 - cy * DIV, DIV - 1)
+			for cx = cx0, cx1 do
+				local mask = static[cellKey(cx, cy, cz)]
+				if mask then
+					if mask == FULL then
+						return "static"
+					end
+					local ax, bx = max(fx0 - cx * DIV, 0), min(fx1 - cx * DIV, DIV - 1)
+					local row = lshift(lshift(1, bx - ax + 1) - 1, ax)
+					for fz = az, bz do
+						for fy = ay, by do
+							if btest(readu16(mask, (fy + fz * DIV) * ROW_BYTES), row) then
+								return "static"
+							end
+						end
+					end
+				end
+			end
+		end
+	end
+	return "clear"
+end
+
+-- Does the map have terrain? (A box query that skips terrain must check it
+-- itself then.)
+function Occupancy.HasTerrain(): boolean
+	return hasTerrain
+end
+
+-- Coarse cell edge and keys, for callers keeping an index aligned with this
+-- grid (BeamChain's sleeping samples).
+Occupancy.Coarse = COARSE
+function Occupancy.CoarseKey(cx: number, cy: number, cz: number): number
+	return cellKey(cx, cy, cz)
+end
+
+-- This frame's moving-part marks: coarse key -> { lo, hi, owner, lo, hi,
+-- owner, ... }. Read only.
+function Occupancy.DynamicMarks(): { [number]: { any } }
+	refreshDynamic()
+	return dynamic
+end
+
+-- Coarse keys that gained static marks since the last call, and whether
+-- more changed than were kept (then treat everything as changed).
+function Occupancy.TakeStaticChanges(): ({ number }, boolean)
+	local keys, overflow = changedStatic, changedOverflow
+	changedStatic, changedOverflow = {}, false
+	return keys, overflow
 end
 
 -- Counters since the last call (DebugService's Stats tab), then reset.

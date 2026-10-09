@@ -20,6 +20,7 @@ local Occupancy = require(script.Parent.Occupancy)
 local Types = require(script.Parent.Types)
 local Store = require(script.Parent.Store)
 local CollisionLOD = require(script.Parent.CollisionLOD)
+local Profile = require(script.Parent.Profile)
 
 type State = Types.State
 type Verdict = Types.Verdict
@@ -125,6 +126,9 @@ local function ignoreSetFor(params: RaycastParams): { [Instance]: boolean }
 	return set
 end
 
+-- (BeamChain: the set a sleeping beam sample's box test ignores)
+Raycast.ignoreSetFor = ignoreSetFor
+
 function Raycast.castMovement(projectile: State, origin: Vector3, displacement: Vector3, overrideParams: RaycastParams?, nearEntities: boolean?): Types.Contact?
 	-- Provably empty space: the cast would find nothing, so don't make it
 	-- (see Occupancy -- it only says yes when nothing could be in the way).
@@ -146,8 +150,10 @@ function Raycast.castMovement(projectile: State, origin: Vector3, displacement: 
 		-- body of Radius around this segment plus spherical caps at both ends.
 		-- Adjacent adaptive substeps share the cap at their common joint, so
 		-- curved paths have no wedge-shaped collision gaps.
+		Profile.Count("CastSphere", 1)
 		result = workspace:Spherecast(origin, radius, displacement, params)
 	else
+		Profile.Count("CastRay", 1)
 		result = workspace:Raycast(origin, displacement, params)
 	end
 	if not result then

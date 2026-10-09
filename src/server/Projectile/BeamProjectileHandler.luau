@@ -19,11 +19,17 @@ Handler.MaxNewJoinersPerFrame = 128
 -- counting after a packet dies -- a front that stopped young can't keep
 -- anchoring fresh joiners forever.
 Handler.MaxJoinerSourceAge = 3
+-- Packets go out often enough that consecutive ones sit just under one link
+-- (MaxStretch) apart, so a steady beam needs no joiners. (It used to floor at
+-- 1/60 s: at 2000 studs/s that spaced packets 33 studs apart, just over the
+-- 32-stud link, so nearly every link also needed a joiner -- twice the
+-- bodies.) A fast beam can need several packets a frame; see
+-- MAX_PACKETS_PER_CHANNEL_FRAME.
 function Handler.GetInterval(speed: number): number
-	return math.max(1 / 60, math.min(Handler.Interval, (BeamPath.MaxStretch - 2) / math.max(speed, 1)))
+	return math.max(1 / 240, math.min(Handler.Interval, (BeamPath.MaxStretch - 2) / math.max(speed, 1)))
 end
 local INPUT_TIMEOUT = .75
-local MAX_PACKETS_PER_CHANNEL_FRAME = 2
+local MAX_PACKETS_PER_CHANNEL_FRAME = 4
 local MAX_CHANNELS_PER_PLAYER = 32
 local channels: { any } = {}
 local lastInput: { [Player]: number } = {}

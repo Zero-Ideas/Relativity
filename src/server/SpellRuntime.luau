@@ -63,7 +63,7 @@ local StatusEffectSys = require(Shared:WaitForChild("StatusEffectSys"))
 local Ragdoll = require(script.Parent:WaitForChild("Ragdoll"))
 local Projectile = require(script.Parent:WaitForChild("Projectile"))
 local ProjectileQuota = require(script.Parent:WaitForChild("ProjectileQuota"))
-local BeamHandler = require(script.Parent:WaitForChild("Projectile"):WaitForChild("BeamProjectileHandler"))
+local BeamHandler = require(script.Parent:WaitForChild("Projectile"):WaitForChild("Beams"))
 local SpellWorld = require(script.Parent:WaitForChild("SpellWorld"))
 local SpellBody = require(script.Parent:WaitForChild("SpellBody"))
 
@@ -1139,6 +1139,18 @@ type Shot = {
 	spawn: Vector3?, -- the From input: where it launches (else Here + spawnOffset)
 }
 
+-- Does any trigger on this vessel watch each projectile's own position over
+-- time (On Timer / On Proximity), rather than firing on its impact/expiry?
+local function positionalTriggers(compiled: any, info: any): boolean
+	for _, triggerId in info.triggers do
+		local rune = compiled.runes[triggerId].rune
+		if rune ~= "OnImpact" and rune ~= "OnExpire" then
+			return true
+		end
+	end
+	return false
+end
+
 -- All flying vessels use the same swept-radius simulation and trigger pipeline.
 local function launch(shot: Shot, direction: Vector3)
 	local ctx = shot.ctx
@@ -1181,7 +1193,13 @@ local function launch(shot: Shot, direction: Vector3)
 		Visualize = true,
 		VisualRange = VISUAL_RANGE,
 		VisualScale = stats.scale,
-		Beam = if shot.vessel == "Beam" then { Length = if stats.sustain then math.max(24, stats.speed * SUSTAIN_INTERVAL * 2) else 24, ChannelId = shot.channelId } else nil,
+		Beam = if shot.vessel == "Beam" then {
+			Length = if stats.sustain then math.max(24, stats.speed * SUSTAIN_INTERVAL * 2) else 24,
+			ChannelId = shot.channelId,
+			-- (a sustained beam may keep a long link as one body until it meets
+			-- something -- unless a trigger watches every joiner's own position)
+			Lazy = positionalTriggers(compiled, shot.info) == false,
+		} else nil,
 		-- Built procedurally on the client -- see VisualModel's styled visuals.
 		Visual = { Style = shot.vessel, Color = elementDef.Color, Core = elementDef.Core },
 	})

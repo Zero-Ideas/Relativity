@@ -52,6 +52,7 @@ return function(window)
 	local sReplication = statLine(tab, "Projectile replication ms (avg / worst)")
 	local sProjectileTotal = statLine(tab, "Projectile total ms")
 	local sSkipped = statLine(tab, "Raycasts skipped (empty space)")
+	local sCasts = statLine(tab, "  engine casts per frame (sphere: chunk with an entity / ray: elsewhere)")
 	local sReasons = statLine(tab, "  not skipped: not baked / too wide / outside terrain / near geometry (of which moving)")
 	local sParallel = statLine(tab, "Parallel movement")
 	local sWorkers = statLine(tab, "Worker ms per frame (slowest / all)")
@@ -62,8 +63,12 @@ return function(window)
 	local sDecode = statLine(tab, "    results KB per frame")
 	local sHeap = statLine(tab, "  Lua heap MB / GC freed MB per frame")
 	local sSplit = statLine(tab, "Frame split ms (ours / sim: workers+physics+others / between frames)")
+	local sSim = statLine(tab, "  sim split ms (slowest worker / physics / early handlers / engine+other)")
+	local sHandlers = statLine(tab, "Heartbeat handlers ms/frame (costliest)")
+	local sNetChannels = statLine(tab, "Network out by channel (msgs/s · KB/s · list items/s)")
 	local sSpawn = statLine(tab, "  spawning ms (count per frame)")
-	local sBeam = statLine(tab, "  beam bodies ms (span casts / plan+connect / new joiners / rest), links, joiners per frame")
+	local sBeam = statLine(tab, "  beam ms (heads / links / stream), samples (asleep), joiners, links kept whole, new joiners per frame")
+	local sAwake = statLine(tab, "    awake beam samples by reason (chain can't / clipped / dilated / short window / moving part / geometry / unknown)")
 	local sLoop = statLine(tab, "  Main: step loop ms (loop / destroys)")
 	local sQueues = statLine(tab, "Visual queue (spawn / hit)")
 	local sBeams = statLine(tab, "Beam pose updates (total)")
@@ -85,7 +90,12 @@ return function(window)
 		sNet(`{rate(s.SendKbps)} / {rate(s.ReceiveKbps, s.ReceiveApprox)} KB/s`)
 		sMemory(fmt("%.0f MB", s.MemoryMb))
 		sInstances(fmt("%d", s.Instances))
-		sProjectiles(fmt("%d", s.Projectiles))
+		if typeof(s.BeamSamples) == "number" then
+			sProjectiles(string.format("%s  (+ %d beam samples in %d chains)", fmt("%d", s.Projectiles), s.BeamSamples,
+				tonumber(s.BeamChains) or 0))
+		else
+			sProjectiles(fmt("%d", s.Projectiles))
+		end
 		-- each phase, and how much of the whole server frame they add up to
 		local function share(ms: any): string
 			return if typeof(s.FrameMs) == "number" and s.FrameMs > 0 and typeof(ms) == "number"
@@ -124,11 +134,45 @@ return function(window)
 		sDecode(string.format("%.0f KB", tonumber(p.TransferKB) or 0))
 		sHeap(string.format("%.0f / %.1f", tonumber(p.HeapMB) or 0, tonumber(p.GcFreedMB) or 0))
 		sSplit(ms("FrameOurs", "FrameSimulation", "FrameBetween"))
+		-- what the sim gap holds: the parallel phase's slowest worker, the
+		-- engine's physics step, our Heartbeat handlers that run before the
+		-- projectile step, and whatever's left (other engine work)
+		local simMs = tonumber(p.FrameSimulation) or 0
+		local workerMs = tonumber(s.SlowestWorkerMs) or 0
+		local physicsMs = tonumber(s.PhysicsMs) or 0
+		local earlyMs = tonumber(s.EarlyHandlersMs) or 0
+		sSim(string.format("%.2f / %.2f / %.2f / %.2f", workerMs, physicsMs, earlyMs, math.max(simMs - workerMs - physicsMs - earlyMs, 0)))
+		local handlerParts = {}
+		for _, entry in (if typeof(s.Handlers) == "table" then s.Handlers else {}) do
+			table.insert(handlerParts, string.format("%s %.2f", tostring(entry.Name), tonumber(entry.Ms) or 0))
+		end
+		sHandlers(if #handlerParts > 0 then table.concat(handlerParts, "  ·  ") else "-")
+		local netParts = {}
+		for _, entry in (if typeof(s.NetChannels) == "table" then s.NetChannels else {}) do
+			table.insert(netParts, string.format("%s %.0f · %.1f · %.0f", tostring(entry.Channel), tonumber(entry.PerSecond) or 0,
+				tonumber(entry.KBps) or 0, tonumber(entry.ItemsPerSecond) or 0))
+		end
+		sNetChannels(if #netParts > 0 then table.concat(netParts, "   ") else "-")
 		sSpawn(string.format("%s  (%.0f)", ms("Spawn"), tonumber(p.Spawned) or 0))
-		local beamTotal = tonumber(s.BeamMs) or 0
-		local beamKnown = (tonumber(p.BeamResolve) or 0) + (tonumber(p.BeamPlan) or 0) + (tonumber(p.BeamCreate) or 0)
-		sBeam(string.format("%s / %.2f, %.0f links, %.1f joiners", ms("BeamResolve", "BeamPlan", "BeamCreate"),
-			math.max(beamTotal - beamKnown, 0), tonumber(p.BeamLinks) or 0, tonumber(p.BeamCreated) or 0))
+		if typeof(s.BeamSamples) == "number" then
+			-- BeamChain: every head step, every link, the event stream
+			sBeam(string.format("%s, %d samples (%d asleep), %d joiners, %d whole, %.1f new", ms("BeamHeads", "BeamLinkPass", "BeamReplicate"),
+				s.BeamSamples, tonumber(s.BeamSleeping) or 0, tonumber(s.BeamJoiners) or 0, tonumber(s.BeamLazyLinks) or 0,
+				tonumber(p.BeamCreated) or 0))
+			local w = if typeof(s.BeamWakeful) == "table" then s.BeamWakeful else {}
+			local function n(key: string): number
+				return tonumber(w[key]) or 0
+			end
+			sAwake(string.format("%d / %d / %d / %d / %d / %d / %d", n("Chain"), n("Clipped"), n("Dilated"), n("Window"),
+				n("Moving"), n("Static"), n("Unknown")))
+		else
+			sAwake("-")
+			-- legacy handler: span casts / plan+connect / new joiners / rest
+			local beamTotal = tonumber(s.BeamMs) or 0
+			local beamKnown = (tonumber(p.BeamResolve) or 0) + (tonumber(p.BeamPlan) or 0) + (tonumber(p.BeamCreate) or 0)
+			sBeam(string.format("%s / %.2f, %.0f links, %.1f joiners", ms("BeamResolve", "BeamPlan", "BeamCreate"),
+				math.max(beamTotal - beamKnown, 0), tonumber(p.BeamLinks) or 0, tonumber(p.BeamCreated) or 0))
+		end
 		sLoop(ms("StepLoop", "StepDestroy"))
 		local reasons = if typeof(s.RaycastReasons) == "table" then s.RaycastReasons else {}
 		local checks = math.max(tonumber(s.RaycastChecks) or 0, 1)
@@ -144,6 +188,7 @@ return function(window)
 		else
 			sSkipped("-")
 		end
+		sCasts(string.format("%.0f / %.0f", tonumber(s.CastsSphere) or 0, tonumber(s.CastsRay) or 0))
 		sQueues(`{fmt("%d", s.PendingSpawns)} / {fmt("%d", s.PendingHits)}`)
 		sBeams(fmt("%d", s.BeamPoseUpdates))
 		sEntities(fmt("%d", s.Entities))
@@ -185,7 +230,9 @@ return function(window)
 		VisualOffload.Fire("DebugClientNet", sent)
 		cMemory(fmt("%.0f MB", Stats:GetTotalMemoryUsageMb()))
 		cInstances(fmt("%d", readStat("InstanceCount")))
-		cVisuals(fmt("%d", ProjectileClient.GetStats().Visuals))
+		local clientStats = ProjectileClient.GetStats()
+		cVisuals(fmt("%d  (+ %d beam chains, %d samples)", clientStats.Visuals, clientStats.BeamChains or 0,
+			clientStats.BeamSamples or 0))
 	end
 
 	return { Active = setActive, Tick = sample }

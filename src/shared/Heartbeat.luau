@@ -26,6 +26,9 @@
 	 Heartbeat.SetGlobalTimeScale(scale) / GetGlobalTimeScale() -> number
 	 Heartbeat.GetStats() -> { ConnectionCount, GlobalTimeScale, AvgFrameTime }
 	 Heartbeat.GetConnections() -> { Connection }
+	 Heartbeat.TakeProfile() -> { { Name, Ms, Priority } }   (each named handler's average
+	     ms per frame since the last call, costliest first -- the debug panel's
+	     per-system breakdown)
 
 	 options: { Name?, Priority? = 0, TimeScale? = 1 }
 	 Connection fields: Name, Priority, TimeScale, LocalTime, Connected
@@ -39,6 +42,12 @@ local Heartbeat = {}
 local connections = {} -- priority-sorted (ascending) array of Connection
 local globalTimeScale = 1
 local needsSort = false
+
+-- per-handler cost for TakeProfile: seconds by connection Name since the last
+-- call (two os.clock reads per handler per frame -- cheap at this count)
+local profileTotals: { [string]: number } = {}
+local profilePriority: { [string]: number } = {}
+local profileFrames = 0
 
 -- rolling average of per-frame cost (seconds) over a fixed window
 local WINDOW = 60
@@ -151,6 +160,20 @@ function Heartbeat.GetConnections()
 	return table.clone(connections)
 end
 
+function Heartbeat.TakeProfile(): { { Name: string, Ms: number, Priority: number } }
+	local frames = math.max(profileFrames, 1)
+	local result = {}
+	for name, seconds in profileTotals do
+		table.insert(result, { Name = name, Ms = seconds / frames * 1000, Priority = profilePriority[name] or 0 })
+	end
+	table.sort(result, function(a, b)
+		return a.Ms > b.Ms
+	end)
+	table.clear(profileTotals)
+	profileFrames = 0
+	return result
+end
+
 --------------------------------------------------------------------------------
 -- The one true loop
 --------------------------------------------------------------------------------
@@ -169,9 +192,12 @@ local function step(realDt: number)
 	-- Snapshot so a callback may connect/disconnect during the frame without
 	-- skipping or double-running siblings. New connections run next frame.
 	local snapshot = table.clone(connections)
+	profileFrames += 1
+	local clock = os.clock
 	for i = 1, #snapshot do
 		local connection = snapshot[i]
 		if connection.Connected then
+			local handlerStarted = clock()
 			local dilatedDt = globalDt * connection.TimeScale
 			connection.LocalTime += dilatedDt
 
@@ -191,6 +217,9 @@ local function step(realDt: number)
 					warn(`[Heartbeat] "{connection.Name}" errored: {err}`)
 				end
 			end
+			local name = connection.Name
+			profileTotals[name] = (profileTotals[name] or 0) + clock() - handlerStarted
+			profilePriority[name] = connection.Priority
 		end
 	end
 

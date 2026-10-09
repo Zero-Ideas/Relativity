@@ -17,8 +17,13 @@
 	 VisualOffload.On(channel, handler) -> { Disconnect }
 	     server handler: handler(payload, player)
 	     client handler: handler(payload)
+	 VisualOffload.TakeSendStats() -> { { Channel, Messages, KB, Items } }
+	     what was sent since the last call, by channel, busiest first:
+	     messages (one per recipient), buffer kilobytes, and table entries
+	     (list payloads -- a table's wire size isn't cheap to measure)
 ]]
 
+local Players = game:GetService("Players")
 local RunService = game:GetService("RunService")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 
@@ -81,18 +86,53 @@ local function ensureListening()
 	end
 end
 
+-- Send counters for the debug panel (see TakeSendStats).
+type SendStat = { Messages: number, Bytes: number, Items: number }
+local sendStats: { [string]: SendStat } = {}
+
+local function noteSend(channel: string, payload: any, recipients: number)
+	local stat = sendStats[channel]
+	if not stat then
+		stat = { Messages = 0, Bytes = 0, Items = 0 }
+		sendStats[channel] = stat
+	end
+	stat.Messages += recipients
+	local kind = typeof(payload)
+	if kind == "buffer" then
+		stat.Bytes += buffer.len(payload) * recipients
+	elseif kind == "string" then
+		stat.Bytes += #payload * recipients
+	elseif kind == "table" then
+		stat.Items += math.max(#payload, 1) * recipients
+	end
+end
+
+function VisualOffload.TakeSendStats(): { { Channel: string, Messages: number, KB: number, Items: number } }
+	local result = {}
+	for channel, stat in sendStats do
+		table.insert(result, { Channel = channel, Messages = stat.Messages, KB = stat.Bytes / 1024, Items = stat.Items })
+	end
+	table.sort(result, function(a, b)
+		return a.Messages + a.Items > b.Messages + b.Items
+	end)
+	table.clear(sendStats)
+	return result
+end
+
 function VisualOffload.Fire(channel: string, payload: any?)
-	
 	local r = getRemote()
 	if RunService:IsServer() then
+		noteSend(channel, payload, #Players:GetPlayers())
 		r:FireAllClients(channel, payload)
 	else
+		noteSend(channel, payload, 1)
 		r:FireServer(channel, payload)
 	end
 end
 
 function VisualOffload.FireClient(player: Player, channel: string, payload: any?)
 	assert(RunService:IsServer(), "VisualOffload.FireClient is server-only")
+	noteSend(channel, payload, 1)
 	getRemote():FireClient(player, channel, payload)
 end
 

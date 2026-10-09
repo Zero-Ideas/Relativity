@@ -363,6 +363,7 @@ type Methods = {
 	Destroy: (self: Projectile, result: { Position: Vector3, Normal: Vector3 }?, kind: string?) -> (),
 	SetTimeScale: (self: Projectile, scale: number) -> (),
 	ResolveBeamSpan: (self: Projectile, points: { Vector3 }, allowHits: boolean?, cornerIndices: { number }?) -> { Vector3 },
+	ProbeBeamSpan: (self: Projectile, points: { Vector3 }, trimEnd: number?) -> boolean,
 	ClearBeamPrevious: (self: Projectile) -> (),
 }
 export type Projectile = Types.State & Methods
@@ -1269,6 +1270,11 @@ local function spanParams(self: Projectile): RaycastParams
 	if cached then
 		return cached
 	end
+	-- Nothing pierced yet: exactly its movement filter, which is already
+	-- shared (Raycast.buildRayParams). ResolveBeamSpan copies before excluding.
+	if next(self._ignore) == nil then
+		return self._rayParams
+	end
 	local ignore = self._rayParams.FilterDescendantsInstances
 	for entity in self._ignore do if entity.Instance then table.insert(ignore, entity.Instance) end end
 	local params = RaycastParams.new()
@@ -1364,6 +1370,41 @@ function Projectile.ResolveBeamSpan(self: Projectile, points: { Vector3 }, allow
 	end
 	return points
 end
+-- True when nothing touches the body along `points` at all. No hits, no
+-- clipping, no side effects: BeamChain keeps a long link in one piece while
+-- this holds, and only subdivides it where the body actually meets something.
+-- `trimEnd` stops that far short of the last point (a world-stopped front sits
+-- exactly one radius off its wall).
+function Projectile.ProbeBeamSpan(self: Projectile, points: { Vector3 }, trimEnd: number?): boolean
+	local last = #points - 1
+	if last < 1 then
+		return true
+	end
+	local params = spanParams(self)
+	for index = 1, last do
+		local from = points[index]
+		local offset = points[index + 1] - from
+		local full = offset.Magnitude
+		local length = if index == last and trimEnd then full - trimEnd else full
+		if length < 1e-4 then
+			continue
+		end
+		local heading, traveled = offset / full, 0
+		while traveled < length - 1e-4 do
+			local distance = math.min(length - traveled, 1000)
+			if Raycast.castMovement(self, from + heading * traveled, heading * distance, params) then
+				return false
+			end
+			traveled += distance
+		end
+	end
+	return true
+end
+
+function Projectile.GetDefaultMaxRealLifetime(): number
+	return defaultMaxRealLifetime
+end
+
 function Projectile.ClearBeamPrevious(self: Projectile)
 	if not self.Beam or not self.Beam.PreviousId then return end
 	self.Beam.PreviousId, self._beamPrevious = nil, nil
