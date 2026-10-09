@@ -30,6 +30,14 @@
 	for other UI. Either HUD hides while the spell editor is open (its glass
 	is see-through), and the editor's look follows the "Spell editor
 	opacity" / "background blur" settings.
+
+	Start menu: none of this UI loads while the place's "StartMenu"
+	ScreenGui (any capitalisation) is enabled -- the player's copy,
+	LocalPlayer.PlayerGui.StartMenu, or StarterGui's before that copy
+	arrives. It loads once StartMenu is disabled; if StartMenu is enabled
+	again later (e.g. a respawn that resets it), the HUD, topbar and menu
+	keys go off and any open window closes, until it's disabled again.
+	Each switch prints a [UiMode] line to the output.
 ]]
 
 local Players = game:GetService("Players")
@@ -70,6 +78,10 @@ local mode: Mode = "Mode3"
 local inboxIcon: any = nil
 local hintIcons: { [string]: any } = {} -- key setting -> the topbar icon showing it
 local editorOpen = false -- (the HUD hides behind the editor's glass)
+local START_MENU = "startmenu" -- (matched without regard to case)
+local startMenuOpen = false -- (the game UI stays off while it's up)
+local uiLoaded = false
+local startMenuClosed = Instance.new("BindableEvent")
 
 -- SetCoreGuiEnabled errors until the CoreScripts have registered it.
 local function hideBackpack()
@@ -86,10 +98,11 @@ end
 local function apply()
 	local ours = mode ~= "Dev"
 	GameHud.SetLayout(if mode == "Mode3" then "Mode 3" else "Mode 1")
-	MainHud.SetEnabled(not ours and not editorOpen)
-	GameHud.SetEnabled(ours and not editorOpen)
+	local hidden = editorOpen or startMenuOpen
+	MainHud.SetEnabled(not ours and not hidden)
+	GameHud.SetEnabled(ours and not hidden)
 	-- (GameHud has its own controls; the compact casting panel is the dev UI's)
-	SpellAssemblerGui.SetCompactHudEnabled(not ours)
+	SpellAssemblerGui.SetCompactHudEnabled(not ours and not startMenuOpen)
 	player:SetAttribute("UiMode", mode)
 end
 
@@ -219,7 +232,7 @@ end
 local function bindKeys()
 	local function menu(open: () -> ()): () -> boolean?
 		return function()
-			if editorOpen then
+			if editorOpen or startMenuOpen then
 				return false
 			end
 			open()
@@ -237,11 +250,12 @@ local function bindKeys()
 	Keybinds.Bind("KeySettings", menu(SettingsWindow.Toggle))
 	Keybinds.Bind("KeyDebug", menu(DebugPanel.Toggle))
 	Keybinds.Bind("KeyEditor", function()
+		if startMenuOpen then return false end
 		SpellAssemblerGui.ToggleEditor()
 		return true
 	end)
 	Keybinds.Bind("KeyHotbar", function()
-		if editorOpen then return false end
+		if editorOpen or startMenuOpen then return false end
 		return GameHud.ToggleHotbar()
 	end)
 
@@ -258,9 +272,119 @@ local function bindKeys()
 	refreshHints()
 end
 
+local function isStartMenu(gui: Instance?): boolean
+	return gui ~= nil and gui:IsA("ScreenGui") and string.lower(gui.Name) == START_MENU
+end
+
+local function findStartMenu(parent: Instance?): ScreenGui?
+	if not parent then
+		return nil
+	end
+	for _, child in parent:GetChildren() do
+		if isStartMenu(child) then
+			return child :: ScreenGui
+		end
+	end
+	return nil
+end
+
+-- The start menu came up or went away (see the module comment).
+local function startMenuChanged(source: Instance?)
+	local where = if source then source:GetFullName() else "StartMenu"
+	if not uiLoaded then
+		if startMenuOpen then
+			print(`[UiMode] {where} is enabled: game UI (HUD, topbar, menus, menu keys) won't load until it's disabled`)
+		else
+			print(`[UiMode] {where} was disabled: loading the game UI`)
+			startMenuClosed:Fire()
+		end
+		return
+	end
+	if startMenuOpen then
+		print(`[UiMode] {where} was enabled: disabling all game UI (HUD, topbar, menus, menu keys)`)
+	else
+		print(`[UiMode] {where} was disabled: enabling the game UI`)
+	end
+	Icon.setTopbarEnabled(not startMenuOpen)
+	if startMenuOpen then
+		SpellAssemblerGui.Close()
+		SpellLibrary.Close()
+		PartyWindow.Close()
+		SettingsWindow.Close()
+		CreditsWindow.Close()
+		ServerBrowser.Close()
+		Notifications.SetOpen(false)
+	end
+	apply()
+end
+
+local function watchStartMenu()
+	local playerGui: Instance? = player:FindFirstChildOfClass("PlayerGui")
+	-- (StarterGui's only counts until the player's own copy has shown up:
+	-- after that, a missing copy means it's gone, not that it's still up)
+	local seenCopy = false
+	local watched: { [Instance]: boolean } = {}
+	local function refresh()
+		local copy = findStartMenu(playerGui)
+		local open, source = false, copy
+		if copy then
+			seenCopy = true
+			open = copy.Enabled
+		elseif not seenCopy then
+			local template = findStartMenu(StarterGui)
+			open, source = template ~= nil and template.Enabled, template
+		end
+		if open ~= startMenuOpen then
+			startMenuOpen = open
+			startMenuChanged(source)
+		end
+	end
+	local function watch(gui: Instance?)
+		if gui and isStartMenu(gui) and not watched[gui] then
+			watched[gui] = true
+			gui:GetPropertyChangedSignal("Enabled"):Connect(refresh)
+			gui.Destroying:Connect(function()
+				watched[gui] = nil
+			end)
+		end
+	end
+	local function attach(gui: Instance)
+		playerGui = gui
+		watch(findStartMenu(gui))
+		gui.ChildAdded:Connect(function(child)
+			watch(child)
+			refresh()
+		end)
+		gui.ChildRemoved:Connect(refresh)
+	end
+	watch(findStartMenu(StarterGui))
+	StarterGui.ChildAdded:Connect(function(child)
+		watch(child)
+		refresh()
+	end)
+	if playerGui then
+		attach(playerGui)
+	else
+		task.spawn(function()
+			attach(player:WaitForChild("PlayerGui"))
+			refresh()
+		end)
+	end
+	refresh()
+	if not startMenuOpen and not findStartMenu(playerGui) and not findStartMenu(StarterGui) then
+		print("[UiMode] no StartMenu ScreenGui found (PlayerGui / StarterGui): loading the game UI now")
+	end
+end
+
 function UiMode.start()
 	hideBackpack()
 	ClientSettings.start() -- (defaults now, saved settings once loaded)
+	-- Nothing of the game UI loads while the start menu is up.
+	watchStartMenu()
+	while startMenuOpen do
+		startMenuClosed.Event:Wait()
+	end
+	uiLoaded = true
 	task.spawn(MainHud.start) -- (waits for the authored MainGui)
 	GameHud.start()
 	buildTopbar()
