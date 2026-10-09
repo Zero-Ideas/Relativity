@@ -547,7 +547,16 @@ function BeamChainVisual.Step(globalDt: number)
 	uniform = ChunkManager.IsTimeUniform()
 	local now = os.clock()
 	local partsLeft = MAX_PARTS_PER_FRAME
-	for _, chain in chains do
+	-- Oldest chain first: past the part budget the same (newest) chains go
+	-- without pieces every frame, instead of whichever the hash order
+	-- reached last -- which flickered beams in and out under load.
+	local order = {}
+	for id in chains do
+		table.insert(order, id)
+	end
+	table.sort(order)
+	for _, id in order do
+		local chain = chains[id]
 		if not chain.driver then
 			continue
 		end

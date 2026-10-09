@@ -82,6 +82,18 @@ local CHAIN_GRACE = 0.25
 -- is widened by as much), and casts are cut at this length.
 local STRAIGHT_TOLERANCE = 0.1
 local MAX_CAST = 1000
+-- Halving: the most times one link is halved in a frame (a link is at most
+-- MaxJoinersPerLink + 1 pieces long, and 2^6 > 33).
+local MAX_HALVINGS = 8
+-- Emission skipping (see Channels): the longest link a skipped run of samples
+-- may leave, how far the aim may turn (cosine) and the launch point move
+-- since the last launched sample before the next one must launch.
+local SKIP_SPACING = 4 * BeamPath.MaxStretch
+local SKIP_TURN = math.cos(math.rad(1))
+local SKIP_SHIFT = 2
+-- A new sample links to a previous one stopped at a wall at most this many
+-- real seconds ago (clients drop a dead sample nothing links to after 0.25).
+local PARKED_LINK_AGE = 0.15
 
 --------------------------------------------------------------------------------
 -- Dormant packets
@@ -173,6 +185,7 @@ function Sample.Destroy(self: any, result: { Position: Vector3, Normal: Vector3 
 		materializeAhead(self)
 	end
 	self.Dead = true
+	self._diedAt = os.clock()
 	self._worldStop = kind == "world" and not self._beamBodyHit
 	local info = {
 		Position = if result then SafeMath.vector(result.Position, self.Position) else self.Position,
@@ -284,7 +297,9 @@ local chains: { [number]: any } = {}
 local chainOrder: { number } = {}
 local frameStats = { Created = 0, BudgetSplits = 0, Lazy = 0, Samples = 0, Joiners = 0, Dormant = 0 }
 local lastStats = table.clone(frameStats)
-local breakReasons = { Geometry = 0, ChannelBudget = 0, FrameBudget = 0, Quota = 0, SourceAge = 0 }
+-- (Parked: a link to a sample stopped at a wall, let go once the sample
+-- behind no longer heads into that spot)
+local breakReasons = { Geometry = 0, ChannelBudget = 0, FrameBudget = 0, Quota = 0, SourceAge = 0, Parked = 0 }
 
 local function colorBytes(color: Color3?, fallback: Color3): (number, number, number)
 	local c = color or fallback
@@ -335,6 +350,19 @@ local function newChain(id: number, config: any, settings: any): any
 	return chain
 end
 
+-- Is `p` still pouring into the spot its front stopped at -- heading along
+-- the first leg of their link, not sliding past it?
+local function feeding(p: any, corners: { Vector3 }): boolean
+	local speed = p.Velocity.Magnitude
+	if speed < 1e-4 then
+		return true
+	end
+	local heading = p.Velocity / speed
+	local leg = corners[2] - corners[1]
+	local along = leg:Dot(heading)
+	return along > 0 and (leg - heading * along).Magnitude <= BeamPath.MaxStretch
+end
+
 -- SpellRuntime hands over its trigger binding instead of binding at once
 -- (see Launch).
 Chain.DefersBinding = true
@@ -360,7 +388,17 @@ function Chain.Launch(config: any, deferred: any?): any
 	local chain = chains[id] or newChain(id, config, settings)
 	local s = fromSettings(chain, settings)
 	local previous = chain.last
-	if previous and not previous.Dead then
+	local linked = previous ~= nil and not previous.Dead
+	if previous and previous.Dead and chain.lazy and previous._worldStop
+		and os.clock() - previous._diedAt < PARKED_LINK_AGE then
+		-- One that just stopped at a wall: with skipped samples it can get
+		-- there well before the next launch, and the beam still pours into
+		-- that spot if this one heads there too. (Clients keep a stopped
+		-- sample nothing links to for only DEAD_GRACE, hence recent ones.)
+		local corners = BeamPath.Plan(s.Position, previous.Position, s._beamTurns, previous._beamTurns)
+		linked = corners ~= nil and #corners > 1 and feeding(s, corners)
+	end
+	if linked then
 		s._ahead = previous
 		previous._behind = s
 	end
@@ -393,10 +431,11 @@ local function realAge(s: any): number
 end
 
 -- Break ONLY this link; the sample keeps a finite body pointing where its
--- link went (cf. BeamProjectileHandler's unlink).
-local function unlink(s: any)
+-- link went (cf. BeamProjectileHandler's unlink) -- or, `forward`, where the
+-- sample itself is heading.
+local function unlink(s: any, forward: boolean?)
 	local path = s._beamSpan
-	local offset = path and path[2] and path[2] - path[1]
+	local offset = if forward then nil else path and path[2] and path[2] - path[1]
 	if not offset or offset.Magnitude < 1e-4 then
 		offset = if s.Velocity.Magnitude > 1e-4 then s.Velocity.Unit * math.min(s.Beam.Length, BeamPath.MaxStretch) else nil
 	end
@@ -591,14 +630,129 @@ function materializeAhead(s: any)
 	s._lazyLink = nil
 end
 
+-- Inserts ONE joiner halfway along the planned link p -> front (by path
+-- length; placed, moving, aged and given its energy share exactly as split
+-- places the joiners there) and links p -> joiner -> front. Returns it.
+local function halve(chain: any, p: any, front: any, corners: { Vector3 }): any
+	local behind, ahead = p._beamTurns, front._beamTurns
+	local total = 0
+	for leg = 1, #corners - 1 do
+		total += (corners[leg + 1] - corners[leg]).Magnitude
+	end
+	local leg, t, along = #corners - 1, .5, 0
+	for index = 1, #corners - 1 do
+		local length = (corners[index + 1] - corners[index]).Magnitude
+		if along + length >= total * .5 then
+			leg, t = index, if length > 0 then (total * .5 - along) / length else 0
+			break
+		end
+		along += length
+	end
+	local from, to = corners[leg], corners[leg + 1]
+	local phase = math.min(#behind + leg - 1, #ahead)
+	local prototype = if phase == #ahead then front else p
+	local velocity = if #behind == #ahead then p.Velocity:Lerp(front.Velocity, .5)
+		elseif phase == #behind then p.Velocity
+		elseif phase == #ahead then front.Velocity
+		else (to - from).Unit * p.Velocity.Magnitude * p.Restitution ^ (phase - #behind)
+	local child = joinerFrom(chain, prototype, from:Lerp(to, t), velocity, table.move(ahead, 1, phase, 1, {}))
+	child._realBehind, child._realAhead = realBehind(p), realAhead(front)
+	-- (toward a parked front, never its frozen age: see split)
+	child.Age = if front.Dead and front._worldStop then p.Age else p.Age + (front.Age - p.Age) * .5
+	child.Damage = p.Damage * .5
+	if p._beamBindChild then
+		p._beamBindChild(child, .5)
+	end
+	if p._beamScaleEnergy then
+		p._beamScaleEnergy(.5)
+	else
+		p.Damage *= .5
+	end
+	table.insert(chain.samples, child)
+	p._ahead, p._everLinked, p._lazyLink = child, true, nil
+	child._ahead, child._everLinked, child._incoming, child._behind = front, true, true, p
+	front._everLinked, front._incoming, front._behind = true, true, child
+	chain.joinerCount += 1
+	created += 1
+	frameStats.Created += 1
+	Profile.Count("BeamCreated", 1)
+	return child
+end
+
+local halveAndSettle: (chain: any, back: any, front: any, corners: { Vector3 }, globalDt: number, depth: number) -> ()
+
+-- Divide and repeat: a lazy chain's long link back -> front (planned:
+-- `corners`, needing joiners) stays ONE body while nothing touches it. When
+-- something does, it's halved, and each half gets the same treatment -- so
+-- joiners appear only around the contact: about 2 * log2(length /
+-- MaxStretch) of them, where splitting the whole link made length /
+-- MaxStretch. Pieces short enough to need no joiners resolve as usual (hits,
+-- clipping). The pieces nothing touches are exactly the bodies the eager
+-- split's joiners would have had there, so no outcome changes.
+local function settle(chain: any, back: any, front: any, corners: { Vector3 }, globalDt: number, depth: number)
+	if Projectile.ProbeBeamSpan(back, corners, if front.Dead then 0.1 else nil) then
+		back._lazyLink, back._everLinked, front._everLinked, front._incoming = true, true, true, true
+		back._beamSpan, back._beamSpanClipped = corners, nil
+		if not front.Dead and not front._ahead then
+			front._beamSpan = { front.Position }
+		end
+		return
+	end
+	local reason = if depth >= MAX_HALVINGS then "Geometry" else blocked(chain, back, front, corners, 1)
+	if reason then
+		-- Out of joiners: it stays whole and takes its contact as one body
+		-- (clipped at a wall) rather than tearing off a fragment that would
+		-- hang in the air for the rest of its life.
+		breakReasons[reason] += 1
+		frameStats.BudgetSplits += 1
+		back._lazyLink, back._everLinked, front._everLinked, front._incoming = nil, true, true, true
+		resolve(back, corners, globalDt)
+		if not front.Dead and not front._ahead then
+			front._beamSpan = { front.Position }
+		end
+		return
+	end
+	halveAndSettle(chain, back, front, corners, globalDt, depth)
+end
+
+-- One of the halves: settled again if it's still long, else resolved.
+local function settlePiece(chain: any, b: any, f: any, globalDt: number, depth: number)
+	if b.Dead then
+		return
+	end
+	local legs, needed = BeamPath.Plan(b.Position, f.Position, b._beamTurns, f._beamTurns)
+	if not legs then
+		unlink(b)
+		resolve(b, initialPath(b), globalDt)
+	elseif needed == 0 then
+		resolve(b, legs, globalDt)
+	else
+		settle(chain, b, f, legs, globalDt, depth + 1)
+	end
+end
+
+function halveAndSettle(chain: any, back: any, front: any, corners: { Vector3 }, globalDt: number, depth: number)
+	local middle = halve(chain, back, front, corners)
+	-- (front half first: the back half then ends wherever the middle did)
+	settlePiece(chain, middle, front, globalDt, depth)
+	settlePiece(chain, back, middle, globalDt, depth)
+	if not front.Dead and not front._ahead then
+		front._beamSpan = { front.Position }
+	end
+end
+
 local function linkOne(chain: any, p: any, globalDt: number)
 	do
 		local front = p._ahead
 		if front and front.Dead and not front._worldStop then
 			if p._lazyLink then
+				-- The stretch the lazy link stood for carries on without its
+				-- front: halve it (graded ages, so it still expires in turn).
+				-- The half that now ends at the dead front is halved again
+				-- next frame, and so on, instead of every joiner at once.
 				local corners, needed = BeamPath.Plan(p.Position, front.Position, p._beamTurns, front._beamTurns)
-				if corners and needed > 0 and not blocked(chain, p, front, corners, needed) then
-					split(chain, p, front, corners, needed, globalDt, true)
+				if corners and needed > 0 and not blocked(chain, p, front, corners, 1) then
+					halveAndSettle(chain, p, front, corners, globalDt, 0)
 					return
 				end
 			end
@@ -610,14 +764,18 @@ local function linkOne(chain: any, p: any, globalDt: number)
 			return
 		end
 		local corners, needed = BeamPath.Plan(p.Position, front.Position, p._beamTurns, front._beamTurns)
-		if corners and needed > 0 and chain.lazy and (ChunkManager.IsTimeUniform() or uniformAlong(corners))
-			and Projectile.ProbeBeamSpan(p, corners, if front.Dead then 0.1 else nil) then
-			-- Nothing touches it: one body, no joiners.
-			p._lazyLink, p._everLinked, front._everLinked, front._incoming = true, true, true, true
-			p._beamSpan, p._beamSpanClipped = corners, nil
-			if not front.Dead and not front._ahead then
-				front._beamSpan = { front.Position }
-			end
+		if corners and needed > 0 and front.Dead and not feeding(p, corners) then
+			-- Its front stopped at a wall and a sweep has carried it past that
+			-- spot. Holding on would stretch a string off the wall, and the
+			-- joiners along it would park on the wall one by one, each
+			-- anchoring another string. Let go: it carries on as a beam end.
+			breakReasons.Parked += 1
+			unlink(p, true)
+			resolve(p, initialPath(p), globalDt)
+			return
+		end
+		if corners and needed > 0 and chain.lazy and (ChunkManager.IsTimeUniform() or uniformAlong(corners)) then
+			settle(chain, p, front, corners, globalDt, 0)
 			return
 		end
 		local reason = blocked(chain, p, front, corners, needed)
@@ -1390,12 +1548,61 @@ function Chain.GetJoinerStats()
 end
 
 --------------------------------------------------------------------------------
--- Channels (identical to BeamProjectileHandler)
+-- Channels (as BeamProjectileHandler's, plus skipping)
 --------------------------------------------------------------------------------
+
+-- A channel ticks every Interval (consecutive samples just under one link
+-- apart). Given Aim / Fire (SpellRuntime) instead of only Emit, a tick on a
+-- lazy chain may skip its sample when it would add nothing: the aim and the
+-- launch point are where the last launched sample left them and that sample
+-- still flies. The skipped samples would all have flown along the chord of
+-- the link from the next launched sample to that one -- the very joiners
+-- that lazy link stands for -- so the skipped ticks' energy rides on the
+-- next sample launched, whose body is where those samples would have been.
+-- A steady beam is then a few long links that only gain joiners where they
+-- touch something; a sweeping beam still gets a sample wherever the aim
+-- turned.
 
 local channels: { any } = {}
 local lastInput: { [Player]: number } = {}
 local nextChannelId = 0
+
+local function fire(channel: any, shot: any, direction: Vector3)
+	local share = channel.Carry / channel.Duration
+	channel.Carry, channel.Pending = 0, nil
+	channel.Fire(shot, direction, share, channel.Id)
+end
+
+-- One tick of `slice` seconds of the channel's duration.
+local function tick(channel: any, slice: number, final: boolean)
+	if not channel.Aim then
+		channel.Emit(slice / channel.Duration, channel.Id)
+		return
+	end
+	local shot, origin, direction = channel.Aim()
+	channel.Carry += slice
+	local chain = chains[channel.Id]
+	local last = channel.Last
+	if not final and last and chain and chain.lazy and chain.last == last.sample and not last.sample.Dead
+		and (channel.Carry + channel.Interval) * channel.Speed <= SKIP_SPACING
+		and direction:Dot(last.direction) >= SKIP_TURN and (origin - last.origin).Magnitude <= SKIP_SHIFT then
+		channel.Pending = { shot, direction }
+		return
+	end
+	fire(channel, shot, direction)
+	chain = chains[channel.Id]
+	channel.Last = { sample = chain and chain.last, origin = origin, direction = direction }
+end
+
+-- A channel ending while a skipped tick's energy waits: launch it now (from
+-- that tick's aim), unless the caster can't cast any more.
+local function flush(channel: any, castable: boolean)
+	local pending = channel.Pending
+	if pending and castable then
+		fire(channel, pending[1], pending[2])
+	end
+	channel.Pending = nil
+end
 
 function Chain.IsActive(player: Player): boolean
 	for _, channel in channels do
@@ -1408,8 +1615,12 @@ end
 
 function Chain.Stop(player: Player)
 	for index = #channels, 1, -1 do
-		if channels[index].Player == player then
+		local channel = channels[index]
+		if channel.Player == player then
 			table.remove(channels, index)
+			local humanoid = channel.Character:FindFirstChildOfClass("Humanoid")
+			flush(channel, player.Parent ~= nil and player.Character == channel.Character
+				and humanoid ~= nil and humanoid.Health > 0)
 		end
 	end
 	lastInput[player] = nil
@@ -1443,14 +1654,19 @@ function Chain.Start(options: any): boolean
 	local channel = table.clone(options)
 	nextChannelId += 1
 	channel.Id = nextChannelId
-	channel.Interval = Chain.GetInterval(options.Speed or 2000)
+	channel.Speed = options.Speed or 2000
+	channel.Interval = Chain.GetInterval(channel.Speed)
 	channel.Remaining = options.Duration
 	channel.NextEmit = options.Delay or 0
 	channel.Started = os.clock()
+	channel.Carry = 0
+	if not (options.Aim and options.Fire) then
+		channel.Aim = nil
+	end
 	if channel.NextEmit == 0 then
 		local slice = math.min(channel.Interval, channel.Remaining)
-		channel.Emit(slice / options.Duration, channel.Id)
 		channel.Remaining -= slice
+		tick(channel, slice, channel.Remaining <= 1e-8)
 		channel.NextEmit = channel.Interval
 	end
 	table.insert(channels, channel)
@@ -1472,15 +1688,18 @@ Heartbeat.Connect(function(globalDt: number)
 				break
 			end
 		end
-		if channel.Remaining <= 1e-8 or not player.Parent or player.Character ~= character
-			or not humanoid or humanoid.Health <= 0 or otherTool
+		local castable = player.Parent ~= nil and player.Character == character and humanoid ~= nil
+			and humanoid.Health > 0 and not otherTool
+		if channel.Remaining <= 1e-8 or not castable
 			or now - (lastInput[player] or 0) > INPUT_TIMEOUT or now - channel.Started >= 60 then
 			table.remove(channels, index)
+			flush(channel, castable)
 			continue
 		end
 		local caster = channel.Caster
 		if caster and (caster.IsDestroyed or caster.Health <= 0) then
 			table.remove(channels, index)
+			flush(channel, false)
 			continue
 		end
 		local scale = ChunkManager.GetTimeScaleAt(channel.Origin()) * (caster and caster.TimeScale or 1)
@@ -1491,8 +1710,8 @@ Heartbeat.Connect(function(globalDt: number)
 		local emitted = 0
 		while channel.NextEmit <= 0 and channel.Remaining > 1e-8 and emitted < MAX_PACKETS_PER_CHANNEL_FRAME do
 			local slice = math.min(channel.Interval, channel.Remaining)
-			channel.Emit(slice / channel.Duration, channel.Id)
 			channel.Remaining -= slice
+			tick(channel, slice, channel.Remaining <= 1e-8)
 			channel.NextEmit += channel.Interval
 			emitted += 1
 		end
