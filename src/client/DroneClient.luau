@@ -23,8 +23,10 @@
 	fires from), leaning into its movement, with a slow bob. Its body only
 	turns to face the aim; the arm points the weapon. Aiming above it, the
 	drone rolls upside down so the arm can reach up, and rolls back once the
-	aim drops again. The aim is the mouse for your own drone, the
-	character's facing for everyone else's.
+	aim drops again. The aim is the mouse for your own drone (sent to the
+	server a few times a second, see DroneRig "Aim replication"); everyone
+	else's drone follows its owner's replicated aim, smoothed, falling back
+	to the character's facing until one arrives.
 
 	Summon(character) / Dismiss(character) also work without a gun (the
 	debug panel's VFX tab uses them).
@@ -53,6 +55,10 @@ local FLIP_UP, FLIP_DOWN = 0.3, 0.1
 local ROLL_RATE = 9
 -- Leaning into its movement: radians per (studs/s), and the most it leans.
 local LEAN_PER_SPEED, MAX_LEAN = 0.012, 0.35
+local REMOTE_AIM_RATE = 15 -- how quickly another player's drone eases to its new aim (1/s)
+local aimRemote: RemoteEvent? = nil
+local lastSentAim: Vector3? = nil
+local lastSentAt = 0
 local MAX_RETURNING = 2 -- rapid tool switching must not accumulate drone copies
 
 type State = "summoning" | "hovering" | "dismissing"
@@ -71,6 +77,7 @@ type Drone = {
 	state: State,
 	t: number, -- seconds into the current summon / dismiss
 	look: Vector3, -- (level: the body only yaws)
+	remoteAim: Vector3?, -- another player's drone: its smoothed replicated aim
 	follow: DroneRig.FollowState,
 	departure: Vector3?, -- dismissing: where it set off from, in the root's space
 	flipped: boolean,
@@ -104,7 +111,27 @@ local function ease(t: number): number
 end
 
 -- Where the drone wants to look: the owner's aim.
-local function aimOf(drone: Drone, from: Vector3): Vector3
+-- Tells the server where our drone aims (throttled; only real changes).
+local function sendAim(aim: Vector3)
+	local now = os.clock()
+	if now - lastSentAt < DroneRig.AimSendInterval then
+		return
+	end
+	if lastSentAim and lastSentAim:Dot(aim) > DroneRig.AimSendAngle then
+		return
+	end
+	if not aimRemote then
+		local found = ReplicatedStorage:FindFirstChild(DroneRig.AimRemote)
+		if not found or not found:IsA("RemoteEvent") then
+			return
+		end
+		aimRemote = found
+	end
+	lastSentAt, lastSentAim = now, aim;
+	(aimRemote :: RemoteEvent):FireServer(aim)
+end
+
+local function aimOf(drone: Drone, from: Vector3, dt: number): Vector3
 	if drone.character == player.Character then
 		local camera = workspace.CurrentCamera
 		if not camera then return drone.root.CFrame.LookVector end
@@ -113,10 +140,20 @@ local function aimOf(drone: Drone, from: Vector3): Vector3
 		local target = ray.Origin + ray.Direction * 300
 		local offset = target - from
 		if offset.Magnitude > 1e-3 then
+			sendAim(offset.Unit)
 			return offset.Unit
 		end
+		return drone.root.CFrame.LookVector
 	end
-	return drone.root.CFrame.LookVector
+	-- someone else's drone: their replicated aim, eased so updates don't snap
+	local replicated = drone.character:GetAttribute(DroneRig.AimAttribute)
+	if typeof(replicated) ~= "Vector3" or replicated.Magnitude < 1e-3 then
+		return drone.root.CFrame.LookVector
+	end
+	local current = drone.remoteAim or replicated.Unit
+	local eased = current:Lerp(replicated.Unit, 1 - math.exp(-REMOTE_AIM_RATE * dt))
+	drone.remoteAim = if eased.Magnitude > 1e-3 then eased.Unit else replicated.Unit
+	return drone.remoteAim :: Vector3
 end
 
 -- The path out of the portal: from START_DEPTH behind its plane to `hover`
@@ -228,7 +265,7 @@ local function step(dt: number)
 		end
 		-- The aim (while travelling: along the path). The body only turns
 		-- level toward it; the arm points the weapon.
-		local aim = if drone.state == "hovering" then aimOf(drone, position) else (hover - portalFrame.Position).Unit
+		local aim = if drone.state == "hovering" then aimOf(drone, position, dt) else (hover - portalFrame.Position).Unit
 		local level = Vector3.new(aim.X, 0, aim.Z)
 		if level.Magnitude > 1e-3 then
 			drone.look = drone.look:Lerp(level.Unit, 1 - math.exp(-TURN_RATE * dt))
@@ -339,6 +376,7 @@ function DroneClient.Summon(character: Model, tool: Tool?)
 		state = "summoning",
 		t = 0,
 		look = (DroneRig.Hover(root.CFrame) - portal.CFrame.Position).Unit,
+		remoteAim = nil,
 		follow = { position = (portal.CFrame * CFrame.new(0, 0, START_DEPTH)).Position, velocity = Vector3.zero },
 		departure = nil,
 		flipped = false,

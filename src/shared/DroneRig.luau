@@ -20,6 +20,11 @@
 	                 it ends up absurdly far behind (a teleport). Clients fly
 	                 the drone with it and the server runs the same motion to
 	                 fire from where the drone actually is.
+	  Aim replication  the owner's client sends where it aims (AimRemote,
+	                 a few times a second, only when it changes); the server
+	                 puts it on the character as the AimAttribute (a unit
+	                 Vector3), so every client's copy of that drone aims, turns
+	                 and flips the same way.
 	  WeaponMountOffset  underside socket in the drone chassis's local space,
 	                 where its arm's shoulder sits.
 	                 Tools may supply a DroneMountOffset CFrame attribute to
@@ -40,6 +45,10 @@ DroneRig.HoverOffset = CFrame.new(2.6, 2.3, 1.2)
 DroneRig.PortalOffset = Vector3.new(5, 3.6, -4.5)
 DroneRig.PortalRadius = 2.4 -- clearance for four prop guards
 DroneRig.WeaponMountOffset = CFrame.new(0, -0.42, 0)
+DroneRig.AimRemote = "DroneAim" -- (RemoteEvent in ReplicatedStorage)
+DroneRig.AimAttribute = "DroneAim" -- (on the character)
+DroneRig.AimSendInterval = 1 / 15 -- seconds between the owner's aim updates
+DroneRig.AimSendAngle = math.cos(math.rad(1.5)) -- smaller aim changes aren't sent
 -- Following: spring stiffness (1/s: higher = snappier), top speed (studs/s)
 -- and how far behind it may fall before it snaps to its hover point.
 DroneRig.FollowStiffness = 7

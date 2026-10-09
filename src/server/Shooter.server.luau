@@ -221,6 +221,31 @@ RunService.Heartbeat:Connect(function(dt: number)
 	end
 end)
 
+-- Drone aim: each owner's client reports where it aims; it goes on the
+-- character as an attribute so every client's copy of the drone aims alike.
+-- (Cosmetic only -- shots still take their direction from the shot request.)
+local aimRemote = Instance.new("RemoteEvent")
+aimRemote.Name = DroneRig.AimRemote
+aimRemote.Parent = ReplicatedStorage
+local lastAim: { [Player]: number } = {}
+aimRemote.OnServerEvent:Connect(function(player: Player, aim: any)
+	if typeof(aim) ~= "Vector3" or aim ~= aim or aim.Magnitude < 0.5 or aim.Magnitude > 2 then
+		return
+	end
+	local now = os.clock()
+	if lastAim[player] and now - lastAim[player] < DroneRig.AimSendInterval * 0.5 then
+		return -- (faster than any honest client sends)
+	end
+	lastAim[player] = now
+	local character = player.Character
+	if character and drones[character] then
+		character:SetAttribute(DroneRig.AimAttribute, aim.Unit)
+	end
+end)
+Players.PlayerRemoving:Connect(function(player)
+	lastAim[player] = nil
+end)
+
 -- Where a shot spawns from: a drone weapon's drone (see DroneRig), else the
 -- equipped weapon's own "Tip" Attachment if
 -- it has one (searched recursively, so it can live under a muzzle model
