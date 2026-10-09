@@ -13,6 +13,8 @@
 	  MaxUpdates   projectile redraws per frame (purely visual: positions come
 	               from elapsed time, so a visual left waiting catches up
 	               exactly when next redrawn -- never out of sync)
+	  (MaxDistance / MaxRendered / MaxUpdates also apply to beams; see
+	  Projectile/Client BeamVisual and BeamChainVisual)
 	  Glints       the cast glint on spell circles (off by default)
 	  EffectsIntensity / ReducedFlashes / CameraShake: local cosmetics only.
 	  HudScale     both HUD modes, 70..130 percent.
@@ -73,10 +75,10 @@ ClientSettings.Specs = {
 	{ Key = "ImpactVolume", Label = "Impact / explosion volume (%)", Kind = "number", Default = 100, Min = 0, Max = 100, Step = 5, Section = "Audio" },
 	{ Key = "UiVolume", Label = "UI volume (%)", Kind = "number", Default = 100, Min = 0, Max = 100, Step = 5, Section = "Audio" },
 	{ Key = "MusicVolume", Label = "Music volume (%)", Kind = "number", Default = 100, Min = 0, Max = 100, Step = 5, Section = "Audio" },
-	{ Key = "MaxDistance", Label = "Projectile render distance (studs)", Kind = "number", Default = 2048, Min = 50, Max = 10000, Step = 50, Section = "Advanced" },
-	{ Key = "MaxRendered", Label = "Max rendered projectiles", Kind = "number", Default = 5000, Min = 0, Max = 50000, Step = 100, Section = "Advanced", Description = "WARNING: Projectiles rejected at this cap stay invisible but can still deal damage." },
+	{ Key = "MaxDistance", Label = "Projectile render distance (studs)", Kind = "number", Default = 2048, Min = 50, Max = 10000, Step = 50, Section = "Advanced", Description = "Beams too: the parts of a beam past this distance aren't drawn." },
+	{ Key = "MaxRendered", Label = "Max rendered projectiles", Kind = "number", Default = 5000, Min = 0, Max = 50000, Step = 100, Section = "Advanced", Description = "WARNING: Projectiles rejected at this cap stay invisible but can still deal damage. Also caps the pieces drawn for sustained beams." },
 	{ Key = "MaxSmooth", Label = "Max high-resolution projectiles (tweened)", Kind = "number", Default = 500, Min = 0, Max = 5000, Step = 25, Section = "Advanced" },
-	{ Key = "MaxUpdates", Label = "Projectile updates per frame", Kind = "number", Default = 2500, Min = 100, Max = 20000, Step = 100, Section = "Advanced" },
+	{ Key = "MaxUpdates", Label = "Projectile updates per frame", Kind = "number", Default = 2500, Min = 100, Max = 20000, Step = 100, Section = "Advanced", Description = "Sustained beams count each piece; past this they redraw in turns." },
 } :: { Spec }
 
 local values: { [string]: any } = {}

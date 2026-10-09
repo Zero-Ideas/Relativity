@@ -42,7 +42,7 @@ local BeamChainVisual = {}
 local MAX_SEGMENT = 128 -- studs per pooled cylinder
 local STRAIGHT = 0.15 -- of the radius: how far a merged straight run may stray from a dropped vertex
 local EXPIRE_GRACE = 0.5 -- seconds a sample out of life waits for the server's death before dying here
-local MAX_PARTS_PER_FRAME = 2400 -- cylinders + joint balls posed per frame, all chains
+local MAX_PARTS_PER_FRAME = 3000 -- cylinders + joint balls shown at once, all chains (about where a live server starts to lag)
 local JOINT_COS = math.cos(math.rad(12)) -- bends sharper than this get a ball
 local DEAD_GRACE = 0.25 -- real seconds a dead sample is kept for in-flight messages
 local GHOST_LIFETIME = 1.5 -- a dead sample still named as a link target
@@ -70,6 +70,12 @@ type Sample = {
 
 local chains: { [number]: any } = {}
 local pending: { [any]: any } = {}
+-- The player's projectile render limits (ClientSettings, via
+-- ProjectileClient.SetRenderSettings): nothing past MaxDistance studs from
+-- the camera is drawn, at most MaxRendered pieces (cylinders + joint balls)
+-- are shown across all chains, and about MaxUpdates pieces are rebuilt per
+-- frame -- chains past that keep their last pose and go first next frame.
+local limits = { MaxDistance = 2048, MaxRendered = 5000, MaxUpdates = 2500 }
 local applyConnection: RBXScriptConnection? = nil
 local enabled = false
 local uniform = true
@@ -294,10 +300,25 @@ local function pathOf(chain: any, s: Sample, incoming: { [number]: boolean }): {
 	end
 	if s.ahead ~= 0 then
 		local ahead = chain.samples[s.ahead]
-		if ahead then
-			return (BeamPath.Plan(s.pos, ahead.pos, s.turns, ahead.turns))
+		if not ahead then
+			return nil
 		end
-		return nil
+		if #s.turns == 0 and #ahead.turns == 0 then
+			-- (the usual straight link: what Plan returns, without a new
+			-- table every frame -- callers that keep it must copy it)
+			local path = s.straight
+			if not path then
+				path = {}
+				s.straight = path
+			end
+			table.clear(path)
+			path[1] = s.pos
+			if (ahead.pos - s.pos).Magnitude > 1e-4 then
+				path[2] = ahead.pos
+			end
+			return path
+		end
+		return (BeamPath.Plan(s.pos, ahead.pos, s.turns, ahead.turns))
 	end
 	if incoming[s.id] then
 		return nil
@@ -312,8 +333,11 @@ local function pathOf(chain: any, s: Sample, incoming: { [number]: boolean }): {
 	return nil
 end
 
-local function incomingOf(chain: any): { [number]: boolean }
-	local incoming = {}
+local function incomingOf(chain: any, into: { [number]: boolean }?): { [number]: boolean }
+	local incoming = into or {}
+	if into then
+		table.clear(into)
+	end
 	for _, s in chain.samples do
 		if not s.dead and s.ahead ~= 0 then
 			incoming[s.ahead] = true
@@ -395,6 +419,7 @@ local function onDeath(chain: any, s: Sample, kind: number, contact: Vector3?, n
 	local body = pathOf(chain, s, incomingOf(chain))
 	s.dead, s.diedAt = true, os.clock()
 	if body and #body > 1 then
+		body = table.clone(body) -- (drained in place; pathOf may reuse its table)
 		local speed = s.vel.Magnitude
 		local points = deathPath(body, if kind ~= DeathKind.Expire then contact else nil)
 		if speed > 1e-3 and #points > 1 then
@@ -546,15 +571,26 @@ function BeamChainVisual.Step(globalDt: number)
 	end
 	uniform = ChunkManager.IsTimeUniform()
 	local now = os.clock()
-	local partsLeft = MAX_PARTS_PER_FRAME
-	-- Oldest chain first: past the part budget the same (newest) chains go
-	-- without pieces every frame, instead of whichever the hash order
-	-- reached last -- which flickered beams in and out under load.
+	local partsLeft = math.min(MAX_PARTS_PER_FRAME, limits.MaxRendered)
+	local updatesLeft = math.max(limits.MaxUpdates, 1)
+	local camera = workspace.CurrentCamera
+	local eye = if camera then camera.CFrame.Position else Vector3.zero
+	local reach = limits.MaxDistance
+	-- Oldest chain first (chains left stale last frame before that): past
+	-- the part budget the same (newest) chains go without pieces every
+	-- frame, instead of whichever the hash order reached last -- which
+	-- flickered beams in and out under load.
 	local order = {}
 	for id in chains do
 		table.insert(order, id)
 	end
-	table.sort(order)
+	table.sort(order, function(a, b)
+		local staleA, staleB = chains[a].stale == true, chains[b].stale == true
+		if staleA ~= staleB then
+			return staleA
+		end
+		return a < b
+	end)
 	for _, id in order do
 		local chain = chains[id]
 		if not chain.driver then
@@ -573,7 +609,16 @@ function BeamChainVisual.Step(globalDt: number)
 				end
 			end
 		end
-		local incoming = incomingOf(chain)
+		local scratch = chain.scratch
+		if not scratch then
+			-- per-chain tables reused every frame instead of rebuilt (the
+			-- segment / joint lists go to `pending`, which apply() consumes
+			-- before the next Step, so they're free again by then)
+			scratch = { incoming = {}, segments = {}, joints = {}, ends = {}, into = {}, out = {}, paths = {},
+				nextOf = {}, joined = {}, starts = {} }
+			chain.scratch = scratch
+		end
+		local incoming = incomingOf(chain, scratch.incoming)
 		for sid, s in chain.samples do
 			if s.dead and now - s.diedAt > DEAD_GRACE
 				and (not incoming[sid] or (not s.stopped and now - s.diedAt > GHOST_LIFETIME)) then
@@ -593,14 +638,27 @@ function BeamChainVisual.Step(globalDt: number)
 			destroyChain(chain)
 			continue
 		end
+		if updatesLeft <= 0 and chain.drawn then
+			-- (over this frame's redraw budget: its last pose stays up, and it
+			-- still counts against the piece cap)
+			chain.stale = true
+			partsLeft -= chain.drawn
+			continue
+		end
+		local partsBefore = partsLeft
 
 		-- Geometry: every visible piece, split into pooled cylinders, with a
 		-- ball wherever a body ends or bends sharply.
-		local segments: { Vector3 } = {}
-		local jointPoints: { Vector3 } = {}
-		local ends: { [Vector3]: number } = {}
-		local inDirection: { [Vector3]: Vector3 } = {}
-		local outDirection: { [Vector3]: Vector3 } = {}
+		local segments: { Vector3 } = scratch.segments
+		local jointPoints: { Vector3 } = scratch.joints
+		local ends: { [Vector3]: number } = scratch.ends
+		local inDirection: { [Vector3]: Vector3 } = scratch.into
+		local outDirection: { [Vector3]: Vector3 } = scratch.out
+		table.clear(segments)
+		table.clear(jointPoints)
+		table.clear(ends)
+		table.clear(inDirection)
+		table.clear(outDirection)
 		local radius = chain.radius
 		local function addPolyline(points: { Vector3 })
 			local first, lastDirection = true, nil
@@ -623,6 +681,22 @@ function BeamChainVisual.Step(globalDt: number)
 				if partsLeft <= 0 or not View.contains((a + b) * .5, length * .5 + radius) then
 					continue
 				end
+				-- only the part within render distance of the camera
+				local f = eye - a
+				local along = f:Dot(direction) -- (the camera's foot on the line)
+				local miss = f - direction * along
+				local inside = reach * reach - miss:Dot(miss)
+				if inside < 0 then
+					continue
+				end
+				local half = math.sqrt(inside)
+				local from, to = math.max(along - half, 0), math.min(along + half, length)
+				if to - from < 1e-3 then
+					continue
+				end
+				if from > 0 or to < length then
+					a, b, length = a + direction * from, a + direction * to, to - from
+				end
 				-- fixed-length pieces from the back; only the last one varies
 				local pieces = math.max(1, math.ceil(length / MAX_SEGMENT - 1e-6))
 				for piece = 1, pieces do
@@ -640,15 +714,18 @@ function BeamChainVisual.Step(globalDt: number)
 		-- Strands: every body, joined to the body of the sample ahead where it
 		-- ends exactly where that one starts, then straightened.
 		local samples = chain.samples
-		local paths: { [number]: { Vector3 } } = {}
+		local paths: { [number]: { Vector3 } } = scratch.paths
+		table.clear(paths)
 		for sid, s in samples do
 			local path = pathOf(chain, s, incoming)
 			if path and #path > 1 then
 				paths[sid] = path
 			end
 		end
-		local nextOf: { [number]: number } = {}
-		local joined: { [number]: boolean } = {}
+		local nextOf: { [number]: number } = scratch.nextOf
+		local joined: { [number]: boolean } = scratch.joined
+		table.clear(nextOf)
+		table.clear(joined)
 		for sid, path in paths do
 			local ahead = samples[sid].ahead
 			local following = ahead ~= 0 and paths[ahead]
@@ -656,7 +733,8 @@ function BeamChainVisual.Step(globalDt: number)
 				nextOf[sid], joined[ahead] = ahead, true
 			end
 		end
-		local starts: { number } = {}
+		local starts: { number } = scratch.starts
+		table.clear(starts)
 		for sid in paths do
 			if not joined[sid] then
 				table.insert(starts, sid)
@@ -709,12 +787,31 @@ function BeamChainVisual.Step(globalDt: number)
 				end
 			end
 		end
+		for index = #jointPoints, 1, -1 do
+			if (jointPoints[index] - eye).Magnitude > reach then
+				table.remove(jointPoints, index)
+			end
+		end
 		local jointCount = math.min(#jointPoints, math.max(partsLeft, 0))
 		for index = #jointPoints, jointCount + 1, -1 do
 			jointPoints[index] = nil
 		end
 		partsLeft -= jointCount
 		pending[chain] = { segments = segments, joints = jointPoints }
+		chain.drawn = partsBefore - partsLeft
+		chain.stale = nil
+		updatesLeft -= math.max(chain.drawn, 1)
+	end
+end
+
+-- The player's render limits (see `limits`); MaxSmooth doesn't apply (chain
+-- pieces aren't tweened).
+function BeamChainVisual.SetRenderSettings(settings: { [string]: number })
+	for key in limits do
+		local value = settings[key]
+		if typeof(value) == "number" and value == value and value >= 0 then
+			limits[key] = value
+		end
 	end
 end
 
