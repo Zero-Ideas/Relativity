@@ -67,7 +67,7 @@ return function(window)
 	local sHandlers = statLine(tab, "Heartbeat handlers ms/frame (costliest)")
 	local sNetChannels = statLine(tab, "Network out by channel (msgs/s · KB/s · list items/s)")
 	local sSpawn = statLine(tab, "  spawning ms (count per frame)")
-	local sBeam = statLine(tab, "  beam ms (heads / links / stream), samples (asleep), joiners, links kept whole, new joiners per frame")
+	local sBeam = statLine(tab, "  beam ms (heads / links / stream), samples (asleep, coasting), joiners, links kept whole, new joiners per frame")
 	local sAwake = statLine(tab, "    awake beam samples by reason (chain can't / clipped / dilated / short window / moving part / geometry / unknown)")
 	local sLoop = statLine(tab, "  Main: step loop ms (loop / destroys)")
 	local sQueues = statLine(tab, "Visual queue (spawn / hit)")
@@ -156,8 +156,9 @@ return function(window)
 		sSpawn(string.format("%s  (%.0f)", ms("Spawn"), tonumber(p.Spawned) or 0))
 		if typeof(s.BeamSamples) == "number" then
 			-- BeamChain: every head step, every link, the event stream
-			sBeam(string.format("%s, %d samples (%d asleep), %d joiners, %d whole, %.1f new", ms("BeamHeads", "BeamLinkPass", "BeamReplicate"),
-				s.BeamSamples, tonumber(s.BeamSleeping) or 0, tonumber(s.BeamJoiners) or 0, tonumber(s.BeamLazyLinks) or 0,
+			sBeam(string.format("%s, %d samples (%d asleep, %d coasting), %d joiners, %d whole, %.1f new",
+				ms("BeamHeads", "BeamLinkPass", "BeamReplicate"), s.BeamSamples, tonumber(s.BeamSleeping) or 0,
+				tonumber(s.BeamCoasting) or 0, tonumber(s.BeamJoiners) or 0, tonumber(s.BeamLazyLinks) or 0,
 				tonumber(p.BeamCreated) or 0))
 			local w = if typeof(s.BeamWakeful) == "table" then s.BeamWakeful else {}
 			local function n(key: string): number

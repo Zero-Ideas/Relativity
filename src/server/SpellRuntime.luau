@@ -1269,15 +1269,27 @@ local function launch(shot: Shot, direction: Vector3)
 	bind(projectile, shot.damageEnergy, nil)
 end
 
-local function emitSustain(parent: Shot, index: number, share: number, channelId: number)
+-- A sustained channel's next shot, aimed from where the caster is now, and
+-- where / which way it would launch (BeamChain looks before it launches).
+local function aimSustain(parent: Shot, index: number): (Shot, Vector3, Vector3)
 	local shot = table.clone(parent)
-	shot.channelId = channelId
 	shot.ctx = liveContext(shot.ctx)
 	shot.spawn = asPoint(input(shot.compiled, shot.ctx, shot.id, "from"))
+	local direction = spreadDirectionAt(aimDirection(shot.compiled, shot.ctx, shot.id, shot.spawn), shot.stats.quantity, index)
+	return shot, shot.spawn or (shot.ctx.origin + direction * shot.ctx.spawnOffset), direction
+end
+
+local function fireSustain(shot: Shot, direction: Vector3, share: number, channelId: number)
+	shot.channelId = channelId
 	shot.perCopy *= share
 	shot.damageEnergy *= share
 	shot.energyScale *= share
-	launch(shot, spreadDirectionAt(aimDirection(shot.compiled, shot.ctx, shot.id, shot.spawn), shot.stats.quantity, index))
+	launch(shot, direction)
+end
+
+local function emitSustain(parent: Shot, index: number, share: number, channelId: number)
+	local shot, _, direction = aimSustain(parent, index)
+	fireSustain(shot, direction, share, channelId)
 end
 
 -- Fling: a blast whose power at a target (centre damage x falloff) reaches
@@ -1797,6 +1809,9 @@ local function fireVessel(compiled: any, ctx: Context, id: string, energy: numbe
 				Delay = if stream then (index - 1) * stats.quantity.Interval else 0,
 				Origin = function() return liveContext(ctx).origin end,
 				Emit = function(share, channelId) emitSustain(shot, index, share, channelId) end,
+				-- (BeamChain: aim every tick, launch only the samples a lazy beam needs)
+				Aim = function() return aimSustain(shot, index) end,
+				Fire = function(aimed, direction, share, channelId) fireSustain(aimed, direction, share, channelId) end,
 			})
 		end
 		return
