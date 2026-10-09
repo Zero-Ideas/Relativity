@@ -250,7 +250,7 @@ local function fromSettings(chain: any, settings: any): any
 		_acquireTimer = 0,
 		_ignore = {},
 		_simulationDebt = 0,
-		_rayParams = Raycast.buildRayParams(settings.Source, settings.IgnoreInstances),
+		_rayParams = settings._rayParams or Raycast.buildRayParams(settings.Source, settings.IgnoreInstances),
 		_spawnStreamed = false,
 		_streamedSynced = false,
 		_lastStreamedTimeScale = 1,
@@ -363,6 +363,44 @@ local function feeding(p: any, corners: { Vector3 }): boolean
 	return along > 0 and (leg - heading * along).Magnitude <= BeamPath.MaxStretch
 end
 
+-- Launches: every packet of a channel is configured alike but for where
+-- and which way it goes and its energy, so the chain keeps one normalized
+-- config (and its RaycastParams) and each launch copies it, instead of
+-- normalizing the whole config and building the cast filter per packet.
+-- It's rebuilt whenever the caller's ignore list changes (SpellRuntime
+-- refreshes it a few times a second). Homing packets always normalize:
+-- their homing state isn't shared.
+local fromTemplate: (chain: any?, config: any) -> any?
+
+local function keepTemplate(chain: any, config: any, settings: any)
+	if config.Homing ~= nil then
+		chain.template = nil
+		return
+	end
+	local template = table.clone(settings)
+	template._raw = config.IgnoreInstances
+	template._filter, template._source = config.Filter, config.Source
+	template._speed, template._radius, template._lifetime = config.Speed, config.Radius, config.Lifetime
+	template._rayParams = Raycast.buildRayParams(settings.Source, settings.IgnoreInstances)
+	chain.template = template
+	settings._rayParams = template._rayParams
+end
+
+function fromTemplate(chain: any?, config: any): any?
+	local template = chain and chain.template
+	if not template or config.Homing ~= nil or template._raw ~= config.IgnoreInstances
+		or template._filter ~= config.Filter or template._source ~= config.Source or template._speed ~= config.Speed
+		or template._radius ~= config.Radius or template._lifetime ~= config.Lifetime then
+		return nil
+	end
+	local settings = table.clone(template)
+	local origin = SafeMath.vector(config.Origin, Vector3.zero)
+	settings.Origin = origin
+	settings.Direction = Config.direction(config, origin)
+	settings.Damage = SafeMath.number(config.Damage, 0)
+	return settings
+end
+
 -- SpellRuntime hands over its trigger binding instead of binding at once
 -- (see Launch).
 Chain.DefersBinding = true
@@ -384,8 +422,14 @@ function Chain.Launch(config: any, deferred: any?): any
 		return projectile
 	end
 	local started = os.clock()
-	local settings = Config.normalize(config, Projectile.GetDefaultMaxRealLifetime())
+	local settings = fromTemplate(chains[id], config)
+	if not settings then
+		settings = Config.normalize(config, Projectile.GetDefaultMaxRealLifetime())
+	end
 	local chain = chains[id] or newChain(id, config, settings)
+	if not chain.template or chain.template._raw ~= config.IgnoreInstances then
+		keepTemplate(chain, config, settings)
+	end
 	local s = fromSettings(chain, settings)
 	local previous = chain.last
 	local linked = previous ~= nil and not previous.Dead

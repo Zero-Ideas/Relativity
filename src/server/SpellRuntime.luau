@@ -48,7 +48,7 @@
 	parts waiting to run later, how long after the cast they may run, and
 	how deep Invoke may nest. Explosions don't count as vessels fired, and
 	each trigger event (an impact, a timer tick...) gets its own allowance
-	of flow steps -- so how many explosions a spell sets off is limited by
+	of flow steps and waiting parts -- so how many explosions a spell sets off is limited by
 	its energy and projectiles, not by how many have gone off already.
 ]]
 
@@ -130,6 +130,8 @@ export type Context = {
 	-- this trigger event's own flow-step count (see spend), shared by
 	-- everything the event runs
 	eventSteps: { n: number }?,
+	-- this trigger event's own count of delayed parts waiting (see later)
+	eventPending: { pending: number }?,
 	-- Invoke: how deep this spell runs inside others, and what it was handed.
 	depth: number?,
 	args: { point: Vector3?, entity: any?, number: number? }?,
@@ -211,6 +213,7 @@ local function memoryOf(ctx: Context, scope: string): { [string]: any }
 end
 
 local evaluate: (compiled: any, ctx: Context, id: string, port: string) -> any
+local queueExplosionVisual: (center: Vector3, radius: number, color: Color3, power: number, normal: Vector3?) -> ()
 
 -- Value arriving at `port` of rune `id`: from its wire, else the param the
 -- port falls back to (SpellRunes PortDef.Param), else nil.
@@ -851,11 +854,12 @@ local function spend(ctx: Context): boolean
 	return true
 end
 
-type Pending = { remaining: number, position: Vector3, cast: CastInfo, run: () -> () }
+type Pending = { remaining: number, position: Vector3, cast: CastInfo, budget: { pending: number }, run: () -> () }
 local pending: { Pending } = {}
 
 -- Runs `run` after `seconds` of time where `position` is (dilated: a slow
--- zone stretches the wait), within the cast's budget.
+-- zone stretches the wait), within the budget of waiting parts -- the
+-- trigger event's own inside one (like flow steps), else the cast's.
 local function later(ctx: Context, seconds: number, position: Vector3, run: () -> ())
 	local cast = ctx.cast
 	if cast.dead or cast.player.Parent ~= Players then
@@ -865,11 +869,12 @@ local function later(ctx: Context, seconds: number, position: Vector3, run: () -
 		run()
 		return
 	end
-	if cast.pending >= SpellRunes.Budget.Pending then
+	local budget: { pending: number } = ctx.eventPending or cast
+	if budget.pending >= SpellRunes.Budget.Pending then
 		return
 	end
-	cast.pending += 1
-	table.insert(pending, { remaining = seconds, position = position, cast = cast, run = run })
+	budget.pending += 1
+	table.insert(pending, { remaining = seconds, position = position, cast = cast, budget = budget, run = run })
 end
 
 Heartbeat.Connect(function(dt)
@@ -884,7 +889,7 @@ Heartbeat.Connect(function(dt)
 		local expired = cast.dead or cast.player.Parent ~= Players or os.clock() - cast.started > SpellRunes.Budget.Lifetime
 		if expired or entry.remaining <= 0 then
 			table.remove(pending, index)
-			cast.pending -= 1
+			entry.budget.pending -= 1
 			if not expired then
 				table.insert(due, entry)
 			end
@@ -1014,6 +1019,7 @@ local function fireTrigger(compiled: any, parent: Context, triggerId: string, en
 	ctx.flight = flight or 0
 	ctx.conjureId = nil
 	ctx.eventSteps = { n = 0 }
+	ctx.eventPending = { pending = 0 }
 	ctx.vars[triggerId] = {
 		point = eventPoint,
 		normal = normal,
@@ -1176,6 +1182,39 @@ local function expireTriggers(compiled: any, info: any): boolean
 	return false
 end
 
+-- A sustained channel launches up to ~67 packets a second with the same
+-- caster: its ignore list and target filter are built once per channel and
+-- reused (the list is rebuilt every SUSTAIN_SHARED_REFRESH seconds, so a
+-- barrier raised mid-beam still counts). Reusing the same list also lets
+-- BeamChain keep one normalized config and one RaycastParams per chain.
+local SUSTAIN_SHARED_REFRESH = 0.25
+local sustainShared: { [number]: { at: number, ignore: { Instance }, filter: (any) -> boolean } } = {}
+
+local function sharedFor(shot: Shot): ({ Instance }, (any) -> boolean)
+	local ctx = shot.ctx
+	local caster = ctx.caster
+	local id = shot.channelId
+	local now = os.clock()
+	local entry = id and sustainShared[id]
+	if entry and now - entry.at < SUSTAIN_SHARED_REFRESH then
+		return entry.ignore, entry.filter
+	end
+	local ignore = SpellWorld.SpellIgnore(ctx.player, caster)
+	table.insert(ignore, 1, ctx.character)
+	local filter = function(entity)
+		return entity ~= caster and not entity.IsDestroyed and entity.Health > 0
+	end
+	if id then
+		for other, old in sustainShared do
+			if now - old.at > 5 then
+				sustainShared[other] = nil -- (that channel has ended)
+			end
+		end
+		sustainShared[id] = { at = now, ignore = ignore, filter = filter }
+	end
+	return ignore, filter
+end
+
 -- All flying vessels use the same swept-radius simulation and trigger pipeline.
 local function launch(shot: Shot, direction: Vector3)
 	local ctx = shot.ctx
@@ -1194,8 +1233,7 @@ local function launch(shot: Shot, direction: Vector3)
 		TurnRate = stats.homing.turnRate,
 		Delay = if shot.vessel == "Beam" then 0 else 0.05,
 	}
-	local ignore = SpellWorld.SpellIgnore(ctx.player, caster)
-	table.insert(ignore, 1, ctx.character)
+	local ignore, filter = sharedFor(shot)
 	-- A sustained beam's packet may stay a dormant record until something is
 	-- near it (see BeamChain): its triggers and damage are bound only then,
 	-- and if it never is, it just gives its quota slot back.
@@ -1223,9 +1261,7 @@ local function launch(shot: Shot, direction: Vector3)
 		Source = caster,
 		-- (barriers that let this caster's magic through)
 		IgnoreInstances = ignore,
-		Filter = function(entity)
-			return entity ~= caster and not entity.IsDestroyed and entity.Health > 0
-		end,
+		Filter = filter,
 		Homing = homing,
 		Visualize = true,
 		VisualRange = VISUAL_RANGE,
@@ -1499,6 +1535,51 @@ end
 -- caster's magic take the hit too.
 local MIN_EXPLOSION_SCALE = 0.2 -- smallest radius fraction a split blast keeps
 
+-- Explosion visuals go out once a frame, as one "SpellExplosions" list per
+-- player holding only the blasts that player could see or hear (audio
+-- carries up to ~3000 studs for the biggest), instead of one message to
+-- everyone per blast. Blasts of one colour going off this frame within
+-- half a radius of each other are drawn as one (powers add) -- purely
+-- cosmetic: every blast still deals its own damage.
+local EXPLOSION_SEND_RANGE = 3000
+local explosionQueue: { any } = {}
+
+function queueExplosionVisual(center: Vector3, radius: number, color: Color3, power: number, normal: Vector3?)
+	for _, queued in explosionQueue do
+		if queued.Color == color and (queued.Position - center).Magnitude <= math.max(queued.Radius, radius) * .5 then
+			queued.Power += power
+			queued.Radius = math.max(queued.Radius, radius)
+			return
+		end
+	end
+	table.insert(explosionQueue, { Position = center, Radius = radius, Color = color, Power = power, Normal = normal })
+end
+
+Heartbeat.Connect(function()
+	if #explosionQueue == 0 then
+		return
+	end
+	local batch = explosionQueue
+	explosionQueue = {}
+	for _, player in Players:GetPlayers() do
+		local character = player.Character
+		local root = character and character.PrimaryPart
+		local list = batch
+		if root then
+			list = {}
+			local at = root.Position
+			for _, blast in batch do
+				if (blast.Position - at).Magnitude <= EXPLOSION_SEND_RANGE + blast.Radius then
+					table.insert(list, blast)
+				end
+			end
+		end
+		if #list > 0 then
+			VisualOffload.FireClient(player, "SpellExplosions", list)
+		end
+	end
+end, { Name = "SpellRuntime.ExplosionVisuals", Priority = 7 })
+
 local function explode(shot: Shot)
 	local ctx = shot.ctx
 	local params = settings(shot.compiled, ctx, shot.id)
@@ -1519,14 +1600,9 @@ local function explode(shot: Shot)
 		end
 	end
 	SpellWorld.DamageInRadius(center, radius, damageEnergy * shot.impact, ctx.player, ctx.caster)
-	VisualOffload.Fire("SpellExplosion", {
-		Position = center,
-		Radius = radius,
-		Color = SpellRunes.Elements[shot.element].Color,
-		Power = damageEnergy * shot.impact, -- centre damage; drives ExplosionVFX
+	queueExplosionVisual(center, radius, SpellRunes.Elements[shot.element].Color, damageEnergy * shot.impact,
 		-- the struck surface, so the visual sits on walls/ceilings/slopes
-		Normal = if ctx.isCast then nil else ctx.surfaceNormal,
-	})
+		if ctx.isCast then nil else ctx.surfaceNormal)
 end
 
 -- Smite: an instant bolt from From to each target within Range (and in
@@ -2169,6 +2245,13 @@ end
 
 -- Timer / proximity triggers. Age is the vessel's own dilated clock, so a
 -- timer inside a slow zone burns slower, like everything else.
+-- (swap-remove: the loop runs backwards, so the watch moved in was visited)
+local function unwatch(index: number)
+	local last = #watches
+	watches[index] = watches[last]
+	watches[last] = nil
+end
+
 Heartbeat.Connect(function()
 	local now = os.clock()
 	for index = #watches, 1, -1 do
@@ -2180,7 +2263,7 @@ Heartbeat.Connect(function()
 		local trigger = watch.compiled.runes[watch.trigger]
 		local params = watch.params
 		if watch.energy <= 0 or projectile.Dead then
-			table.remove(watches, index)
+			unwatch(index)
 			continue
 		end
 		if trigger.rune == "OnTimer" then
@@ -2192,7 +2275,7 @@ Heartbeat.Connect(function()
 				local last = watch.pulses >= pulses
 				if last then
 					watch.energy = 0 -- do not duplicate a spent trigger when later subdividing
-					table.remove(watches, index)
+					unwatch(index)
 				end
 				fireTrigger(watch.compiled, watch.ctx, watch.trigger, amount, watch.element, projectile.Position, headingOf(projectile, watch.ctx.heading), nil, nil, triggerScale(watch, amount * pulses), projectile.Age, watch.pulses)
 				if last and params.Detonate then
@@ -2203,7 +2286,7 @@ Heartbeat.Connect(function()
 			watch.nextCheck = now + PROXIMITY_CHECK_INTERVAL
 			local struck = nearestEntity(projectile.Position, params.Radius, params.Filter, watch.ctx.caster)
 			if struck then
-				table.remove(watches, index)
+				unwatch(index)
 				local energy = watch.energy
 				watch.energy = 0 -- do not duplicate a spent trigger when later subdividing
 				fireTrigger(watch.compiled, watch.ctx, watch.trigger, energy, watch.element, projectile.Position, headingOf(projectile, watch.ctx.heading), nil, struck, triggerScale(watch, energy), projectile.Age)
