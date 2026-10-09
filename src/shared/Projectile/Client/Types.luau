@@ -15,8 +15,10 @@ export type Rig = {
 	model: Instance,
 	root: BasePart,
 	poolKey: string?,
-	-- where `driver` sits (it's never rotated or moved after building, so a
-	-- pose's Transform is just pose - origin, no Instance read)
+	-- where the joint frame sits: projectile rigs use Terrain as `driver`
+	-- with C0 = this spawn point (beam rigs keep their own driver part and
+	-- don't set it). Never rotated, so a pose's Transform is just
+	-- pose - origin, no Instance read.
 	origin: Vector3?,
 	identityOffset: boolean?, -- rootOffset is the identity
 	beam: any?, -- bounded cylindrical path geometry (BeamVisual)
