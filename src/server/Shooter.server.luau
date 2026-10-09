@@ -221,6 +221,47 @@ RunService.Heartbeat:Connect(function(dt: number)
 	end
 end)
 
+-- Drone aim (like SpellService's SpellAim / SpellAimRelay): the owner's
+-- client reports where its drone aims only when it changes; it's relayed
+-- only to players near that drone, unreliably (the next update supersedes a
+-- lost one). Cosmetic only -- shots take their direction from the shot.
+local aimRemote = Instance.new("UnreliableRemoteEvent")
+aimRemote.Name = DroneRig.AimRemote
+aimRemote.Parent = ReplicatedStorage
+local aimRelay = Instance.new("UnreliableRemoteEvent")
+aimRelay.Name = DroneRig.AimRelay
+aimRelay.Parent = ReplicatedStorage
+local lastAim: { [Player]: number } = {}
+aimRemote.OnServerEvent:Connect(function(player: Player, aim: any)
+	if typeof(aim) ~= "Vector3" or aim ~= aim or aim.Magnitude < 0.5 or aim.Magnitude > 2 then
+		return
+	end
+	local now = os.clock()
+	if lastAim[player] and now - lastAim[player] < DroneRig.AimSendInterval * 0.5 then
+		return -- (faster than any honest client sends)
+	end
+	local character = player.Character
+	local drone = character and drones[character]
+	if not drone then
+		return -- (no drone out: nothing to aim)
+	end
+	lastAim[player] = now
+	local unit = aim.Unit
+	for _, other in Players:GetPlayers() do
+		if other == player then
+			continue
+		end
+		local otherCharacter = other.Character
+		local otherRoot = otherCharacter and otherCharacter.PrimaryPart
+		if otherRoot and (otherRoot.Position - drone.position).Magnitude <= DroneRig.AimRange then
+			aimRelay:FireClient(other, character, unit)
+		end
+	end
+end)
+Players.PlayerRemoving:Connect(function(player)
+	lastAim[player] = nil
+end)
+
 -- Where a shot spawns from: a drone weapon's drone (see DroneRig), else the
 -- equipped weapon's own "Tip" Attachment if
 -- it has one (searched recursively, so it can live under a muzzle model
