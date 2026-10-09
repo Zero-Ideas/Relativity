@@ -996,4 +996,9 @@ shareRemote.OnClientEvent:Connect(function(kind: any, a: any, b: any, c: any, d:
 	end
 end)
 
+
+function SpellLibrary.IsOpen(): boolean
+	return open
+end
+
 return SpellLibrary

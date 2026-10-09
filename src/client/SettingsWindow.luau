@@ -205,4 +205,9 @@ function SettingsWindow.Toggle()
 	end
 end
 
+
+function SettingsWindow.IsOpen(): boolean
+	return open
+end
+
 return SettingsWindow

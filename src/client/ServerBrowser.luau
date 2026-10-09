@@ -203,4 +203,9 @@ function ServerBrowser.Toggle()
 	end
 end
 
+
+function ServerBrowser.IsOpen(): boolean
+	return open
+end
+
 return ServerBrowser

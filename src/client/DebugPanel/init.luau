@@ -244,4 +244,16 @@ function DebugPanel.start()
 	refresh()
 end
 
+
+-- (UiMode's start menu hides the panel and puts it back afterwards)
+function DebugPanel.IsOpen(): boolean
+	return panelWindow ~= nil and panelWindow.Visible == true
+end
+
+function DebugPanel.SetOpen(open: boolean)
+	if panelWindow and (not open or DebugPanel.IsAllowed()) then
+		panelWindow:SetVisible(open)
+	end
+end
+
 return DebugPanel

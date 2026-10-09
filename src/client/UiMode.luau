@@ -35,8 +35,9 @@
 	ScreenGui (any capitalisation) is enabled -- the player's copy,
 	LocalPlayer.PlayerGui.StartMenu, or StarterGui's before that copy
 	arrives. It loads once StartMenu is disabled; if StartMenu is enabled
-	again later (e.g. a respawn that resets it), the HUD, topbar and menu
-	keys go off and any open window closes, until it's disabled again.
+	again later (the topbar's Start Menu button, or a respawn that resets
+	it), the HUD, topbar and menu keys go off and the open windows hide --
+	remembering which, so closing the start menu reopens exactly those.
 	Each switch prints a [UiMode] line to the output.
 ]]
 
@@ -217,6 +218,11 @@ local function buildTopbar()
 	DebugPanel.AccessChanged:Connect(refreshDebug)
 	refreshDebug()
 
+	-- Start menu: brings the place's StartMenu back up (the open menus hide
+	-- until it's closed, then reopen -- see startMenuChanged)
+	local startIcon = Icon.new():setName("StartMenu"):setLabel("Start Menu"):oneClick()
+	startIcon.selected:Connect(UiMode.OpenStartMenu)
+
 	-- Settings (gear): the player's own settings (SettingsWindow)
 	local settingsIcon = Icon.new()
 		:setName("Settings")
@@ -289,6 +295,23 @@ local function findStartMenu(parent: Instance?): ScreenGui?
 	return nil
 end
 
+-- The menus the start menu hides and then puts back: each one's "is it open"
+-- and its open / close.
+type Menu = { name: string, isOpen: () -> boolean, open: () -> (), close: () -> () }
+local MENUS: { Menu } = {
+	{ name = "Spells", isOpen = SpellLibrary.IsOpen, open = SpellLibrary.Open, close = SpellLibrary.Close },
+	{ name = "Party", isOpen = PartyWindow.IsOpen, open = function() PartyWindow.Open() end, close = PartyWindow.Close },
+	{ name = "Settings", isOpen = SettingsWindow.IsOpen, open = SettingsWindow.Open, close = SettingsWindow.Close },
+	{ name = "Credits", isOpen = CreditsWindow.IsOpen, open = CreditsWindow.Open, close = CreditsWindow.Close },
+	{ name = "Servers", isOpen = ServerBrowser.IsOpen, open = ServerBrowser.Open, close = ServerBrowser.Close },
+	{ name = "Notifications", isOpen = Notifications.IsOpen, open = function() Notifications.SetOpen(true) end,
+		close = function() Notifications.SetOpen(false) end },
+	{ name = "Debug", isOpen = DebugPanel.IsOpen, open = function() DebugPanel.SetOpen(true) end,
+		close = function() DebugPanel.SetOpen(false) end },
+	{ name = "Spell editor", isOpen = SpellAssemblerGui.IsOpen, open = SpellAssemblerGui.Open, close = SpellAssemblerGui.Close },
+}
+local hiddenMenus: { Menu } = {} -- (what the start menu hid, to reopen after)
+
 -- The start menu came up or went away (see the module comment).
 local function startMenuChanged(source: Instance?)
 	local where = if source then source:GetFullName() else "StartMenu"
@@ -308,15 +331,30 @@ local function startMenuChanged(source: Instance?)
 	end
 	Icon.setTopbarEnabled(not startMenuOpen)
 	if startMenuOpen then
-		SpellAssemblerGui.Close()
-		SpellLibrary.Close()
-		PartyWindow.Close()
-		SettingsWindow.Close()
-		CreditsWindow.Close()
-		ServerBrowser.Close()
-		Notifications.SetOpen(false)
+		table.clear(hiddenMenus)
+		for _, menu in MENUS do
+			local ok, isOpen = pcall(menu.isOpen)
+			if ok and isOpen then
+				table.insert(hiddenMenus, menu)
+				pcall(menu.close)
+			end
+		end
+		if #hiddenMenus > 0 then
+			local names = {}
+			for _, menu in hiddenMenus do
+				table.insert(names, menu.name)
+			end
+			print(`[UiMode] hid open menus until the start menu closes: {table.concat(names, ", ")}`)
+		end
 	end
 	apply()
+	if not startMenuOpen then
+		-- (after apply: the HUD is back before the windows reopen over it)
+		for _, menu in hiddenMenus do
+			pcall(menu.open)
+		end
+		table.clear(hiddenMenus)
+	end
 end
 
 local function watchStartMenu()
@@ -375,6 +413,17 @@ local function watchStartMenu()
 	if not startMenuOpen and not findStartMenu(playerGui) and not findStartMenu(StarterGui) then
 		print("[UiMode] no StartMenu ScreenGui found (PlayerGui / StarterGui): loading the game UI now")
 	end
+end
+
+-- Shows the place's StartMenu ScreenGui again (the topbar's Start Menu button).
+function UiMode.OpenStartMenu()
+	local playerGui = player:FindFirstChildOfClass("PlayerGui")
+	local gui = findStartMenu(playerGui) or nil
+	if not gui then
+		warn("[UiMode] Start Menu button: no StartMenu ScreenGui in PlayerGui")
+		return
+	end
+	gui.Enabled = true
 end
 
 function UiMode.start()
