@@ -137,6 +137,15 @@ local entityChunks: { [Vector3]: boolean } = {}
 -- A SERIAL handler: setting FilterDescendantsInstances isn't allowed in
 -- parallel. Filters are only used from the frame after they're sent; until
 -- one arrives, castHits reports a contact and the serial path casts it.
+-- Serial, ordered before the next Sweep. Never retire a resident filter.
+actor:BindToMessage("RetireFilters", function(ids: { number })
+	for _, id in ids do filters[id] = nil; filterIgnores[id] = nil end
+end)
+actor:BindToMessage("ResetFilters", function()
+	table.clear(filters)
+	table.clear(filterIgnores)
+end)
+
 actor:BindToMessage("Filter", function(id: number, instances: { Instance }, ignoreWater: boolean, group: string)
 	local params = RaycastParams.new()
 	params.FilterType = Enum.RaycastFilterType.Exclude

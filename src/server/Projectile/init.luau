@@ -961,10 +961,10 @@ local function advance(projectile: Projectile, stepDt: number, highRes: boolean)
 	local displacement = movementVelocity * stepDt
 	local to = from + displacement
 
-	-- Lag-compensated entity check, only while in an entity-containing chunk
-	-- and only for shots carrying a shooter's rewind offset. RewindHit already
+	-- The historical broadphase includes neighboring hurtboxes and old chunks.
+	-- Only shots carrying a shooter's rewind offset use it. RewindHit already
 	-- applies Filter, so a hit here never falls through.
-	if highRes and projectile.RewindSeconds > 0 then
+	if projectile.RewindSeconds > 0 then
 		local entity, point, normal, hurtbox = RewindHit.check(projectile, from, to)
 		if entity and point and normal then
 			if debugRays then
@@ -1018,7 +1018,7 @@ local function advance(projectile: Projectile, stepDt: number, highRes: boolean)
 	local contactPosition = projectile.Position
 
 	local instance = contact.Instance
-	if highRes and projectile.RewindSeconds > 0 and instance and Entity.Get(instance) then
+	if projectile.RewindSeconds > 0 and instance and Entity.Get(instance) then
 		-- We're lag-compensating this segment and the rewound check above
 		-- found no valid hit -- from the shooter's ping-adjusted view this
 		-- entity wasn't actually there, so the live-position coincidence
@@ -1527,7 +1527,12 @@ local POSE_EITHER = bit32.bor(Store.Synced, Store.Beam)
 local dispatchEndedAt = 0
 local stepEndedAt = 0
 
-Heartbeat.Connect(function(globalDt: number)
+local simulationDt: number? = nil
+Heartbeat.Connect(function(heartbeatDt: number)
+	-- Every projectile consumes the same frame budget, including serial fallback.
+	local globalDt = simulationDt or heartbeatDt
+	simulationDt = nil
+	RewindHit.BeginFrame()
 	phaseFrames += 1
 	local stepStartedAt = os.clock()
 	if dispatchEndedAt > 0 and stepEndedAt < dispatchEndedAt then
@@ -1546,7 +1551,10 @@ Heartbeat.Connect(function(globalDt: number)
 	local stepCount = #active
 	stepMark += 1
 	applyDt = globalDt
-	Parallel.Apply(applySwept, stepMark, os.clock(), ChunkManager.GetTimeVersion())
+	local paused = Parallel.IsPaused()
+	if not paused then
+		Parallel.Apply(applySwept, stepMark, os.clock(), ChunkManager.GetTimeVersion())
+	end
 	local loopStarted = os.clock()
 	local destroyTime = 0
 	local serialTime, offerTime, poseTime, serialCount, poseCount, deferredCount = 0, 0, 0, 0, 0, 0
@@ -1567,8 +1575,11 @@ Heartbeat.Connect(function(globalDt: number)
 		elseif mark == -stepMark then
 			alive = false
 		elseif readu8(Store.Resident, slot) ~= 0 then
-			-- (its worker moved it this frame and keeps its record)
+			-- Frozen residents keep their last output; real-time expiry still runs.
 			alive = band(readu8(Store.Flags, slot), STORE_DEAD) == 0
+			if alive and paused then
+				alive = stepStartedAt - projectile._spawnRealTime < projectile.MaxRealLifetime
+			end
 		elseif deferFirst[projectile] then
 			-- created while the batch was in flight: next dispatch moves it first
 			deferFirst[projectile] = nil
@@ -1661,7 +1672,8 @@ FrameProfiler.Connect(RunService.PreSimulation, "Projectile.PreSimulation", func
 		Profile.Add("FrameBetween", started - stepEndedAt)
 	end
 	dispatchNow = started
-	Parallel.Dispatch(#active, dt * Heartbeat.GetGlobalTimeScale(), not debugRays)
+	simulationDt = dt * Heartbeat.GetGlobalTimeScale()
+	Parallel.Dispatch(#active, simulationDt, not debugRays)
 	dispatchEndedAt = os.clock()
 	dispatchElapsed = dispatchEndedAt - started
 	Profile.Add("FrameOurs", dispatchElapsed)

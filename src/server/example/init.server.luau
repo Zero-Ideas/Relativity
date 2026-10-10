@@ -21,17 +21,20 @@ local ChunkManager = require(Shared.ChunkManager)
 local Entity = require(Shared.Entity)
 local VisualOffload = require(Shared.VisualOffload)
 local Projectile = require(script.Parent.Projectile)
+local DebugAccess = require(script.Parent.DebugAccess)
 
 ChunkManager.EnableReplication()
 
--- Clients can toggle projectile raycast visualization (B key by default).
-VisualOffload.On("SetProjectileDebug", function(enabled)
+-- Global debug switches require listed administrators, including hotkeys.
+VisualOffload.On("SetProjectileDebug", function(enabled, player)
+	if not player or not DebugAccess.CanUseTab(player, "Admin") or typeof(enabled) ~= "boolean" then return end
 	Projectile.SetDebugRays(enabled == true)
 end)
 
 -- Clients can toggle ProjSpawn/ProjSync/ProjHit + ProjMove-rate server console
 -- logging (V key by default) -- see Projectile.SetDebugSync's doc comment.
-VisualOffload.On("SetProjectileSyncDebug", function(enabled)
+VisualOffload.On("SetProjectileSyncDebug", function(enabled, player)
+	if not player or not DebugAccess.CanUseTab(player, "Admin") or typeof(enabled) ~= "boolean" then return end
 	Projectile.SetDebugSync(enabled == true)
 end)
 

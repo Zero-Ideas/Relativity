@@ -8,10 +8,10 @@
 --     src/shared/SafeMath.luau (110 lines)
 --     src/shared/Signal.luau (100 lines)
 --     src/shared/Heartbeat.luau (237 lines)
---     src/shared/VisualOffload.luau (157 lines)
+--     src/shared/VisualOffload.luau (176 lines)
 --     src/shared/ClientPresentation.luau (62 lines)
 --     src/shared/ChunkManager.luau (651 lines)
---     src/shared/Entity.luau (1102 lines)
+--     src/shared/Entity.luau (1106 lines)
 --   Shared projectile motion and protocol
 --     src/shared/Projectile/Motion.luau (227 lines)
 --     src/shared/Projectile/StepPlanner.luau (101 lines)
@@ -27,21 +27,22 @@
 --     src/server/Projectile/Raycast.luau (332 lines)
 --     src/server/Projectile/Occupancy.luau (1270 lines)
 --     src/server/Projectile/Homing.luau (154 lines)
---     src/server/Projectile/RewindHit.luau (144 lines)
+--     src/server/Projectile/RewindHit.luau (214 lines)
 --     src/server/Projectile/Replication.luau (579 lines)
 --     src/server/Projectile/Store.luau (575 lines)
 --     src/server/Projectile/Spec.luau (124 lines)
 --     src/server/Projectile/Sweep.luau (494 lines)
 --     src/server/Projectile/ApplyPass.luau (67 lines)
 --     src/server/Projectile/Profile.luau (67 lines)
---     src/server/Projectile/Parallel.luau (1498 lines)
---     src/server/Projectile/init.luau (1670 lines)
+--     src/server/Projectile/FilterRegistry.luau (107 lines)
+--     src/server/Projectile/Parallel.luau (1489 lines)
+--     src/server/Projectile/init.luau (1682 lines)
 --     src/server/Projectile/BeamProjectileHandler.luau (377 lines)
 --     src/server/Projectile/BeamChain.luau (1822 lines)
 --     src/server/Projectile/BeamFlow.luau (1447 lines)
 --     src/server/Projectile/Beams.luau (9 lines)
---     src/server/ProjectileQuota.luau (41 lines)
---     src/server/ProjectileWorkerBootstrap.server.luau (466 lines)
+--     src/server/ProjectileQuota.luau (60 lines)
+--     src/server/ProjectileWorkerBootstrap.server.luau (475 lines)
 --   Client prediction and visuals
 --     src/shared/Projectile/Client/Types.luau (109 lines)
 --     src/shared/Projectile/Client/Prediction.luau (147 lines)
@@ -567,6 +568,25 @@ local VisualOffload = {}
 local handlers: { [string]: { (any, any?) -> () } } = {}
 local remote: RemoteEvent? = nil
 local listening = false
+-- Bound client ingress before dispatch allocates handler tasks. Handler-specific
+-- validation/authorization still owns the payload; this is only flood control.
+local ingress: { [Player]: { Tokens: number, Time: number } } = {}
+local INGRESS_RATE, INGRESS_BURST = 120, 240
+Players.PlayerRemoving:Connect(function(player) ingress[player] = nil end)
+
+local function admit(player: Player): boolean
+	local now = os.clock()
+	local state = ingress[player]
+	if not state then
+		state = { Tokens = INGRESS_BURST, Time = now }
+		ingress[player] = state
+	end
+	state.Tokens = math.min(INGRESS_BURST, state.Tokens + (now - state.Time) * INGRESS_RATE)
+	state.Time = now
+	if state.Tokens < 1 then return false end
+	state.Tokens -= 1
+	return true
+end
 
 local function getRemote(): RemoteEvent
 	if remote then
@@ -606,7 +626,7 @@ local function ensureListening()
 	local r = getRemote()
 	if RunService:IsServer() then
 		r.OnServerEvent:Connect(function(player, channel, payload)
-			if typeof(channel) == "string" then
+			if typeof(channel) == "string" and #channel <= 128 and handlers[channel] and admit(player) then
 				dispatch(channel, payload, player)
 			end
 		end)
@@ -1530,6 +1550,7 @@ local Entity = {}
 Entity.__index = Entity
 
 -- Position-history tuning (real seconds, not dilated) -- see GetPositionAt below.
+Entity.PositionVersion = 0 -- invalidates frame-shared rewind broadphases
 Entity.HistoryWindow = 0.5 -- how far back samples are retained
 Entity.HistorySnapshotInterval = 0.01 -- minimum real time between recorded samples
 Entity.HistoryMinDelta = 0.5 -- studs; skip recording if barely moved since the last sample
@@ -1745,6 +1766,7 @@ function Entity.new(instance: Instance?, props: { [string]: any }?)
 
 	-- registry + initial chunk
 	table.insert(entities, self)
+	Entity.PositionVersion += 1
 	entityIndex[self] = #entities
 	self._chunk = ChunkManager._addEntity(self, self:GetPosition())
 
@@ -1877,6 +1899,7 @@ function Entity:GetPosition(): Vector3
 end
 
 function Entity:SetPosition(position: Vector3)
+	Entity.PositionVersion += 1
 	if self._root then
 		self._root.Position = position
 	else
@@ -2183,6 +2206,7 @@ function Entity:Destroy()
 		return
 	end
 	self.IsDestroyed = true
+	Entity.PositionVersion += 1
 
 	local idx = entityIndex[self]
 	if idx then
@@ -5861,7 +5885,6 @@ return Homing
 
 local Shared = game:GetService("ReplicatedStorage"):WaitForChild("Shared")
 local Entity = require(Shared:WaitForChild("Entity"))
-local ChunkManager = require(Shared:WaitForChild("ChunkManager"))
 local SafeMath = require(Shared:WaitForChild("SafeMath"))
 
 local Math = require(script.Parent.Math)
@@ -5886,13 +5909,74 @@ local function byDistance(a: Candidate, b: Candidate): boolean
 	return a.distAlong < b.distAlong
 end
 
--- Lag-compensated entity check for one movement substep. Only meaningful while
--- passing through a chunk that contains entities (see `highRes` in init.luau's
--- Step) and only for shots that carry a positive RewindSeconds. Builds its
--- hurtbox whitelist directly from the (loaded) chunk(s) the segment touches --
--- not a radius sweep -- so a projectile only ever considers entities actually
--- in a loaded chunk it's in, per-shooter-desync.
---
+-- A frame-shared historical broadphase. Index the envelope of every retained
+-- root sample plus the live root, inflated by BOTH hurtboxes. Interpolation
+-- stays inside that envelope, even after a teleport or a chunk transition.
+-- Queries visit nearby 3D cells, independent of delayed current membership.
+local CELL = 64
+local MAX_CELLS = 256
+local buckets: { [Vector3]: { any } } = {}
+local overflow: { any } = {}
+local indexed: { any } = {}
+local whitelist: { [any]: boolean } = {}
+local indexReady = false
+local indexVersion = -1
+
+function RewindHit.BeginFrame()
+	indexReady = false
+	-- Drop entity references even in frames with no rewound shots.
+	table.clear(buckets)
+	table.clear(overflow)
+	table.clear(indexed)
+end
+
+local function cellRange(lo: Vector3, hi: Vector3): (Vector3, Vector3, number)
+	local a = Vector3.new(math.floor(lo.X / CELL), math.floor(lo.Y / CELL), math.floor(lo.Z / CELL))
+	local b = Vector3.new(math.floor(hi.X / CELL), math.floor(hi.Y / CELL), math.floor(hi.Z / CELL))
+	return a, b, (b.X - a.X + 1) * (b.Y - a.Y + 1) * (b.Z - a.Z + 1)
+end
+
+local function buildIndex()
+	table.clear(buckets)
+	table.clear(overflow)
+	indexed = Entity.GetAll()
+	for _, entity in indexed do
+		if entity.IsDestroyed then continue end
+		local position = entity:GetPosition()
+		local lo, hi = position, position
+		for _, sample in entity._history do
+			lo, hi = lo:Min(sample.Position), hi:Max(sample.Position)
+		end
+		local bodyOffset = entity.BodyOffset
+		local bodyRadius = Vector3.one * entity.HitboxRadius
+		local lowOffset, highOffset = bodyOffset - bodyRadius, bodyOffset + bodyRadius
+		if entity._headOffset then
+			local headOffset = entity._headOffset + entity.HeadOffset
+			local headRadius = Vector3.one * entity.HeadRadius
+			lowOffset = lowOffset:Min(headOffset - headRadius)
+			highOffset = highOffset:Max(headOffset + headRadius)
+		end
+		local a, b, count = cellRange(lo + lowOffset, hi + highOffset)
+		if count > MAX_CELLS then
+			-- Huge teleports/radii remain correct without allocating a giant grid.
+			table.insert(overflow, entity)
+			continue
+		end
+		for x = a.X, b.X do
+			for y = a.Y, b.Y do
+				for z = a.Z, b.Z do
+					local key = Vector3.new(x, y, z)
+					local list = buckets[key]
+					if not list then list = {}; buckets[key] = list end
+					table.insert(list, entity)
+				end
+			end
+		end
+	end
+	indexReady = true
+	indexVersion = Entity.PositionVersion
+end
+
 -- Two memoization/deferral choices preserve the exact "nearest in-range entity
 -- with a clear LOS to `from`" semantics while cutting redundant work:
 --  - The rewind instant (os.clock() - RewindSeconds) is pinned for the whole
@@ -5908,14 +5992,22 @@ function RewindHit.check(
 	from: Vector3,
 	to: Vector3
 ): (Types.EntityLike?, Vector3?, Vector3?, Types.Hurtbox?)
-	local whitelist: { [Types.EntityLike]: boolean } = {}
-	for _, position in { from, to } do
-		local chunk = ChunkManager.GetChunk(position)
-		if chunk and ChunkManager.IsChunkActive(chunk) then
-			for entity in chunk.Entities do
-				whitelist[entity] = true
+	if not indexReady or indexVersion ~= Entity.PositionVersion then buildIndex() end
+	table.clear(whitelist)
+	local padding = Vector3.one * projectile.Radius
+	local a, b, count = cellRange(from:Min(to) - padding, from:Max(to) + padding)
+	if count > MAX_CELLS then
+		for _, entity in indexed do whitelist[entity] = true end
+	else
+		for x = a.X, b.X do
+			for y = a.Y, b.Y do
+				for z = a.Z, b.Z do
+					local list = buckets[Vector3.new(x, y, z)]
+					if list then for _, entity in list do whitelist[entity] = true end end
+				end
 			end
 		end
+		for _, entity in overflow do whitelist[entity] = true end
 	end
 
 	-- Each entity is tested against BOTH its rewound Head and Body spheres --
@@ -5924,7 +6016,7 @@ function RewindHit.check(
 	local filter = projectile.Filter
 	local cache = projectile._rewindCache
 	for entity in whitelist do
-		if entity ~= projectile.Source and not projectile._ignore[entity] and (not filter or filter(entity)) then
+		if not entity.IsDestroyed and entity:IsActive() and entity ~= projectile.Source and not projectile._ignore[entity] and (not filter or filter(entity)) then
 			local rewound = cache[entity]
 			if not rewound then
 				rewound = {
@@ -5977,6 +6069,7 @@ function RewindHit.check(
 			and Entity.Get(los.Instance) ~= candidate.entity
 		if not blocked then
 			table.clear(candidates)
+			table.clear(whitelist)
 			return candidate.entity,
 				candidate.point,
 				SafeMath.direction(from - candidate.point, Vector3.yAxis),
@@ -5985,6 +6078,7 @@ function RewindHit.check(
 	end
 
 	table.clear(candidates)
+	table.clear(whitelist)
 	return nil, nil, nil, nil
 end
 
@@ -7942,6 +8036,120 @@ return Profile
 -- =============================================================================
 
 -- =============================================================================
+-- BEGIN FILE: src/server/Projectile/FilterRegistry.luau
+-- =============================================================================
+--!strict
+--!optimize 2
+-- Filter lifetime follows resident slots. Idle entries get a grace period so
+-- bursts share their params without retaining every respawn for the server's life.
+local Registry = {}
+Registry.__index = Registry
+
+function Registry.new(send: (string, ...any) -> ())
+	return setmetatable({ Send = send, Trie = {}, Records = {}, Ids = {}, Cursor = 1, NextId = 0,
+		ByParams = setmetatable({}, { __mode = "k" }), NextCollection = 0 }, Registry)
+end
+
+function Registry:Ready(id: number?, frame: number): boolean
+	local record = id and self.Records[id]
+	return record ~= nil and record.Ready <= frame
+end
+
+function Registry:Get(params: RaycastParams, frame: number): number?
+	local known = self.ByParams[params]
+	local record = known and self.Records[known]
+	if record then
+		record.LastUsed = os.clock()
+		return if record.Ready <= frame then known else nil
+	end
+	local instances = params.FilterDescendantsInstances
+	local node = self.Trie
+	local path = { node }
+	for _, instance in instances do
+		local child = node[instance]
+		if not child then child = {}; node[instance] = child end
+		node = child
+		table.insert(path, node)
+	end
+	local flags = `{params.IgnoreWater}|{params.CollisionGroup}`
+	local id = node[flags]
+	if not id then
+		self.NextId += 1
+		id = self.NextId
+		node[flags] = id
+		self.Records[id] = { Ready = frame + 1, References = 0, LastUsed = os.clock(),
+			Path = path, Instances = instances, Flags = flags }
+		table.insert(self.Ids, id)
+		self.Send("Filter", id, instances, params.IgnoreWater, params.CollisionGroup)
+	else
+		self.Records[id].LastUsed = os.clock()
+	end
+	self.ByParams[params] = id
+	return if self:Ready(id, frame) then id else nil
+end
+
+function Registry:Retain(id: number)
+	self.Records[id].References += 1
+end
+
+function Registry:Release(id: number)
+	local record = self.Records[id]
+	assert(record and record.References > 0, "unbalanced projectile filter release")
+	record.References -= 1
+	if record.References == 0 then record.LastUsed = os.clock() end
+end
+
+function Registry:Collect(now: number)
+	if now < self.NextCollection then return end
+	local retired = {}
+	local index = self.Cursor
+	-- Bounded maintenance: even adversarial ignore-list churn cannot turn a
+	-- periodic collection into a full-table hitch on one server frame.
+	for _ = 1, 64 do
+		if index > #self.Ids then break end
+		local id = self.Ids[index]
+		local record = self.Records[id]
+		if record.References == 0 and now - record.LastUsed >= 60 then
+			local path = record.Path
+			path[#path][record.Flags] = nil
+			for index = #record.Instances, 1, -1 do
+				if next(path[index + 1]) ~= nil then break end
+				path[index][record.Instances[index]] = nil
+			end
+			self.Records[id] = nil
+			local last = #self.Ids
+			self.Ids[index] = self.Ids[last]
+			self.Ids[last] = nil
+			table.insert(retired, id)
+		else
+			index += 1
+		end
+	end
+	if index > #self.Ids then
+		self.Cursor = 1
+		self.NextCollection = now + 5
+	else
+		self.Cursor = index
+	end
+	if #retired > 0 then self.Send("RetireFilters", retired) end
+end
+
+function Registry:Reset()
+	table.clear(self.Trie)
+	table.clear(self.Records)
+	table.clear(self.Ids)
+	self.Cursor = 1
+	table.clear(self.ByParams)
+	-- IDs remain monotonic: stale handle metadata can never alias a new filter.
+	self.Send("ResetFilters")
+end
+
+return Registry
+-- =============================================================================
+-- END FILE: src/server/Projectile/FilterRegistry.luau
+-- =============================================================================
+
+-- =============================================================================
 -- BEGIN FILE: src/server/Projectile/Parallel.luau
 -- =============================================================================
 --!strict
@@ -8143,6 +8351,7 @@ type Batch = {
 	Projectiles: { any },
 	Slot: { number }, -- its Store record
 	Generation: { number }, -- Store.Generation[slot] when packed (a mismatch: released since)
+	Filter: { number }, -- retained registry ID for each resident slot
 	Scale: { number },
 	Deadline: { number }, -- os.clock() past which MaxRealLifetime is up
 	Homing: { boolean }, -- the item homes (its state goes in HomingIn each dispatch)
@@ -8158,9 +8367,10 @@ type Batch = {
 local workers: { Worker } = {}
 local frame = 0
 local sentTimeVersion = -1
-local filterIds: { [any]: any } = {} -- instance trie -> { [flags]: id }
-local filterReady: { [number]: number } = {} -- id -> first frame workers have it
-local nextFilterId = 0
+local FilterRegistry = require(script.Parent.FilterRegistry)
+local filters = FilterRegistry.new(function(channel: string, ...: any)
+	for _, worker in workers do worker.Actor:SendMessage(channel, ...) end
+end)
 local specIds: { [any]: any } = {} -- trie of motion-spec values -> id
 local specReady: { [number]: number } = {} -- id -> first frame workers have it
 local nextSpecId = 0
@@ -8168,7 +8378,8 @@ local MAX_SPECS = 65535 -- past this many distinct specs, new ones just step ser
 local batches: { Batch } = {}
 local batchUniform = true
 local batchTimeVersion = 0
-local running = false -- the last Dispatch sent batches
+local running = false -- parallel mode (retained through global freezes)
+local paused = false
 local inFlight = false -- between a Dispatch and its Apply
 local applying = false -- inside Apply (item numbers must hold still)
 local applyEpoch = 1 -- counts Applies (Store.Fresh compares against it)
@@ -8285,41 +8496,8 @@ end
 -- Filter id for a projectile's movement RaycastParams, by content (beam
 -- samples rebuild identical params per packet). New ids are sent to every
 -- worker and become usable next frame.
-local filterByParams: { [RaycastParams]: number } = setmetatable({}, { __mode = "k" }) :: any
-
 local function filterFor(projectile: any): number?
-	local params: RaycastParams = projectile._rayParams
-	-- params are shared between projectiles (Raycast.buildRayParams), so most
-	-- lookups end here, without reading FilterDescendantsInstances back (and
-	-- nothing is written to the projectile, which for an efficient one would
-	-- mean a per-projectile override table)
-	local known = filterByParams[params]
-	if known then
-		return if filterReady[known] <= frame then known else nil
-	end
-	local instances = params.FilterDescendantsInstances
-	local node = filterIds
-	for _, instance in instances do
-		local nextNode = node[instance]
-		if not nextNode then
-			nextNode = {}
-			node[instance] = nextNode
-		end
-		node = nextNode
-	end
-	local flags = `{params.IgnoreWater}|{params.CollisionGroup}`
-	local id = node[flags]
-	if not id then
-		nextFilterId += 1
-		id = nextFilterId
-		node[flags] = id
-		filterReady[id] = frame + 1
-		for _, worker in workers do
-			worker.Actor:SendMessage("Filter", id, instances, params.IgnoreWater, params.CollisionGroup)
-		end
-	end
-	filterByParams[params] = id
-	return if filterReady[id] <= frame then id else nil
+	return filters:Get(projectile._rayParams, frame)
 end
 
 local function syncTimeWorld()
@@ -8365,7 +8543,7 @@ local function newBatch(index: number): Batch
 	local batch: Batch = {
 		Index = index, Count = 0, Sent = 0, Ops = buffer.create(4096), OpBytes = 0,
 		Output = nil, HomingOutput = nil, OutputCount = 0, OutputEpoch = 0, PendingDrop = {},
-		Projectiles = {}, Slot = {}, Generation = {}, Scale = {}, Deadline = {}, Homing = {}, HomingCount = 0, HomingIn = nil,
+		Projectiles = {}, Slot = {}, Generation = {}, Filter = {}, Scale = {}, Deadline = {}, Homing = {}, HomingCount = 0, HomingIn = nil,
 		HomingConfig = {}, HomingSource = {}, HomingMainSearch = {},
 	}
 	-- (a new batch's worker may hold slots from before: start it empty)
@@ -8493,6 +8671,12 @@ end
 
 -- Packs `projectile` into slot `item` (new or reused) with its current state.
 local function pack(batch: Batch, item: number, projectile: any, filter: number, spec: number, scale: number)
+	local previous = batch.Filter[item]
+	if previous ~= filter then
+		if previous then filters:Release(previous) end
+		filters:Retain(filter)
+		batch.Filter[item] = filter
+	end
 	local slot = projectile._slot
 	batch.Projectiles[item] = projectile
 	batch.Slot[item] = slot
@@ -8622,7 +8806,7 @@ local function eligible(projectile: any): (number?, number?, number?)
 	local spec = specFor(projectile)
 	if filter and spec and plainHandle(projectile) then
 		local metatable = getmetatable(projectile)
-		if not handleInfo[metatable] then
+		if not handleInfo[metatable] or handleInfo[metatable].Filter ~= filter then
 			handleInfo[metatable] = { Filter = filter, Spec = spec, MaxRealLifetime = projectile.MaxRealLifetime }
 		end
 	end
@@ -8634,12 +8818,14 @@ end
 local function release(batch: Batch, item: number)
 	local last = batch.Count
 	local projectiles = batch.Projectiles
+	filters:Release(batch.Filter[item])
 	unresident(batch, item)
 	projectiles[item]._parallelState = nil
 	if item ~= last then
 		projectiles[item] = projectiles[last]
 		batch.Slot[item] = batch.Slot[last]
 		batch.Generation[item] = batch.Generation[last]
+		batch.Filter[item] = batch.Filter[last]
 		batch.Scale[item] = batch.Scale[last]
 		batch.Deadline[item] = batch.Deadline[last]
 		opMove(batch, item, last)
@@ -8664,12 +8850,15 @@ local function release(batch: Batch, item: number)
 		batch.HomingConfig[last], batch.HomingSource[last], batch.HomingMainSearch[last]
 	batch.HomingConfig[last], batch.HomingSource[last], batch.HomingMainSearch[last] = nil, nil, nil
 	projectiles[last] = nil
+	batch.Filter[last] = nil
 	batch.Count = last - 1
 end
 
 local function releaseBatch(batch: Batch)
 	local projectiles = batch.Projectiles
 	for item = 1, batch.Count do
+		filters:Release(batch.Filter[item])
+		batch.Filter[item] = nil
 		unresident(batch, item)
 		projectiles[item]._parallelState = nil
 		projectiles[item] = nil
@@ -8688,10 +8877,7 @@ end
 -- motion specs and time world the workers were sent, so every worker gets
 -- them again (new ones never had them).
 local function resetWorkerCaches()
-	table.clear(filterIds)
-	table.clear(filterByParams)
-	table.clear(filterReady)
-	nextFilterId = 0
+	filters:Reset()
 	table.clear(specIds)
 	table.clear(specReady)
 	nextSpecId = 0
@@ -8744,9 +8930,9 @@ function Parallel.PackNew(projectile: any, position: Vector3, velocity: Vector3,
 		return false
 	end
 	if inFlight then
-		local filter = filterByParams[rayParams]
+		local filter = filters.ByParams[rayParams]
 		local spec = specByMetatable[getmetatable(projectile)]
-		if not filter or not spec then
+		if not filters:Ready(filter, frame) or not spec then
 			return false
 		end
 		lateCount += 1
@@ -8763,8 +8949,8 @@ packNow = function(projectile: any, position: Vector3, velocity: Vector3, scale:
 	if inFlight then
 		return false
 	end
-	local filter = filterByParams[rayParams]
-	if not filter or filterReady[filter] > frame then
+	local filter = filters.ByParams[rayParams]
+	if not filters:Ready(filter, frame) then
 		return false
 	end
 	local spec = specByMetatable[getmetatable(projectile)]
@@ -8787,6 +8973,8 @@ packNow = function(projectile: any, position: Vector3, velocity: Vector3, scale:
 	batch.Projectiles[item] = projectile
 	batch.Slot[item] = slot
 	batch.Generation[item] = Store.Generation[slot]
+	batch.Filter[item] = filter
+	filters:Retain(filter)
 	batch.Scale[item] = scale
 	batch.Deadline[item] = deadline
 	setHoming(batch, item, false)
@@ -8811,6 +8999,10 @@ end
 -- Asks for a slot for `projectile` (call after it stepped serially or was
 -- created). Packed at the next Dispatch if it's still eligible then.
 -- True between a Dispatch and its Apply (a batch is with the workers).
+function Parallel.IsPaused(): boolean
+	return paused
+end
+
 function Parallel.IsInFlight(): boolean
 	return inFlight
 end
@@ -8833,7 +9025,7 @@ end
 -- state needs streaming...): the caller takes the ordinary path.
 local function fastAcquire(projectile: any, batch: Batch, now: number): boolean
 	local info = handleInfo[getmetatable(projectile)]
-	if not info or filterReady[info.Filter] > frame or specReady[info.Spec] > frame then
+	if not info or not filters:Ready(info.Filter, frame) or specReady[info.Spec] > frame then
 		return false
 	end
 	local slot = rawget(projectile, "_slot")
@@ -8871,6 +9063,8 @@ local function fastAcquire(projectile: any, batch: Batch, now: number): boolean
 	batch.Projectiles[item] = projectile
 	batch.Slot[item] = slot
 	batch.Generation[item] = Store.Generation[slot]
+	batch.Filter[item] = info.Filter
+	filters:Retain(info.Filter)
 	batch.Scale[item] = scale
 	batch.Deadline[item] = deadline
 	setHoming(batch, item, false)
@@ -8906,8 +9100,13 @@ function Parallel.Dispatch(activeCount: number, globalDt: number, allowed: boole
 			batches[w] = nil
 		end
 	end
+	filters:Collect(clock())
 	local workerCount = #workers
-	running = Parallel.Enabled and allowed and workerCount > 0 and activeCount >= Parallel.MinProjectiles and globalDt > 0
+	-- A separate exit threshold avoids repacking bursts around 32 projectiles.
+	local threshold = if running then math.max(1, Parallel.MinProjectiles // 2) else Parallel.MinProjectiles
+	running = Parallel.Enabled and allowed and workerCount > 0 and activeCount >= threshold
+	paused = running and globalDt <= 0
+	if paused then return end
 	if not running then
 		releaseAll()
 		return
@@ -10412,10 +10611,10 @@ local function advance(projectile: Projectile, stepDt: number, highRes: boolean)
 	local displacement = movementVelocity * stepDt
 	local to = from + displacement
 
-	-- Lag-compensated entity check, only while in an entity-containing chunk
-	-- and only for shots carrying a shooter's rewind offset. RewindHit already
+	-- The historical broadphase includes neighboring hurtboxes and old chunks.
+	-- Only shots carrying a shooter's rewind offset use it. RewindHit already
 	-- applies Filter, so a hit here never falls through.
-	if highRes and projectile.RewindSeconds > 0 then
+	if projectile.RewindSeconds > 0 then
 		local entity, point, normal, hurtbox = RewindHit.check(projectile, from, to)
 		if entity and point and normal then
 			if debugRays then
@@ -10469,7 +10668,7 @@ local function advance(projectile: Projectile, stepDt: number, highRes: boolean)
 	local contactPosition = projectile.Position
 
 	local instance = contact.Instance
-	if highRes and projectile.RewindSeconds > 0 and instance and Entity.Get(instance) then
+	if projectile.RewindSeconds > 0 and instance and Entity.Get(instance) then
 		-- We're lag-compensating this segment and the rewound check above
 		-- found no valid hit -- from the shooter's ping-adjusted view this
 		-- entity wasn't actually there, so the live-position coincidence
@@ -10978,7 +11177,12 @@ local POSE_EITHER = bit32.bor(Store.Synced, Store.Beam)
 local dispatchEndedAt = 0
 local stepEndedAt = 0
 
-Heartbeat.Connect(function(globalDt: number)
+local simulationDt: number? = nil
+Heartbeat.Connect(function(heartbeatDt: number)
+	-- Every projectile consumes the same frame budget, including serial fallback.
+	local globalDt = simulationDt or heartbeatDt
+	simulationDt = nil
+	RewindHit.BeginFrame()
 	phaseFrames += 1
 	local stepStartedAt = os.clock()
 	if dispatchEndedAt > 0 and stepEndedAt < dispatchEndedAt then
@@ -10997,7 +11201,10 @@ Heartbeat.Connect(function(globalDt: number)
 	local stepCount = #active
 	stepMark += 1
 	applyDt = globalDt
-	Parallel.Apply(applySwept, stepMark, os.clock(), ChunkManager.GetTimeVersion())
+	local paused = Parallel.IsPaused()
+	if not paused then
+		Parallel.Apply(applySwept, stepMark, os.clock(), ChunkManager.GetTimeVersion())
+	end
 	local loopStarted = os.clock()
 	local destroyTime = 0
 	local serialTime, offerTime, poseTime, serialCount, poseCount, deferredCount = 0, 0, 0, 0, 0, 0
@@ -11018,8 +11225,11 @@ Heartbeat.Connect(function(globalDt: number)
 		elseif mark == -stepMark then
 			alive = false
 		elseif readu8(Store.Resident, slot) ~= 0 then
-			-- (its worker moved it this frame and keeps its record)
+			-- Frozen residents keep their last output; real-time expiry still runs.
 			alive = band(readu8(Store.Flags, slot), STORE_DEAD) == 0
+			if alive and paused then
+				alive = stepStartedAt - projectile._spawnRealTime < projectile.MaxRealLifetime
+			end
 		elseif deferFirst[projectile] then
 			-- created while the batch was in flight: next dispatch moves it first
 			deferFirst[projectile] = nil
@@ -11112,7 +11322,8 @@ FrameProfiler.Connect(RunService.PreSimulation, "Projectile.PreSimulation", func
 		Profile.Add("FrameBetween", started - stepEndedAt)
 	end
 	dispatchNow = started
-	Parallel.Dispatch(#active, dt * Heartbeat.GetGlobalTimeScale(), not debugRays)
+	simulationDt = dt * Heartbeat.GetGlobalTimeScale()
+	Parallel.Dispatch(#active, simulationDt, not debugRays)
 	dispatchEndedAt = os.clock()
 	dispatchElapsed = dispatchEndedAt - started
 	Profile.Add("FrameOurs", dispatchElapsed)
@@ -14820,34 +15031,53 @@ local ProjectileQuota = {}
 -- ordinary sustain, leaving real gaps. Allow the requested 10k-scale loads;
 -- spawn/render/network per-frame caps remain separate and unchanged.
 ProjectileQuota.Maximum = 15000
+-- Gameplay admission only; administrator benchmarks deliberately bypass quotas.
+ProjectileQuota.GlobalMaximum = 100000
 
 local active: { [Player]: number } = {}
+local total = 0
+
+local function amountOf(count: number?): number?
+	local value = count or 1
+	if typeof(value) ~= "number" or value ~= value or math.abs(value) == math.huge then return nil end
+	return math.max(math.floor(value), 0)
+end
+
+function ProjectileQuota.GetTotal(): number
+	return total
+end
 
 function ProjectileQuota.Get(player: Player): number
 	return active[player] or 0
 end
 
 function ProjectileQuota.TryAcquire(player: Player, count: number?): boolean
-	local amount = math.max(math.floor(count or 1), 0)
+	if player.Parent ~= Players then return false end
+	local amount = amountOf(count)
+	if not amount then return false end
 	if amount == 0 then
 		return true
 	end
 	local current = active[player] or 0
-	if current + amount > ProjectileQuota.Maximum then
+	if current + amount > ProjectileQuota.Maximum or total + amount > ProjectileQuota.GlobalMaximum then
 		return false
 	end
 	active[player] = current + amount
+	total += amount
 	return true
 end
 
 function ProjectileQuota.Release(player: Player, count: number?)
-	local amount = math.max(math.floor(count or 1), 0)
-	active[player] = math.max((active[player] or 0) - amount, 0)
+	local amount = amountOf(count)
+	if not amount then return end
+	local current = active[player] or 0
+	local released = math.min(current, amount)
+	active[player] = if current > released then current - released else nil
+	total -= released
 end
 
-Players.PlayerRemoving:Connect(function(player)
-	active[player] = nil
-end)
+-- Departing players' projectiles still consume global capacity until destroyed.
+-- Their final Release removes the entry; no early removal or double decrement.
 
 return ProjectileQuota
 -- =============================================================================
@@ -14996,6 +15226,15 @@ local entityChunks: { [Vector3]: boolean } = {}
 -- A SERIAL handler: setting FilterDescendantsInstances isn't allowed in
 -- parallel. Filters are only used from the frame after they're sent; until
 -- one arrives, castHits reports a contact and the serial path casts it.
+-- Serial, ordered before the next Sweep. Never retire a resident filter.
+actor:BindToMessage("RetireFilters", function(ids: { number })
+	for _, id in ids do filters[id] = nil; filterIgnores[id] = nil end
+end)
+actor:BindToMessage("ResetFilters", function()
+	table.clear(filters)
+	table.clear(filterIgnores)
+end)
+
 actor:BindToMessage("Filter", function(id: number, instances: { Instance }, ignoreWater: boolean, group: string)
 	local params = RaycastParams.new()
 	params.FilterType = Enum.RaycastFilterType.Exclude

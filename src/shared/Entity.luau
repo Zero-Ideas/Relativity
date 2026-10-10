@@ -106,6 +106,7 @@ local Entity = {}
 Entity.__index = Entity
 
 -- Position-history tuning (real seconds, not dilated) -- see GetPositionAt below.
+Entity.PositionVersion = 0 -- invalidates frame-shared rewind broadphases
 Entity.HistoryWindow = 0.5 -- how far back samples are retained
 Entity.HistorySnapshotInterval = 0.01 -- minimum real time between recorded samples
 Entity.HistoryMinDelta = 0.5 -- studs; skip recording if barely moved since the last sample
@@ -321,6 +322,7 @@ function Entity.new(instance: Instance?, props: { [string]: any }?)
 
 	-- registry + initial chunk
 	table.insert(entities, self)
+	Entity.PositionVersion += 1
 	entityIndex[self] = #entities
 	self._chunk = ChunkManager._addEntity(self, self:GetPosition())
 
@@ -453,6 +455,7 @@ function Entity:GetPosition(): Vector3
 end
 
 function Entity:SetPosition(position: Vector3)
+	Entity.PositionVersion += 1
 	if self._root then
 		self._root.Position = position
 	else
@@ -759,6 +762,7 @@ function Entity:Destroy()
 		return
 	end
 	self.IsDestroyed = true
+	Entity.PositionVersion += 1
 
 	local idx = entityIndex[self]
 	if idx then

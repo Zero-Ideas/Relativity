@@ -23,6 +23,8 @@
 	               overrides of Lighting, saved as the "Lighting" entry.
 	  EffectsIntensity / ReducedFlashes / CameraShake: local cosmetics only.
 	  HudScale     both HUD modes, 70..130 percent.
+	  SmoothAvatars  straight R15 limbs drawn as one smooth R6 piece each
+	               (SmoothLimbs); local only.
 	  EditorOpacity / EditorBlur  the spell editor's holographic glass: how
 	               opaque it is (20..100 percent) and how much the world
 	               behind it blurs (0 = off). UiMode hands them to the editor.
@@ -42,6 +44,7 @@ local HudScale = require(script.Parent.HudScale)
 local LightingSettings = require(script.Parent.LightingSettings)
 local Effects = require(script.Parent.Effects)
 local UiVisibility = require(script.Parent.UiVisibility)
+local SmoothLimbs = require(script.Parent.SmoothLimbs)
 
 local remote = ReplicatedStorage:WaitForChild("ClientSettings") :: RemoteFunction
 
@@ -73,6 +76,7 @@ ClientSettings.Specs = {
 	{ Key = "SurfaceImpacts", Label = "Surface impact effects", Kind = "boolean", Default = true, Section = "Effects", Description = "Sparks, dust, splinters, splashes and debris that match what a shot or blade hit." },
 	{ Key = "ProjectileStreaks", Label = "Fast projectile streaks", Kind = "boolean", Default = true, Section = "Effects", Description = "A motion streak behind very fast projectiles (supersonic: 1225+ studs/s, like the Railgun; the nearest 64)." },
 	{ Key = "BladeTrails", Label = "Blade swing trails", Kind = "boolean", Default = true, Section = "Effects" },
+	{ Key = "SmoothAvatars", Label = "Smooth avatar limbs", Kind = "boolean", Default = true, Section = "Effects", Description = "Draws straight R15 arms, legs and torsos as one smooth piece (no ridges at the joints); real R15 segments come back while an animation bends them." },
 	{ Key = "Glints", Label = "Cast glints", Kind = "boolean", Default = false, Section = "Effects" },
 	{ Key = "LensFlare", Label = "Lens flare", Kind = "boolean", Default = true, Section = "Lighting", Description = "The sun's lens flare. Everything under Lighting can be tuned below." },
 	{ Key = "KeySpells", Label = "Spells menu", Kind = "key", Default = "B", Section = "Controls" },
@@ -129,6 +133,7 @@ local function apply(key: string?)
 	ClientAudio.SetVolumes(values.MasterVolume / 100, values.SpellVolume / 100, values.ImpactVolume / 100, values.UiVolume / 100, values.MusicVolume / 100)
 	HudScale.Set(values.HudScale)
 	LightingSettings.SetLensFlare(values.LensFlare ~= false)
+	SmoothLimbs.SetEnabled(values.SmoothAvatars ~= false)
 end
 
 local function specOf(key: string): Spec?

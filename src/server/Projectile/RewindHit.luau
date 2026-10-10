@@ -14,7 +14,6 @@
 
 local Shared = game:GetService("ReplicatedStorage"):WaitForChild("Shared")
 local Entity = require(Shared:WaitForChild("Entity"))
-local ChunkManager = require(Shared:WaitForChild("ChunkManager"))
 local SafeMath = require(Shared:WaitForChild("SafeMath"))
 
 local Math = require(script.Parent.Math)
@@ -39,13 +38,74 @@ local function byDistance(a: Candidate, b: Candidate): boolean
 	return a.distAlong < b.distAlong
 end
 
--- Lag-compensated entity check for one movement substep. Only meaningful while
--- passing through a chunk that contains entities (see `highRes` in init.luau's
--- Step) and only for shots that carry a positive RewindSeconds. Builds its
--- hurtbox whitelist directly from the (loaded) chunk(s) the segment touches --
--- not a radius sweep -- so a projectile only ever considers entities actually
--- in a loaded chunk it's in, per-shooter-desync.
---
+-- A frame-shared historical broadphase. Index the envelope of every retained
+-- root sample plus the live root, inflated by BOTH hurtboxes. Interpolation
+-- stays inside that envelope, even after a teleport or a chunk transition.
+-- Queries visit nearby 3D cells, independent of delayed current membership.
+local CELL = 64
+local MAX_CELLS = 256
+local buckets: { [Vector3]: { any } } = {}
+local overflow: { any } = {}
+local indexed: { any } = {}
+local whitelist: { [any]: boolean } = {}
+local indexReady = false
+local indexVersion = -1
+
+function RewindHit.BeginFrame()
+	indexReady = false
+	-- Drop entity references even in frames with no rewound shots.
+	table.clear(buckets)
+	table.clear(overflow)
+	table.clear(indexed)
+end
+
+local function cellRange(lo: Vector3, hi: Vector3): (Vector3, Vector3, number)
+	local a = Vector3.new(math.floor(lo.X / CELL), math.floor(lo.Y / CELL), math.floor(lo.Z / CELL))
+	local b = Vector3.new(math.floor(hi.X / CELL), math.floor(hi.Y / CELL), math.floor(hi.Z / CELL))
+	return a, b, (b.X - a.X + 1) * (b.Y - a.Y + 1) * (b.Z - a.Z + 1)
+end
+
+local function buildIndex()
+	table.clear(buckets)
+	table.clear(overflow)
+	indexed = Entity.GetAll()
+	for _, entity in indexed do
+		if entity.IsDestroyed then continue end
+		local position = entity:GetPosition()
+		local lo, hi = position, position
+		for _, sample in entity._history do
+			lo, hi = lo:Min(sample.Position), hi:Max(sample.Position)
+		end
+		local bodyOffset = entity.BodyOffset
+		local bodyRadius = Vector3.one * entity.HitboxRadius
+		local lowOffset, highOffset = bodyOffset - bodyRadius, bodyOffset + bodyRadius
+		if entity._headOffset then
+			local headOffset = entity._headOffset + entity.HeadOffset
+			local headRadius = Vector3.one * entity.HeadRadius
+			lowOffset = lowOffset:Min(headOffset - headRadius)
+			highOffset = highOffset:Max(headOffset + headRadius)
+		end
+		local a, b, count = cellRange(lo + lowOffset, hi + highOffset)
+		if count > MAX_CELLS then
+			-- Huge teleports/radii remain correct without allocating a giant grid.
+			table.insert(overflow, entity)
+			continue
+		end
+		for x = a.X, b.X do
+			for y = a.Y, b.Y do
+				for z = a.Z, b.Z do
+					local key = Vector3.new(x, y, z)
+					local list = buckets[key]
+					if not list then list = {}; buckets[key] = list end
+					table.insert(list, entity)
+				end
+			end
+		end
+	end
+	indexReady = true
+	indexVersion = Entity.PositionVersion
+end
+
 -- Two memoization/deferral choices preserve the exact "nearest in-range entity
 -- with a clear LOS to `from`" semantics while cutting redundant work:
 --  - The rewind instant (os.clock() - RewindSeconds) is pinned for the whole
@@ -61,14 +121,22 @@ function RewindHit.check(
 	from: Vector3,
 	to: Vector3
 ): (Types.EntityLike?, Vector3?, Vector3?, Types.Hurtbox?)
-	local whitelist: { [Types.EntityLike]: boolean } = {}
-	for _, position in { from, to } do
-		local chunk = ChunkManager.GetChunk(position)
-		if chunk and ChunkManager.IsChunkActive(chunk) then
-			for entity in chunk.Entities do
-				whitelist[entity] = true
+	if not indexReady or indexVersion ~= Entity.PositionVersion then buildIndex() end
+	table.clear(whitelist)
+	local padding = Vector3.one * projectile.Radius
+	local a, b, count = cellRange(from:Min(to) - padding, from:Max(to) + padding)
+	if count > MAX_CELLS then
+		for _, entity in indexed do whitelist[entity] = true end
+	else
+		for x = a.X, b.X do
+			for y = a.Y, b.Y do
+				for z = a.Z, b.Z do
+					local list = buckets[Vector3.new(x, y, z)]
+					if list then for _, entity in list do whitelist[entity] = true end end
+				end
 			end
 		end
+		for _, entity in overflow do whitelist[entity] = true end
 	end
 
 	-- Each entity is tested against BOTH its rewound Head and Body spheres --
@@ -77,7 +145,7 @@ function RewindHit.check(
 	local filter = projectile.Filter
 	local cache = projectile._rewindCache
 	for entity in whitelist do
-		if entity ~= projectile.Source and not projectile._ignore[entity] and (not filter or filter(entity)) then
+		if not entity.IsDestroyed and entity:IsActive() and entity ~= projectile.Source and not projectile._ignore[entity] and (not filter or filter(entity)) then
 			local rewound = cache[entity]
 			if not rewound then
 				rewound = {
@@ -130,6 +198,7 @@ function RewindHit.check(
 			and Entity.Get(los.Instance) ~= candidate.entity
 		if not blocked then
 			table.clear(candidates)
+			table.clear(whitelist)
 			return candidate.entity,
 				candidate.point,
 				SafeMath.direction(from - candidate.point, Vector3.yAxis),
@@ -138,6 +207,7 @@ function RewindHit.check(
 	end
 
 	table.clear(candidates)
+	table.clear(whitelist)
 	return nil, nil, nil, nil
 end
 

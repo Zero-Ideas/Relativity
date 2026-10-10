@@ -34,6 +34,25 @@ local VisualOffload = {}
 local handlers: { [string]: { (any, any?) -> () } } = {}
 local remote: RemoteEvent? = nil
 local listening = false
+-- Bound client ingress before dispatch allocates handler tasks. Handler-specific
+-- validation/authorization still owns the payload; this is only flood control.
+local ingress: { [Player]: { Tokens: number, Time: number } } = {}
+local INGRESS_RATE, INGRESS_BURST = 120, 240
+Players.PlayerRemoving:Connect(function(player) ingress[player] = nil end)
+
+local function admit(player: Player): boolean
+	local now = os.clock()
+	local state = ingress[player]
+	if not state then
+		state = { Tokens = INGRESS_BURST, Time = now }
+		ingress[player] = state
+	end
+	state.Tokens = math.min(INGRESS_BURST, state.Tokens + (now - state.Time) * INGRESS_RATE)
+	state.Time = now
+	if state.Tokens < 1 then return false end
+	state.Tokens -= 1
+	return true
+end
 
 local function getRemote(): RemoteEvent
 	if remote then
@@ -73,7 +92,7 @@ local function ensureListening()
 	local r = getRemote()
 	if RunService:IsServer() then
 		r.OnServerEvent:Connect(function(player, channel, payload)
-			if typeof(channel) == "string" then
+			if typeof(channel) == "string" and #channel <= 128 and handlers[channel] and admit(player) then
 				dispatch(channel, payload, player)
 			end
 		end)

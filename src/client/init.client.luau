@@ -35,6 +35,7 @@ local _SpellEffects = require(script.SpellEffects) -- spell Beam visuals
 local Effects = require(script.Effects) -- adaptive impacts, blade swings, speed streaks
 local _DummyEffects = require(script.DummyEffects) -- test dummy damage flashes
 local BarrierWatch = require(script.BarrierWatch) -- hides + reports barrier builds of a disallowed shape
+local SmoothLimbs = require(script.SmoothLimbs) -- straight R15 limbs drawn as one smooth piece (no joint ridges)
 
 ChunkManager.EnableReplication()
 ProjectileClient.EnableClientRendering()
@@ -46,6 +47,7 @@ MovementController.start()
 task.spawn(function() require(script.PlayerLocomotion).start(game.Players.LocalPlayer) end)
 ChunkVisualizer.start()
 BarrierWatch.start()
+SmoothLimbs.start()
 -- the time slider lives in the debug panel's Time tab; the old on-screen
 -- panel is gone everywhere
 TimeControlGui.start({ Headless = true })

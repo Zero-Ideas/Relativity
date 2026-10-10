@@ -197,6 +197,7 @@ type Batch = {
 	Projectiles: { any },
 	Slot: { number }, -- its Store record
 	Generation: { number }, -- Store.Generation[slot] when packed (a mismatch: released since)
+	Filter: { number }, -- retained registry ID for each resident slot
 	Scale: { number },
 	Deadline: { number }, -- os.clock() past which MaxRealLifetime is up
 	Homing: { boolean }, -- the item homes (its state goes in HomingIn each dispatch)
@@ -212,9 +213,10 @@ type Batch = {
 local workers: { Worker } = {}
 local frame = 0
 local sentTimeVersion = -1
-local filterIds: { [any]: any } = {} -- instance trie -> { [flags]: id }
-local filterReady: { [number]: number } = {} -- id -> first frame workers have it
-local nextFilterId = 0
+local FilterRegistry = require(script.Parent.FilterRegistry)
+local filters = FilterRegistry.new(function(channel: string, ...: any)
+	for _, worker in workers do worker.Actor:SendMessage(channel, ...) end
+end)
 local specIds: { [any]: any } = {} -- trie of motion-spec values -> id
 local specReady: { [number]: number } = {} -- id -> first frame workers have it
 local nextSpecId = 0
@@ -222,7 +224,8 @@ local MAX_SPECS = 65535 -- past this many distinct specs, new ones just step ser
 local batches: { Batch } = {}
 local batchUniform = true
 local batchTimeVersion = 0
-local running = false -- the last Dispatch sent batches
+local running = false -- parallel mode (retained through global freezes)
+local paused = false
 local inFlight = false -- between a Dispatch and its Apply
 local applying = false -- inside Apply (item numbers must hold still)
 local applyEpoch = 1 -- counts Applies (Store.Fresh compares against it)
@@ -339,41 +342,8 @@ end
 -- Filter id for a projectile's movement RaycastParams, by content (beam
 -- samples rebuild identical params per packet). New ids are sent to every
 -- worker and become usable next frame.
-local filterByParams: { [RaycastParams]: number } = setmetatable({}, { __mode = "k" }) :: any
-
 local function filterFor(projectile: any): number?
-	local params: RaycastParams = projectile._rayParams
-	-- params are shared between projectiles (Raycast.buildRayParams), so most
-	-- lookups end here, without reading FilterDescendantsInstances back (and
-	-- nothing is written to the projectile, which for an efficient one would
-	-- mean a per-projectile override table)
-	local known = filterByParams[params]
-	if known then
-		return if filterReady[known] <= frame then known else nil
-	end
-	local instances = params.FilterDescendantsInstances
-	local node = filterIds
-	for _, instance in instances do
-		local nextNode = node[instance]
-		if not nextNode then
-			nextNode = {}
-			node[instance] = nextNode
-		end
-		node = nextNode
-	end
-	local flags = `{params.IgnoreWater}|{params.CollisionGroup}`
-	local id = node[flags]
-	if not id then
-		nextFilterId += 1
-		id = nextFilterId
-		node[flags] = id
-		filterReady[id] = frame + 1
-		for _, worker in workers do
-			worker.Actor:SendMessage("Filter", id, instances, params.IgnoreWater, params.CollisionGroup)
-		end
-	end
-	filterByParams[params] = id
-	return if filterReady[id] <= frame then id else nil
+	return filters:Get(projectile._rayParams, frame)
 end
 
 local function syncTimeWorld()
@@ -419,7 +389,7 @@ local function newBatch(index: number): Batch
 	local batch: Batch = {
 		Index = index, Count = 0, Sent = 0, Ops = buffer.create(4096), OpBytes = 0,
 		Output = nil, HomingOutput = nil, OutputCount = 0, OutputEpoch = 0, PendingDrop = {},
-		Projectiles = {}, Slot = {}, Generation = {}, Scale = {}, Deadline = {}, Homing = {}, HomingCount = 0, HomingIn = nil,
+		Projectiles = {}, Slot = {}, Generation = {}, Filter = {}, Scale = {}, Deadline = {}, Homing = {}, HomingCount = 0, HomingIn = nil,
 		HomingConfig = {}, HomingSource = {}, HomingMainSearch = {},
 	}
 	-- (a new batch's worker may hold slots from before: start it empty)
@@ -547,6 +517,12 @@ end
 
 -- Packs `projectile` into slot `item` (new or reused) with its current state.
 local function pack(batch: Batch, item: number, projectile: any, filter: number, spec: number, scale: number)
+	local previous = batch.Filter[item]
+	if previous ~= filter then
+		if previous then filters:Release(previous) end
+		filters:Retain(filter)
+		batch.Filter[item] = filter
+	end
 	local slot = projectile._slot
 	batch.Projectiles[item] = projectile
 	batch.Slot[item] = slot
@@ -676,7 +652,7 @@ local function eligible(projectile: any): (number?, number?, number?)
 	local spec = specFor(projectile)
 	if filter and spec and plainHandle(projectile) then
 		local metatable = getmetatable(projectile)
-		if not handleInfo[metatable] then
+		if not handleInfo[metatable] or handleInfo[metatable].Filter ~= filter then
 			handleInfo[metatable] = { Filter = filter, Spec = spec, MaxRealLifetime = projectile.MaxRealLifetime }
 		end
 	end
@@ -688,12 +664,14 @@ end
 local function release(batch: Batch, item: number)
 	local last = batch.Count
 	local projectiles = batch.Projectiles
+	filters:Release(batch.Filter[item])
 	unresident(batch, item)
 	projectiles[item]._parallelState = nil
 	if item ~= last then
 		projectiles[item] = projectiles[last]
 		batch.Slot[item] = batch.Slot[last]
 		batch.Generation[item] = batch.Generation[last]
+		batch.Filter[item] = batch.Filter[last]
 		batch.Scale[item] = batch.Scale[last]
 		batch.Deadline[item] = batch.Deadline[last]
 		opMove(batch, item, last)
@@ -718,12 +696,15 @@ local function release(batch: Batch, item: number)
 		batch.HomingConfig[last], batch.HomingSource[last], batch.HomingMainSearch[last]
 	batch.HomingConfig[last], batch.HomingSource[last], batch.HomingMainSearch[last] = nil, nil, nil
 	projectiles[last] = nil
+	batch.Filter[last] = nil
 	batch.Count = last - 1
 end
 
 local function releaseBatch(batch: Batch)
 	local projectiles = batch.Projectiles
 	for item = 1, batch.Count do
+		filters:Release(batch.Filter[item])
+		batch.Filter[item] = nil
 		unresident(batch, item)
 		projectiles[item]._parallelState = nil
 		projectiles[item] = nil
@@ -742,10 +723,7 @@ end
 -- motion specs and time world the workers were sent, so every worker gets
 -- them again (new ones never had them).
 local function resetWorkerCaches()
-	table.clear(filterIds)
-	table.clear(filterByParams)
-	table.clear(filterReady)
-	nextFilterId = 0
+	filters:Reset()
 	table.clear(specIds)
 	table.clear(specReady)
 	nextSpecId = 0
@@ -798,9 +776,9 @@ function Parallel.PackNew(projectile: any, position: Vector3, velocity: Vector3,
 		return false
 	end
 	if inFlight then
-		local filter = filterByParams[rayParams]
+		local filter = filters.ByParams[rayParams]
 		local spec = specByMetatable[getmetatable(projectile)]
-		if not filter or not spec then
+		if not filters:Ready(filter, frame) or not spec then
 			return false
 		end
 		lateCount += 1
@@ -817,8 +795,8 @@ packNow = function(projectile: any, position: Vector3, velocity: Vector3, scale:
 	if inFlight then
 		return false
 	end
-	local filter = filterByParams[rayParams]
-	if not filter or filterReady[filter] > frame then
+	local filter = filters.ByParams[rayParams]
+	if not filters:Ready(filter, frame) then
 		return false
 	end
 	local spec = specByMetatable[getmetatable(projectile)]
@@ -841,6 +819,8 @@ packNow = function(projectile: any, position: Vector3, velocity: Vector3, scale:
 	batch.Projectiles[item] = projectile
 	batch.Slot[item] = slot
 	batch.Generation[item] = Store.Generation[slot]
+	batch.Filter[item] = filter
+	filters:Retain(filter)
 	batch.Scale[item] = scale
 	batch.Deadline[item] = deadline
 	setHoming(batch, item, false)
@@ -865,6 +845,10 @@ end
 -- Asks for a slot for `projectile` (call after it stepped serially or was
 -- created). Packed at the next Dispatch if it's still eligible then.
 -- True between a Dispatch and its Apply (a batch is with the workers).
+function Parallel.IsPaused(): boolean
+	return paused
+end
+
 function Parallel.IsInFlight(): boolean
 	return inFlight
 end
@@ -887,7 +871,7 @@ end
 -- state needs streaming...): the caller takes the ordinary path.
 local function fastAcquire(projectile: any, batch: Batch, now: number): boolean
 	local info = handleInfo[getmetatable(projectile)]
-	if not info or filterReady[info.Filter] > frame or specReady[info.Spec] > frame then
+	if not info or not filters:Ready(info.Filter, frame) or specReady[info.Spec] > frame then
 		return false
 	end
 	local slot = rawget(projectile, "_slot")
@@ -925,6 +909,8 @@ local function fastAcquire(projectile: any, batch: Batch, now: number): boolean
 	batch.Projectiles[item] = projectile
 	batch.Slot[item] = slot
 	batch.Generation[item] = Store.Generation[slot]
+	batch.Filter[item] = info.Filter
+	filters:Retain(info.Filter)
 	batch.Scale[item] = scale
 	batch.Deadline[item] = deadline
 	setHoming(batch, item, false)
@@ -960,8 +946,13 @@ function Parallel.Dispatch(activeCount: number, globalDt: number, allowed: boole
 			batches[w] = nil
 		end
 	end
+	filters:Collect(clock())
 	local workerCount = #workers
-	running = Parallel.Enabled and allowed and workerCount > 0 and activeCount >= Parallel.MinProjectiles and globalDt > 0
+	-- A separate exit threshold avoids repacking bursts around 32 projectiles.
+	local threshold = if running then math.max(1, Parallel.MinProjectiles // 2) else Parallel.MinProjectiles
+	running = Parallel.Enabled and allowed and workerCount > 0 and activeCount >= threshold
+	paused = running and globalDt <= 0
+	if paused then return end
 	if not running then
 		releaseAll()
 		return

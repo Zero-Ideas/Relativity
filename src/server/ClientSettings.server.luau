@@ -27,6 +27,7 @@ local SCHEMA: { [string]: any } = {
 	MaxUpdates = { 100, 20000 },
 	MaxDetailed = { 0, 1000 },
 	Glints = "boolean",
+	SmoothAvatars = "boolean",
 	LensFlare = "boolean",
 	-- the Lighting tab's overrides (client/LightingSettings):
 	-- { ["<object>.<Property>"] = number | boolean | string | { r, g, b } }
