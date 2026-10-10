@@ -35,6 +35,9 @@ export type Context = {
 
 local WARM = Color3.fromRGB(255, 170, 70)
 local HOT_MARK = Color3.fromRGB(255, 120, 40)
+-- Scorch / heat marks (Debris.Mark) are flat hard-edged discs: they read as
+-- stickers on every hit, so they are off until there is a soft scorch decal.
+local SURFACE_MARKS = false
 
 local function darker(color: Color3, amount: number): Color3
 	return color:Lerp(Color3.new(0, 0, 0), amount)
@@ -107,7 +110,7 @@ function Recipes.Impact(surface: any, context: Context)
 		emit(dustLayer, 1 * s, lighter(color, 0.2))
 		if full and not scrape then
 			Debris.Flash(position, WARM, 5 + 3 * s, 1.2)
-			if heavy and s >= 0.7 then
+			if SURFACE_MARKS and heavy and s >= 0.7 then
 				Debris.Mark(surface.Position, n, 0.25 + 0.2 * s, darker(color, 0.55), HOT_MARK, 5)
 			end
 		end
@@ -120,7 +123,7 @@ function Recipes.Impact(surface: any, context: Context)
 		if full and not scrape then
 			Debris.Throw({ Position = surface.Position, Normal = n, Direction = spray, Count = 2.5 * s,
 				Size = 0.22 * math.sqrt(s), Speed = 22 * speedScale, Color = color, Material = surface.Material })
-			if heavy and s >= 0.9 then
+			if SURFACE_MARKS and heavy and s >= 0.9 then
 				Debris.Mark(surface.Position, n, 0.3 + 0.25 * s, darker(color, 0.6))
 			end
 		end
@@ -131,7 +134,7 @@ function Recipes.Impact(surface: any, context: Context)
 			Debris.Throw({ Position = surface.Position, Normal = n, Direction = spray, Count = 3 * s,
 				Size = 0.16 * math.sqrt(s), Shape = "Splinter", Speed = 20 * speedScale, Color = color,
 				Material = surface.Material, Spread = 0.8 })
-			if heavy and s >= 0.9 then
+			if SURFACE_MARKS and heavy and s >= 0.9 then
 				Debris.Mark(surface.Position, n, 0.25 + 0.2 * s, darker(color, 0.7))
 			end
 		end

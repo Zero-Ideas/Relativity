@@ -744,6 +744,7 @@ local function buildStats()
 		ParallelWorkers = parallel.Workers,
 		SlowestWorkerMs = parallel.SlowestWorkerMs,
 		WorkerMs = parallel.WorkerMs,
+		WorkerProfile = parallel.WorkerProfile,
 		MainProfile = profile,
 		PendingSpawns = projectiles.PendingVisualSpawns,
 		PendingHits = projectiles.PendingVisualHits,

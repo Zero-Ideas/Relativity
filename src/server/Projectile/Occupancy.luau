@@ -282,7 +282,15 @@ end
 
 -- Re-marks every moving part, once per physics frame (all queries in one
 -- Heartbeat see the same world).
+-- Inside a worker batch (BeginBatch .. EndBatch) the moving parts were
+-- refreshed once at its start: queries skip the per-call refresh, which reads
+-- an engine property every time.
+local batchRefreshed = false
+
 local function refreshDynamic()
+	if batchRefreshed then
+		return
+	end
 	local stamp = workspace.DistributedGameTime
 	if stamp == dynamicStamp then
 		return
@@ -771,11 +779,12 @@ local function walk(origin: Vector3, displacement: Vector3, size: number, occupi
 end
 
 -- Is the whole segment (plus padding) inside the scanned terrain area?
+-- (scalars: no Vector3s made per query)
 local function insideTerrainScan(origin: Vector3, finish: Vector3): boolean
-	local lo = origin:Min(finish) - Vector3.one * PAD
-	local hi = origin:Max(finish) + Vector3.one * PAD
-	return lo.X >= terrainMin.X and lo.Y >= terrainMin.Y and lo.Z >= terrainMin.Z
-		and hi.X <= terrainMax.X and hi.Y <= terrainMax.Y and hi.Z <= terrainMax.Z
+	local ax, ay, az, bx, by, bz = origin.X, origin.Y, origin.Z, finish.X, finish.Y, finish.Z
+	local lo, hi = terrainMin, terrainMax
+	return min(ax, bx) - PAD >= lo.X and min(ay, by) - PAD >= lo.Y and min(az, bz) - PAD >= lo.Z
+		and max(ax, bx) + PAD <= hi.X and max(ay, by) + PAD <= hi.Y and max(az, bz) + PAD <= hi.Z
 end
 
 -- True when a sweep of `radius` from `origin` along `displacement` provably
@@ -800,21 +809,152 @@ function Occupancy.SegmentClear(origin: Vector3, displacement: Vector3, radius: 
 		return false
 	end
 	refreshDynamic()
+	-- (the walks are inlined: this runs once per substep of every projectile)
+	local ox, oy, oz = origin.X, origin.Y, origin.Z
+	local dX, dY, dZ = displacement.X, displacement.Y, displacement.Z
+	local inf = math.huge
+
+	-- coarse cells: is anything (static or moving) anywhere near the path?
+	local x, y, z = ox / COARSE, oy / COARSE, oz / COARSE
+	local dx, dy, dz = dX / COARSE, dY / COARSE, dZ / COARSE
+	local ix, iy, iz = floor(x), floor(y), floor(z)
+	local ex, ey, ez = floor(x + dx), floor(y + dy), floor(z + dz)
+	local sx = if dx > 0 then 1 elseif dx < 0 then -1 else 0
+	local sy = if dy > 0 then 1 elseif dy < 0 then -1 else 0
+	local sz = if dz > 0 then 1 elseif dz < 0 then -1 else 0
+	local tx = if dx > 0 then (ix + 1 - x) / dx elseif dx < 0 then (x - ix) / -dx else inf
+	local ty = if dy > 0 then (iy + 1 - y) / dy elseif dy < 0 then (y - iy) / -dy else inf
+	local tz = if dz > 0 then (iz + 1 - z) / dz elseif dz < 0 then (z - iz) / -dz else inf
+	local ux = if dx ~= 0 then 1 / abs(dx) else inf
+	local uy = if dy ~= 0 then 1 / abs(dy) else inf
+	local uz = if dz ~= 0 then 1 / abs(dz) else inf
+	local any = false
+	for _ = 1, abs(ex - ix) + abs(ey - iy) + abs(ez - iz) + 1 do
+		local k = cellKey(ix, iy, iz)
+		if dynamic[k] ~= nil or static[k] ~= nil then
+			any = true
+			break
+		end
+		if tx <= ty and tx <= tz then
+			ix += sx
+			tx += ux
+		elseif ty <= tz then
+			iy += sy
+			ty += uy
+		else
+			iz += sz
+			tz += uz
+		end
+	end
+	if not any then
+		local k = cellKey(ex, ey, ez) -- (floating-point slack: the end cell always counts)
+		any = dynamic[k] ~= nil or static[k] ~= nil
+	end
+	if not any then
+		stats.Skipped += 1
+		return true
+	end
+	stats.Coarse += 1
+
+	-- fine voxels: each cell's mask and moving boxes are looked up once, as
+	-- the walk enters it (consecutive voxels nearly always share a cell)
+	x, y, z = ox / FINE, oy / FINE, oz / FINE
+	dx, dy, dz = dX / FINE, dY / FINE, dZ / FINE
+	ix, iy, iz = floor(x), floor(y), floor(z)
+	ex, ey, ez = floor(x + dx), floor(y + dy), floor(z + dz)
+	sx = if dx > 0 then 1 elseif dx < 0 then -1 else 0
+	sy = if dy > 0 then 1 elseif dy < 0 then -1 else 0
+	sz = if dz > 0 then 1 elseif dz < 0 then -1 else 0
+	tx = if dx > 0 then (ix + 1 - x) / dx elseif dx < 0 then (x - ix) / -dx else inf
+	ty = if dy > 0 then (iy + 1 - y) / dy elseif dy < 0 then (y - iy) / -dy else inf
+	tz = if dz > 0 then (iz + 1 - z) / dz elseif dz < 0 then (z - iz) / -dz else inf
+	ux = if dx ~= 0 then 1 / abs(dx) else inf
+	uy = if dy ~= 0 then 1 / abs(dy) else inf
+	uz = if dz ~= 0 then 1 / abs(dz) else inf
+	local cellX, cellY, cellZ = inf, inf, inf
+	local mask: buffer? = nil
+	local moving: { any }? = nil
+	local steps = abs(ex - ix) + abs(ey - iy) + abs(ez - iz) + 1
+	for step = 1, steps + 1 do
+		if step > steps then
+			-- (floating-point slack: the end voxel is always checked)
+			ix, iy, iz = ex, ey, ez
+		end
+		local cx, cy, cz = ix // DIV, iy // DIV, iz // DIV
+		if cx ~= cellX or cy ~= cellY or cz ~= cellZ then
+			cellX, cellY, cellZ = cx, cy, cz
+			local k = cellKey(cx, cy, cz)
+			mask, moving = static[k], dynamic[k]
+			if mask == FULL then
+				stats.Blocked += 1
+				return false
+			end
+		end
+		if moving then
+			local x0, y0, z0 = ix * FINE, iy * FINE, iz * FINE
+			local x1, y1, z1 = x0 + FINE, y0 + FINE, z0 + FINE
+			for index = 1, #moving, 3 do
+				local lo, hi = moving[index], moving[index + 1]
+				if x1 > lo.X and x0 < hi.X and y1 > lo.Y and y0 < hi.Y and z1 > lo.Z and z0 < hi.Z
+					and not (ignore and ignore[moving[index + 2]]) then
+					stats.Blocked += 1
+					stats.BlockedMoving += 1
+					return false
+				end
+			end
+		end
+		if mask then
+			local lx, ly, lz = ix - cx * DIV, iy - cy * DIV, iz - cz * DIV
+			if btest(readu16(mask, (ly + lz * DIV) * ROW_BYTES), lshift(1, lx)) then
+				stats.Blocked += 1
+				return false
+			end
+		end
+		if tx <= ty and tx <= tz then
+			ix += sx
+			tx += ux
+		elseif ty <= tz then
+			iy += sy
+			ty += uy
+		else
+			iz += sz
+			tz += uz
+		end
+	end
+	stats.Skipped += 1
+	return true
+end
+
+-- A worker batch starts: refresh the moving parts once for all its queries.
+function Occupancy.BeginBatch()
+	batchRefreshed = false
+	refreshDynamic()
+	batchRefreshed = true
+end
+
+function Occupancy.EndBatch()
+	batchRefreshed = false
+end
+
+-- SegmentClear's previous (generic-walk) form, kept as the reference its
+-- inlined version is checked against (no stats).
+function Occupancy.SegmentClearReference(origin: Vector3, displacement: Vector3, radius: number,
+	ignore: { [Instance]: boolean }?): boolean
+	if not ready or not Occupancy.Enabled or radius > Occupancy.MaxRadius then
+		return false
+	end
+	if hasTerrain and not insideTerrainScan(origin, origin + displacement) then
+		return false
+	end
+	refreshDynamic()
 	if walk(origin, displacement, COARSE, coarseOccupied) then
-		stats.Coarse += 1
-		blockedByMoving = false
 		currentIgnore = ignore
 		local blocked = walk(origin, displacement, FINE, fineOccupied)
 		currentIgnore = nil
 		if blocked then
-			stats.Blocked += 1
-			if blockedByMoving then
-				stats.BlockedMoving += 1
-			end
 			return false
 		end
 	end
-	stats.Skipped += 1
 	return true
 end
 

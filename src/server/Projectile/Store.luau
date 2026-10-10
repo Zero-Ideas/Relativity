@@ -81,6 +81,28 @@ Store.Flags = buffer.create(capacity)
 Store.Scales = buffer.create(capacity * SCALES)
 Store.Cold = buffer.create(capacity * COLD)
 Store.HomingTimers = buffer.create(capacity * HOMING)
+-- Resident records (see Parallel): a slotted projectile's motion lives in its
+-- worker between frames. Resident: its batch index (0: none). ResidentItem:
+-- its item there. Fresh: Parallel's apply epoch when this record was last
+-- made current -- the batch's latest output is read instead while it's
+-- newer. Reading those fields goes through Parallel's hooks; writing one
+-- first pulls the worker's values in, then marks it Dirty.
+Store.Resident = buffer.create(capacity)
+Store.ResidentItem = buffer.create(capacity * 4)
+Store.Fresh = buffer.create(capacity * 4)
+-- Resident slots marked Dirty since Parallel last looked (it drains this).
+Store.DirtyList = {} :: { number }
+local residentRead: ((slot: number, batch: number, kind: number) -> any)? = nil
+local residentPull: ((slot: number, batch: number) -> ())? = nil
+local residentForget: ((slot: number, batch: number) -> ())? = nil
+
+-- Parallel's hooks: read(slot, batch, kind) -> value or nil (the record here
+-- is current), pull(slot, batch) (bring the worker's values into the
+-- record), forget(slot, batch) (the projectile is being released).
+function Store.SetResidentHooks(read: (number, number, number) -> any, pull: (number, number) -> (),
+	forget: (number, number) -> ())
+	residentRead, residentPull, residentForget = read, pull, forget
+end
 Store.Generation = {} :: { number } -- [slot] = times released
 local used = 0 -- slots ever handed out
 local free: { number } = {}
@@ -120,7 +142,27 @@ local function flag(slot: number, bitValue: number, on: boolean)
 	writeu8(Store.Flags, slot, if on then bor(flags, bitValue) else band(flags, bnot(bitValue)))
 end
 
+-- Dirty, and listed for Parallel when its motion lives in a worker.
+local function markDirty(slot: number)
+	local flags = readu8(Store.Flags, slot)
+	if band(flags, DIRTY) == 0 then
+		writeu8(Store.Flags, slot, bor(flags, DIRTY))
+		if readu8(Store.Resident, slot) ~= 0 then
+			table.insert(Store.DirtyList, slot)
+		end
+	end
+end
+
 local function read(slot: number, kind: number): any
+	if kind <= 4 or kind >= 14 then
+		local b = readu8(Store.Resident, slot)
+		if b ~= 0 and residentRead then
+			local value = residentRead(slot, b, kind)
+			if value ~= nil then
+				return value
+			end
+		end
+	end
 	if kind == 1 then
 		return readVector(Store.Motion, slot * MOTION)
 	elseif kind == 2 then
@@ -153,6 +195,12 @@ local function read(slot: number, kind: number): any
 end
 
 local function write(slot: number, kind: number, value: any)
+	if kind <= MOTION_LAST or kind >= 14 then
+		local b = readu8(Store.Resident, slot)
+		if b ~= 0 and residentPull then
+			residentPull(slot, b) -- (the record's other fields current before this one changes)
+		end
+	end
 	if kind == 1 then
 		writeVector(Store.Motion, slot * MOTION, if typeof(value) == "Vector3" then value else BAD_POSITION)
 	elseif kind == 2 then
@@ -183,8 +231,8 @@ local function write(slot: number, kind: number, value: any)
 	else
 		writef64(Store.HomingTimers, slot * HOMING + (kind - 14) * 8, tonumber(value) or 0)
 	end
-	if kind <= MOTION_LAST then
-		flag(slot, DIRTY, true)
+	if kind <= MOTION_LAST or (kind >= 14 and readu8(Store.Resident, slot) ~= 0) then
+		markDirty(slot)
 	end
 end
 
@@ -208,6 +256,9 @@ local function allocate(): number
 			Store.Scales = grow(Store.Scales, SCALES)
 			Store.Cold = grow(Store.Cold, COLD)
 			Store.HomingTimers = grow(Store.HomingTimers, HOMING)
+			Store.Resident = grow(Store.Resident, 1)
+			Store.ResidentItem = grow(Store.ResidentItem, 4)
+			Store.Fresh = grow(Store.Fresh, 4)
 			capacity *= 2
 		end
 		Store.Generation[slot] = 0
@@ -219,6 +270,7 @@ local function allocate(): number
 	buffer.fill(Store.Scales, slot * SCALES, 0, SCALES)
 	buffer.fill(Store.Cold, slot * COLD, 0, COLD)
 	buffer.fill(Store.HomingTimers, slot * HOMING, 0, HOMING)
+	writeu8(Store.Resident, slot, 0)
 	return slot
 end
 
@@ -289,7 +341,7 @@ function Store.Metatable(class: any): any
 			local watched = REPACK[key] and rawget(self, "_w")
 			if watched then
 				watched[key] = value
-				flag(self._slot, DIRTY, true)
+				markDirty(self._slot)
 				return
 			end
 			rawset(self, key, value)
@@ -369,7 +421,7 @@ function Store.HandleMetatable(spec: any, class: any, lazy: { [string]: () -> an
 			end
 			extras[key] = value
 			if slot and REPACK[key] then
-				flag(slot, DIRTY, true)
+				markDirty(slot)
 			end
 		end,
 	}
@@ -474,6 +526,13 @@ function Store.Release(state: any, metatable: any?)
 			rawset(state, key, value)
 		end
 	end
+	local b = readu8(Store.Resident, slot)
+	if b ~= 0 then
+		if residentForget then
+			residentForget(slot, b)
+		end
+		writeu8(Store.Resident, slot, 0)
+	end
 	Store.Generation[slot] += 1
 	table.insert(free, slot)
 end
@@ -501,7 +560,7 @@ function Store.CloneRaw(state: any): any
 end
 
 function Store.MarkDirty(slot: number)
-	flag(slot, DIRTY, true)
+	markDirty(slot)
 end
 
 function Store.ClearDirty(slot: number)

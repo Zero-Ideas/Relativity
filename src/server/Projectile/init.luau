@@ -454,7 +454,7 @@ end
 -- Construction
 --------------------------------------------------------------------------------
 
-local createProjectile: (config: Config) -> Projectile
+local createProjectile: (config: Config, normalized: any?) -> Projectile
 
 -- (timed for the Stats tab's frame split: spawning runs wherever the caller
 -- does, usually between frames)
@@ -466,8 +466,33 @@ function Projectile.new(config: Config): Projectile
 	return self
 end
 
-function createProjectile(config: Config): Projectile
-	local settings = Config.normalize(config, defaultMaxRealLifetime)
+-- Projectiles created while a batch is with the workers (see the step loop):
+-- their first move is the next dispatch's, like a shot fired after Apply,
+-- instead of a serial Step this frame. Weak keys: no cleanup needed.
+local deferFirst: { [any]: boolean } = setmetatable({}, { __mode = "k" }) :: any
+
+local function offerNew(self: any)
+	if Parallel.IsInFlight() then
+		deferFirst[self] = true
+	end
+	Parallel.Offer(self)
+end
+
+-- `normalized`: settings already normalized from this config (a compiled
+-- config's, Projectile.Fire): only Origin / Direction are per shot, so the
+-- rest isn't normalized again. Nothing writes into normalized settings'
+-- sub-tables (Homing...), so shots can share them.
+function createProjectile(config: Config, normalized: any?): Projectile
+	local normalizeStarted = os.clock()
+	local settings
+	if normalized then
+		settings = table.clone(normalized)
+		settings.Origin = SafeMath.vector(config.Origin, Vector3.zero)
+		settings.Direction = SafeMath.unit(config.Direction, Vector3.zAxis)
+	else
+		settings = Config.normalize(config, defaultMaxRealLifetime)
+	end
+	Profile.Add("SpawnNormalize", os.clock() - normalizeStarted)
 	local homing = settings.Homing
 	nextId += 1
 
@@ -504,10 +529,11 @@ function createProjectile(config: Config): Projectile
 		table.insert(active, self)
 		table.insert(activeSlot, (self :: any)._slot)
 		Replication.spawnVisual(self)
-		Parallel.Offer(self)
+		offerNew(self)
 		return self
 	end
 
+	local buildStarted = os.clock()
 	local state: Types.State = {
 		Id = nextId,
 		Position = settings.Origin,
@@ -579,12 +605,19 @@ function createProjectile(config: Config): Projectile
 	-- Baseline for Replication.updateTimeScale; set before spawnVisual so the
 	-- spawn snapshot's TimeScale matches.
 	state._lastStreamedTimeScale = combinedTimeScale(state)
+	local adoptStarted = os.clock()
+	Profile.Add("SpawnBuild", adoptStarted - buildStarted)
 
 	local self: Projectile = Store.Adopt(state, Live)
 	table.insert(active, self)
 	table.insert(activeSlot, (self :: any)._slot)
+	local visualStarted = os.clock()
+	Profile.Add("SpawnAdopt", visualStarted - adoptStarted)
 	Replication.spawnVisual(self)
-	Parallel.Offer(self)
+	local offerStarted = os.clock()
+	Profile.Add("SpawnVisual", offerStarted - visualStarted)
+	offerNew(self)
+	Profile.Add("SpawnOffer", os.clock() - offerStarted)
 	return self
 end
 
@@ -697,12 +730,12 @@ function Projectile.Fire(compiled: Compiled, origin: Vector3, direction: Vector3
 		-- straight into a worker slot when it can be (else queued as usual)
 		if debugRays or not Parallel.PackNew(self, origin, velocity, lastScale, compiled.RayParams :: RaycastParams,
 			spawnTime + settings.MaxRealLifetime) then
-			Parallel.Offer(self)
+			offerNew(self)
 		end
 	else
-		local config = table.clone(compiled.Config) :: any
-		config.Origin, config.Direction = origin, direction
-		self = createProjectile(config)
+		-- (the compiled settings, with this shot's origin and direction)
+		self = createProjectile({ Origin = origin, Direction = direction, Efficient = compiled.Config.Efficient } :: any,
+			compiled.Settings)
 	end
 	Profile.Add("Spawn", os.clock() - started)
 	Profile.Count("Spawned", 1)
@@ -917,7 +950,11 @@ end
 -- than stepDt when a contact interrupted the chord, possibly more when a
 -- pass-through skipped ahead), or nil once the projectile has been destroyed.
 local function advance(projectile: Projectile, stepDt: number, highRes: boolean): number?
+	local advanceStarted = os.clock()
 	Homing.update(projectile, stepDt)
+	local homingEnded = os.clock()
+	Profile.Add("AdvHoming", homingEnded - advanceStarted)
+	Profile.Count("AdvSubstepCount", 1)
 	local startVelocity = projectile.Velocity
 	local endVelocity, movementVelocity = integrate(projectile, startVelocity, stepDt)
 	local from = projectile.Position
@@ -956,8 +993,12 @@ local function advance(projectile: Projectile, stepDt: number, highRes: boolean)
 			reused = true
 		end
 	end
+	local castStarted = os.clock()
+	Profile.Add("AdvIntegrate", castStarted - homingEnded)
 	if not reused then
 		contact = Raycast.castMovement(projectile, from, displacement, nil, highRes)
+		Profile.Add("AdvCast", os.clock() - castStarted)
+		Profile.Count("AdvCastCount", 1)
 	end
 	if debugRays then
 		Replication.streamRay(projectile, from, if contact then contact.Position else to, not highRes)
@@ -986,8 +1027,14 @@ local function advance(projectile: Projectile, stepDt: number, highRes: boolean)
 		return settle(projectile, "pass", nil, contact, contactPosition, consumed)
 	end
 
+	local resolveStarted = os.clock()
 	local verdict, kind = Raycast.resolveHit(projectile, contact)
-	return settle(projectile, verdict :: Types.Verdict, kind, contact, contactPosition, consumed)
+	local settleStarted = os.clock()
+	Profile.Add("AdvResolveHit", settleStarted - resolveStarted)
+	local result = settle(projectile, verdict :: Types.Verdict, kind, contact, contactPosition, consumed)
+	Profile.Add("AdvSettle", os.clock() - settleStarted)
+	Profile.Count("AdvContactCount", 1)
+	return result
 end
 
 --------------------------------------------------------------------------------
@@ -1233,7 +1280,11 @@ local function applySweep(self: Projectile, globalDt: number, status: number, po
 		Profile.Count("SerialContacts", 1)
 		return alive
 	end
-	return finishStep(self, remaining)
+	local finishStarted = os.clock()
+	local alive = finishStep(self, remaining)
+	Profile.Add("SerialFinish", os.clock() - finishStarted)
+	Profile.Count("SerialFinishCount", 1)
+	return alive
 end
 
 -- Results are applied in one pass before the step loop; each projectile is
@@ -1498,6 +1549,8 @@ Heartbeat.Connect(function(globalDt: number)
 	Parallel.Apply(applySwept, stepMark, os.clock(), ChunkManager.GetTimeVersion())
 	local loopStarted = os.clock()
 	local destroyTime = 0
+	local serialTime, offerTime, poseTime, serialCount, poseCount, deferredCount = 0, 0, 0, 0, 0, 0
+	local POSE_SAMPLE = Profile.SAMPLE
 	-- Backwards with swap-removal: dead projectiles leave `active` the same
 	-- frame (so GetAll/GetInRadius never return them), and anything spawned by
 	-- an OnHit/OnDestroy handler mid-loop is appended past `i` and first steps
@@ -1513,12 +1566,25 @@ Heartbeat.Connect(function(globalDt: number)
 			alive = band(readu8(Store.Flags, slot), STORE_DEAD) == 0
 		elseif mark == -stepMark then
 			alive = false
+		elseif readu8(Store.Resident, slot) ~= 0 then
+			-- (its worker moved it this frame and keeps its record)
+			alive = band(readu8(Store.Flags, slot), STORE_DEAD) == 0
+		elseif deferFirst[projectile] then
+			-- created while the batch was in flight: next dispatch moves it first
+			deferFirst[projectile] = nil
+			alive = band(readu8(Store.Flags, slot), STORE_DEAD) == 0
+			deferredCount += 1
 		else
 			counted.Serial += 1
+			serialCount += 1
+			local serialStarted = os.clock()
 			alive = projectile:Step(globalDt)
+			local offerStarted = os.clock()
+			serialTime += offerStarted - serialStarted
 			if alive then
 				Parallel.Offer(projectile)
 			end
+			offerTime += os.clock() - offerStarted
 		end
 		if alive then
 			-- Ordinary homing streams continuously; beams are filtered into sparse
@@ -1527,7 +1593,14 @@ Heartbeat.Connect(function(globalDt: number)
 			-- (_streamedSynced or Beam ~= nil) -- checked here to skip the call)
 			local flags = readu8(Store.Flags, slot)
 			if band(flags, POSE_NEEDS) == POSE_NEEDS and band(flags, POSE_EITHER) ~= 0 then
-				Replication.queuePose(projectile)
+				poseCount += 1
+				if poseCount % POSE_SAMPLE == 0 then
+					local poseStarted = os.clock()
+					Replication.queuePose(projectile)
+					poseTime += (os.clock() - poseStarted) * POSE_SAMPLE
+				else
+					Replication.queuePose(projectile)
+				end
 			end
 		else
 			local last = #active
@@ -1542,7 +1615,14 @@ Heartbeat.Connect(function(globalDt: number)
 			destroyTime += os.clock() - destroyStarted
 		end
 	end
-	Profile.Add("StepLoop", os.clock() - loopStarted - destroyTime)
+	-- StepLoop: the scan itself (marks, flags, swap-removal), the rest apart
+	Profile.Add("StepLoop", math.max(os.clock() - loopStarted - destroyTime - serialTime - offerTime - poseTime, 0))
+	Profile.Add("StepSerial", serialTime)
+	Profile.Add("StepOffer", offerTime)
+	Profile.Add("StepPoseEst", poseTime)
+	Profile.Count("StepSerialCount", serialCount)
+	Profile.Count("StepPoseCount", poseCount)
+	Profile.Count("StepDeferredNewCount", deferredCount)
 	Profile.Add("StepDestroy", destroyTime)
 	Profile.Frame()
 	Parallel.AddCounts(counted.Parallel, counted.Resumed, counted.Serial, counted.Fallback)

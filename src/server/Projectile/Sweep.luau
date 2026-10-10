@@ -28,6 +28,7 @@ local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local Shared = ReplicatedStorage:WaitForChild("Shared")
 local ProjectileMotion = require(Shared:WaitForChild("Projectile"):WaitForChild("Motion"))
 local Math = require(script.Parent.Math)
+local SafeMath = require(Shared:WaitForChild("SafeMath"))
 local Planner = require(Shared:WaitForChild("Projectile"):WaitForChild("StepPlanner"))
 
 local Sweep = {}
@@ -38,6 +39,8 @@ Sweep.Contact = 1 -- the next substep hits something: resume serially from here
 Sweep.Expired = 2 -- lifetime ran out (Step returns false)
 
 local MIN_STEP_DT = ProjectileMotion.MinStepDt
+local POSITION_EPSILON = ProjectileMotion.PositionEpsilon
+local RELATIVE_NUDGE = 2 ^ -18 -- (ProjectileMotion.GetNudge's)
 local MAX_SUBSTEPS = Sweep.MaxSubsteps
 local DONE, CONTACT, EXPIRED = Sweep.Done, Sweep.Contact, Sweep.Expired
 
@@ -51,6 +54,17 @@ Sweep.InputRemaining = 40
 -- output offsets
 Sweep.OutStatus, Sweep.OutGuard, Sweep.OutPosition, Sweep.OutVelocity, Sweep.OutAge, Sweep.OutRemaining =
 	0, 1, 4, 16, 28, 36
+
+-- Edits Parallel sends a worker each frame for the slots it keeps between
+-- frames (resident slots; see Parallel). SET: op u8, item u32, the input
+-- record (IN bytes), scale f64, deadline f64, homing timers (3 x f64).
+-- MOVE: op u8, to u32, from u32 (a swap-removal). RESET: op u8 (empty).
+Sweep.OpSet, Sweep.OpMove, Sweep.OpReset = 1, 2, 3
+Sweep.SetOpBytes = 1 + 4 + IN + 8 + 8 + 24
+Sweep.MoveOpBytes = 9
+Sweep.SetOpScale = 5 + IN -- offsets within a SET op
+Sweep.SetOpDeadline = 5 + IN + 8
+Sweep.SetOpTimers = 5 + IN + 16
 
 -- A projectile's per-shot motion constants, as the workers keep them (plus
 -- its homing constants, when it homes).
@@ -232,8 +246,11 @@ function Sweep.Run(
 	onContact: ((item: number, from: Vector3, displacement: Vector3, hit: any) -> ())?,
 	homingIn: buffer?,
 	homingOut: buffer?,
-	homingFrame: HomingFrame?
+	homingFrame: HomingFrame?,
+	timing: { number }? -- (sampled items only: seconds per phase, see the worker's profile)
 )
+	local clock = os.clock
+	local t0 = if timing then clock() else 0
 	local o = (item - 1) * IN
 	local filter = readu32(input, o + 4)
 	local position = readVector32(input, o + 8)
@@ -274,6 +291,70 @@ function Sweep.Run(
 	local targetChange = 0
 	local workerSearch = homing and spec.WorkerSearch == true and homingFrame ~= nil
 
+	-- Straight shots (no acceleration, no gravity, not homing) in uniform time:
+	-- the same substeps as the loop below, with its helpers' arithmetic inlined
+	-- for that case (Planner.Sample's nudge, Planner.StepDt with no curvature or
+	-- boundaries, Integrate returning the velocity unchanged) -- most shots.
+	local straight = spec.Straight
+	if straight == nil then
+		local function zero(value: any): boolean
+			return value == 0 or value == Vector3.zero
+		end
+		straight = zero(acceleration) and zero(gravity)
+		spec.Straight = straight
+	end
+	if straight and uniformTime and not homing then
+		local tStraight = if timing then clock() else 0
+		local speed = velocity.Magnitude
+		local unit = SafeMath.direction(velocity, Vector3.zAxis)
+		local guard = 0
+		while remaining > MIN_STEP_DT and guard < MAX_SUBSTEPS do
+			guard += 1
+			local lifeRemaining = lifetime - age
+			if lifeRemaining <= MIN_STEP_DT then
+				Sweep.WriteOutput(output, item, EXPIRED, position, velocity, age, remaining, guard)
+				return
+			end
+			local largest = math.max(math.abs(position.X), math.abs(position.Y), math.abs(position.Z))
+			local highRes = hasEntities(position + unit * math.max(POSITION_EPSILON, largest * RELATIVE_NUDGE))
+			if remaining <= MIN_STEP_DT then
+				break
+			end
+			local stepDt = math.min(remaining, lifeRemaining)
+			if speed > 1e-5 then
+				stepDt = math.min(stepDt, ProjectileMotion.GetAdaptiveMaxDistance(speed, highRes) / speed)
+			end
+			stepDt = math.max(stepDt, math.min(MIN_STEP_DT, remaining, lifeRemaining))
+			local displacement = velocity * stepDt
+			if timing then
+				timing[8] += clock() - tStraight
+			end
+			local hit = castHits(position, displacement, radius, filter, highRes)
+			if timing then
+				tStraight = clock()
+			end
+			if hit then
+				if onContact and hit ~= true then
+					onContact(item, position, displacement, hit)
+				end
+				Sweep.WriteOutput(output, item, CONTACT, position, velocity, age, remaining, guard - 1)
+				return
+			end
+			position += displacement
+			age += stepDt
+			remaining -= stepDt
+			if age >= lifetime - MIN_STEP_DT then
+				Sweep.WriteOutput(output, item, EXPIRED, position, velocity, age, remaining, guard)
+				return
+			end
+		end
+		Sweep.WriteOutput(output, item, DONE, position, velocity, age, remaining, guard)
+		if timing then
+			timing[8] += clock() - tStraight
+		end
+		return
+	end
+
 	-- Mirrors Projectile.Step's loop (no rewind: no lag-compensated entity
 	-- check).
 	local guard = 0
@@ -286,18 +367,30 @@ function Sweep.Run(
 			return
 		end
 
+		local t1 = if timing then clock() else 0
+		if timing then
+			timing[1] += t1 - t0 -- (reads, loop checks)
+		end
 		local accelerationVector = ProjectileMotion.GetAcceleration(velocity, acceleration, direction, gravity)
 		local sample, chunkScale = Planner.Sample(position, velocity, accelerationVector, uniformTime)
+		local t2 = if timing then clock() else 0
 		if chunkScale <= 0 then
 			remaining = 0
 			break
 		end
 		local highRes = hasEntities(sample)
+		local t3 = if timing then clock() else 0
 		local maxDt = if homing and hasTarget and (turnRate :: number) > 0
 			then Sweep.MaxHomingTurnStep / (turnRate :: number)
 			else math.huge
 		local stepDt = Planner.StepDt(position, velocity, accelerationVector, chunkScale, remaining, lifeRemaining,
 			highRes, uniformTime, maxDt)
+		local t4 = if timing then clock() else 0
+		if timing then
+			timing[2] += t2 - t1 -- acceleration + time-scale sample
+			timing[3] += t3 - t2 -- entity-chunk check
+			timing[4] += t4 - t3 -- step size
+		end
 		if stepDt <= 0 then
 			break
 		end
@@ -343,7 +436,11 @@ function Sweep.Run(
 						targetPosition = (homingFrame :: HomingFrame).Positions[found]
 						hasTargetPosition, hasTarget, explicit = true, true, false
 					else
-						targetChange = -1
+						-- (losing a target is a change; finding nothing again isn't --
+						-- the main thread would clear an already-empty target for it)
+						if hasTarget or targetChange > 0 then
+							targetChange = -1
+						end
 						hasTargetPosition, hasTarget, explicit = false, false, false
 					end
 				end
@@ -354,10 +451,19 @@ function Sweep.Run(
 			end
 		end
 
+		local t5 = if timing then clock() else 0
 		local endVelocity, movementVelocity = ProjectileMotion.Integrate(velocity, acceleration, direction, gravity,
 			minSpeed, maxSpeed, stepDt)
 		local displacement = movementVelocity * stepDt
+		local t6 = if timing then clock() else 0
+		if timing then
+			timing[5] += t5 - t4 -- homing
+			timing[6] += t6 - t5 -- integrate
+		end
 		local hit = castHits(position, displacement, radius, filter, highRes)
+		if timing then
+			t0 = clock() -- (the cast is timed by the caller; the next substep's reads start here)
+		end
 		if hit then
 			-- hand this substep back untouched; Step redoes it serially (with
 			-- this cast's result, so it needn't cast it again -- see onContact)
@@ -380,6 +486,9 @@ function Sweep.Run(
 	end
 	if homing then writeTimers(homingOut, item, delay, acquireTimer, reacquireTimer, targetChange) end
 	Sweep.WriteOutput(output, item, DONE, position, velocity, age, remaining, guard)
+	if timing then
+		timing[7] += clock() - t0 -- (the last substep's bookkeeping + the write)
+	end
 end
 
 return Sweep
