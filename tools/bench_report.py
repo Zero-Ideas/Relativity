@@ -33,7 +33,8 @@ SCALARS = [
     ("HeartbeatMs", "heartbeat", 2), ("ReplicationMs", "replication", 2), ("CastsRay", "rays/frame", 0),
     ("CastsSphere", "spheres/frame", 0), ("ParallelSteps", "parallel", 0), ("ResumedSteps", "resumed", 0),
     ("SerialSteps", "serial", 0), ("FallbackSteps", "fallback", 0), ("LateSteps", "late", 0),
-    ("SendKbps", "send KB/s", 1), ("MemoryMb", "memory MB", 0),
+    ("SendKbps", "send KB/s", 1), ("MemoryMb", "memory MB", 0), ("OccupancyDynamic", "moving parts", 0),
+    ("EffectiveCores", "cores used", 1), ("CoreProbeCores", "cores (probe)", 1),
 ]
 
 

@@ -237,8 +237,11 @@ local homingTimers: { number } = { 0, 0, 0 } -- scratch for Apply
 -- Worker time by phase, summed over workers since the last TakeStats (see
 -- ProjectileWorkerBootstrap).
 local workerProfile: { [string]: number } = {}
+-- How many workers really ran at once: per frame, their total busy time over
+-- the wall time from the first one starting to the last one finishing.
+local coreFrame, coreBusy, coreFirst, coreLast, coreWall = -1, 0, math.huge, -math.huge, 0
 local stats = { Parallel = 0, Resumed = 0, Serial = 0, Fallback = 0, Late = 0, Frames = 0, SlowestWorkerMs = 0, WorkerMs = 0,
-	AppliedFrames = 0, WorkerChecks = 0, WorkerSkipped = 0 }
+	AppliedFrames = 0, WorkerChecks = 0, WorkerSkipped = 0, CoreBusy = 0, CoreWall = 0 }
 -- workers' reasons a cast wasn't skipped: not ready, too wide, outside terrain, blocked, blocked by a moving part
 local workerReasons = { 0, 0, 0, 0, 0 }
 
@@ -285,6 +288,21 @@ local function refreshWorkers(): boolean
 			data: buffer, checks: number, skipped: number, reasons: { number }?, contacts: any, homingOut: buffer?,
 			exceptions: { number }?, changes: { number }?, profile: { [string]: number }?)
 			if profile then
+				-- one frame's batches: busy time and first start .. last finish
+				local tStart, tEnd = profile.TStart, profile.TEnd
+				profile.TStart, profile.TEnd = nil, nil
+				if tStart and tEnd then
+					if resultFrame ~= coreFrame then
+						if coreWall > 0 then
+							stats.CoreBusy += coreBusy
+							stats.CoreWall += coreWall
+						end
+						coreFrame, coreBusy, coreFirst, coreLast, coreWall = resultFrame, 0, math.huge, -math.huge, 0
+					end
+					coreBusy += tEnd - tStart
+					coreFirst, coreLast = math.min(coreFirst, tStart), math.max(coreLast, tEnd)
+					coreWall = coreLast - coreFirst
+				end
 				-- (summed over workers; TakeStats averages it per frame)
 				for key, value in profile do
 					workerProfile[key] = (workerProfile[key] or 0) + value
@@ -720,6 +738,22 @@ local function releaseBatch(batch: Batch)
 	batch.Count, batch.Sent, batch.HomingCount = 0, 0, 0
 end
 
+-- The worker set changed (CoreProbe resizes it): forget which filters,
+-- motion specs and time world the workers were sent, so every worker gets
+-- them again (new ones never had them).
+local function resetWorkerCaches()
+	table.clear(filterIds)
+	table.clear(filterByParams)
+	table.clear(filterReady)
+	nextFilterId = 0
+	table.clear(specIds)
+	table.clear(specReady)
+	nextSpecId = 0
+	table.clear(specByMetatable)
+	table.clear(handleInfo)
+	sentTimeVersion = -1
+end
+
 -- Empties every slot and the queue (parallel movement paused or off).
 local function releaseAll()
 	for _, batch in batches do
@@ -919,7 +953,12 @@ function Parallel.Dispatch(activeCount: number, globalDt: number, allowed: boole
 		batch.Sent = 0
 	end
 	if refreshWorkers() then
-		releaseAll() -- (batches follow worker order; this only happens at startup)
+		-- (batches follow worker order: at startup, and when CoreProbe resizes the set)
+		releaseAll()
+		resetWorkerCaches()
+		for w = #workers + 1, #batches do
+			batches[w] = nil
+		end
 	end
 	local workerCount = #workers
 	running = Parallel.Enabled and allowed and workerCount > 0 and activeCount >= Parallel.MinProjectiles and globalDt > 0
@@ -1446,6 +1485,8 @@ function Parallel.TakeStats()
 	end
 	snapshot.WorkerProfile = averaged
 	table.clear(workerProfile)
+	snapshot.EffectiveCores = if stats.CoreWall > 0 then stats.CoreBusy / stats.CoreWall else nil
+	stats.CoreBusy, stats.CoreWall = 0, 0
 	table.clear(workerReasons)
 	for index = 1, 5 do
 		workerReasons[index] = 0

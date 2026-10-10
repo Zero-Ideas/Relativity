@@ -33,6 +33,7 @@ local Server = ServerScriptService:WaitForChild("Server")
 local Projectile = require(Server:WaitForChild("Projectile"))
 local DebugStream = require(Server:WaitForChild("DebugStream"))
 local Entity = require(game:GetService("ReplicatedStorage"):WaitForChild("Shared"):WaitForChild("Entity"))
+local Heartbeat = require(game:GetService("ReplicatedStorage"):WaitForChild("Shared"):WaitForChild("Heartbeat"))
 
 local SPEED = 220
 local LIFETIME = 4
@@ -117,11 +118,24 @@ local function run(message: any)
 	DebugStream.Send("bench", { phase = "start", label = label, mode = mode, target = target, seconds = seconds,
 		origin = { origin.X, origin.Y, origin.Z } })
 	print(`[Bench] {label}: {mode}, {target} projectiles for {seconds} s`)
+	-- Profile=1: the workers' detailed phase timing for this run (it costs a little)
+	local profile = tonumber(message.Profile) == 1
+	ServerScriptService:SetAttribute("ProjectileProfile", if profile then true else nil)
+	-- TimeScale=x: the world time scale for the run (restored after)
+	local previousScale = Heartbeat.GetGlobalTimeScale()
+	local timeScale = tonumber(message.TimeScale)
+	if timeScale then
+		Heartbeat.SetGlobalTimeScale(timeScale)
+	end
 	local started = os.clock()
 	local connection: RBXScriptConnection
 	connection = RunService.Heartbeat:Connect(function()
 		if state.stop or os.clock() - started >= seconds or not root.Parent then
 			connection:Disconnect()
+			if timeScale then
+				Heartbeat.SetGlobalTimeScale(previousScale)
+			end
+			ServerScriptService:SetAttribute("ProjectileProfile", nil)
 			if running == state then
 				running = nil
 			end

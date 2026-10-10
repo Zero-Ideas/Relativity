@@ -745,6 +745,10 @@ local function buildStats()
 		SlowestWorkerMs = parallel.SlowestWorkerMs,
 		WorkerMs = parallel.WorkerMs,
 		WorkerProfile = parallel.WorkerProfile,
+		-- cores: how many projectile workers ran side by side (measured every
+		-- frame), and the CoreProbe result (how many parallel Luau gets at all)
+		EffectiveCores = parallel.EffectiveCores,
+		CoreProbeCores = game:GetService("ServerScriptService"):GetAttribute("CoreProbeCores"),
 		MainProfile = profile,
 		PendingSpawns = projectiles.PendingVisualSpawns,
 		PendingHits = projectiles.PendingVisualHits,

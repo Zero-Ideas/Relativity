@@ -18,9 +18,15 @@
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 
 -- More workers than cores is fine (the parallel phase spreads them over the
--- engine's threads) and evens out the slowest batch; each costs a Luau VM and
--- its own occupancy copy.
+-- engine's threads) and evens out the slowest batch; each costs a Luau VM, its
+-- own occupancy copy and a little fixed work every frame. Starts at
+-- WORKER_COUNT; once CoreProbe has measured the server's cores (its
+-- "CoreProbeCores" attribute) it becomes twice that, rounded to an even
+-- number within MIN..MAX_WORKERS -- a multiple of the cores, so equal batches
+-- divide evenly over them (3 workers on 2 cores leave one core idle half the
+-- time; 4 don't).
 local WORKER_COUNT = 6
+local MIN_WORKERS, MAX_WORKERS = 2, 8
 
 local actor = script:GetActor()
 if not actor then
@@ -40,16 +46,43 @@ if not actor then
 		hello.Name = "OccupancyHello" -- a worker is listening: send it the baked grid
 		hello.Parent = folder
 	end
-	if not folder:FindFirstChildWhichIsA("Actor") then
-		for index = 1, WORKER_COUNT do
+	local template = script:Clone() -- (taken now: clones made later copy this, not a running worker)
+	local function setWorkerCount(count: number)
+		local existing = 0
+		for _, child in folder:GetChildren() do
+			if child:IsA("Actor") then
+				local index = tonumber(string.match(child.Name, "(%d+)$"))
+				if index and index > count then
+					child:Destroy()
+				else
+					existing = math.max(existing, index or 0)
+				end
+			end
+		end
+		for index = existing + 1, count do
 			local workerActor = Instance.new("Actor")
 			workerActor.Name = `ProjectileWorker{index}`
-			local workerScript = script:Clone()
+			local workerScript = template:Clone()
 			workerScript.Name = "Worker"
 			workerScript.Parent = workerActor
 			workerActor.Parent = folder
 		end
 	end
+	if not folder:FindFirstChildWhichIsA("Actor") then
+		setWorkerCount(WORKER_COUNT)
+	end
+	local ServerScriptService = game:GetService("ServerScriptService")
+	local function fitToCores()
+		local cores = ServerScriptService:GetAttribute("CoreProbeCores")
+		if typeof(cores) ~= "number" or cores <= 0 then
+			return
+		end
+		local count = math.clamp(2 * math.max(math.floor(cores + 0.5), 1), MIN_WORKERS, MAX_WORKERS)
+		print(`[Projectile] {count} parallel workers for about {cores} cores`)
+		setWorkerCount(count)
+	end
+	ServerScriptService:GetAttributeChangedSignal("CoreProbeCores"):Connect(fitToCores)
+	fitToCores()
 	return
 end
 
@@ -58,6 +91,7 @@ end
 --------------------------------------------------------------------------------
 
 local workerId = assert(tonumber(string.match(actor.Name, "(%d+)$")), "projectile worker needs a numeric suffix")
+local ServerScriptService = game:GetService("ServerScriptService")
 local Shared = ReplicatedStorage:WaitForChild("Shared")
 local ChunkManager = require(Shared:WaitForChild("ChunkManager"))
 local projectileModule = (actor.Parent :: Instance).Parent:WaitForChild("Projectile")
@@ -294,6 +328,10 @@ actor:BindToMessageParallel("Sweep", function(frame: number, ops: buffer?, count
 	end
 	local homingOut = if homingIn then buffer.create(count * Sweep.HomingOutStride) else nil
 	Occupancy.BeginBatch()
+	-- detailed phase timing only while ServerScriptService.ProjectileProfile is
+	-- set (the analytics bench sets it): off, every item takes the plain path
+	local profiling = ServerScriptService:GetAttribute("ProjectileProfile") == true
+	local sample = if profiling then SAMPLE else 0
 	local loopStarted = os.clock()
 	local sampledRun = 0
 	sampledOccupancy, sampledEngine = 0, 0
@@ -314,7 +352,7 @@ actor:BindToMessageParallel("Sweep", function(frame: number, ops: buffer?, count
 			table.insert(exceptions, item)
 			continue
 		end
-		if item % SAMPLE == 0 then
+		if sample ~= 0 and item % sample == 0 then
 			sampling = true
 			local t = os.clock()
 			Sweep.Run(records, item, result, uniformTime, specs, castHits, hasEntities, onContact, homingIn, homingOut, homingFrame,
@@ -352,11 +390,13 @@ actor:BindToMessageParallel("Sweep", function(frame: number, ops: buffer?, count
 	local loopEnded = os.clock()
 	Occupancy.EndBatch()
 	local loop = loopEnded - loopStarted
-	-- substeps run (the guard byte of every result)
+	-- substeps run (the guard byte of every result; profiling only)
 	local substeps = 0
-	local outStride = Sweep.OutputStride
-	for item = 1, count do
-		substeps += buffer.readu8(result, (item - 1) * outStride + 1)
+	if profiling then
+		local outStride = Sweep.OutputStride
+		for item = 1, count do
+			substeps += buffer.readu8(result, (item - 1) * outStride + 1)
+		end
 	end
 	local scale = if sampledRun > 0 then loop / sampledRun else 0
 	local occupancyTime, engineTime = sampledOccupancy * scale, sampledEngine * scale
@@ -368,6 +408,10 @@ actor:BindToMessageParallel("Sweep", function(frame: number, ops: buffer?, count
 		WEngine = engineTime * 1000,
 		WPlanIntegrate = math.max(loop - occupancyTime - engineTime, 0) * 1000,
 		WSyncWait = lastWait,
+		-- (absolute os.clock times: Parallel turns them into the cores the
+		-- workers really ran on -- not summed like the rest)
+		TStart = started,
+		TEnd = loopEnded,
 		WFire = lastFire,
 		WItemsCount = count,
 		WContactsCount = #contacts.Item,

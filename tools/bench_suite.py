@@ -70,7 +70,14 @@ def main():
     for run in runs:
         label, mode = run.split(":", 1)
         offset = STREAM.stat().st_size if STREAM.exists() else 0
-        send({"cmd": "bench", "Mode": mode, "Target": target, "Seconds": seconds, "Label": label})
+        fields = {"cmd": "bench", "Mode": mode, "Target": target, "Seconds": seconds, "Label": label}
+        for key, value in extra.items():
+            if key not in ("Target", "Seconds"):
+                try:
+                    fields[key] = float(value)
+                except ValueError:
+                    fields[key] = value
+        send(fields)
         wait_for_end(label, offset, seconds + 60)
         time.sleep(3)  # let the last projectiles die before the next run
     subprocess.run([sys.executable, str(ROOT / "tools" / "bench_report.py"), *[r.split(":", 1)[0] for r in runs]])
