@@ -36,6 +36,7 @@ local Effects = require(script.Effects) -- adaptive impacts, blade swings, speed
 local _DummyEffects = require(script.DummyEffects) -- test dummy damage flashes
 local BarrierWatch = require(script.BarrierWatch) -- hides + reports barrier builds of a disallowed shape
 local SmoothLimbs = require(script.SmoothLimbs) -- straight R15 limbs drawn as one smooth piece (no joint ridges)
+local CastPose = require(script.CastPose) -- casting: side-on stance, arm pointed at the aim, head turned to it
 
 ChunkManager.EnableReplication()
 ProjectileClient.EnableClientRendering()
@@ -48,6 +49,7 @@ task.spawn(function() require(script.PlayerLocomotion).start(game.Players.LocalP
 ChunkVisualizer.start()
 BarrierWatch.start()
 SmoothLimbs.start()
+task.spawn(CastPose.start) -- (waits for the server's CastAim remote)
 -- the time slider lives in the debug panel's Time tab; the old on-screen
 -- panel is gone everywhere
 TimeControlGui.start({ Headless = true })
