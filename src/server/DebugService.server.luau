@@ -131,6 +131,19 @@ local Entity = require(Shared.Entity)
 local StatusEffectSys = require(Shared.StatusEffectSys)
 local Projectile = require(script.Parent.Projectile)
 
+-- The published-server experiment uses the same admin gate as game settings.
+-- On by default; an explicit false switches to the baseline path.
+local function publishApplyPass()
+	ReplicatedStorage:SetAttribute("ProjectileApplyPass", game:GetService("ServerScriptService"):GetAttribute("ProjectileApplyPass") ~= false)
+end
+game:GetService("ServerScriptService"):GetAttributeChangedSignal("ProjectileApplyPass"):Connect(publishApplyPass)
+publishApplyPass()
+VisualOffload.On("DebugSetProjectileApplyPass", function(enabled, player)
+	if player and DebugAccess.CanUseTab(player, "Admin") and typeof(enabled) == "boolean" then
+		game:GetService("ServerScriptService"):SetAttribute("ProjectileApplyPass", enabled)
+	end
+end)
+
 local STATS_INTERVAL = 0.5
 
 --------------------------------------------------------------------------------
@@ -745,6 +758,8 @@ local function buildStats()
 		SlowestWorkerMs = parallel.SlowestWorkerMs,
 		WorkerMs = parallel.WorkerMs,
 		WorkerProfile = parallel.WorkerProfile,
+		ApplyPassEnabled = game:GetService("ServerScriptService"):GetAttribute("ProjectileApplyPass") ~= false,
+		ProjectileVersion = "c3a79b9 - resident workers, automatic core scaling",
 		-- cores: how many projectile workers ran side by side (measured every
 		-- frame), and the CoreProbe result (how many parallel Luau gets at all)
 		EffectiveCores = parallel.EffectiveCores,

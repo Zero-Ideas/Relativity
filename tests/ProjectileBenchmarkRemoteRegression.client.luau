@@ -36,8 +36,8 @@ local function run(overrides)
 end
 local ok, problem = pcall(function()
 	clear()
-	stage = "10k server-only"
-	run({Count = 10000, Visualize = false})
+	stage = "12k server-only sky"
+	run({Count = 12000, BatchSize = 1000, Visualize = false, SpawnInSky = true})
 	stage = "replicated"
 	run({Count = 1000, Visualize = true, Pattern = "Grid", GridSpacing = 0.25})
 	stage = "homing"
@@ -46,7 +46,7 @@ local ok, problem = pcall(function()
 	run({Count = 16, BeamEnabled = true, Radius = 0.35, Visualize = true})
 	stage = "malformed"
 	task.wait(0.6)
-	Offload.Fire("DebugBenchmark", {Action = "Run", Settings = {Count = 50001}})
+	Offload.Fire("DebugBenchmark", {Action = "Run", Settings = {Count = 0}})
 	assert(receive(function(data) return data.Error ~= nil end).Error, "Malformed request accepted")
 	stage = "batched cancellation"
 	task.wait(0.6)
@@ -63,4 +63,4 @@ local ok, problem = pcall(function()
 end)
 listener:Disconnect()
 assert(ok, problem)
-print("[ProjectileBenchmarkRemoteRegression] PASS: 10k server-only, replication, homing, beams, validation, cancel/clear")
+print("[ProjectileBenchmarkRemoteRegression] PASS: 12k sky server-only, replication, homing, beams, validation, cancel/clear")

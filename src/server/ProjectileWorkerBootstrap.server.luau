@@ -30,6 +30,10 @@ local MIN_WORKERS, MAX_WORKERS = 2, 8
 
 local actor = script:GetActor()
 if not actor then
+	local settings = game:GetService("ServerScriptService")
+	if settings:GetAttribute("ProjectileApplyPass") == nil then
+		settings:SetAttribute("ProjectileApplyPass", true)
+	end
 	local folder = script.Parent:FindFirstChild("ProjectileActors")
 	if not folder then
 		folder = Instance.new("Folder")
@@ -96,6 +100,7 @@ local Shared = ReplicatedStorage:WaitForChild("Shared")
 local ChunkManager = require(Shared:WaitForChild("ChunkManager"))
 local projectileModule = (actor.Parent :: Instance).Parent:WaitForChild("Projectile")
 local Sweep = require(projectileModule:WaitForChild("Sweep"))
+local ApplyPass = require(projectileModule:WaitForChild("ApplyPass"))
 local CollisionLOD = require(projectileModule:WaitForChild("CollisionLOD"))
 -- Workers import centrally baked masks; they never probe shapes/read terrain.
 _G.__RelativityOccupancyWorker = true
@@ -304,20 +309,28 @@ actor:BindToMessageParallel("Sweep", function(frame: number, ops: buffer?, count
 	if count == 0 then
 		return
 	end
-	-- this frame's budget on top of each slot's carried debt
-	for item = 1, count do
-		local o = (item - 1) * IN + IN_REMAINING
-		writef64(records, o, readf64(records, o) + globalDt * readf64(scales, (item - 1) * 8))
-	end
-	-- homing items' timers (kept here) into this frame's homing input
-	if homingIn then
+	-- Captured once for this batch; toggling never changes ownership or layout.
+	local useApplyPass = ServerScriptService:GetAttribute("ProjectileApplyPass") ~= false
+	local prepareStarted = os.clock()
+	if useApplyPass then
+		ApplyPass.Prepare(records, scales, timers, count, globalDt, homingIn)
+	else
+		-- this frame's budget on top of each slot's carried debt
 		for item = 1, count do
-			local h = (item - 1) * HOMING_IN
-			if readu8(homingIn, h) ~= 0 then
-				bufferCopy(homingIn, h + 24, timers, (item - 1) * 24, 24)
+			local o = (item - 1) * IN + IN_REMAINING
+			writef64(records, o, readf64(records, o) + globalDt * readf64(scales, (item - 1) * 8))
+		end
+		-- homing items' timers (kept here) into this frame's homing input
+		if homingIn then
+			for item = 1, count do
+				local h = (item - 1) * HOMING_IN
+				if readu8(homingIn, h) ~= 0 then
+					bufferCopy(homingIn, h + 24, timers, (item - 1) * 24, 24)
+				end
 			end
 		end
 	end
+	local prepareMs = (os.clock() - prepareStarted) * 1000
 	table.clear(entityChunks)
 	for _, key in entityKeys do
 		entityChunks[key] = true
@@ -349,7 +362,7 @@ actor:BindToMessageParallel("Sweep", function(frame: number, ops: buffer?, count
 			local velocity = Vector3.new(readf32(records, r + 20), readf32(records, r + 24), readf32(records, r + 28))
 			Sweep.WriteOutput(result, item, Sweep.Contact, position, velocity, readf64(records, r + IN_AGE),
 				readf64(records, r + IN_REMAINING), 0)
-			table.insert(exceptions, item)
+			if not useApplyPass then table.insert(exceptions, item) end
 			continue
 		end
 		if sample ~= 0 and item % sample == 0 then
@@ -362,6 +375,7 @@ actor:BindToMessageParallel("Sweep", function(frame: number, ops: buffer?, count
 		else
 			Sweep.Run(records, item, result, uniformTime, specs, castHits, hasEntities, onContact, homingIn, homingOut, homingFrame)
 		end
+		if useApplyPass then continue end
 		local o = i * OUT
 		local homes = homingOut ~= nil and homingIn ~= nil and readu8(homingIn :: buffer, i * HOMING_IN) ~= 0
 		if homes then
@@ -387,6 +401,11 @@ actor:BindToMessageParallel("Sweep", function(frame: number, ops: buffer?, count
 		end
 		table.insert(exceptions, item)
 	end
+	local applyStarted = os.clock()
+	if useApplyPass then
+		ApplyPass.Commit(records, timers, result, count, homingIn, homingOut, exceptions, changes)
+	end
+	local applyMs = if useApplyPass then (os.clock() - applyStarted) * 1000 else 0
 	local loopEnded = os.clock()
 	Occupancy.EndBatch()
 	local loop = loopEnded - loopStarted
@@ -398,15 +417,21 @@ actor:BindToMessageParallel("Sweep", function(frame: number, ops: buffer?, count
 			substeps += buffer.readu8(result, (item - 1) * outStride + 1)
 		end
 	end
-	local scale = if sampledRun > 0 then loop / sampledRun else 0
+	-- The native writeback has its own measurement; do not attribute it to
+	-- sampled sweep phases or count it again in plan/integrate.
+	local sweepLoop = math.max(loop - applyMs / 1000, 0)
+	local scale = if sampledRun > 0 then sweepLoop / sampledRun else 0
 	local occupancyTime, engineTime = sampledOccupancy * scale, sampledEngine * scale
 	local ms = (loopEnded - started) * 1000 -- how long this batch took (Stats tab)
 	local occupancy = Occupancy.TakeStats()
 	local profile = {
 		WSetup = (loopStarted - started) * 1000,
+		WPrepare = prepareMs,
+		WApply = applyMs,
+		WApplyPassCount = if useApplyPass then 1 else 0,
 		WOccupancy = occupancyTime * 1000,
 		WEngine = engineTime * 1000,
-		WPlanIntegrate = math.max(loop - occupancyTime - engineTime, 0) * 1000,
+		WPlanIntegrate = math.max(sweepLoop - occupancyTime - engineTime, 0) * 1000,
 		WSyncWait = lastWait,
 		-- (absolute os.clock times: Parallel turns them into the cores the
 		-- workers really ran on -- not summed like the rest)

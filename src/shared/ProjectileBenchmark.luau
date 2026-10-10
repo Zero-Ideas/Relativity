@@ -2,8 +2,7 @@
 -- Serializable benchmark inputs only. Entity/source, callbacks, ignore lists
 -- and beam IDs are constructed by the server, never supplied by the client.
 local Schema = {}
-Schema.MaxCount = 50000
-Schema.MaxActive = 100000
+Schema.MaxCount = math.huge -- No benchmark count cap; validation still requires finite integers.
 Schema.Fields = {} :: {any}
 local function field(group: string, key: string, label: string, kind: string, default: any, min: number?, max: number?, choices: {string}?)
 	table.insert(Schema.Fields, {Group = group, Key = key, Label = label, Kind = kind, Default = default, Min = min, Max = max, Choices = choices})
@@ -28,6 +27,8 @@ n("Launch", "Spread", 20, 0, 180, "Cone half-angle (degrees)")
 n("Launch", "SpawnRadius", 3, 0, 1000)
 n("Launch", "GridSpacing", 1, 0, 100)
 v("Launch", "SpawnOffset", "0, 0, 0", 10000)
+b("Launch", "SpawnInSky", false, "Spawn in the sky")
+n("Launch", "SkyHeight", 1000, 0, 1e7, "Sky height above character (studs)")
 b("Launch", "CustomDirection", false)
 v("Launch", "Direction", "0, 0, -1", 1e6)
 b("Launch", "UseTargetPosition", false, "Aim at explicit world position")
@@ -140,6 +141,10 @@ function Schema.Validate(raw: any): (any?, string?)
 	if result.UseAccelerationDirection and result.AccelerationDirection.Magnitude < 0.001 then return nil, "AccelerationDirection cannot be zero" end
 	if result.VisualSize.X <= 0 or result.VisualSize.Y <= 0 or result.VisualSize.Z <= 0 then return nil, "VisualSize must be positive" end
 	return result, nil
+end
+
+function Schema.Origin(s: any, characterPosition: Vector3): Vector3
+	return characterPosition + s.SpawnOffset + Vector3.new(0, if s.SpawnInSky then s.SkyHeight else 0, 0)
 end
 
 function Schema.Config(s: any): any

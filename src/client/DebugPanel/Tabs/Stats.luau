@@ -113,6 +113,8 @@ return function(window)
 	local sReasons = statLine(tab, "  not skipped: not baked / too wide / outside terrain / near geometry (of which moving)")
 	local sParallel = statLine(tab, "Parallel movement")
 	local sWorkers = statLine(tab, "Worker ms per frame (slowest / all)")
+	local sVersion = statLine(tab, "Projectile version")
+	local sApplyPass = statLine(tab, "  Native ApplyPass / prepare / writeback ms (all workers)")
 	local sCores = statLine(tab, "  Server cores (workers ran side by side / probe: parallel Luau total)")
 	local sSlots = statLine(tab, "  Slots (held / packed / released per frame)")
 	local sDispatch = statLine(tab, "  Main: dispatch ms (setup / pack / budget / send)")
@@ -142,6 +144,10 @@ return function(window)
 		if typeof(s) ~= "table" then
 			return
 		end
+		sVersion(s.ProjectileVersion or "unknown")
+		local wp = if typeof(s.WorkerProfile) == "table" then s.WorkerProfile else {}
+		sApplyPass(string.format("%s / %.2f / %.2f", if s.ApplyPassEnabled then "on" else "off",
+			tonumber(wp.WPrepare) or 0, tonumber(wp.WApply) or 0))
 		sFps(fmt("%.0f", s.Fps))
 		sFrame(`{fmt("%.2f", s.FrameMs)} / {fmt("%.2f", s.WorstFrameMs)}`)
 		sStep(`{fmt("%.2f", s.HeartbeatMs)} / {fmt("%.2f", s.PhysicsMs)}`)

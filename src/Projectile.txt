@@ -32,15 +32,16 @@
 --     src/server/Projectile/Store.luau (575 lines)
 --     src/server/Projectile/Spec.luau (124 lines)
 --     src/server/Projectile/Sweep.luau (494 lines)
+--     src/server/Projectile/ApplyPass.luau (67 lines)
 --     src/server/Projectile/Profile.luau (67 lines)
---     src/server/Projectile/Parallel.luau (1457 lines)
+--     src/server/Projectile/Parallel.luau (1498 lines)
 --     src/server/Projectile/init.luau (1670 lines)
 --     src/server/Projectile/BeamProjectileHandler.luau (377 lines)
 --     src/server/Projectile/BeamChain.luau (1822 lines)
 --     src/server/Projectile/BeamFlow.luau (1447 lines)
 --     src/server/Projectile/Beams.luau (9 lines)
 --     src/server/ProjectileQuota.luau (41 lines)
---     src/server/ProjectileWorkerBootstrap.server.luau (397 lines)
+--     src/server/ProjectileWorkerBootstrap.server.luau (466 lines)
 --   Client prediction and visuals
 --     src/shared/Projectile/Client/Types.luau (109 lines)
 --     src/shared/Projectile/Client/Prediction.luau (147 lines)
@@ -7793,6 +7794,80 @@ return Sweep
 -- =============================================================================
 
 -- =============================================================================
+-- BEGIN FILE: src/server/Projectile/ApplyPass.luau
+-- =============================================================================
+--!strict
+--!native
+--!optimize 2
+-- Native bookkeeping for the worker's resident records. The main thread
+-- still resolves contacts and dirty records; this pass only commits the
+-- ordinary movement results the worker previously copied in its script.
+local Sweep = require(script.Parent.Sweep)
+local SafeMath = require(game:GetService("ReplicatedStorage"):WaitForChild("Shared"):WaitForChild("SafeMath"))
+
+local IN, OUT = Sweep.InputStride, Sweep.OutputStride
+local IN_MOTION, IN_AGE, IN_REMAINING = Sweep.InputMotion, Sweep.InputAge, Sweep.InputRemaining
+local OUT_POSITION, OUT_AGE, OUT_REMAINING = Sweep.OutPosition, Sweep.OutAge, Sweep.OutRemaining
+local HOMING_IN, HOMING_OUT = Sweep.HomingInStride, Sweep.HomingOutStride
+local DONE, LIMIT = Sweep.Done, SafeMath.Limit
+
+local ApplyPass = {}
+
+function ApplyPass.Prepare(records: buffer, scales: buffer, timers: buffer, count: number, dt: number,
+	 homingIn: buffer?)
+	for item = 1, count do
+		local i = item - 1
+		local o = i * IN + IN_REMAINING
+		buffer.writef64(records, o, buffer.readf64(records, o) + dt * buffer.readf64(scales, i * 8))
+	end
+	if homingIn then
+		for item = 1, count do
+			local h = (item - 1) * HOMING_IN
+			if buffer.readu8(homingIn, h) ~= 0 then
+				buffer.copy(homingIn, h + 24, timers, (item - 1) * 24, 24)
+			end
+		end
+	end
+end
+
+function ApplyPass.Commit(records: buffer, timers: buffer, result: buffer, count: number,
+	homingIn: buffer?, homingOut: buffer?, exceptions: { number }, changes: { number })
+	for item = 1, count do
+		local i = item - 1
+		local o = i * OUT
+		local homes = homingOut ~= nil and homingIn ~= nil and buffer.readu8(homingIn :: buffer, i * HOMING_IN) ~= 0
+		if homes then
+			local change = buffer.readf64(homingOut :: buffer, i * HOMING_OUT + 24)
+			if change ~= 0 then
+				table.insert(changes, item)
+				table.insert(changes, change)
+			end
+		end
+		if buffer.readu8(result, o) == DONE then
+			local px = buffer.readf32(result, o + OUT_POSITION)
+			local py = buffer.readf32(result, o + OUT_POSITION + 4)
+			local pz = buffer.readf32(result, o + OUT_POSITION + 8)
+			if math.abs(px) <= LIMIT and math.abs(py) <= LIMIT and math.abs(pz) <= LIMIT then
+				local r = i * IN
+				buffer.copy(records, r + IN_MOTION, result, o + OUT_POSITION, 24)
+				buffer.writef64(records, r + IN_AGE, buffer.readf64(result, o + OUT_AGE))
+				buffer.writef64(records, r + IN_REMAINING, buffer.readf64(result, o + OUT_REMAINING))
+				if homes then
+					buffer.copy(timers, i * 24, homingOut :: buffer, i * HOMING_OUT, 24)
+				end
+				continue
+			end
+		end
+		table.insert(exceptions, item)
+	end
+end
+
+return ApplyPass
+-- =============================================================================
+-- END FILE: src/server/Projectile/ApplyPass.luau
+-- =============================================================================
+
+-- =============================================================================
 -- BEGIN FILE: src/server/Projectile/Profile.luau
 -- =============================================================================
 --!strict
@@ -8108,8 +8183,11 @@ local homingTimers: { number } = { 0, 0, 0 } -- scratch for Apply
 -- Worker time by phase, summed over workers since the last TakeStats (see
 -- ProjectileWorkerBootstrap).
 local workerProfile: { [string]: number } = {}
+-- How many workers really ran at once: per frame, their total busy time over
+-- the wall time from the first one starting to the last one finishing.
+local coreFrame, coreBusy, coreFirst, coreLast, coreWall = -1, 0, math.huge, -math.huge, 0
 local stats = { Parallel = 0, Resumed = 0, Serial = 0, Fallback = 0, Late = 0, Frames = 0, SlowestWorkerMs = 0, WorkerMs = 0,
-	AppliedFrames = 0, WorkerChecks = 0, WorkerSkipped = 0 }
+	AppliedFrames = 0, WorkerChecks = 0, WorkerSkipped = 0, CoreBusy = 0, CoreWall = 0 }
 -- workers' reasons a cast wasn't skipped: not ready, too wide, outside terrain, blocked, blocked by a moving part
 local workerReasons = { 0, 0, 0, 0, 0 }
 
@@ -8156,6 +8234,21 @@ local function refreshWorkers(): boolean
 			data: buffer, checks: number, skipped: number, reasons: { number }?, contacts: any, homingOut: buffer?,
 			exceptions: { number }?, changes: { number }?, profile: { [string]: number }?)
 			if profile then
+				-- one frame's batches: busy time and first start .. last finish
+				local tStart, tEnd = profile.TStart, profile.TEnd
+				profile.TStart, profile.TEnd = nil, nil
+				if tStart and tEnd then
+					if resultFrame ~= coreFrame then
+						if coreWall > 0 then
+							stats.CoreBusy += coreBusy
+							stats.CoreWall += coreWall
+						end
+						coreFrame, coreBusy, coreFirst, coreLast, coreWall = resultFrame, 0, math.huge, -math.huge, 0
+					end
+					coreBusy += tEnd - tStart
+					coreFirst, coreLast = math.min(coreFirst, tStart), math.max(coreLast, tEnd)
+					coreWall = coreLast - coreFirst
+				end
 				-- (summed over workers; TakeStats averages it per frame)
 				for key, value in profile do
 					workerProfile[key] = (workerProfile[key] or 0) + value
@@ -8591,6 +8684,22 @@ local function releaseBatch(batch: Batch)
 	batch.Count, batch.Sent, batch.HomingCount = 0, 0, 0
 end
 
+-- The worker set changed (CoreProbe resizes it): forget which filters,
+-- motion specs and time world the workers were sent, so every worker gets
+-- them again (new ones never had them).
+local function resetWorkerCaches()
+	table.clear(filterIds)
+	table.clear(filterByParams)
+	table.clear(filterReady)
+	nextFilterId = 0
+	table.clear(specIds)
+	table.clear(specReady)
+	nextSpecId = 0
+	table.clear(specByMetatable)
+	table.clear(handleInfo)
+	sentTimeVersion = -1
+end
+
 -- Empties every slot and the queue (parallel movement paused or off).
 local function releaseAll()
 	for _, batch in batches do
@@ -8790,7 +8899,12 @@ function Parallel.Dispatch(activeCount: number, globalDt: number, allowed: boole
 		batch.Sent = 0
 	end
 	if refreshWorkers() then
-		releaseAll() -- (batches follow worker order; this only happens at startup)
+		-- (batches follow worker order: at startup, and when CoreProbe resizes the set)
+		releaseAll()
+		resetWorkerCaches()
+		for w = #workers + 1, #batches do
+			batches[w] = nil
+		end
 	end
 	local workerCount = #workers
 	running = Parallel.Enabled and allowed and workerCount > 0 and activeCount >= Parallel.MinProjectiles and globalDt > 0
@@ -9317,6 +9431,8 @@ function Parallel.TakeStats()
 	end
 	snapshot.WorkerProfile = averaged
 	table.clear(workerProfile)
+	snapshot.EffectiveCores = if stats.CoreWall > 0 then stats.CoreBusy / stats.CoreWall else nil
+	stats.CoreBusy, stats.CoreWall = 0, 0
 	table.clear(workerReasons)
 	for index = 1, 5 do
 		workerReasons[index] = 0
@@ -14761,12 +14877,22 @@ return ProjectileQuota
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 
 -- More workers than cores is fine (the parallel phase spreads them over the
--- engine's threads) and evens out the slowest batch; each costs a Luau VM and
--- its own occupancy copy.
+-- engine's threads) and evens out the slowest batch; each costs a Luau VM, its
+-- own occupancy copy and a little fixed work every frame. Starts at
+-- WORKER_COUNT; once CoreProbe has measured the server's cores (its
+-- "CoreProbeCores" attribute) it becomes twice that, rounded to an even
+-- number within MIN..MAX_WORKERS -- a multiple of the cores, so equal batches
+-- divide evenly over them (3 workers on 2 cores leave one core idle half the
+-- time; 4 don't).
 local WORKER_COUNT = 6
+local MIN_WORKERS, MAX_WORKERS = 2, 8
 
 local actor = script:GetActor()
 if not actor then
+	local settings = game:GetService("ServerScriptService")
+	if settings:GetAttribute("ProjectileApplyPass") == nil then
+		settings:SetAttribute("ProjectileApplyPass", true)
+	end
 	local folder = script.Parent:FindFirstChild("ProjectileActors")
 	if not folder then
 		folder = Instance.new("Folder")
@@ -14783,16 +14909,43 @@ if not actor then
 		hello.Name = "OccupancyHello" -- a worker is listening: send it the baked grid
 		hello.Parent = folder
 	end
-	if not folder:FindFirstChildWhichIsA("Actor") then
-		for index = 1, WORKER_COUNT do
+	local template = script:Clone() -- (taken now: clones made later copy this, not a running worker)
+	local function setWorkerCount(count: number)
+		local existing = 0
+		for _, child in folder:GetChildren() do
+			if child:IsA("Actor") then
+				local index = tonumber(string.match(child.Name, "(%d+)$"))
+				if index and index > count then
+					child:Destroy()
+				else
+					existing = math.max(existing, index or 0)
+				end
+			end
+		end
+		for index = existing + 1, count do
 			local workerActor = Instance.new("Actor")
 			workerActor.Name = `ProjectileWorker{index}`
-			local workerScript = script:Clone()
+			local workerScript = template:Clone()
 			workerScript.Name = "Worker"
 			workerScript.Parent = workerActor
 			workerActor.Parent = folder
 		end
 	end
+	if not folder:FindFirstChildWhichIsA("Actor") then
+		setWorkerCount(WORKER_COUNT)
+	end
+	local ServerScriptService = game:GetService("ServerScriptService")
+	local function fitToCores()
+		local cores = ServerScriptService:GetAttribute("CoreProbeCores")
+		if typeof(cores) ~= "number" or cores <= 0 then
+			return
+		end
+		local count = math.clamp(2 * math.max(math.floor(cores + 0.5), 1), MIN_WORKERS, MAX_WORKERS)
+		print(`[Projectile] {count} parallel workers for about {cores} cores`)
+		setWorkerCount(count)
+	end
+	ServerScriptService:GetAttributeChangedSignal("CoreProbeCores"):Connect(fitToCores)
+	fitToCores()
 	return
 end
 
@@ -14801,10 +14954,12 @@ end
 --------------------------------------------------------------------------------
 
 local workerId = assert(tonumber(string.match(actor.Name, "(%d+)$")), "projectile worker needs a numeric suffix")
+local ServerScriptService = game:GetService("ServerScriptService")
 local Shared = ReplicatedStorage:WaitForChild("Shared")
 local ChunkManager = require(Shared:WaitForChild("ChunkManager"))
 local projectileModule = (actor.Parent :: Instance).Parent:WaitForChild("Projectile")
 local Sweep = require(projectileModule:WaitForChild("Sweep"))
+local ApplyPass = require(projectileModule:WaitForChild("ApplyPass"))
 local CollisionLOD = require(projectileModule:WaitForChild("CollisionLOD"))
 -- Workers import centrally baked masks; they never probe shapes/read terrain.
 _G.__RelativityOccupancyWorker = true
@@ -15013,20 +15168,28 @@ actor:BindToMessageParallel("Sweep", function(frame: number, ops: buffer?, count
 	if count == 0 then
 		return
 	end
-	-- this frame's budget on top of each slot's carried debt
-	for item = 1, count do
-		local o = (item - 1) * IN + IN_REMAINING
-		writef64(records, o, readf64(records, o) + globalDt * readf64(scales, (item - 1) * 8))
-	end
-	-- homing items' timers (kept here) into this frame's homing input
-	if homingIn then
+	-- Captured once for this batch; toggling never changes ownership or layout.
+	local useApplyPass = ServerScriptService:GetAttribute("ProjectileApplyPass") ~= false
+	local prepareStarted = os.clock()
+	if useApplyPass then
+		ApplyPass.Prepare(records, scales, timers, count, globalDt, homingIn)
+	else
+		-- this frame's budget on top of each slot's carried debt
 		for item = 1, count do
-			local h = (item - 1) * HOMING_IN
-			if readu8(homingIn, h) ~= 0 then
-				bufferCopy(homingIn, h + 24, timers, (item - 1) * 24, 24)
+			local o = (item - 1) * IN + IN_REMAINING
+			writef64(records, o, readf64(records, o) + globalDt * readf64(scales, (item - 1) * 8))
+		end
+		-- homing items' timers (kept here) into this frame's homing input
+		if homingIn then
+			for item = 1, count do
+				local h = (item - 1) * HOMING_IN
+				if readu8(homingIn, h) ~= 0 then
+					bufferCopy(homingIn, h + 24, timers, (item - 1) * 24, 24)
+				end
 			end
 		end
 	end
+	local prepareMs = (os.clock() - prepareStarted) * 1000
 	table.clear(entityChunks)
 	for _, key in entityKeys do
 		entityChunks[key] = true
@@ -15037,6 +15200,10 @@ actor:BindToMessageParallel("Sweep", function(frame: number, ops: buffer?, count
 	end
 	local homingOut = if homingIn then buffer.create(count * Sweep.HomingOutStride) else nil
 	Occupancy.BeginBatch()
+	-- detailed phase timing only while ServerScriptService.ProjectileProfile is
+	-- set (the analytics bench sets it): off, every item takes the plain path
+	local profiling = ServerScriptService:GetAttribute("ProjectileProfile") == true
+	local sample = if profiling then SAMPLE else 0
 	local loopStarted = os.clock()
 	local sampledRun = 0
 	sampledOccupancy, sampledEngine = 0, 0
@@ -15054,10 +15221,10 @@ actor:BindToMessageParallel("Sweep", function(frame: number, ops: buffer?, count
 			local velocity = Vector3.new(readf32(records, r + 20), readf32(records, r + 24), readf32(records, r + 28))
 			Sweep.WriteOutput(result, item, Sweep.Contact, position, velocity, readf64(records, r + IN_AGE),
 				readf64(records, r + IN_REMAINING), 0)
-			table.insert(exceptions, item)
+			if not useApplyPass then table.insert(exceptions, item) end
 			continue
 		end
-		if item % SAMPLE == 0 then
+		if sample ~= 0 and item % sample == 0 then
 			sampling = true
 			local t = os.clock()
 			Sweep.Run(records, item, result, uniformTime, specs, castHits, hasEntities, onContact, homingIn, homingOut, homingFrame,
@@ -15067,6 +15234,7 @@ actor:BindToMessageParallel("Sweep", function(frame: number, ops: buffer?, count
 		else
 			Sweep.Run(records, item, result, uniformTime, specs, castHits, hasEntities, onContact, homingIn, homingOut, homingFrame)
 		end
+		if useApplyPass then continue end
 		local o = i * OUT
 		local homes = homingOut ~= nil and homingIn ~= nil and readu8(homingIn :: buffer, i * HOMING_IN) ~= 0
 		if homes then
@@ -15092,25 +15260,42 @@ actor:BindToMessageParallel("Sweep", function(frame: number, ops: buffer?, count
 		end
 		table.insert(exceptions, item)
 	end
+	local applyStarted = os.clock()
+	if useApplyPass then
+		ApplyPass.Commit(records, timers, result, count, homingIn, homingOut, exceptions, changes)
+	end
+	local applyMs = if useApplyPass then (os.clock() - applyStarted) * 1000 else 0
 	local loopEnded = os.clock()
 	Occupancy.EndBatch()
 	local loop = loopEnded - loopStarted
-	-- substeps run (the guard byte of every result)
+	-- substeps run (the guard byte of every result; profiling only)
 	local substeps = 0
-	local outStride = Sweep.OutputStride
-	for item = 1, count do
-		substeps += buffer.readu8(result, (item - 1) * outStride + 1)
+	if profiling then
+		local outStride = Sweep.OutputStride
+		for item = 1, count do
+			substeps += buffer.readu8(result, (item - 1) * outStride + 1)
+		end
 	end
-	local scale = if sampledRun > 0 then loop / sampledRun else 0
+	-- The native writeback has its own measurement; do not attribute it to
+	-- sampled sweep phases or count it again in plan/integrate.
+	local sweepLoop = math.max(loop - applyMs / 1000, 0)
+	local scale = if sampledRun > 0 then sweepLoop / sampledRun else 0
 	local occupancyTime, engineTime = sampledOccupancy * scale, sampledEngine * scale
 	local ms = (loopEnded - started) * 1000 -- how long this batch took (Stats tab)
 	local occupancy = Occupancy.TakeStats()
 	local profile = {
 		WSetup = (loopStarted - started) * 1000,
+		WPrepare = prepareMs,
+		WApply = applyMs,
+		WApplyPassCount = if useApplyPass then 1 else 0,
 		WOccupancy = occupancyTime * 1000,
 		WEngine = engineTime * 1000,
-		WPlanIntegrate = math.max(loop - occupancyTime - engineTime, 0) * 1000,
+		WPlanIntegrate = math.max(sweepLoop - occupancyTime - engineTime, 0) * 1000,
 		WSyncWait = lastWait,
+		-- (absolute os.clock times: Parallel turns them into the cores the
+		-- workers really ran on -- not summed like the rest)
+		TStart = started,
+		TEnd = loopEnded,
 		WFire = lastFire,
 		WItemsCount = count,
 		WContactsCount = #contacts.Item,

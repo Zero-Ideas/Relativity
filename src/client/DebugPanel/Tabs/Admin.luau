@@ -158,6 +158,25 @@ return function(window)
 	ReplicatedStorage:GetAttributeChangedSignal("SpellCooldown"):Connect(refreshSettings)
 	refreshSettings()
 
+	tab:Separator({ Text = "Projectile performance experiment" })
+	local function applyPassEnabled(): boolean
+		return ReplicatedStorage:GetAttribute("ProjectileApplyPass") ~= false
+	end
+	local applyBox = tab:Checkbox({
+		Label = "Native projectile ApplyPass",
+		Value = applyPassEnabled(),
+		Callback = function(_, value: boolean)
+			if value ~= applyPassEnabled() then
+				VisualOffload.Fire("DebugSetProjectileApplyPass", value)
+			end
+		end,
+	})
+	tab:Label({ Text = "Compare off/on with the same active projectiles. Affects this server; starts on in each new server.",
+		TextWrapped = true, Size = UDim2.new(1, 0, 0, 0), AutomaticSize = Enum.AutomaticSize.Y })
+	ReplicatedStorage:GetAttributeChangedSignal("ProjectileApplyPass"):Connect(function()
+		if applyBox.Value ~= applyPassEnabled() then applyBox:SetTicked(applyPassEnabled()) end
+	end)
+
 	----------------------------------------------------------------------------
 	-- Player access: take tabs from one player you outrank
 	----------------------------------------------------------------------------

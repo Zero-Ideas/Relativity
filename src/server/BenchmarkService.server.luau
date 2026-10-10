@@ -63,14 +63,14 @@ VisualOffload.On("DebugBenchmark", function(data, player)
 		end
 		config.Model = model
 	end
-	local origin = root.Position + settings.SpawnOffset
+	local origin = Schema.Origin(settings, root.Position)
 	local aim = root.CFrame.LookVector
 	if settings.CustomDirection then aim = settings.Direction.Unit end
 	if settings.UseTargetPosition then
 		local offset = settings.TargetPosition - origin
 		if offset.Magnitude < 0.001 then reply(player, {Error = "TargetPosition equals spawn origin"}); return end
 		aim = offset.Unit
-	elseif typeof(data.Target) == "Vector3" then
+	elseif not settings.SpawnInSky and typeof(data.Target) == "Vector3" then
 		local target = data.Target
 		if target.X == target.X and target.Y == target.Y and target.Z == target.Z and target.Magnitude < 1e8 then
 			local offset = target - origin
@@ -87,9 +87,6 @@ VisualOffload.On("DebugBenchmark", function(data, player)
 		return settings.Damage == 0 or DebugAccess.CanAffect(player, targetPlayer)
 	end
 	prune(state)
-	if #state.shots + settings.Count > Schema.MaxActive then
-		reply(player, {Error = `Benchmark active limit ({Schema.MaxActive}) exceeded; clear previous runs first`}); return
-	end
 	state.cancelled, state.busy = false, true
 	local requested, spawned, spawnSeconds = settings.Count, 0, 0
 	local started, lastProgress = os.clock(), os.clock()

@@ -7,12 +7,13 @@ assert(s.Count == 10000 and s.BatchSize == 0)
 local config = Schema.Config(s)
 assert(config.Damage == 0 and config.Efficient and config.Visualize)
 assert(config.MaxSpeed == math.huge and config.Speed == 220)
-for key, value in {Count = 50001, BatchSize = -1, Speed = 0/0, Lifetime = math.huge, Efficient = "true", CountBad = 1} do
+for key, value in {Count = 0, BatchSize = -1, Speed = 0/0, Lifetime = math.huge, Efficient = "true", CountBad = 1} do
 	local raw = table.clone(defaults); raw[key] = value
 	assert(not Schema.Validate(raw), "Accepted malformed " .. key)
 end
 for _, raw in {
 	{Count = 1.5}, {VisualSize = "0, 1, 1"}, {Direction = "nan, 0, 1"},
+	{Count = math.huge}, {Count = 0/0}, {SkyHeight = -1}, {SpawnInSky = "true"},
 	{Color = "red"}, {MinSpeed = 200, MaxSpeed = 100}, {Source = workspace},
 	{CustomDirection = true, Direction = "0, 0, 0"},
 } do
@@ -20,6 +21,15 @@ for _, raw in {
 	for key, value in raw do full[key] = value end
 	assert(not Schema.Validate(full), "Malformed payload accepted")
 end
+local large = table.clone(defaults)
+large.Count, large.BatchSize = 1000000, 200000
+assert(Schema.Validate(large), "Benchmark counts still capped")
+local sky = table.clone(defaults)
+sky.SpawnOffset, sky.SkyHeight = "10, 20, 30", 1500
+local skySettings = assert(Schema.Validate(sky))
+assert(Schema.Origin(skySettings, Vector3.new(1, 2, 3)) == Vector3.new(11, 22, 33))
+skySettings.SpawnInSky = true
+assert(Schema.Origin(skySettings, Vector3.new(1, 2, 3)) == Vector3.new(11, 1522, 33), "Sky height or offset lost")
 local raw = table.clone(defaults)
 raw.VectorAcceleration, raw.AccelerationVector = true, "10, -20, 30"
 raw.VectorGravity, raw.GravityVector = true, "-5, 0, 0"

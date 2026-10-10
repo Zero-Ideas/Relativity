@@ -120,6 +120,9 @@ local function run(message: any)
 	print(`[Bench] {label}: {mode}, {target} projectiles for {seconds} s`)
 	-- Profile=1: the workers' detailed phase timing for this run (it costs a little)
 	local profile = tonumber(message.Profile) == 1
+	local previousApplyPass = ServerScriptService:GetAttribute("ProjectileApplyPass")
+	local applyPass = tonumber(message.ApplyPass)
+	if applyPass then ServerScriptService:SetAttribute("ProjectileApplyPass", applyPass == 1) end
 	ServerScriptService:SetAttribute("ProjectileProfile", if profile then true else nil)
 	-- TimeScale=x: the world time scale for the run (restored after)
 	local previousScale = Heartbeat.GetGlobalTimeScale()
@@ -132,6 +135,7 @@ local function run(message: any)
 	connection = RunService.Heartbeat:Connect(function()
 		if state.stop or os.clock() - started >= seconds or not root.Parent then
 			connection:Disconnect()
+			if applyPass then ServerScriptService:SetAttribute("ProjectileApplyPass", previousApplyPass) end
 			if timeScale then
 				Heartbeat.SetGlobalTimeScale(previousScale)
 			end

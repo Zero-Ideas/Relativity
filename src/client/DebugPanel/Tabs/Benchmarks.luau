@@ -21,7 +21,7 @@ return function(window)
 	local frameLine = Util.statLine(tab, "Client FPS / avg / worst ms")
 	local serverFrame = Util.statLine(tab, "Server frame ms at spawn completion")
 	status("Ready; defaults match the harmless 10k stress test")
-	tab:Label({Text = "Real server projectiles; nonzero Damage affects entities. Count limit: 50,000 per run. Independent beams, not a sustained linked stream.",
+	tab:Label({Text = "Real server projectiles; nonzero Damage affects entities. No projectile count cap. Sky spawns use your facing/custom direction unless an explicit target is set. Independent beams, not a sustained linked stream.",
 		TextWrapped = true, Size = UDim2.new(1, 0, 0, 0), AutomaticSize = Enum.AutomaticSize.Y})
 	local function applyDefaults(overrides)
 		local defaults = Schema.Defaults()
